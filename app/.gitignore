@@ -1,0 +1,15 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# Legacy backup snapshots — 23 of these as of 2026-07-18, noted as clutter in
+# IMPROVEMENT_PLAN.md. Excluded from the repo entirely, not just untracked,
+# so they can't cause confusion (stale copies of app.js/server.js/etc. sitting
+# next to the real files).
+*.bak
+*.synccheck
+
+# Real trade/account history — Anoop asked this not be uploaded at all.
+data/
+

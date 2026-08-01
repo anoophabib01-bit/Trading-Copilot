@@ -1,0 +1,181 @@
+// ============================================================
+// MNQ 4H ENGULFING BACKTEST STRATEGY
+// Anoop Habib | Lucid Trading Co-Pilot
+// Version 1.0 | June 2026
+//
+// WHAT THIS TESTS:
+//   4H engulfing candle as primary entry signal
+//   Entry: close of engulfing bar
+//   Stop:  low/high of engulfing bar + buffer
+//   Target: configurable R:R
+//   Filter: Daily 200 EMA trend direction (optional)
+//
+// HOW TO USE:
+//   1. Open TradingView → Pine Script Editor (bottom panel)
+//   2. Click "Open" → "New script" → paste this entire file
+//   3. Click "Add to chart"
+//   4. Set chart to MNQ1! on 4H timeframe
+//   5. Open "Strategy Tester" tab (bottom panel)
+//   6. Look at: Win Rate, Avg Win/Loss, Max Consecutive Losses
+// ============================================================
+
+//@version=5
+strategy("MNQ 4H Engulfing Backtest | Anoop",
+     overlay             = true,
+     initial_capital     = 50000,
+     default_qty_type    = strategy.fixed,
+     default_qty_value   = 1,
+     commission_type     = strategy.commission.cash_per_contract,
+     commission_value    = 1.0,        // $1/contract roundtrip — Lucid rate
+     slippage            = 2,          // 2 ticks slippage assumption
+     calc_on_every_tick  = false,
+     max_bars_back       = 500)
+
+// ─── INPUTS ───────────────────────────────────────────────
+var GRP1 = "Signal Settings"
+rr_ratio    = input.float (2.0,  "Target R:R Ratio",                minval=1.0, maxval=5.0, step=0.5, group=GRP1)
+stop_buf    = input.float (3.0,  "Stop Buffer beyond candle (pts)",  minval=0.0, maxval=20.0, step=0.5, group=GRP1)
+use_trend   = input.bool  (true, "Use Daily 200 EMA trend filter",   group=GRP1)
+body_pct    = input.float (0.3,  "Min engulfing body size (% of ATR)",minval=0.1, maxval=2.0, step=0.1, group=GRP1,
+                           tooltip="Filters out tiny doji engulfs. 0.3 = body must be at least 30% of 14-ATR")
+
+var GRP2 = "Risk Management"
+max_contracts = input.int(1, "Contracts (MNQ micros)", minval=1, maxval=40, group=GRP2,
+                           tooltip="MNQ = $2/point. 1 contract on a 50pt move = $100")
+
+// ─── DAILY 200 EMA TREND FILTER ──────────────────────────
+ema200 = request.security(syminfo.tickerid, "D", ta.ema(close, 200), lookahead=barmerge.lookahead_off)
+above_ema = close > ema200
+below_ema = close < ema200
+
+// ─── ATR FOR MINIMUM BODY SIZE FILTER ────────────────────
+atr14 = ta.atr(14)
+min_body = atr14 * body_pct
+
+// ─── ENGULFING CANDLE DETECTION ──────────────────────────
+// Definitions:
+//   Bullish engulfing: current bar is bullish AND completely engulfs prior bearish bar's body
+//   Bearish engulfing: current bar is bearish AND completely engulfs prior bullish bar's body
+
+prev_bull = close[1] > open[1]   // previous bar was bullish
+prev_bear = close[1] < open[1]   // previous bar was bearish
+
+curr_body = math.abs(close - open)  // size of current bar's body
+
+bull_engulf = close > open       and  // current bar is bullish
+              prev_bear           and  // previous bar was bearish
+              open  <= close[1]   and  // current open at or below prev close (bottom of prev body)
+              close >= open[1]    and  // current close at or above prev open (top of prev body)
+              curr_body >= min_body    // body is meaningful size, not a doji
+
+bear_engulf = close < open       and  // current bar is bearish
+              prev_bull           and  // previous bar was bullish
+              open  >= close[1]   and  // current open at or above prev close (top of prev body)
+              close <= open[1]    and  // current close at or below prev open (bottom of prev body)
+              curr_body >= min_body    // body is meaningful size
+
+// ─── APPLY TREND FILTER ──────────────────────────────────
+long_signal  = bull_engulf and (not use_trend or above_ema) and strategy.position_size == 0
+short_signal = bear_engulf and (not use_trend or below_ema) and strategy.position_size == 0
+
+// ─── STOP AND TARGET CALCULATION ─────────────────────────
+// Long: stop below low of engulfing candle, target at R:R multiple
+long_stop_px = low  - stop_buf
+long_risk    = close - long_stop_px
+long_tp_px   = close + (long_risk * rr_ratio)
+
+// Short: stop above high of engulfing candle
+short_stop_px = high + stop_buf
+short_risk    = short_stop_px - close
+short_tp_px   = close - (short_risk * rr_ratio)
+
+// ─── ENTRIES ─────────────────────────────────────────────
+if long_signal
+    strategy.entry("Long", strategy.long, qty=max_contracts, comment="Bull Engulf")
+    strategy.exit("Long Exit", "Long",
+                  stop  = long_stop_px,
+                  limit = long_tp_px,
+                  comment_loss = "SL Hit",
+                  comment_profit = "TP Hit")
+
+if short_signal
+    strategy.entry("Short", strategy.short, qty=max_contracts, comment="Bear Engulf")
+    strategy.exit("Short Exit", "Short",
+                  stop  = short_stop_px,
+                  limit = short_tp_px,
+                  comment_loss = "SL Hit",
+                  comment_profit = "TP Hit")
+
+// ─── VISUALS ─────────────────────────────────────────────
+// Signal arrows
+plotshape(bull_engulf and (not use_trend or above_ema),
+          "Bull Signal", shape.triangleup, location.belowbar,
+          color.new(color.lime, 10), size=size.small)
+
+plotshape(bear_engulf and (not use_trend or below_ema),
+          "Bear Signal", shape.triangledown, location.abovebar,
+          color.new(color.red, 10), size=size.small)
+
+// Engulfs filtered out by trend (show as faded)
+plotshape(bull_engulf and use_trend and not above_ema,
+          "Bull (filtered)", shape.triangleup, location.belowbar,
+          color.new(color.gray, 60), size=size.tiny)
+
+plotshape(bear_engulf and use_trend and not below_ema,
+          "Bear (filtered)", shape.triangledown, location.abovebar,
+          color.new(color.gray, 60), size=size.tiny)
+
+// 200 EMA line
+plot(use_trend ? ema200 : na, "200 EMA (Daily)", color.new(color.orange, 30), 2)
+
+// Active trade levels
+var float sl_line = na
+var float tp_line = na
+
+if strategy.position_size > 0
+    sl_line := long_stop_px
+    tp_line  := long_tp_px
+else if strategy.position_size < 0
+    sl_line := short_stop_px
+    tp_line  := short_tp_px
+else
+    sl_line := na
+    tp_line  := na
+
+plot(sl_line, "Stop Loss",   color.new(color.red,   0), 1, plot.style_linebr)
+plot(tp_line, "Take Profit", color.new(color.lime,  0), 1, plot.style_linebr)
+
+// ─── INFO TABLE ──────────────────────────────────────────
+var table t = table.new(position.top_right, 2, 8,
+     bgcolor      = color.new(color.navy, 15),
+     border_color = color.new(color.blue, 50),
+     border_width = 1,
+     frame_color  = color.new(color.blue, 30),
+     frame_width  = 1)
+
+if barstate.islast
+    // Header
+    table.cell(t, 0, 0, "MNQ Engulfing Backtest", text_color=color.white,
+               text_size=size.small, bgcolor=color.new(color.blue, 20),
+               text_halign=text.align_center)
+    table.merge_cells(t, 0, 0, 1, 0)
+
+    // Settings rows
+    rows = array.from(
+         "R:R Target", str.tostring(rr_ratio) + ":1",
+         "Stop Buffer", str.tostring(stop_buf) + " pts",
+         "Min Body", str.tostring(body_pct * 100, "#") + "% ATR",
+         "Trend Filter", use_trend ? "ON — D 200 EMA" : "OFF",
+         "Commission", "$1 / contract",
+         "Slippage", "2 ticks",
+         "Contracts", str.tostring(max_contracts) + " MNQ micro(s)")
+
+    for i = 0 to 6
+        label_txt = array.get(rows, i * 2)
+        value_txt = array.get(rows, i * 2 + 1)
+        table.cell(t, 0, i + 1, label_txt, text_color=color.new(color.gray, 20), text_size=size.tiny)
+        table.cell(t, 1, i + 1, value_txt, text_color=color.white, text_size=size.tiny)
+
+// ─── ALERTS ──────────────────────────────────────────────
+alertcondition(long_signal,  "Bullish Engulf Signal",  "MNQ 4H Bullish Engulfing detected — check 1H/15M/5M for entry")
+alertcondition(short_signal, "Bearish Engulf Signal",  "MNQ 4H Bearish Engulfing detected — check 1H/15M/5M for entry")

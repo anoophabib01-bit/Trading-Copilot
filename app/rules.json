@@ -1,0 +1,43 @@
+{
+  "_comment": "Single source of truth for all discipline rules. Edit here — scorer, guardrails and reports all read this file. Times are IST wall-clock minutes (e.g. 810 = 13:30).",
+  "sizeCap": 2,
+  "_sizeCap_comment": "FIXED 2026-07-28 (Anoop): was 6, silently 3x looser than the documented hard rule (CLAUDE.md rule #2: max 2 contracts/entry). The 150K eval breach on 2026-07-21 was exactly this — sized 5 lots, doubled to 10, against a stated 2-cap the app was never actually enforcing at this number.",
+  "tradeLimit": { "eval": 2, "funded": 20 },
+  "_tradeLimit_comment": "SUPERSEDED 2026-07-28 by tradesPerSession/tradesPerDay below — kept only so any code path still reading the old shape doesn't crash. Do not raise this back up as the active limit.",
+  "tradesPerSession": 5,
+  "tradesPerDay": 10,
+  "qualifyingTradeMinAbsPnl": 100,
+  "_qualifying_comment": "2026-07-28 (Anoop): only trades that closed with |P&L| >= $100 count toward the 5/session, 10/day cap. Anything that closed between -$100 and +$100 is a scratch/near-breakeven trade and doesn't count as one of the 5.",
+  "scorerTradesPerDayLimit": 10,
+  "dailyLossTiers": { "yellow": -250, "red": -350, "hard": -500 },
+  "_dailyLossTiers_comment": "CHANGED 2026-07-28 (Anoop): was -100/-150/-200.",
+  "dayStop": { "eval": 1500, "funded": 200 },
+  "cooldownMinutes": 15,
+  "sessionWindowsIST": [
+    { "name": "London", "startMin": 810, "endMin": 900 },
+    { "name": "NY", "startMin": 1140, "endMin": 1260 }
+  ],
+  "oneInstrumentPerDay": true,
+  "commissionPerContractPerSide": 0.59,
+  "giveback": { "armAtProfit": 400, "retracePct": 50 },
+  "perTradeMaxLoss": 300,
+  "challenge": { "greenDays": 5, "scoreTarget": 70 },
+  "eval": {
+    "start": 150000,
+    "startDate": "2026-07-08",
+    "maxDrawdown": 4500,
+    "profitTarget": 9000,
+    "consistencyPctMax": 50
+  },
+  "tradingMode": "standard",
+  "scalperRules": {
+    "_comment": "Override rules when tradingMode === 'scalper'. Anything NOT listed here falls through to the standard rules above.",
+    "sizeCap": 4,
+    "tradesPerSession": 8,
+    "tradesPerDay": 15,
+    "dailyLossTiers": { "yellow": -200, "red": -300, "hard": -400 },
+    "cooldownAfterLossOnly": true,
+    "maxHoldSeconds": 1800,
+    "scorerTradesPerDayLimit": 15
+  }
+}
