@@ -1,0 +1,11 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+*.bak
+*.synccheck
+
+# Real trade/account history and personal chat transcripts — not for the repo.
+DATA/
+sessions/
+_backup_before_move/
