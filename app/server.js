@@ -7,6 +7,7 @@ const { WebSocketServer } = require('ws');
 const mcpBridge = require('./mcp-bridge');
 const claudeAgent = require('./claude-agent');
 const groqAgent = require('./groq-agent');
+const { resolveDataDir, DEFAULT_DATA_DIR, FALLBACK_DATA_DIR } = require('./resolve-data-dir');
 const edgeTts = require('./edge-tts');
 const localTts = require('./local-tts'); // offline Windows SAPI fallback (2026-07-28)
 const sessionMgr = require('./session-manager');
@@ -37,6 +38,61 @@ function loadConfig() {
 }
 function saveConfig(cfg) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+}
+
+// ── OmniRoute primary-provider selection (2026-08-07) ───────────────────────────
+// Every Jessi/Scalper/Debate/PO3/Post-Session call previously hardcoded
+// `provider: 'gemini', model: 'gemini-3.5-flash'` plus an identical 3-entry
+// Gemini→Gemini→Groq fallbackChain. OmniRoute (approved via office-hours
+// design doc) is wired in as an OPTIONAL primary that sits in FRONT of that
+// unchanged chain — not a replacement for it. If OmniRoute is disabled, has
+// no key, or fails/errors mid-turn, groqAgent.stream()'s existing chain logic
+// (untouched) falls through to Gemini/Groq exactly as it did before OmniRoute
+// existed. This is the fail-open behavior Anoop asked for after seeing
+// OmniRoute's free/high-reasoning models ride pooled CLI-subscription
+// accounts (real ban risk, no SLA) rather than paid API keys.
+const STANDARD_FALLBACK_CHAIN = [
+  { provider: 'gemini', model: 'gemini-3.1-flash-lite' },
+  { provider: 'gemini', model: 'gemini-2.5-flash' },
+  { provider: 'groq',   model: 'openai/gpt-oss-20b' }
+];
+function primaryProviderModel() {
+  const cfg = loadConfig();
+  if (!cfg.disableOmniRoute && groqAgent.isOmniRouteReady()) {
+    return { provider: 'omniroute', model: cfg.omniRouteModel || 'auto/best-reasoning' };
+  }
+  return { provider: 'gemini', model: 'gemini-3.5-flash' };
+}
+// When OmniRoute is primary, Gemini's own default model rejoins the chain as
+// the first fallback step (it was the primary before OmniRoute existed);
+// otherwise the chain is unchanged from before this feature was added.
+function fallbackChainFor(primary) {
+  return primary.provider === 'omniroute'
+    ? [{ provider: 'gemini', model: 'gemini-3.5-flash' }, ...STANDARD_FALLBACK_CHAIN]
+    : STANDARD_FALLBACK_CHAIN;
+}
+
+// ── Request cancellation (2026-08-06) ───────────────────────────────────────────
+// Real end-to-end cancellation. Before this, window.api.cancelChat() and
+// friends only cleared local UI state — the server kept generating (and
+// burning API quota/rate-limit budget) in the background regardless. Each
+// chat-ish handler below registers an AbortController here for its reqId,
+// passes its .signal into claudeAgent.stream()/groqAgent.stream(), and
+// unregisters in a finally block. 'cancel-request' just looks it up and
+// fires it — reqIds are process-wide unique (a single incrementing counter
+// in ws-client.js), so no per-connection scoping is needed.
+const activeRequests = new Map(); // reqId -> AbortController
+function registerRequest(reqId) {
+  const ctrl = new AbortController();
+  activeRequests.set(reqId, ctrl);
+  return ctrl;
+}
+function unregisterRequest(reqId) {
+  activeRequests.delete(reqId);
+}
+function handleCancelRequest(msg) {
+  const ctrl = activeRequests.get(msg.reqId);
+  if (ctrl) { ctrl.abort(); activeRequests.delete(msg.reqId); }
 }
 
 // ── Server state ───────────────────────────────────────────────────────────────
@@ -117,8 +173,6 @@ function saveRules(rules) {
 // else stays at the root as a lifetime record. Falls back to the old in-project
 // data/ folder if the configured drive isn't writable, so the app never dies
 // just because an external path is missing.
-const DEFAULT_DATA_DIR = 'G:\\MNQ-CoPilot\\DATA';
-const FALLBACK_DATA_DIR = path.join(__dirname, 'data');
 let DATA_DIR = FALLBACK_DATA_DIR;
 // LIFETIME files (account_fees, account_archives, trade_journal) must never
 // silently reset just because DATA_DIR resolves differently between runs
@@ -158,15 +212,12 @@ function migrateLifetimeFiles() {
   });
 }
 function initDataDir() {
-  const wanted = (loadConfig().dataDir || DEFAULT_DATA_DIR);
-  try {
-    fs.mkdirSync(wanted, { recursive: true });
-    fs.accessSync(wanted, fs.constants.W_OK);
-    DATA_DIR = wanted;
-  } catch (e) {
-    DATA_DIR = FALLBACK_DATA_DIR;
-    try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
-    console.log(`⚠  Could not use "${wanted}" (${e.code || e.message}) — falling back to ${DATA_DIR}`);
+  const resolved = resolveDataDir();
+  DATA_DIR = resolved.dir;
+  if (resolved.isFallback) {
+    const wanted = loadConfig().dataDir || DEFAULT_DATA_DIR;
+    const e = resolved.error;
+    console.log(`⚠  Could not use "${wanted}" (${(e && (e.code || e.message)) || 'unknown error'}) — falling back to ${DATA_DIR}`);
   }
   console.log('✓ Data directory: ' + DATA_DIR);
   migrateLifetimeFiles();
@@ -435,6 +486,7 @@ wss.on('connection', (ws) => {
       case 'debate-chat-send': handleDebateChat(ws, msg);  break;
       case 'post-session-review': handlePostSessionReview(ws, msg); break;
       case 'scalper-chat-send': handleScalperChat(ws, msg); break;
+      case 'cancel-request':   handleCancelRequest(msg);   break;
       case 'tts-speak':        handleTtsSpeak(ws, msg);   break;
       case 'ict-po3':          handleIctPo3(ws, msg);     break;
       case 'po3-monitor-toggle':
@@ -587,6 +639,8 @@ function handleConfigSet(ws, msg) {
   if (msg.key === 'apiKey') claudeAgent.init(msg.value);
   if (msg.key === 'groqApiKey') groqAgent.init(msg.value);
   if (msg.key === 'geminiApiKey') groqAgent.initGemini(msg.value);
+  if (msg.key === 'omniRouteApiKey') groqAgent.initOmniRoute(msg.value, cfg.omniRouteBaseUrl);
+  if (msg.key === 'omniRouteBaseUrl') groqAgent.initOmniRoute(cfg.omniRouteApiKey, msg.value);
   if (msg.key === 'tvEnabled') startTradovate();
   send(ws, { type: 'config-saved', key: msg.key });
 }
@@ -612,14 +666,27 @@ function setCurrentMode(mode) {
 async function handleChat(ws, msg) {
   const { messages, reqId } = msg;
 
-  await claudeAgent.stream(messages, {
-    mode: currentMode,
-    onToken:    (text)              => send(ws, { type: 'chat-token',     reqId, text }),
-    onToolStart:(name, id)          => send(ws, { type: 'chat-tool-start',reqId, name, id }),
-    onToolDone: (name, id, ok, res) => send(ws, { type: 'chat-tool-done', reqId, name, id, ok, result: res }),
-    onDone:     (fullText)          => send(ws, { type: 'chat-done',      reqId, fullText }),
-    onError:    (errMsg)            => send(ws, { type: 'chat-error',     reqId, message: errMsg })
-  });
+  let extraContext = null;
+  try {
+    const align = formatAlignmentNotes(3);
+    if (align) extraContext = `### Where he's at (his own dated reflections — read before coaching, don't just cite it, actually factor it in):\n${align}`;
+  } catch (e) {}
+
+  const abortCtrl = registerRequest(reqId);
+  try {
+    await claudeAgent.stream(messages, {
+      mode: currentMode,
+      extraContext,
+      signal: abortCtrl.signal,
+      onToken:    (text)              => send(ws, { type: 'chat-token',     reqId, text }),
+      onToolStart:(name, id)          => send(ws, { type: 'chat-tool-start',reqId, name, id }),
+      onToolDone: (name, id, ok, res) => send(ws, { type: 'chat-tool-done', reqId, name, id, ok, result: res }),
+      onDone:     (fullText)          => send(ws, { type: 'chat-done',      reqId, fullText }),
+      onError:    (errMsg)            => send(ws, { type: 'chat-error',     reqId, message: errMsg })
+    });
+  } finally {
+    unregisterRequest(reqId);
+  }
 }
 
 // ── Jessi — Groq-backed accountability companion ────────────────────────────────
@@ -938,7 +1005,10 @@ function makeJessiToolExecutor(ws) {
       if (!mcpBridge.ready || !mcpBridge.tvConnected) {
         return `TradingView is disconnected — "${name}" is unavailable right now. Do not retry chart tools this turn. Tell Anoop TradingView Desktop needs to be running and reconnected (Refresh in the app), and answer whatever you can from his app data instead.`;
       }
-      const raw = await mcpBridge.callTool(name, args || {});
+      // FIX (2026-08-06): 'market_key_levels' is not a real tradingview-mcp
+      // tool (see getKeyLevelsSnapshot() above) — route it there instead of
+      // the generic mcpBridge passthrough, which would just fail silently.
+      const raw = name === 'market_key_levels' ? await getKeyLevelsSnapshot() : await mcpBridge.callTool(name, args || {});
       return (raw && raw.content) ? raw.content.map(c => c.text || '').join('\n') : JSON.stringify(raw);
     }
     if (name === 'app_get_data') {
@@ -972,6 +1042,29 @@ function makeJessiToolExecutor(ws) {
 // it in with an age indicator so Jessi has near-live chart awareness without a
 // fetch on every single message.
 let jessiTVCache = { text: null, ts: 0 };
+// FIX (2026-08-06, Anoop: "power of 3 is always unclear" investigation
+// surfaced this too): 'market_key_levels' — meant to "aggregate all Pine
+// lines/boxes/labels into one sorted list of key levels" — has never existed
+// as a real tradingview-mcp tool (same class of bug as market_multi_tf,
+// fixed just above in gatherPO3Context). Every call site below silently got
+// "Key levels: unavailable" forever. Real replacement: the three tools that
+// actually exist for this (data_get_pine_lines/labels/boxes), combined and
+// returned in the same {content:[{text}]} shape every call site already
+// expects — so this is a drop-in swap, not a rewrite of each caller.
+async function getKeyLevelsSnapshot() {
+  const [lines, labels, boxes] = await Promise.all([
+    mcpBridge.callTool('data_get_pine_lines', {}).catch(() => null),
+    mcpBridge.callTool('data_get_pine_labels', {}).catch(() => null),
+    mcpBridge.callTool('data_get_pine_boxes', {}).catch(() => null)
+  ]);
+  const txt = (r) => (r && r.content) ? r.content.map(c => c.text || '').join(' ') : '';
+  const parts = [];
+  const l1 = txt(lines); if (l1) parts.push('Lines: ' + l1);
+  const l2 = txt(labels); if (l2) parts.push('Labels: ' + l2);
+  const l3 = txt(boxes); if (l3) parts.push('Zones: ' + l3);
+  return { content: [{ text: parts.length ? parts.join(' | ') : 'no key levels drawn' }] };
+}
+
 let jessiTVMonitorInterval = null;
 function startJessiTVMonitor() {
   if (jessiTVMonitorInterval) clearInterval(jessiTVMonitorInterval);
@@ -981,7 +1074,7 @@ function startJessiTVMonitor() {
       const [state, quote, levels] = await Promise.all([
         mcpBridge.callTool('chart_get_state', {}).catch(() => null),
         mcpBridge.callTool('quote_get', {}).catch(() => null),
-        mcpBridge.callTool('market_key_levels', {}).catch(() => null)
+        getKeyLevelsSnapshot().catch(() => null)
       ]);
       const txt = (r) => (r && r.content) ? r.content.map(c => c.text || '').join(' ') : 'unavailable';
       jessiTVCache = { text: `Chart state: ${txt(state)}\nQuote: ${txt(quote)}\nKey levels: ${txt(levels)}`, ts: Date.now() };
@@ -994,6 +1087,24 @@ function startJessiTVMonitor() {
 // minimal=true (voice): only the account one-liner + the tool directory, no
 // chart snapshot / history / journal — those are all fetchable via tools and
 // were padding every voice turn against the 6000 TPM cap.
+// 2026-08-06: "Where your head's at" (Alignment tab) — Anoop's own dated
+// reflections, stored globally (not slot-namespaced, same as Lessons/trade
+// journal) via dataSave/dataLoad('align_notes'). Was localStorage-only
+// before this — no agent could ever read it despite the UI claiming
+// otherwise. This is the single formatter every agent's context-builder
+// below calls, so there's one place to change the format, not N copies.
+function formatAlignmentNotes(limit) {
+  try {
+    const list = dataLoad('align_notes');
+    if (!Array.isArray(list) || !list.length) return null;
+    const recent = list.slice(0, limit || 3);
+    return recent.map(e => {
+      const d = e.ts ? new Date(e.ts).toISOString().slice(0, 10) : '?';
+      return `- [${d}] ${e.text}`;
+    }).join('\n');
+  } catch (e) { return null; }
+}
+
 function buildJessiContext(minimal) {
   const cfg = loadConfig();
   const key = jessiBucketKey(cfg); // see jessiBucketKey() note above — slot-keyed, not legacy accountSize_mode
@@ -1007,6 +1118,12 @@ function buildJessiContext(minimal) {
   parts.push(`## DATA CONTEXT (open account — treat as ground truth)`);
   parts.push(`Active account: ${(cfg.accountSize || '150k').toUpperCase()} ${currentMode.toUpperCase()} — balance $${acc.balance || '?'}, today's P&L $${acc.profit != null ? acc.profit : '?'}.`);
   parts.push(`For cost/insights/trades/scalp/checklist/roadmap/history/rules call app_get_data(section) — "scalp" is the per-day hold-time/gap breakdown. To act call app_do. This open account only. No trades.`);
+
+  // Even in minimal (voice) context, a single most-recent Alignment entry is
+  // worth the few extra tokens — it's usually one short dated line, and it's
+  // exactly the continuity ("where his head's at") voice coaching needs too.
+  const minimalAlign = formatAlignmentNotes(1);
+  if (minimalAlign) parts.push(`\n### Where his head's at (most recent):\n${minimalAlign}`);
 
   if (minimal) return parts.join('\n');
 
@@ -1041,6 +1158,10 @@ Do NOT call any chart tool (chart_get_state, quote_get, market_key_levels, data_
     const sn = scalperNotesRead(null, 3);
     if (sn && !/^No scalper notes/.test(sn)) parts.push('\n### Scalper agent notes (behaviour, from video reviews):\n' + sn);
   } catch (e) {}
+  // Fuller Alignment history for full (text chat) context — the minimal/voice
+  // path above already got the single most-recent entry.
+  const fullAlign = formatAlignmentNotes(3);
+  if (fullAlign) parts.push(`\n### Where his head's at (his own dated reflections — read before coaching, don't just cite it, actually factor it in):\n${fullAlign}`);
   return parts.join('\n');
 }
 
@@ -1054,7 +1175,7 @@ async function maybeFetchTVSnapshot(text) {
     const [state, quote, levels] = await Promise.all([
       mcpBridge.callTool('chart_get_state', {}).catch(() => null),
       mcpBridge.callTool('quote_get', {}).catch(() => null),
-      mcpBridge.callTool('market_key_levels', {}).catch(() => null)
+      getKeyLevelsSnapshot().catch(() => null)
     ]);
     const txt = (r) => (r && r.content) ? r.content.map(c => c.text || '').join(' ') : '';
     return `### Live TradingView snapshot (pulled just now, on-demand)\nChart state: ${txt(state) || 'unavailable'}\nQuote: ${txt(quote) || 'unavailable'}\nKey levels: ${txt(levels) || 'unavailable'}`;
@@ -1110,10 +1231,14 @@ async function handleJessiChat(ws, msg) {
   // the marginal reasoning gain.
   // Groq stays as the fallback: separate vendor, entirely separate quota, and
   // still the fastest inference available if Gemini's RPD ever runs out.
+  const abortCtrl = registerRequest(reqId);
+  const primary = primaryProviderModel();
+  try {
   await groqAgent.stream(messages, systemPrompt, JESSI_TOOLS, {
-    provider: 'gemini',
-    model: 'gemini-3.5-flash',
+    provider: primary.provider,
+    model: primary.model,
     temperature: 0.85,
+    signal: abortCtrl.signal,
     // 2026-07-25 (revised): started as a single gemini-2.5-flash-lite +
     // one Groq fallback, which died on a live 404 — Google had closed the 2.5
     // line to new accounts, and 404 wasn't retryable at the time. Now an
@@ -1128,11 +1253,7 @@ async function handleJessiChat(ws, msg) {
     //      08/16/26). Last because of Groq's 6-8K TPM ceiling, which is what
     //      caused the original failures this whole switch was meant to fix.
     // Entries whose provider has no key configured are skipped automatically.
-    fallbackChain: [
-      { provider: 'gemini', model: 'gemini-3.1-flash-lite' },
-      { provider: 'gemini', model: 'gemini-2.5-flash' },
-      { provider: 'groq',   model: 'openai/gpt-oss-20b' }
-    ],
+    fallbackChain: fallbackChainFor(primary),
     toolExecutor: makeJessiToolExecutor(ws),
     onToken:     (text)              => send(ws, { type: 'jessi-chat-token',     reqId, text }),
     onToolStart: (name, id)          => send(ws, { type: 'jessi-chat-tool-start',reqId, name, id }),
@@ -1143,6 +1264,9 @@ async function handleJessiChat(ws, msg) {
     onDone:      (fullText)          => send(ws, { type: 'jessi-chat-done',      reqId, fullText }),
     onError:     (errMsg)            => send(ws, { type: 'jessi-chat-error',     reqId, message: errMsg })
   });
+  } finally {
+    unregisterRequest(reqId);
+  }
 }
 
 // ── 3-Agent Debate System ──────────────────────────────────────────────────────
@@ -1202,7 +1326,7 @@ async function gatherAnalysisContext() {
       const [state, quote, levels, ohlcv, labels, boxes] = await Promise.all([
         mcpBridge.callTool('chart_get_state', {}).catch(() => null),
         mcpBridge.callTool('quote_get', {}).catch(() => null),
-        mcpBridge.callTool('market_key_levels', {}).catch(() => null),
+        getKeyLevelsSnapshot().catch(() => null),
         mcpBridge.callTool('data_get_ohlcv', { summary: true }).catch(() => null),
         mcpBridge.callTool('data_get_pine_labels', {}).catch(() => null),
         mcpBridge.callTool('data_get_pine_boxes', {}).catch(() => null)
@@ -1236,22 +1360,20 @@ async function gatherAnalysisContext() {
 }
 
 // Run one debate agent (no tools, collect full text)
-function runDebateAgent(systemPrompt, userQuestion, dataContext) {
+function runDebateAgent(systemPrompt, userQuestion, dataContext, signal) {
   return new Promise((resolve) => {
     let fullText = '';
+    const primary = primaryProviderModel();
     groqAgent.stream(
       [{ role: 'user', content: userQuestion }],
       systemPrompt + '\n\n' + dataContext,
       [], // no tools
       {
-        provider: 'gemini',
-        model: 'gemini-3.5-flash',
+        provider: primary.provider,
+        model: primary.model,
         temperature: 0.7,
-        fallbackChain: [
-          { provider: 'gemini', model: 'gemini-3.1-flash-lite' },
-          { provider: 'gemini', model: 'gemini-2.5-flash' },
-          { provider: 'groq',   model: 'openai/gpt-oss-20b' }
-        ],
+        signal,
+        fallbackChain: fallbackChainFor(primary),
         onToken: (text) => { fullText += text; },
         onDone: () => resolve(fullText || '(No argument produced)'),
         onError: (err) => resolve('(Agent error: ' + err + ')')
@@ -1263,6 +1385,7 @@ function runDebateAgent(systemPrompt, userQuestion, dataContext) {
 async function handleDebateChat(ws, msg) {
   const { messages, reqId } = msg;
   const lastUserText = (messages && messages.length) ? messages[messages.length - 1].content : '';
+  const abortCtrl = registerRequest(reqId);
 
   // BUGFIX (2026-07-28): this whole function used to run with no top-level
   // try/catch. Anoop hit a hard stuck chat ("the chat is crashed" — red stop
@@ -1295,9 +1418,9 @@ async function handleDebateChat(ws, msg) {
     const po3SystemPrompt = ICT_PO3_PERSONA + ICT_PO3_DEBATE_SUFFIX;
 
     const [jessiArgument, analysisArgument, po3Argument] = await Promise.all([
-      runDebateAgent(jessiSystemPrompt, lastUserText, ''),
-      runDebateAgent(analysisSystemPrompt, lastUserText, analysisContext),
-      runDebateAgent(po3SystemPrompt, lastUserText, po3Context)
+      runDebateAgent(jessiSystemPrompt, lastUserText, '', abortCtrl.signal),
+      runDebateAgent(analysisSystemPrompt, lastUserText, analysisContext, abortCtrl.signal),
+      runDebateAgent(po3SystemPrompt, lastUserText, po3Context, abortCtrl.signal)
     ]);
 
     // Send all three arguments to the UI
@@ -1308,19 +1431,17 @@ async function handleDebateChat(ws, msg) {
 
     const judgeContext = `## JESSI'S ARGUMENT (Discipline & Psychology)\n${jessiArgument}\n\n## ANALYSIS AGENT'S ARGUMENT (Technical & Market)\n${analysisArgument}\n\n## ICT POWER OF 3 ARGUMENT (AMD phase — Accumulation / Manipulation / Distribution)\n${po3Argument}\n\n## ORIGINAL QUESTION\n${lastUserText}`;
 
+    const judgePrimary = primaryProviderModel();
     await groqAgent.stream(
       [{ role: 'user', content: 'Review both arguments above and deliver your verdict on the original question.' }],
       JUDGE_PERSONA + '\n\n' + judgeContext,
       [], // no tools
       {
-        provider: 'gemini',
-        model: 'gemini-3.5-flash',
+        provider: judgePrimary.provider,
+        model: judgePrimary.model,
         temperature: 0.5,
-        fallbackChain: [
-          { provider: 'gemini', model: 'gemini-3.1-flash-lite' },
-          { provider: 'gemini', model: 'gemini-2.5-flash' },
-          { provider: 'groq',   model: 'openai/gpt-oss-20b' }
-        ],
+        signal: abortCtrl.signal,
+        fallbackChain: fallbackChainFor(judgePrimary),
         onToken:  (text) => send(ws, { type: 'debate-judge-token', reqId, text }),
         onDone:   (fullText) => {
           send(ws, { type: 'debate-judge-done', reqId, fullText });
@@ -1341,6 +1462,8 @@ async function handleDebateChat(ws, msg) {
   } catch (e) {
     console.error('[handleDebateChat] uncaught error:', e);
     send(ws, { type: 'debate-judge-error', reqId, message: e.message || 'Debate failed unexpectedly.' });
+  } finally {
+    unregisterRequest(reqId);
   }
 }
 
@@ -1798,7 +1921,7 @@ async function gatherPO3Context() {
     const [state, quote, levels] = await Promise.all([
       mcpBridge.callTool('chart_get_state', {}).catch(() => null),
       mcpBridge.callTool('quote_get', {}).catch(() => null),
-      mcpBridge.callTool('market_key_levels', {}).catch(() => null)
+      getKeyLevelsSnapshot().catch(() => null)
     ]);
     const txt = (r) => (r && r.content) ? r.content.map(c => c.text || '').join(' ') : 'unavailable';
     parts.push('## CURRENT CHART');
@@ -1828,24 +1951,29 @@ async function gatherPO3Context() {
     '15':  '15-MIN — PRIMARY phase read (weight most)',
     '5':   '5-MIN — PRIMARY trigger read (displacement / FVG)'
   };
-  try {
-    const res = await mcpBridge.callTool('market_multi_tf', {
-      timeframes: PO3_TFS,
-      collect: ['ohlcv_summary']
-    });
-    const data = parseMultiTFResult(res);
-    if (data) {
-      parts.push('\n## MULTI-TIMEFRAME BARS (most recent last)');
-      for (const tf of PO3_TFS) {
-        const bars = getBarsFromMultiTF(data, tf);
-        parts.push('\n### ' + PO3_LABELS[tf]);
-        parts.push(bars && bars.length ? JSON.stringify(bars) : 'no bars returned for this timeframe');
-      }
-    } else {
-      parts.push('\n## MULTI-TIMEFRAME BARS: could not parse result');
+  // Bar counts sized to cover roughly one session's worth of AMD structure per TF.
+  const PO3_BAR_COUNTS = { '60': 30, '15': 40, '5': 48 };
+  // FIX (2026-08-06, Anoop: "power of 3 is always unclear"): this called
+  // mcpBridge.callTool('market_multi_tf', ...) — a tool name that has never
+  // existed anywhere in tradingview-mcp (confirmed against its full 68-tool
+  // registry and git history — not a removed/renamed tool, never implemented).
+  // Every call silently failed and was caught below, so PO3 ALWAYS received
+  // "no bars returned" for 15m/5m and correctly (per its own instructions)
+  // answered UNCLEAR every single time — the phase-gate logic was fine, its
+  // only input was empty. Replaced with getFullBars(tfCode, count), the same
+  // real, chart-lock-protected chart_set_timeframe + data_get_ohlcv + restore
+  // mechanism getTrendForTF()/getPDHPDL() already use successfully elsewhere
+  // in this file — reusing proven code instead of a second broken tool name.
+  parts.push('\n## MULTI-TIMEFRAME BARS (most recent last)');
+  for (const tf of PO3_TFS) {
+    try {
+      const bars = await getFullBars(tf, PO3_BAR_COUNTS[tf]);
+      parts.push('\n### ' + PO3_LABELS[tf]);
+      parts.push(bars && bars.length ? JSON.stringify(bars) : 'no bars returned for this timeframe');
+    } catch (e) {
+      parts.push('\n### ' + PO3_LABELS[tf]);
+      parts.push('fetch failed: ' + e.message);
     }
-  } catch (e) {
-    parts.push('\n## MULTI-TIMEFRAME BARS: failed (' + e.message + ')');
   }
 
   // BIAS SOURCE — FIXED 2026-07-29. This previously called ONLY get4HTrend(),
@@ -1909,19 +2037,16 @@ async function handleIctPo3(ws, msg) {
       ? String(question).trim() + '\n\nLIVE DATA:\n' + dataContext
       : 'Judge the current AMD phase from this live data.\n\n' + dataContext;
 
+    const po3Primary = primaryProviderModel();
     await groqAgent.stream(
       [{ role: 'user', content: userMsg }],
       ICT_PO3_PERSONA,
       [],
       {
-        provider: 'gemini',
-        model: 'gemini-3.5-flash',
+        provider: po3Primary.provider,
+        model: po3Primary.model,
         temperature: 0.4,
-        fallbackChain: [
-          { provider: 'gemini', model: 'gemini-3.1-flash-lite' },
-          { provider: 'gemini', model: 'gemini-2.5-flash' },
-          { provider: 'groq',   model: 'openai/gpt-oss-20b' }
-        ],
+        fallbackChain: fallbackChainFor(po3Primary),
         onToken: (text) => send(ws, { type: 'po3-token', reqId, text }),
         onDone:  (fullText) => send(ws, { type: 'po3-done', reqId, fullText }),
         onError: (errMsg) => send(ws, { type: 'po3-error', reqId, message: errMsg })
@@ -2116,19 +2241,16 @@ async function handlePostSessionReview(ws, msg) {
     send(ws, { type: 'post-review-status', reqId, phase: 'analyzing' });
 
     // Stream the review
+    const postSessionPrimary = primaryProviderModel();
     await groqAgent.stream(
       [{ role: 'user', content: 'Analyze my just-completed trading session. Here is ALL the data:\n\n' + dataContext }],
       POST_SESSION_ANALYST_PERSONA,
       [], // no tools
       {
-        provider: 'gemini',
-        model: 'gemini-3.5-flash',
+        provider: postSessionPrimary.provider,
+        model: postSessionPrimary.model,
         temperature: 0.8,
-        fallbackChain: [
-          { provider: 'gemini', model: 'gemini-3.1-flash-lite' },
-          { provider: 'gemini', model: 'gemini-2.5-flash' },
-          { provider: 'groq',   model: 'openai/gpt-oss-20b' }
-        ],
+        fallbackChain: fallbackChainFor(postSessionPrimary),
         onToken:  (text) => send(ws, { type: 'post-review-token', reqId, text }),
         onDone:   (fullText) => {
           send(ws, { type: 'post-review-done', reqId, fullText });
@@ -2322,6 +2444,7 @@ function makeScalperToolExecutor() {
 // knowing the numbers instead of burning a tool round-trip on every message.
 async function handleScalperChat(ws, msg) {
   const { reqId, messages } = msg;
+  const abortCtrl = registerRequest(reqId);
   try {
     const seed = [];
     try {
@@ -2334,23 +2457,25 @@ async function handleScalperChat(ws, msg) {
     try { seed.push('\n## SCALP STATS (per day)\n' + jessiAppGetData('scalp')); } catch (e) {}
     try { seed.push('\n## RECENT TRADES\n' + jessiAppGetData('trades')); } catch (e) {}
     try { seed.push('\n## YOUR PRIOR NOTES\n' + scalperNotesRead(null, 10)); } catch (e) {}
+    try {
+      const align = formatAlignmentNotes(3);
+      if (align) seed.push('\n## WHERE HIS HEAD\'S AT (his own dated reflections — read before coaching)\n' + align);
+    } catch (e) {}
 
     const seeded = [{ role: 'user', content: 'CONTEXT (auto-attached, not typed by Anoop):\n' + seed.join('\n') }]
       .concat(Array.isArray(messages) ? messages : []);
 
+    const scalperPrimary = primaryProviderModel();
     await groqAgent.stream(
       seeded,
       SCALPER_PERSONA,
       SCALPER_TOOLS,
       {
-        provider: 'gemini',
-        model: 'gemini-3.5-flash',
+        provider: scalperPrimary.provider,
+        model: scalperPrimary.model,
         temperature: 0.7,
-        fallbackChain: [
-          { provider: 'gemini', model: 'gemini-3.1-flash-lite' },
-          { provider: 'gemini', model: 'gemini-2.5-flash' },
-          { provider: 'groq',   model: 'openai/gpt-oss-20b' }
-        ],
+        signal: abortCtrl.signal,
+        fallbackChain: fallbackChainFor(scalperPrimary),
         toolExecutor: makeScalperToolExecutor(),
         onToken: (text) => send(ws, { type: 'scalper-token', reqId, text }),
         onToolStart: (name) => send(ws, { type: 'scalper-tool', reqId, name, phase: 'start' }),
@@ -2365,6 +2490,8 @@ async function handleScalperChat(ws, msg) {
   } catch (e) {
     console.error('[handleScalperChat] uncaught error:', e);
     send(ws, { type: 'scalper-error', reqId, message: e.message || 'Scalper chat failed unexpectedly.' });
+  } finally {
+    unregisterRequest(reqId);
   }
 }
 
@@ -2389,6 +2516,7 @@ async function handleJessiVoiceSend(ws, msg) {
   // Groq Orpheus call and just return the reply text. This removes 2 of the 3
   // Groq calls per turn, which is what was burning the daily token budget.
   const clientTts = msg.clientTts === true;
+  const abortCtrl = registerRequest(reqId);
   try {
     // 2026-07-25: this used to hard-require a Groq key for ANY voice turn.
     // That became wrong once Gemini became the default brain: if the browser
@@ -2448,23 +2576,28 @@ async function handleJessiVoiceSend(ws, msg) {
     if (voiceBrain === 'groq') { brainProvider = 'groq'; brainModel = 'openai/gpt-oss-20b'; }
     else if (voiceBrain === 'ollama-llama') { brainProvider = 'ollama'; brainModel = 'llama3.1:8b'; }
     else if (voiceBrain === 'ollama-qwen') { brainProvider = 'ollama'; brainModel = 'qwen2.5:3b'; }
+    else {
+      // 'gemini' (default brain) is the only choice OmniRoute is allowed to
+      // preempt — an explicit groq/ollama pick in Settings is a deliberate
+      // choice and stays untouched.
+      const voicePrimary = primaryProviderModel();
+      brainProvider = voicePrimary.provider;
+      brainModel = voicePrimary.model;
+    }
 
     // Same ordered fallback chain as text chat (see handleJessiChat) so a
     // retired Gemini model ID or an exhausted quota degrades instead of
     // failing the turn. Local Ollama brains get no chain — they're already
     // unlimited, and silently jumping to a cloud vendor would contradict the
     // whole point of picking a local brain.
-    const brainChain = brainProvider === 'ollama' ? undefined : [
-      { provider: 'gemini', model: 'gemini-3.1-flash-lite' },
-      { provider: 'gemini', model: 'gemini-2.5-flash' },
-      { provider: 'groq',   model: 'openai/gpt-oss-20b' }
-    ];
+    const brainChain = brainProvider === 'ollama' ? undefined : fallbackChainFor({ provider: brainProvider, model: brainModel });
 
     let fullReply = '';
     await new Promise((resolve) => {
       groqAgent.stream(turnMessages, systemPrompt, JESSI_VOICE_TOOLS, {
         provider: brainProvider,
         model: brainModel,
+        signal: abortCtrl.signal,
         fallbackChain: brainChain,
         toolExecutor: makeJessiToolExecutor(ws),
         onToolStart: (name, id) => send(ws, { type: 'jessi-voice-tool-start', reqId, name, id }),
@@ -2512,6 +2645,8 @@ async function handleJessiVoiceSend(ws, msg) {
     }
   } catch (e) {
     send(ws, { type: 'jessi-voice-error', reqId, message: e.message });
+  } finally {
+    unregisterRequest(reqId);
   }
 }
 
@@ -2564,10 +2699,12 @@ function handleScreenshot(ws, msg) {
 }
 
 // ── Engulfing monitors (multi-timeframe: 1H / 30M / 15M) ────────────────────────
-// Each monitor runs its own interval and uses market_multi_tf to switch the
-// TradingView chart to its target timeframe, pull Pine/OHLCV data, then restore
-// the chart — so 30M/15M checks are real, not just gated behind "chart happens
-// to already be on that TF" the way the old single-TF version was.
+// Each monitor runs its own interval and uses getBarsAndLabels() (2026-08-06 —
+// was market_multi_tf, a tool name that never existed, see its fix comment
+// below) to switch the TradingView chart to its target timeframe, pull
+// Pine/OHLCV data, then restore the chart — so 30M/15M checks are real, not
+// just gated behind "chart happens to already be on that TF" the way the old
+// single-TF version was.
 const ENGULF_TFS = {
   '1h':  { tfCode: '60', label: '1H',  intervalMs: 60 * 1000 },
   '30m': { tfCode: '30', label: '30M', intervalMs: 45 * 1000 },
@@ -2625,17 +2762,14 @@ async function checkEngulfingSignal(key) {
   let source = null;
 
   try {
-    // market_multi_tf switches the chart to cfg.tfCode, collects Pine labels/
-    // study values/OHLCV, then restores whatever TF was showing before.
-    const res = await mcpBridge.callTool('market_multi_tf', {
-      timeframes: [cfg.tfCode],
-      collect: ['pine_labels', 'study_values', 'ohlcv_summary']
-    });
-    const data = parseMultiTFResult(res);
-    const bars = getBarsFromMultiTF(data, cfg.tfCode);
+    // FIX (2026-08-06): market_multi_tf never existed as a real tool — see
+    // gatherPO3Context's fix above. getBarsAndLabels switches the chart to
+    // cfg.tfCode, collects bars + Pine labels/study values, then restores
+    // whatever TF was showing before — same contract the old comment claimed
+    // market_multi_tf had, now actually true.
+    const { bars, labelText } = await getBarsAndLabels(cfg.tfCode, 5);
 
     // ── Method 1/2: indicator label or study-value text mentions engulfing ──
-    const labelText = flattenIndicatorText(data, cfg.tfCode);
     if (/bull[^|]{0,30}engulf|engulf[^|]{0,30}bull/i.test(labelText)) {
       found = true; direction = 'BULLISH'; source = `${cfg.label} indicator`;
     } else if (/bear[^|]{0,30}engulf|engulf[^|]{0,30}bear/i.test(labelText)) {
@@ -2702,51 +2836,6 @@ async function checkEngulfingSignal(key) {
   }
 }
 
-// ── Shared OHLCV/label parsing for market_multi_tf responses ───────────────────
-// market_multi_tf returns real JSON (not just text to regex-scrape) shaped like:
-//   { results: { "<tfCode>": { pine_labels: {...}, study_values: {...}, ohlcv: { last_5_bars: [...] } } } }
-// Parsing it properly (instead of the old regex-over-joined-text approach) is
-// what makes full-range engulfing validity and the 4H trend read possible —
-// the old approach only ever saw open/close text fragments, never high/low.
-function parseMultiTFResult(res) {
-  try {
-    const raw = res && res.content && res.content[0] && res.content[0].text;
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-function getBarsFromMultiTF(data, tfCode) {
-  try {
-    const bars = data.results[tfCode].ohlcv.last_5_bars;
-    return Array.isArray(bars) ? bars : [];
-  } catch {
-    return [];
-  }
-}
-
-function flattenIndicatorText(data, tfCode) {
-  try {
-    const tf = data.results[tfCode];
-    const parts = [];
-    if (tf.pine_labels && Array.isArray(tf.pine_labels.studies)) {
-      for (const s of tf.pine_labels.studies) {
-        for (const l of (s.labels || [])) parts.push(l.text || '');
-      }
-    }
-    if (tf.study_values && Array.isArray(tf.study_values.studies)) {
-      for (const s of tf.study_values.studies) {
-        for (const k of Object.keys(s.values || {})) parts.push(`${s.name} ${k} ${s.values[k]}`);
-      }
-    }
-    return parts.join(' | ');
-  } catch {
-    return '';
-  }
-}
-
 // Full-range engulfing per Playbook C: the current bar must take out BOTH the
 // high AND the low of the previous bar (not just overlap its open/close body,
 // which is what the old body-only check did). Direction must also be the
@@ -2782,9 +2871,11 @@ async function get4HTrend() {
   // market_multi_tf call every time.
   if (trendCache.value && Date.now() - trendCache.at < 3 * 60 * 1000) return trendCache.value;
   try {
-    const res = await mcpBridge.callTool('market_multi_tf', { timeframes: ['240'], collect: ['ohlcv_summary'] });
-    const data = parseMultiTFResult(res);
-    const bars = getBarsFromMultiTF(data, '240');
+    // FIX (2026-08-06): market_multi_tf never existed as a real tool (see
+    // gatherPO3Context's fix above) — swapped for getFullBars, same real
+    // mechanism, same 5-bar count to preserve this function's documented
+    // "majority vote across the last 5 bars" behavior unchanged.
+    const bars = await getFullBars('240', 5);
     const trend = classifyTrendFromBars(bars);
     trendCache = { value: trend, at: Date.now() };
     return trend;
@@ -2873,9 +2964,10 @@ async function checkFVGSignal(key) {
   let found = false, direction = null, gapLow = null, gapHigh = null;
 
   try {
-    const res = await mcpBridge.callTool('market_multi_tf', { timeframes: [cfg.tfCode], collect: ['ohlcv_summary'] });
-    const data = parseMultiTFResult(res);
-    const bars = getBarsFromMultiTF(data, cfg.tfCode);
+    // FIX (2026-08-06): market_multi_tf never existed as a real tool — see
+    // gatherPO3Context's fix above. detectFVGFromBars only looks at the last
+    // 3 bars, so 5 is ample.
+    const bars = await getFullBars(cfg.tfCode, 5);
     const fvg = detectFVGFromBars(bars);
     if (fvg) {
       found = true; direction = fvg.direction; gapLow = fvg.gapLow; gapHigh = fvg.gapHigh;
@@ -3002,6 +3094,52 @@ async function _getFullBarsUnlocked(tfCode, count) {
     }
     const res = await mcpBridge.callTool('data_get_ohlcv', { count, summary: false });
     return extractBarsArray(parseToolResult(res));
+  } finally {
+    if (originalTf) {
+      try { await mcpBridge.callTool('chart_set_timeframe', { timeframe: originalTf }); } catch { /* best effort restore */ }
+    }
+  }
+}
+
+// FIX (2026-08-06): added for checkEngulfingSignal, which needs bars AND
+// pine labels/study values from the SAME switched timeframe (market_multi_tf
+// never existed — see gatherPO3Context's fix above). getFullBars can't be
+// reused here as-is since it restores the original timeframe before
+// returning, and label/study-value reads need to happen while still ON
+// cfg.tfCode. Same switch/poll/restore pattern as _getFullBarsUnlocked,
+// just also collecting labels + study values in the same switched window.
+async function getBarsAndLabels(tfCode, count) {
+  return withChartLock(() => _getBarsAndLabelsUnlocked(tfCode, count));
+}
+
+async function _getBarsAndLabelsUnlocked(tfCode, count) {
+  let originalTf = null;
+  try {
+    const stateRes = await mcpBridge.callTool('chart_get_state', {});
+    const state = parseToolResult(stateRes);
+    originalTf = (state && (state.timeframe || state.resolution)) || null;
+  } catch { /* if we can't read current TF, we just won't restore it below */ }
+
+  try {
+    await mcpBridge.callTool('chart_set_timeframe', { timeframe: tfCode });
+    for (let i = 0; i < 5; i++) {
+      try {
+        const check = parseToolResult(await mcpBridge.callTool('chart_get_state', {}));
+        const reported = check && (check.resolution || check.timeframe);
+        if (timeframeMatches(reported, tfCode)) break;
+      } catch { /* keep polling */ }
+      await new Promise(r => setTimeout(r, 400));
+    }
+    const [ohlcvRes, labelsRes, studyRes] = await Promise.all([
+      mcpBridge.callTool('data_get_ohlcv', { count, summary: false }).catch(() => null),
+      mcpBridge.callTool('data_get_pine_labels', {}).catch(() => null),
+      mcpBridge.callTool('data_get_study_values', {}).catch(() => null)
+    ]);
+    const txt = (r) => (r && r.content) ? r.content.map(c => c.text || '').join(' ') : '';
+    return {
+      bars: extractBarsArray(parseToolResult(ohlcvRes)),
+      labelText: (txt(labelsRes) + ' ' + txt(studyRes)).trim()
+    };
   } finally {
     if (originalTf) {
       try { await mcpBridge.callTool('chart_set_timeframe', { timeframe: originalTf }); } catch { /* best effort restore */ }
@@ -4030,6 +4168,8 @@ httpServer.listen(PORT, '127.0.0.1', async () => {
   else console.log('⚠  No Gemini key — Jessi falls back to Groq (smaller 6-8K tokens/min ceiling). Free key: aistudio.google.com/apikey');
   if (cfg.groqApiKey) { groqAgent.init(cfg.groqApiKey); console.log('✓ Groq API key loaded (Jessi fallback + voice STT/TTS)'); }
   else console.log('⚠  No Groq key — Jessi chat falls back to offline mode until one is added in Settings');
+  if (cfg.omniRouteApiKey) { groqAgent.initOmniRoute(cfg.omniRouteApiKey, cfg.omniRouteBaseUrl); console.log('✓ OmniRoute API key loaded (primary brain when enabled)'); }
+  else console.log('ℹ  No OmniRoute key — using Gemini/Groq chain only');
   startJessiTVMonitor();
   console.log('✓ Jessi background chart monitor started (3-min cadence)');
   console.log(`✓ Mode: ${(cfg.mode || 'funded').toUpperCase()}`);

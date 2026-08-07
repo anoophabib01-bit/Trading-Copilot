@@ -1670,43 +1670,6 @@ function renderCsvDisciplineReport(filename, r) {
   return lines.join('\n');
 }
 
-async function sendCsvForAnalysis(filename, csvText) {
-  // Keep it bounded — same rationale as the old MNQ-CoPilot-Server's 8000-char cap
-  const MAX_CHARS = 12000;
-  const truncated = csvText.length > MAX_CHARS;
-  const csvSample = truncated ? csvText.slice(0, MAX_CHARS) + '\n[...truncated]' : csvText;
-  const rowCount = Math.max(0, csvText.split('\n').filter(l => l.trim()).length - 1);
-
-  const prompt = `Analyze this Tradovate Performance CSV (${filename}, ${rowCount} data rows${truncated ? ', truncated to fit' : ''}) against my current rules.
-
-Check specifically:
-1. Trade count vs the 20/day limit
-2. Daily loss tiers: -$100 yellow / -$150 red / -$200 hard cut-off — did the session cross any of these, and when?
-3. Session window violations — trades outside London (1:30–3:00 PM IST) or NY (7:00–9:00 PM IST)
-4. One-instrument-per-day — any MNQ AND MGC trades on the same day?
-5. Revenge clusters — rapid re-entries at the same price zone within minutes of a loss
-6. R:R inversion — are winners cut short and losers held long? (avg win vs avg loss)
-7. 15-minute break rule — any re-entries within 15 minutes of the prior trade?
-8. Net P&L after estimated commission (~$0.59/contract/side)
-
-Give a clear verdict: COMPLIANT / PARTIAL VIOLATION / FULL BREAKDOWN. Be specific with timestamps and numbers. No softening.
-
-CSV DATA:
-${csvSample}`;
-
-  addUserMessage(`📄 Analyzing ${filename} (${rowCount} rows)…`);
-  state.messages.push({ role: 'user', content: prompt });
-
-  setStreaming(true);
-  startNewAssistantBubble();
-
-  try {
-    await window.api.sendChat([buildContextMessage(), ...state.messages]);
-  } catch (e) {
-    setStreaming(false);
-    addSystemMessage('CSV analysis error: ' + e.message);
-  }
-}
 
 // ── Mode switching ─────────────────────────────────────────────────────────────
 // FIX (2026-07-21): the old switchMode/applyMode pair (flat state.mode only,
@@ -3208,8 +3171,13 @@ function wireVoiceListeners() {
   voiceState.offFallback = window.api.onJessiVoiceFallback((from, to) => {
     setVoicePhase('thinking', 'Switched brains (' + from + ' limit hit)…', document.getElementById('voice-caption').textContent);
   });
+  // 2026-08-03: was addSystemMessage (a visible chat bubble) — inconsistent
+  // with text-chat's onJessiChatQuotaWarn, which is deliberately console-only
+  // (2026-07-27: "model routing is Jessi's business, not something that
+  // should interrupt the conversation on screen"). Matched to that stated
+  // philosophy: caption-only, like offFallback just above.
   voiceState.offQuotaWarn = window.api.onJessiVoiceQuotaWarn((message) => {
-    addSystemMessage('⏳ Running low — ' + message);
+    setVoicePhase('thinking', '⏳ Running low — ' + message, document.getElementById('voice-caption').textContent);
   });
   voiceState.offAudio = window.api.onJessiVoiceAudio((fullText, clips, mime) => {
     clearVoiceWatchdog();
@@ -3869,7 +3837,13 @@ function renderMarkdown(text) {
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/\*(.+?)\*/g,     '<em>$1</em>');
   html = html.replace(/`(.+?)`/g,       '<code>$1</code>');
-  html = html.replace(/^[•\-] (.+)$/gm, '<div class="md-li">$1</div>');
+  // 2026-08-05: was [•\-] only, so a single-asterisk bullet ("* Verdict on
+  // the process...", Jessi's actual output style) fell through as a literal
+  // asterisk instead of a bullet. Safe to add '*' here: the \*\*bold\*\* and
+  // \*italic\* passes above already ran and only ever consume a MATCHED pair
+  // of asterisks on the same line, so a lone leading "* " survives untouched
+  // and lands here.
+  html = html.replace(/^[•\-*] (.+)$/gm, '<div class="md-li">$1</div>');
   html = html.replace(/^\d+\. (.+)$/gm, '<div class="md-li">$1</div>');
   html = html.replace(/^---+$/gm,        '<hr class="md-sep">');
   html = html.replace(/\bGO\b(?!-)/g,    '<span class="badge-go">GO</span>');
@@ -4838,6 +4812,9 @@ function openSettings() {
     if (cfg.apiKey) document.getElementById('settings-api-key').value = cfg.apiKey;
     if (cfg.groqApiKey) document.getElementById('settings-groq-key').value = cfg.groqApiKey;
     { const gk = document.getElementById('settings-gemini-key'); if (gk && cfg.geminiApiKey) gk.value = cfg.geminiApiKey; }
+    { const ork = document.getElementById('settings-omniroute-key'); if (ork && cfg.omniRouteApiKey) ork.value = cfg.omniRouteApiKey; }
+    { const oru = document.getElementById('settings-omniroute-url'); if (oru) oru.value = cfg.omniRouteBaseUrl || 'http://localhost:20128'; }
+    { const dor = document.getElementById('settings-disable-omniroute'); if (dor) dor.checked = !!cfg.disableOmniRoute; }
     { const vb = document.getElementById('settings-voice-brain'); if (vb) vb.value = cfg.voiceBrain || 'gemini'; }
     { const vn = document.getElementById('settings-voice-name'); if (vn) vn.value = cfg.edgeVoice || 'en-IN-NeerjaNeural'; }
     val('settings-balance', 'balance', acc.balance);
@@ -4862,6 +4839,7 @@ function openSettings() {
     val('settings-tv-appid', 'tvAppId', 'MNQ Co-Pilot');
     val('settings-tv-cid', 'tvCid', '');
     if (cfg.tvSec) document.getElementById('settings-tv-sec').value = cfg.tvSec;
+    { const dto = document.getElementById('settings-disable-token-opt'); if (dto) dto.checked = !!cfg.disableTokenOpt; }
   });
   document.getElementById('settings-overlay').className = 'visible';
 }
@@ -4878,6 +4856,10 @@ async function saveSettings() {
   const groqApiKey = document.getElementById('settings-groq-key').value.trim();
   const geminiKeyEl = document.getElementById('settings-gemini-key');
   const geminiApiKey = geminiKeyEl ? geminiKeyEl.value.trim() : '';
+  const omniRouteKeyEl = document.getElementById('settings-omniroute-key');
+  const omniRouteApiKey = omniRouteKeyEl ? omniRouteKeyEl.value.trim() : '';
+  const omniRouteUrlEl = document.getElementById('settings-omniroute-url');
+  const omniRouteBaseUrl = omniRouteUrlEl ? omniRouteUrlEl.value.trim() : '';
   const voiceBrainEl = document.getElementById('settings-voice-brain');
   const voiceBrain = voiceBrainEl ? voiceBrainEl.value : 'gemini';
   const voiceNameEl = document.getElementById('settings-voice-name');
@@ -4899,7 +4881,7 @@ async function saveSettings() {
   const telegramChatId   = document.getElementById('settings-telegram-chatid').value.trim();
 
   const cfgEntries = {
-    apiKey, groqApiKey, geminiApiKey, voiceBrain, edgeVoice, balance, profit,
+    apiKey, groqApiKey, geminiApiKey, omniRouteApiKey, omniRouteBaseUrl, voiceBrain, edgeVoice, balance, profit,
     fundedFloor, fundedDayStop, fundedTargetMin, fundedTargetMax, payoutTarget,
     evalFloor, evalDayCap, evalDayStop
   };
@@ -4922,6 +4904,12 @@ async function saveSettings() {
   await window.api.setConfig('tvCid', document.getElementById('settings-tv-cid').value.trim());
   await window.api.setConfig('tvSec', document.getElementById('settings-tv-sec').value);
   await window.api.setConfig('tvEnabled', document.getElementById('settings-tv-enabled').checked);
+
+  const dtoEl = document.getElementById('settings-disable-token-opt');
+  if (dtoEl) await window.api.setConfig('disableTokenOpt', dtoEl.checked);
+
+  const dorEl = document.getElementById('settings-disable-omniroute');
+  if (dorEl) await window.api.setConfig('disableOmniRoute', dorEl.checked);
 
   Object.assign(acc, {
     balance, profit,
@@ -5083,27 +5071,54 @@ document.getElementById('settings-open-btn').addEventListener('click', openSetti
 // accounts, same as Lessons — that Claude should read before coaching him,
 // so continuity isn't assumed from memory alone.
 (function(){
-  const AKEY = 'copilot_align_notes';
-  function loadA(){ try{ return JSON.parse(localStorage.getItem(AKEY)) || []; }catch(e){ return []; } }
-  function saveA(list){ localStorage.setItem(AKEY, JSON.stringify(list)); }
-  window.addAlignNote = function(){
+  const AKEY = 'copilot_align_notes'; // local cache/offline fallback only — server (DATA/align_notes.json) is the source of truth
+  let cache = [];
+  let loaded = false;
+
+  // 2026-08-06: was localStorage-only — browser-local, never reached the
+  // server, so (a) clearing browser data or switching machines silently lost
+  // every entry, and (b) no agent could ever read it, despite the UI copy
+  // literally saying "Claude reads recent entries here before coaching you."
+  // Neither was true. Fixed: server is now the source of truth (global key,
+  // not slot-namespaced — same as Lessons, since your psychology isn't
+  // per-account); localStorage is kept only as an instant-paint cache/
+  // offline fallback if the server round-trip fails.
+  async function loadA(force){
+    if (loaded && !force) return cache;
+    try {
+      if (window.api && window.api.dataLoad) {
+        const remote = await window.api.dataLoad('align_notes');
+        if (Array.isArray(remote)) { cache = remote; loaded = true; localStorage.setItem(AKEY, JSON.stringify(remote)); return cache; }
+      }
+    } catch (e) { console.error('Alignment load failed, using local cache:', e.message); }
+    try { cache = JSON.parse(localStorage.getItem(AKEY)) || []; } catch (e) { cache = []; }
+    loaded = true;
+    return cache;
+  }
+  async function saveA(list){
+    cache = list;
+    localStorage.setItem(AKEY, JSON.stringify(list));
+    try { if (window.api && window.api.dataSave) await window.api.dataSave('align_notes', list); }
+    catch (e) { console.error('Alignment save failed (kept locally, will retry next save):', e.message); }
+  }
+  window.addAlignNote = async function(){
     const el = document.getElementById('align-text');
     const text = el ? el.value.trim() : '';
     if (!text) return;
-    const list = loadA();
+    const list = (await loadA()).slice();
     list.unshift({ id: Date.now(), ts: new Date().toISOString(), text: text });
-    saveA(list.slice(0, 150));
+    await saveA(list.slice(0, 150));
     if (el) el.value = '';
     const saved = document.getElementById('align-saved');
     if (saved) { saved.textContent = 'Saved ✓'; setTimeout(() => { saved.textContent = ''; }, 2000); }
     renderAlignment();
   };
-  window.deleteAlignNote = function(id){
+  window.deleteAlignNote = async function(id){
     if (!confirm('Delete this entry?')) return;
-    saveA(loadA().filter(x => x.id !== id));
+    await saveA((await loadA()).filter(x => x.id !== id));
     renderAlignment();
   };
-  window.renderAlignment = function(){
+  window.renderAlignment = async function(){
     const liveEl = document.getElementById('align-live-rules');
     if (liveEl) {
       const r = (typeof getRules === 'function') ? getRules() : {};
@@ -5128,7 +5143,8 @@ document.getElementById('settings-open-btn').addEventListener('click', openSetti
       liveEl.innerHTML = h;
     }
     const wrap = document.getElementById('align-notes-list'); if (!wrap) return;
-    const list = loadA();
+    wrap.innerHTML = '<div style="font-size:12px;opacity:.5;">Loading…</div>';
+    const list = await loadA(true); // force a fresh server read on every tab-open, not just the cache
     if (!list.length) { wrap.innerHTML = '<div style="font-size:12px;opacity:.5;">Nothing logged yet.</div>'; return; }
     wrap.innerHTML = list.map(function(e){
       const d = new Date(e.ts).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
@@ -6626,10 +6642,19 @@ function csvIngest(filename, csvText) {
 }
 
 // ── Panel drag-resize: left and right panels, widths persisted locally ────────
+// UPDATED 2026-08-02 (design-shotgun): the right panel carries 10 tabs
+// (Analysis/Journal/Rules/Lessons/Alignment/Ladder/Checklist/Roadmap/
+// Insights/Cost) with dense nested cards — a fixed 1000px cap wasn't enough
+// room to read comfortably. Right's max is now computed live from the actual
+// window width each drag, so it can expand nearly to the center panel's
+// floor instead of stopping at an arbitrary number. Left keeps a static cap
+// since it's a fixed nav/account list, not detail-heavy.
 (function () {
   const KEY = 'copilot_panel_widths';
   const DEFAULTS = { left: 240, right: 480 };
-  const LIMITS = { left: [170, 480], right: [320, 1000] };
+  const LIMITS = { left: [170, 480] };
+  const MIN_RIGHT = 320;
+  const CENTER_MIN = 280; // center (chart/chat) never shrinks below this
 
   function loadWidths() { try { return Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch (e) { return Object.assign({}, DEFAULTS); } }
   function saveWidths(w) { try { localStorage.setItem(KEY, JSON.stringify(w)); } catch (e) {} }
@@ -6642,9 +6667,15 @@ function csvIngest(filename, csvText) {
     const rzR = document.getElementById('resizer-right');
     if (!left || !right || !rzL || !rzR) return;
 
+    function maxRight() {
+      const totalW = window.innerWidth;
+      const leftW = left.getBoundingClientRect().width;
+      return Math.max(MIN_RIGHT, totalW - leftW - CENTER_MIN - 24 /* resizer + gutters */);
+    }
+
     const widths = loadWidths();
     left.style.width = clamp(widths.left, LIMITS.left[0], LIMITS.left[1]) + 'px';
-    right.style.width = clamp(widths.right, LIMITS.right[0], LIMITS.right[1]) + 'px';
+    right.style.width = clamp(widths.right, MIN_RIGHT, maxRight()) + 'px';
 
     function attach(handle, panel, side) {
       handle.addEventListener('mousedown', (e) => {
@@ -6656,7 +6687,12 @@ function csvIngest(filename, csvText) {
         function onMove(ev) {
           // left panel grows dragging right; right panel grows dragging left
           const dx = ev.clientX - startX;
-          const w = clamp(side === 'left' ? startW + dx : startW - dx, LIMITS[side][0], LIMITS[side][1]);
+          let w;
+          if (side === 'left') {
+            w = clamp(startW + dx, LIMITS.left[0], LIMITS.left[1]);
+          } else {
+            w = clamp(startW - dx, MIN_RIGHT, maxRight());
+          }
           panel.style.width = w + 'px';
         }
         function onUp() {
@@ -6679,6 +6715,14 @@ function csvIngest(filename, csvText) {
     }
     attach(rzL, left, 'left');
     attach(rzR, right, 'right');
+
+    // Re-clamp the right panel on window resize so it never overruns center
+    // if the user shrinks the window after dragging it wide.
+    window.addEventListener('resize', () => {
+      const w = right.getBoundingClientRect().width;
+      const m = maxRight();
+      if (w > m) right.style.width = m + 'px';
+    });
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 })();

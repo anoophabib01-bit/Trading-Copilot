@@ -67,9 +67,27 @@ const GEMINI_MODEL = 'gemini-3.5-flash';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
 const GEMINI_PATH = '/v1beta/openai/chat/completions';
 
+// OmniRoute — self-hosted, locally-run LLM routing proxy (OpenAI-compatible),
+// added 2026-08-07 per the approved office-hours design doc. Anoop runs it
+// himself at localhost:20128 with his own API key/account pool behind it, so
+// this is plain http to a local port, same shape as the Ollama branch below.
+// DELIBERATE SCOPE NOTE: some models OmniRoute exposes ride pooled/shared
+// "free" CLI-subscription accounts (its Tier-1 stealth layer) rather than
+// real paid API keys — a real account-ban risk, acknowledged and accepted by
+// Anoop for the reasoning/large-context capability it unlocks. This is why
+// OmniRoute is wired as the PRIMARY provider with the existing Gemini/Groq
+// chain kept as an unmodified fail-open fallback (see server.js
+// primaryProviderModel()/fallbackChainFor()) — a ban or outage here falls
+// through to the same chain that worked before OmniRoute existed, not a dead
+// end. Host/port are read from config at call time (initOmniRoute), not
+// hardcoded, since this runs on Anoop's machine only.
+const OMNIROUTE_PATH = '/v1/chat/completions';
+const OMNIROUTE_MODEL = 'auto/best-reasoning';
+
 // Build the HTTP(S) request for whichever provider. Returns the transport
-// module too so the caller uses http for Ollama, https for Groq/Gemini.
-function buildRequest(provider, apiKey, payload) {
+// module too so the caller uses http for Ollama/OmniRoute (both local), https
+// for Groq/Gemini.
+function buildRequest(provider, apiKey, payload, omniRouteBase) {
   const body = JSON.stringify(payload);
   if (provider === 'ollama') {
     return {
@@ -77,6 +95,17 @@ function buildRequest(provider, apiKey, payload) {
       options: {
         hostname: OLLAMA_HOST, port: OLLAMA_PORT, path: OLLAMA_PATH, method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+      },
+      body
+    };
+  }
+  if (provider === 'omniroute') {
+    const base = omniRouteBase || { host: '127.0.0.1', port: 20128 };
+    return {
+      mod: http,
+      options: {
+        hostname: base.host, port: base.port, path: OMNIROUTE_PATH, method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Content-Length': Buffer.byteLength(body) }
       },
       body
     };
@@ -101,12 +130,33 @@ function buildRequest(provider, apiKey, payload) {
   };
 }
 
-const PROVIDER_LABEL = { groq: 'Groq', gemini: 'Gemini', ollama: 'Ollama (local)' };
+const PROVIDER_LABEL = { groq: 'Groq', gemini: 'Gemini', ollama: 'Ollama (local)', omniroute: 'OmniRoute' };
+
+// ── Fallback-loop cap decision (extracted 2026-08-03 for unit testing) ──────
+// Pure function: given the current retry state, should the model chain loop
+// back to the start instead of giving up? Kept separate from stream()'s HTTP
+// orchestration so it's testable without mocking network calls — see
+// app/test/fallback-loop.test.js.
+const RETRYABLE_STATUSES = [429, 413, 404, 400, 500, 502, 503];
+function shouldLoopChain({ statusCode, chainLength, lapCount, maxLaps, elapsedMs, budgetMs }) {
+  return RETRYABLE_STATUSES.includes(statusCode)
+    && chainLength > 1
+    && lapCount < maxLaps
+    && elapsedMs < budgetMs;
+}
+// Reason a loop gave up, for logging/error messages — only meaningful when
+// shouldLoopChain(...) is false. Distinguishes the two independent caps so
+// "why did it stop" is never a guess.
+function loopGiveUpReason({ lapCount, maxLaps }) {
+  return lapCount >= maxLaps ? `lap cap (${maxLaps}) reached` : 'time budget exceeded';
+}
 
 class GroqAgent {
   constructor() {
     this.apiKey = null;        // Groq (also used for Whisper STT / Orpheus TTS below)
     this.geminiApiKey = null;  // Google Gemini — separate vendor, separate quota
+    this.omniRouteApiKey = null;
+    this.omniRouteBase = { host: '127.0.0.1', port: 20128 }; // local instance, see buildRequest
   }
 
   init(apiKey) {
@@ -117,17 +167,33 @@ class GroqAgent {
     this.geminiApiKey = (apiKey || '').trim() || null;
   }
 
+  // baseUrl (optional): e.g. "http://localhost:20128" — parsed for host/port,
+  // falls back to the 127.0.0.1:20128 default (Anoop's local instance) if
+  // omitted or unparseable.
+  initOmniRoute(apiKey, baseUrl) {
+    this.omniRouteApiKey = (apiKey || '').trim() || null;
+    if (baseUrl) {
+      try {
+        const u = new URL(baseUrl);
+        this.omniRouteBase = { host: u.hostname, port: u.port ? parseInt(u.port, 10) : 80 };
+      } catch {}
+    }
+  }
+
   // Groq-specific readiness — voice (Whisper/Orpheus) is Groq-only, so this
   // deliberately still means "Groq usable", not "any provider usable".
   isReady() { return !!this.apiKey; }
 
   isGeminiReady() { return !!this.geminiApiKey; }
 
+  isOmniRouteReady() { return !!this.omniRouteApiKey; }
+
   // Which providers can actually serve a chat turn right now. Ollama needs no
   // key (local), so it's always considered available at this layer — a
   // connection failure surfaces as a normal request error instead.
   keyFor(provider) {
     if (provider === 'gemini') return this.geminiApiKey;
+    if (provider === 'omniroute') return this.omniRouteApiKey;
     if (provider === 'ollama') return null;
     return this.apiKey;
   }
@@ -137,9 +203,9 @@ class GroqAgent {
   // tools: OpenAI-style tool defs (optional) — [{type:'function', function:{name, description, parameters}}]
   async stream(messages, systemPrompt, tools, opts = {}) {
     const { onToken, onToolStart, onToolDone, onDone, onError, onFallback, onQuota, onWait, model, fallbackModel, fallbackProvider, fallbackChain, toolExecutor } = opts;
-    const VALID_PROVIDERS = ['groq', 'gemini', 'ollama'];
+    const VALID_PROVIDERS = ['groq', 'gemini', 'ollama', 'omniroute'];
     const startProvider = VALID_PROVIDERS.includes(opts.provider) ? opts.provider : 'groq';
-    const DEFAULT_MODEL = { groq: GROQ_MODEL, gemini: GEMINI_MODEL, ollama: 'llama3.1:8b' };
+    const DEFAULT_MODEL = { groq: GROQ_MODEL, gemini: GEMINI_MODEL, ollama: 'llama3.1:8b', omniroute: OMNIROUTE_MODEL };
 
     const missingKey = (p) => p !== 'ollama' && !this.keyFor(p);
 
@@ -185,6 +251,20 @@ class GroqAgent {
     // to the chain on its second 429 rather than stalling forever.
     let minuteWaited = false;
 
+    // 2026-08-03: chain exhaustion used to be a dead end — if every configured
+    // model failed once, the turn just failed, even though a per-minute 429
+    // often clears within a lap or two. Now it loops back to the start of the
+    // chain, capped hard so a genuine multi-provider outage still fails fast
+    // and visibly instead of hanging indefinitely during a live trading
+    // session. MAX_LAPS=2 means the chain is tried twice total (1 extra
+    // wrap); MAX_LOOP_BUDGET_MS bounds total wall-clock time regardless of
+    // lap count, since per-minute waits (up to 30s each, above) could
+    // otherwise stack up across laps.
+    const MAX_LAPS = 2;
+    const MAX_LOOP_BUDGET_MS = 60 * 1000;
+    const turnStartedAt = Date.now();
+    let lapCount = 1; // 1 = first pass through the chain, not yet a "lap"
+
     let settled = false;
     const finishError = (msg) => { if (!settled) { settled = true; onError && onError(msg); } };
     const finishDone = (fullText) => { if (!settled) { settled = true; onDone && onDone(fullText); } };
@@ -205,19 +285,40 @@ class GroqAgent {
     // from opts per call) so a switch survives the tool-calling loop's
     // recursive runLoop() calls within one turn — once moved down the chain,
     // the rest of THIS turn stays there instead of flapping back.
+    // 2026-08-06: real end-to-end cancellation. opts.signal is an
+    // AbortSignal server.js creates per reqId and aborts when the client
+    // sends 'cancel-request' — previously cancelChat()/cancelJessiChat() etc.
+    // only cleared local UI state, so a cancelled turn kept retrying (and
+    // burning API quota) in the background indefinitely. Checked before every
+    // attempt (covers chain-advance and the lap loop) AND threaded into the
+    // actual HTTP request below (covers an already-in-flight request).
+    if (opts.signal && opts.signal.aborted) {
+      clearGlobalTimer();
+      finishError('Cancelled.');
+      return;
+    }
     const runLoop = async (msgs, accumulatedText) => {
+      if (opts.signal && opts.signal.aborted) {
+        clearGlobalTimer();
+        finishError('Cancelled.');
+        return;
+      }
       const payload = {
         model: activeModel,
         stream: true,
         // 0.85 for chat (passed by server — variety in coaching phrasing was an
         // explicit Anoop complaint), default 0.7 elsewhere.
         temperature: opts.temperature || 0.7,
-        max_tokens: 1536,
+        // 2026-08-05: was 1536 — too low once the tool-call JSON for all 14
+        // tools got large enough, so the model hit finish_reason:'length'
+        // before completing a single tool call, returning empty content on
+        // an otherwise-200-OK response.
+        max_tokens: 4096,
         messages: [{ role: 'system', content: systemPrompt }, ...msgs]
       };
       if (tools && tools.length) { payload.tools = tools; payload.tool_choice = 'auto'; }
 
-      const { mod, options, body } = buildRequest(activeProvider, this.keyFor(activeProvider), payload);
+      const { mod, options, body } = buildRequest(activeProvider, this.keyFor(activeProvider), payload, this.omniRouteBase);
 
       // BUG FIX 2026-07-25 (caught by a local 404-simulation test, not shipped
       // broken): both continuation paths below used to call `resolveReq()` and
@@ -243,9 +344,41 @@ class GroqAgent {
       // errors are excluded — those are genuine and shouldn't be masked.
       const TRANSIENT = /socket hang up|ECONNRESET|EPIPE|ETIMEDOUT/i;
       const handleSocketError = (e, resolveReq) => {
-        const msg = (e && e.message) || String(e);
+        // User cancelled (opts.signal aborted mid-request) — not a real
+        // failure, don't retry, don't log it as one.
+        if (e && e.name === 'AbortError') {
+          clearGlobalTimer();
+          finishError('Cancelled.');
+          resolveReq();
+          return;
+        }
+        const msg = (e && e.message) || String(e) || 'connection failed';
         if (TRANSIENT.test(msg) && !transientRetried) {
           transientRetried = true;
+          next = { msgs, text: accumulatedText };
+          resolveReq();
+          return;
+        }
+        // 2026-08-07: a non-transient CONNECTION-level failure (refused, DNS,
+        // TLS, "AggregateError" from Node's dual-stack ECONNREFUSED) used to
+        // be immediately fatal — only HTTP-status errors (429/413/etc, below)
+        // advanced the fallback chain. That's a real gap for a provider like
+        // a local OmniRoute instance that can be fully down (process crashed,
+        // never started): the whole turn would just fail instead of falling
+        // through to the next configured provider. Advance the chain here too
+        // so "unreachable" is treated the same as "errored" for fail-open
+        // purposes. Deliberately NOT lap-looped (unlike the HTTP-status path)
+        // — a hard-down connection should fail fast once the chain is
+        // exhausted, not retry a dead endpoint repeatedly during a live
+        // session.
+        const hasNext = chainIdx + 1 < chain.length;
+        if (hasNext) {
+          const fromLabel = `${PROVIDER_LABEL[activeProvider] || activeProvider}/${activeModel}`;
+          chainIdx += 1;
+          activeProvider = chain[chainIdx].provider;
+          activeModel = chain[chainIdx].model;
+          const toLabel = `${PROVIDER_LABEL[activeProvider] || activeProvider}/${activeModel}`;
+          onFallback && onFallback(fromLabel, toLabel, msg);
           next = { msgs, text: accumulatedText };
           resolveReq();
           return;
@@ -256,7 +389,7 @@ class GroqAgent {
       };
 
       await new Promise((resolveReq) => {
-        const req = mod.request(options, (res) => {
+        const req = mod.request(opts.signal ? { ...options, signal: opts.signal } : options, (res) => {
           if (res.statusCode !== 200) {
             let errBuf = '';
             res.on('data', (c) => { errBuf += c; });
@@ -306,9 +439,8 @@ class GroqAgent {
                   return;
                 }
               }
-              const RETRYABLE = [429, 413, 404, 400, 500, 502, 503];
               const hasNext = chainIdx + 1 < chain.length;
-              if (RETRYABLE.includes(res.statusCode) && hasNext) {
+              if (RETRYABLE_STATUSES.includes(res.statusCode) && hasNext) {
                 const fromLabel = `${PROVIDER_LABEL[activeProvider] || activeProvider}/${activeModel}`;
                 chainIdx += 1;
                 activeProvider = chain[chainIdx].provider;
@@ -319,12 +451,46 @@ class GroqAgent {
                 resolveReq();
                 return;
               }
+              // Chain exhausted. Loop back to the top instead of dead-ending —
+              // a per-minute 429 or a transient provider hiccup often clears
+              // within a lap or two — but capped hard on both lap count and
+              // total elapsed time so a genuine multi-provider outage still
+              // fails fast and visibly instead of hanging during a live
+              // session. Both caps checked together: whichever is hit first
+              // stops the loop.
+              const canLoopAgain = shouldLoopChain({
+                statusCode: res.statusCode,
+                chainLength: chain.length,
+                lapCount,
+                maxLaps: MAX_LAPS,
+                elapsedMs: Date.now() - turnStartedAt,
+                budgetMs: MAX_LOOP_BUDGET_MS
+              });
+              if (canLoopAgain) {
+                const fromLabel = `${PROVIDER_LABEL[activeProvider] || activeProvider}/${activeModel}`;
+                lapCount += 1;
+                chainIdx = 0;
+                activeProvider = chain[0].provider;
+                activeModel = chain[0].model;
+                minuteWaited = false; // fresh lap gets its own one-time per-minute wait allowance
+                console.log(`[groq-agent] fallback chain exhausted, restarting lap ${lapCount}/${MAX_LAPS} (${Math.round((Date.now() - turnStartedAt) / 1000)}s elapsed) — last error: ${detail}`);
+                onFallback && onFallback(fromLabel, `${PROVIDER_LABEL[activeProvider] || activeProvider}/${activeModel}`,
+                  `restarting model chain (lap ${lapCount}/${MAX_LAPS}) — ${detail}`);
+                next = { msgs, text: accumulatedText };
+                resolveReq();
+                return;
+              }
               clearGlobalTimer();
-              // Exhausting the chain is worth naming explicitly — otherwise the
-              // surfaced error looks like a single-model failure when in fact
-              // every configured candidate was tried.
-              const exhausted = RETRYABLE.includes(res.statusCode) && !hasNext && chain.length > 1
-                ? ` (all ${chain.length} configured models tried)` : '';
+              if (RETRYABLE_STATUSES.includes(res.statusCode) && !hasNext && chain.length > 1) {
+                const why = loopGiveUpReason({ lapCount, maxLaps: MAX_LAPS });
+                console.log(`[groq-agent] giving up after ${lapCount} lap(s), ${why} — last error: ${detail}`);
+              }
+              // Exhausting the chain (and any lap budget) is worth naming
+              // explicitly — otherwise the surfaced error looks like a
+              // single-model failure when in fact every configured candidate
+              // was tried, potentially across multiple laps.
+              const exhausted = RETRYABLE_STATUSES.includes(res.statusCode) && !hasNext && chain.length > 1
+                ? ` (all ${chain.length} configured models tried, ${lapCount} lap${lapCount > 1 ? 's' : ''})` : '';
               finishError(`${PROVIDER_LABEL[activeProvider] || activeProvider} API error (${res.statusCode})${exhausted}: ${detail}`);
               resolveReq();
             });
@@ -442,13 +608,26 @@ class GroqAgent {
               resolveReq();
             } else if (!String(fullText || '').trim()) {
               // Stream closed cleanly but produced NOTHING — no text, no tool
-              // calls. Previously this called finishDone('') and the UI drew a
-              // permanently empty bubble with no explanation and no fallback.
-              // Treat it as an error instead so the caller's offline/local path
-              // takes over and Jessi always says something.
-              clearGlobalTimer();
-              finishError(`${PROVIDER_LABEL[activeProvider] || activeProvider}/${activeModel} returned an empty reply${finishReason ? ` (finish_reason: ${finishReason})` : ''}.`);
-              resolveReq();
+              // calls. Common cause: finish_reason 'length' means the output
+              // hit max_tokens before completing any content or tool call.
+              // 2026-08-05 FIX: try the next model in the chain before giving
+              // up — a smaller/different model may succeed where this one
+              // truncated. Only hard-error if the chain is exhausted.
+              const hasNext = chainIdx + 1 < chain.length;
+              if (hasNext) {
+                const fromLabel = `${PROVIDER_LABEL[activeProvider] || activeProvider}/${activeModel}`;
+                chainIdx += 1;
+                activeProvider = chain[chainIdx].provider;
+                activeModel = chain[chainIdx].model;
+                const toLabel = `${PROVIDER_LABEL[activeProvider] || activeProvider}/${activeModel}`;
+                onFallback && onFallback(fromLabel, toLabel, `empty reply (finish_reason: ${finishReason || 'unknown'})`);
+                next = { msgs, text: accumulatedText };
+                resolveReq();
+              } else {
+                clearGlobalTimer();
+                finishError(`${PROVIDER_LABEL[activeProvider] || activeProvider}/${activeModel} returned an empty reply${finishReason ? ` (finish_reason: ${finishReason})` : ''}.`);
+                resolveReq();
+              }
             } else {
               clearGlobalTimer();
               finishDone(fullText);
@@ -586,3 +765,7 @@ class GroqAgent {
 }
 
 module.exports = new GroqAgent();
+// Internal-only accessor for unit tests (app/test/fallback-loop.test.js) —
+// namespaced under _debug rather than exported directly, same pattern as
+// claude-agent.js's _debug, so nothing else in the app depends on it.
+module.exports._debug = { shouldLoopChain, loopGiveUpReason, RETRYABLE_STATUSES };
