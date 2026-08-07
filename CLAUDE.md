@@ -2,6 +2,38 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚠️ THIS IS THE ONLY COPY — READ BEFORE TOUCHING ANYTHING
+
+**`G:\MNQ-CoPilot` is the single, canonical, live copy of this project. Nowhere else.**
+Anoop confirmed this explicitly on 2026-08-05: "everything should be only in this
+[G:\MNQ-CoPilot], nowhere else... it should run from the desktop app location
+Desktop MNQ co-pilot."
+
+This matters because it has gone wrong twice already:
+- 2026-07-31: everything was copied from C:\ and D:\ onto G:\ (script:
+  `Prop Trading\_ARCHIVED_2026-08-05_DUPLICATE_USE_G_DRIVE\MOVE TO G DRIVE.bat`,
+  preserved for history), but the old originals were never actually removed.
+- 2026-08-05: a Claude session spent an entire debugging pass editing
+  `C:\Users\Admin\Claude\Projects\MNQ-CoPilot-App` — a stale copy — before
+  discovering the real server runs from here. Real fixes (Jessi's empty-reply
+  bug, G5 restyle) had to be redone on this copy after the mistake was found.
+
+**As of 2026-08-05, every other copy has been retired** (renamed/moved, never
+deleted — see each location's own `README_START_HERE.md` for what to do with
+it):
+- `C:\Users\Admin\Claude\Projects\MNQ-CoPilot-App` — contents moved into
+  `_ARCHIVED_2026-08-05_DUPLICATE_USE_G_DRIVE\` inside itself.
+- `D:\Claude Pro trading\Prop Trading` — contents moved into
+  `_ARCHIVED_2026-08-05_DUPLICATE_USE_G_DRIVE\` inside itself (was confirmed
+  byte-identical to `G:\MNQ-CoPilot\Prop Trading` before archiving).
+- `C:\Users\Admin\tradingview-mcp` → renamed to `tradingview-mcp_OLD_DUPLICATE_SEE_G_DRIVE`.
+- `C:\Users\Admin\sessions` → renamed to `sessions_OLD_DUPLICATE_SEE_G_DRIVE`.
+- Desktop shortcut "MNQ Co-Pilot" now points at `G:\MNQ-CoPilot\START CO-PILOT.bat`
+  (any shortcut still pointing at C: was auto-retired as "... (OLD - do not use)").
+
+**Before editing anything in a future session: confirm you're reading/writing
+under `G:\MNQ-CoPilot`, not a path that merely looks similar.**
+
 ## What this repo is
 
 A personal trading co-pilot for Anoop Habib, trading MNQ (Micro Nasdaq) and MGC (Micro Gold) futures. It has three independently-runnable parts:
@@ -39,7 +71,7 @@ npm run test:e2e    # requires a live TradingView Desktop instance with CDP on :
 ```
 See `tradingview-mcp/CLAUDE.md` for the full tool-by-tool guide.
 
-There is no test suite for `app/`.
+`app/` has a minimal test suite (added 2026-08-06): `cd app && npm test` runs Node's built-in test runner (`node --test`, no external framework) against `app/test/*.test.js`. Currently covers the groq-agent.js fallback-loop cap decision (`shouldLoopChain`/`loopGiveUpReason`, exposed via `groqAgent._debug`) — the correctness-critical pure-logic pieces. Not a full suite; extend it as more pure-logic pieces get pulled out of `server.js`/`claude-agent.js`/`groq-agent.js`.
 
 ## Architecture of `app/server.js` (~4000 lines, single file)
 
@@ -59,3 +91,71 @@ Everything is one process: a raw `http` server + `ws` WebSocketServer, no Expres
 - When changing any trading-rule number (size caps, loss tiers, trade limits), change it in `rules.json`, not in `server.js` — and check whether `Prop Trading/CLAUDE.md`'s documented rules need to move in lockstep (they've drifted out of sync before).
 - Timestamps/session windows are IST wall-clock; `sessionWindowsIST` entries are minutes since midnight IST.
 - This is a live production tool used during real trading sessions — prefer non-breaking, additive changes and keep the crash guards intact.
+
+## Prompt/LLM changes
+
+These files define what the AI agents actually say and enforce — they drive real trading-discipline decisions on a live-money account, so a bad edit here is higher-stakes than an equivalent bug in, say, a rendering helper.
+
+**Files that count as "Prompt/LLM changes":**
+- `app/claude-agent.js` — `EVAL_RULES`, `FUNDED_RULES`, `SHARED_RULES`, `buildSystemPrompt()`, `ALL_TOOLS` (tool schemas double as prompt content — the model reads tool descriptions as instructions).
+- `app/server.js` — `JESSI_PERSONA`, `JESSI_PERSONA_VOICE`, `SCALPER_PERSONA`, `ANALYSIS_DEBATE_PERSONA`, `ICT_PO3_PERSONA`, `JUDGE_PERSONA`, `POST_SESSION_ANALYST_PERSONA`, `buildJessiContext()`, `formatAlignmentNotes()`, `JESSI_TOOLS`/`JESSI_TV_TOOLS`/`JESSI_APP_TOOLS`/`JESSI_VOICE_TOOL_NAMES`/`SCALPER_TOOLS` schemas.
+- `app/renderer/app.js` — `buildContextMessage()` (client-built context for the Claude path).
+
+**Before shipping a change to any of the above:**
+1. **Read the diff aloud as if you were Jessi/the Scalper/the Judge receiving it.** Does it still say what you meant, or did a word change flip the meaning (e.g. "never" → "rarely")?
+2. **Check for drift against `rules.json` and `Prop Trading/CLAUDE.md`.** Any concrete number (size caps, loss tiers, session windows) mentioned in prose must match `rules.json` — never hardcode a number in a persona/context string that already exists in `rules.json`.
+3. **Manual smoke test, not a full eval suite** (this repo doesn't have one — see `## Running the app`'s test-suite note): run the app, trigger the specific agent/path you touched (text chat, voice, Scalper, Debate, Post-Session Analyst — whichever persona changed), and read the actual response. A prompt change with no observed response is unverified.
+4. **If the change affects tool schemas** (`ALL_TOOLS`, `JESSI_TOOLS`, `SCALPER_TOOLS`, etc.): confirm token cost with `node token-audit.js` (uses the real tokenizer if `ANTHROPIC_API_KEY` is set, else a labeled estimate) and check `node token-usage-report.js` after a live session to confirm cache behavior wasn't broken (see `app/TOKEN_AUDIT_SETUP.md`).
+5. **If the change is behavioral** (not just wording — e.g. changing when a persona escalates, what it's allowed to do via `app_do`), treat it like any other code change: state the failure mode it fixes or introduces, and prefer additive/reversible over rewriting a working persona wholesale.
+
+No formal automated eval suite exists for prompt regressions today — this is a manual-verification convention, not a CI gate. If prompt-related bugs start recurring, that's the signal to build one (a fixed set of test conversations + expected-behavior assertions), not to skip step 3 above.
+
+## GBrain Search Guidance (configured by /sync-gbrain)
+<!-- gstack-gbrain-search-guidance:start -->
+
+GBrain is set up and synced on this machine. The agent should prefer gbrain
+over Grep when the question is semantic or when you don't know the exact
+identifier yet.
+
+**This worktree is pinned to a worktree-scoped code source** via the
+`.gbrain-source` file in the repo root (kubectl-style context).
+`gbrain code-def`, `code-refs`, `code-callers`, `code-callees`, `search`, and
+`query` from anywhere under this worktree route to that source by default —
+no `--source` flag needed (gbrain >= 0.41.38.0; on older gbrain the call-graph
+commands need `--source "$(cat .gbrain-source)"`). Conductor sibling worktrees
+of the same repo each have their own pin and their own indexed pages, so
+semantic results match the code on disk here.
+
+Call-graph queries (`code-callers`/`code-callees`) also need the graph to be
+built first — run `/sync-gbrain --dream` (or `--full`) if they return
+`count: 0`. This only works if this source's gbrain schema pack extracts code
+symbols; on a non-code-aware pack `--dream` completes but the graph stays empty
+and reports a WARN. `code-def`/`code-refs` need the same extraction.
+
+Two indexed corpora available via the `gbrain` CLI:
+- This worktree's code (auto-pinned via `.gbrain-source`).
+- `~/.gstack/` curated memory (registered as `gstack-brain-<user>` source via
+  the existing federation pipeline).
+
+Prefer gbrain when:
+- "Where is X handled?" / semantic intent, no exact string yet:
+    `gbrain search "<terms>"` or `gbrain query "<question>"`
+- "Where is symbol Y defined?" / symbol-based code questions:
+    `gbrain code-def <symbol>` or `gbrain code-refs <symbol>`
+- "What calls Y?" / "What does Y depend on?":
+    `gbrain code-callers <symbol>` / `gbrain code-callees <symbol>`
+- "What did we decide last time?" / past plans, retros, learnings:
+    `gbrain search "<terms>" --source gstack-brain-<user>`
+
+Grep is still right for known exact strings, regex, multiline patterns, and
+file globs. Run `/sync-gbrain` after meaningful code changes; for ongoing
+auto-sync across all worktrees, run `gbrain autopilot --install` once per
+machine — gbrain's daemon handles incremental refresh on a schedule.
+
+Safety: don't run `/sync-gbrain` while `gbrain autopilot` is active — the
+orchestrator refuses destructive source ops when it detects a running autopilot
+to avoid racing it (#1734). Prefer registering user repos with `gbrain sources
+add --path <dir>` (no `--url`): URL-managed sources can auto-reclone, and the
+sync code walk for them requires an explicit `--allow-reclone` opt-in.
+
+<!-- gstack-gbrain-search-guidance:end -->

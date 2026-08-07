@@ -474,7 +474,12 @@
       });
     },
 
+    // 2026-08-06: was local-only (cleared UI state, never told the server) —
+    // the server kept generating and burning API quota in the background
+    // even after "cancel" was clicked. Now sends 'cancel-request' so the
+    // in-flight claudeAgent.stream()/groqAgent.stream() call actually aborts.
     cancelChat: () => {
+      if (currentReqId != null) rawSend({ type: 'cancel-request', reqId: currentReqId });
       currentReqId = null;
       emit('chat:done', '');
     },
@@ -509,7 +514,11 @@
         on('jessiChat:error', onErr);
       });
     },
-    cancelJessiChat: () => { currentJessiReqId = null; emit('jessiChat:done', ''); },
+    cancelJessiChat: () => {
+      if (currentJessiReqId != null) rawSend({ type: 'cancel-request', reqId: currentJessiReqId });
+      currentJessiReqId = null;
+      emit('jessiChat:done', '');
+    },
     onJessiChatToken:     (cb) => on('jessiChat:token',    cb),
     onJessiChatToolStart: (cb) => on('jessiChat:toolStart', cb),
     onJessiChatToolDone:  (cb) => on('jessiChat:toolDone',  cb),
@@ -537,7 +546,11 @@
         on('scalper:error', onErr);
       });
     },
-    cancelScalperChat: () => { currentScalperReqId = null; emit('scalper:done', ''); },
+    cancelScalperChat: () => {
+      if (currentScalperReqId != null) rawSend({ type: 'cancel-request', reqId: currentScalperReqId });
+      currentScalperReqId = null;
+      emit('scalper:done', '');
+    },
     onScalperToken:     (cb) => on('scalper:token',     cb),
     onScalperToolStart: (cb) => on('scalper:toolStart', cb),
     onScalperToolDone:  (cb) => on('scalper:toolDone',  cb),
@@ -558,7 +571,10 @@
       currentJessiVoiceReqId = reqId;
       rawSend({ type: 'jessi-voice-send', transcript, clientTts: true, messages, reqId });
     },
-    cancelJessiVoice: () => { currentJessiVoiceReqId = null; },
+    cancelJessiVoice: () => {
+      if (currentJessiVoiceReqId != null) rawSend({ type: 'cancel-request', reqId: currentJessiVoiceReqId });
+      currentJessiVoiceReqId = null;
+    },
     onJessiVoiceTranscript: (cb) => on('jessiVoice:transcript', cb),
     onJessiVoiceToolStart:  (cb) => on('jessiVoice:toolStart',  cb),
     onJessiVoiceToolDone:   (cb) => on('jessiVoice:toolDone',   cb),
@@ -585,7 +601,11 @@
         on('debate:judgeError', onErr);
       });
     },
-    cancelDebateChat:      () => { currentDebateReqId = null; emit('debate:judgeDone', ''); },
+    cancelDebateChat:      () => {
+      if (currentDebateReqId != null) rawSend({ type: 'cancel-request', reqId: currentDebateReqId });
+      currentDebateReqId = null;
+      emit('debate:judgeDone', '');
+    },
     onDebateStatus:        (cb) => on('debate:status',     cb),
     onDebateArguments:     (cb) => on('debate:arguments',  cb),
     onDebateJudgeToken:    (cb) => on('debate:judgeToken', cb),

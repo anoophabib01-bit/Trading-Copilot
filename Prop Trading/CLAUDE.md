@@ -326,13 +326,24 @@ Start every session by asking Anoop to send his Performance CSV from Tradovate, 
 - **Checklist:** `MNQ MGC Scalper Checklist v2.docx` in `D:\Claude Pro trading\Prop Trading\`
 - **Screen recording:** Anoop records 1 dedicated monitor daily — TradingView chart + PNL + entries. Source for trade data recovery before next session.
 
-### Related Projects (consolidated 2026-07-02)
+### Related Projects (consolidated 2026-07-02, SUPERSEDED 2026-08-05)
 
-All co-pilot builds now live under `C:\Users\Admin\Claude\Projects\`:
-- `MNQ-CoPilot-App` — live Electron dashboard, serves `http://localhost:7433`, double-click desktop shortcut "MNQ Co-Pilot" to launch (auto-opens browser)
-- `MNQ-CoPilot` — Claude Code project wired to TradingView MCP over CDP port 9222
-- `MNQ-CoPilot-Server` — FastAPI server (port 8080), direct Anthropic API calls for screenshot/CSV analysis
-- `Trade Healer` — source of the merged rules above (journal notes, checklist enhancement suggestions, London-session context)
+**CORRECTION (2026-08-05):** The `C:\Users\Admin\Claude\Projects\` location below is
+stale. Everything was moved onto `G:\MNQ-CoPilot` on 2026-07-31 and, as of
+2026-08-05, every other copy has been retired (renamed/archived, not deleted —
+see `G:\MNQ-CoPilot\CLAUDE.md`'s "ONLY COPY" section at the top for the full
+list). This paragraph is left for history only:
+
+~~All co-pilot builds now live under `C:\Users\Admin\Claude\Projects\`:~~
+~~- `MNQ-CoPilot-App` — live Electron dashboard, serves `http://localhost:7433`, double-click desktop shortcut "MNQ Co-Pilot" to launch (auto-opens browser)~~
+~~- `MNQ-CoPilot` — Claude Code project wired to TradingView MCP over CDP port 9222~~
+~~- `MNQ-CoPilot-Server` — FastAPI server (port 8080), direct Anthropic API calls for screenshot/CSV analysis~~
+- `Trade Healer` — source of the merged rules above (journal notes, checklist enhancement suggestions, London-session context) — location not yet re-verified against the G: consolidation, treat with caution
+
+**Current state:** the app is `G:\MNQ-CoPilot\app`, launched via the Desktop
+shortcut "MNQ Co-Pilot" (now repointed at `G:\MNQ-CoPilot\START CO-PILOT.bat`)
+or by running `G:\MNQ-CoPilot\app\launch.bat` directly. TradingView MCP is
+`G:\MNQ-CoPilot\tradingview-mcp`.
 
 ---
 

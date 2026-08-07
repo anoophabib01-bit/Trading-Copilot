@@ -6,7 +6,7 @@
   <title>Co-Pilot</title>
   <link rel="stylesheet" href="styles.css">
   <!-- Apply saved theme before paint to avoid a flash of the wrong theme -->
-  <script>(function(){try{if(localStorage.getItem('copilot-theme')==='dark')document.documentElement.classList.add('theme-dark');}catch(e){}})();</script>
+  <script>(function(){try{var t=localStorage.getItem('copilot-theme');if(t==='dark')document.documentElement.classList.add('theme-dark');else if(t==='graphite')document.documentElement.classList.add('theme-graphite');}catch(e){}})();</script>
 </head>
 <body>
 
@@ -67,7 +67,11 @@
        an option to get to this page if i want to shift my account later on") -->
   <button class="api-btn" id="switch-acct-btn" onclick="showAccountGate(state.accountSize, state.mode)" title="Switch account — reopen the account picker">⇄ Account</button>
   <button class="api-btn" id="settings-open-btn">⚙ Settings</button>
-  <button class="api-btn theme-toggle-btn no-drag" id="theme-toggle-btn" title="Toggle dark / light theme" onclick="toggleTheme()"><span id="theme-toggle-icon">🌙</span></button>
+  <div class="theme-switch no-drag" id="theme-switch">
+    <button class="theme-switch-btn" data-theme-btn="dark" onclick="setTheme('dark')">Indigo</button>
+    <button class="theme-switch-btn" data-theme-btn="graphite" onclick="setTheme('graphite')">Graphite</button>
+    <button class="theme-switch-btn" data-theme-btn="light" onclick="setTheme('light')">Paper</button>
+  </div>
 </div>
 
 <!-- ── Alert banner ───────────────────────────────────────────────────────── -->
@@ -924,6 +928,17 @@
       <input type="password" id="settings-groq-key" placeholder="gsk_…" autocomplete="off">
     </div>
     <div class="settings-field">
+      <label>OmniRoute API Key (optional — high-reasoning primary brain when set; some models route through pooled/shared accounts, see README before enabling)</label>
+      <input type="password" id="settings-omniroute-key" placeholder="sk-…" autocomplete="off">
+    </div>
+    <div class="settings-field">
+      <label>OmniRoute Base URL</label>
+      <input type="text" id="settings-omniroute-url" placeholder="http://localhost:20128" autocomplete="off">
+    </div>
+    <div class="settings-field">
+      <label><input type="checkbox" id="settings-disable-omniroute" style="width:auto;margin-right:6px;vertical-align:middle;">Disable OmniRoute (kill switch — revert to Gemini/Groq only, e.g. if an OmniRoute account gets banned)</label>
+    </div>
+    <div class="settings-field">
       <label>Speaking voice (how Jessi sounds in Voice mode)</label>
       <select id="settings-voice-name">
         <option value="en-IN-NeerjaNeural">Neerja — Indian English, female (neural, default)</option>
@@ -1028,6 +1043,12 @@
       <div id="settings-tv-status" style="font-size:11px;margin-top:6px;color:var(--text-dim);line-height:1.5">Not tested. Confirm Lucid allows API access before enabling.</div>
     </div>
 
+    <div class="settings-subhead">Token Optimization (Jessi / Claude path)</div>
+    <div class="settings-field">
+      <label><input type="checkbox" id="settings-disable-token-opt" style="width:auto;margin-right:6px;vertical-align:middle;">Disable prompt caching (kill switch — revert to pre-2026-08-06 behavior)</label>
+      <div style="font-size:11px;margin-top:6px;color:var(--text-dim);line-height:1.5">Checked live on every message — takes effect immediately, no restart needed. Use if caching ever behaves unexpectedly mid-session.</div>
+    </div>
+
     <div class="settings-actions">
       <button class="btn-cancel" onclick="closeSettings()">Cancel</button>
       <button class="btn-save" onclick="saveSettings()">Save</button>
@@ -1046,20 +1067,40 @@
      and chat transcript persistence. See renderer/resilience.js. -->
 <script src="resilience.js"></script>
 <script>
-  // Dark / light theme toggle. Dark = TradingView-style palette (see styles.css .theme-dark).
-  function applyThemeIcon(){
-    var dark = document.documentElement.classList.contains('theme-dark');
-    var icon = document.getElementById('theme-toggle-icon');
-    if (icon) icon.textContent = dark ? '☀' : '🌙';
-    var btn = document.getElementById('theme-toggle-btn');
-    if (btn) btn.title = dark ? 'Switch to light theme' : 'Switch to dark theme';
+  // Theme cycle: Paper (light) -> Indigo (theme-dark) -> Graphite (theme-graphite) -> Paper.
+  // Approved via /design-shotgun 2026-08-02 (see variant-G5-themes.html in the
+  // design session for the reviewed mockup). Class name 'theme-dark' kept as-is
+  // for Indigo so nothing else keyed off that class needs to change.
+  var THEME_ORDER = ['light', 'dark', 'graphite'];
+  function currentTheme(){
+    if (document.documentElement.classList.contains('theme-dark')) return 'dark';
+    if (document.documentElement.classList.contains('theme-graphite')) return 'graphite';
+    return 'light';
   }
-  function toggleTheme(){
-    var dark = document.documentElement.classList.toggle('theme-dark');
-    try { localStorage.setItem('copilot-theme', dark ? 'dark' : 'light'); } catch(e){}
+  function applyThemeIcon(){
+    var t = currentTheme();
+    document.querySelectorAll('#theme-switch [data-theme-btn]').forEach(function(b){
+      b.classList.toggle('active', b.getAttribute('data-theme-btn') === t);
+    });
+  }
+  function setTheme(t){
+    document.documentElement.classList.remove('theme-dark', 'theme-graphite');
+    if (t === 'dark') document.documentElement.classList.add('theme-dark');
+    else if (t === 'graphite') document.documentElement.classList.add('theme-graphite');
+    try { localStorage.setItem('copilot-theme', t); } catch(e){}
     applyThemeIcon();
   }
-  applyThemeIcon();
+  function toggleTheme(){
+    var t = currentTheme();
+    var next = THEME_ORDER[(THEME_ORDER.indexOf(t) + 1) % THEME_ORDER.length];
+    setTheme(next);
+  }
+  (function initTheme(){
+    var saved = null;
+    try { saved = localStorage.getItem('copilot-theme'); } catch(e){}
+    if (saved === 'dark' || saved === 'graphite') setTheme(saved);
+    else applyThemeIcon();
+  })();
 </script>
 </body>
 </html>

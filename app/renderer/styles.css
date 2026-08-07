@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap'); /* DESIGN PASS 4 — must be first rule in the file or browsers ignore it */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Outfit:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap'); /* DESIGN PASS 4 — must be first rule in the file or browsers ignore it. Inter added 2026-08-02 to match variant-G5 mockup font. */
 /* ── Reset & Base ─────────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -610,7 +610,12 @@ body.panel-resizing * { user-select: none !important; }
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  font-weight: 700; /* bold text throughout the right tab panel, per Anoop's ask */
+  font-weight: 700; /* bold text throughout the right tab panel, per Anoop's ask (earlier).
+    SUPERSEDED 2026-08-05: Anoop asked to make the right panel match G5 exactly
+    and explicitly overwrite this — see "G5 FINAL POLISH" near the end of this
+    file, which resets this to 400 and re-bolds only what G5 itself keeps
+    bold (tab labels, section headers, headline figures, mini-btn). Left here
+    for history. */
 }
 
 /* Tab nav */
@@ -1541,7 +1546,11 @@ html.theme-dark ::-webkit-scrollbar-thumb:hover{background:#4a4f5c;}
 #scalper-agent-btn{margin-left:6px;}
 #scalper-agent-btn.active{background:#22d3ee;color:#000;border-color:#22d3ee;}
 .debate-arguments{display:flex;gap:8px;margin:6px 0;}
-.debate-arg{flex:1;background:var(--surface-2,#1e293b);border:1px solid var(--border,#334155);border-radius:8px;padding:8px 10px;font-size:0.82rem;line-height:1.4;max-height:180px;overflow-y:auto;}
+/* 2026-08-06 (Anoop: "i do not want to scroll to read text for each agent,
+   it should visible in one go"): was max-height:180px + overflow-y:auto,
+   truncating every argument into its own tiny scrollbox. Panel now grows to
+   fit its full argument — the page scrolls if needed, not each individual box. */
+.debate-arg{flex:1;background:var(--surface-2,#1e293b);border:1px solid var(--border,#334155);border-radius:8px;padding:8px 10px;font-size:0.82rem;line-height:1.4;}
 .debate-arg-header{font-weight:600;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;padding-bottom:3px;border-bottom:1px solid var(--border,#334155);}
 .debate-arg-header.jessi{color:var(--green,#22c55e);}
 .debate-arg-header.analysis{color:var(--accent,#3b82f6);}
@@ -2146,3 +2155,319 @@ html.theme-dark #send-btn {
 .jr-datadir { font-size: 9.5px; color: var(--text-dim); margin-bottom: 8px; font-family: 'JetBrains Mono', monospace; word-break: break-all; }
 .jr-datadir.warn { color: var(--amber); }
 .jr-archive-banner { background: rgba(255,180,50,0.1); border: 1px solid var(--amber); border-radius: 6px; padding: 8px 12px; margin-bottom: 10px; font-size: 11px; color: var(--amber); line-height: 1.4; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   DESIGN PASS — 2026-08-02 (Paper / Indigo / Graphite theme refresh)
+   Placed last on purpose: custom-property overrides here win the cascade over
+   every earlier "DESIGN PASS" block for the same selector without needing to
+   edit those blocks in place. Approved via /design-shotgun (see
+   ~/.gstack/projects/MNQ-CoPilot/designs/main-dashboard-20260802/variant-G5-themes.html
+   for the reviewed mockup this is based on).
+
+   Three themes total:
+     :root            = "Paper"    — default, off-white/dark-grey, no pure white
+     html.theme-dark   = "Indigo"  — dark navy/blue, existing toggle keeps this class name
+     html.theme-graphite = "Graphite" — grayscale dark, new third state
+
+   --red-dim/--green-dim/--amber-dim are redefined as fading gradients built
+   from color-mix() against the theme's own --red/--green/--amber, instead of
+   flat low-alpha fills. Every existing rule that does
+   `background: var(--red-dim)` (gonogo badges, gate rows, mode pills, step
+   numbers, etc.) picks up the fade automatically — no per-rule changes needed.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  --bg:        #dcdad3;
+  --surface:   #ebe9e2;
+  --surface2:  #e0ded6;
+  --surface3:  #d4d2c9;
+  --border:    #c9c6bc;
+  --border2:   #b6b3a7;
+  --text:      #2a2925;
+  --text-dim:  #84816f;
+  --text-mid:  #5f5d55;
+  --red:       #a8404a;
+  --green:     #3c7a52;
+  --amber:     #8a6318;
+  --red-dim:   linear-gradient(90deg, color-mix(in srgb, var(--red) 16%, transparent), transparent 70%);
+  --green-dim: linear-gradient(90deg, color-mix(in srgb, var(--green) 16%, transparent), transparent 70%);
+  --amber-dim: linear-gradient(90deg, color-mix(in srgb, var(--amber) 18%, transparent), transparent 70%);
+  --accent:      #33322d;
+  --accent-dim:  color-mix(in srgb, var(--accent) 10%, transparent);
+  --accent-glow: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+html.theme-dark {
+  --bg:        #0d0f16;
+  --surface:   #161925;
+  --surface2:  #1b1f2d;
+  --surface3:  #222738;
+  --border:    #252a3a;
+  --border2:   #363c52;
+  --text:      #e7e9f2;
+  --text-dim:  #8890a8;
+  --text-mid:  #b7bdd0;
+  --red:       #f0576b;
+  --green:     #3ecf8e;
+  --amber:     #f0b64c;
+  --red-dim:   linear-gradient(90deg, color-mix(in srgb, var(--red) 16%, transparent), transparent 70%);
+  --green-dim: linear-gradient(90deg, color-mix(in srgb, var(--green) 16%, transparent), transparent 70%);
+  --amber-dim: linear-gradient(90deg, color-mix(in srgb, var(--amber) 18%, transparent), transparent 70%);
+  --accent:      #5b8cff;
+  --accent-dim:  color-mix(in srgb, var(--accent) 12%, transparent);
+  --accent-glow: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+html.theme-graphite {
+  --bg:        #0b0b0c;
+  --surface:   #17171a;
+  --surface2:  #1e1e22;
+  --surface3:  #26262b;
+  --border:    #2c2c31;
+  --border2:   #3d3d44;
+  --text:      #e8e8ec;
+  --text-dim:  #8d8d96;
+  --text-mid:  #b4b4bc;
+  --red:       #d97b86;
+  --green:     #7bc99a;
+  --amber:     #c9a35c;
+  --red-dim:   linear-gradient(90deg, color-mix(in srgb, var(--red) 16%, transparent), transparent 70%);
+  --green-dim: linear-gradient(90deg, color-mix(in srgb, var(--green) 16%, transparent), transparent 70%);
+  --amber-dim: linear-gradient(90deg, color-mix(in srgb, var(--amber) 18%, transparent), transparent 70%);
+  --accent:      #9aa0ac;
+  --accent-dim:  color-mix(in srgb, var(--accent) 12%, transparent);
+  --accent-glow: color-mix(in srgb, var(--accent) 26%, transparent);
+  background: var(--bg);
+  color: var(--text);
+}
+html.theme-graphite body { background: var(--bg); color: var(--text); }
+html.theme-graphite #titlebar { background: linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%); border-bottom-color: var(--border); }
+
+/* Themed, mostly-transparent scrollbar thumb in all 3 themes — replaces the
+   flat var(--border2) fill with a soft color-mix overlay so it reads as
+   "faint until you scroll", not a solid bar. Track was already transparent. */
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-dim) 45%, transparent);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--text-mid) 55%, transparent);
+}
+html.theme-dark ::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-dim) 45%, transparent);
+}
+html.theme-dark ::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--text-mid) 55%, transparent);
+}
+
+/* Visible 3-way theme switcher (replaces the old single cycling icon button)
+   — matches variant-G5-themes.html's top-right pill switcher so the current
+   theme is always visible at a glance, not just discoverable by clicking. */
+.theme-switch {
+  display: flex;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2px;
+  gap: 2px;
+}
+.theme-switch-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.theme-switch-btn:hover { color: var(--text); }
+.theme-switch-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+html:not(.theme-dark):not(.theme-graphite) .theme-switch-btn.active { color: var(--surface); }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MATCH-MOCKUP PASS — 2026-08-02 · make the LIVE app look like variant-G5.
+   Two things the earlier variable-only override could not fix:
+     1. Font — the app was on Outfit/Segoe; the approved mockup is Inter.
+     2. Indigo (html.theme-dark) still pulled its whole LOOK from the older
+        "DESIGN PASS 4 / 4b" glass blocks (translucent panels, backdrop blur,
+        ambient radial glows, film grain, floating-card gaps, edge masks).
+        The mockup's Indigo is FLAT solid cards — same structure as the base
+        (Paper) theme, just dark colors. This block neutralizes the glass pass
+        so Indigo matches the mockup. Graphite/Paper never had the glass pass,
+        so they already match. Wins by cascade order (last in file).
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* 1 ── Inter everywhere (mockup body font); keep JetBrains Mono for figures. */
+body,
+html.theme-dark body {
+  font-family: 'Inter', 'Segoe UI Variable Text', 'Segoe UI', -apple-system, system-ui, sans-serif;
+}
+
+/* 2 ── Kill the glass/ambient treatment on Indigo → flat like the mockup. */
+html.theme-dark body {
+  background: var(--bg);                 /* drop the two ambient radial glows */
+}
+html.theme-dark body::after { display: none !important; }   /* drop film grain */
+html.theme-dark #messages { -webkit-mask-image: none; mask-image: none; }  /* drop edge fade */
+
+/* Panels: solid cards, no blur, no floating-gap layout — flat columns like Paper */
+html.theme-dark #app { gap: 0; padding: 0; }
+html.theme-dark #left-panel,
+html.theme-dark #right-panel {
+  background: var(--surface);
+  backdrop-filter: none;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+html.theme-dark #left-panel { border-right: 1px solid var(--border); }
+html.theme-dark #right-panel { border-left: 1px solid var(--border); }
+html.theme-dark #center-panel {
+  background: var(--bg);
+  backdrop-filter: none;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+/* Remove the accent header strip Pass-4b added to each panel's first child */
+html.theme-dark #left-panel > :first-child,
+html.theme-dark #right-panel > :first-child { border-top: none; }
+html.theme-dark #titlebar {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding-top: 0;
+}
+
+/* Chat bubbles: flat mockup cards, not the glass gradient bubbles */
+html.theme-dark .msg.assistant .msg-bubble {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+html.theme-dark .msg.user .msg-bubble {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+html.theme-dark .msg.system-msg .msg-bubble {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+}
+html.theme-dark #input-area {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  box-shadow: none;
+}
+
+/* Right-panel analysis cards: solid, rounded, like the mockup r-cards */
+html.theme-dark .analysis-block {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+/* 3 ── Card-radius polish shared by all three themes to match the mockup. */
+.analysis-block, .ins-card { border-radius: 12px; }
+.msg-bubble { border-radius: 12px; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   G5 FINAL POLISH (2026-08-05)
+   The pass above (2026-08-02) already fixed colors and killed the glass/blur
+   treatment on Indigo — that part was correct. What was still visibly off,
+   per Anoop comparing live screenshots against variant-G5-themes.html side by
+   side: the right-panel tabs were still full-width uppercase underline tabs
+   (G5 uses small rounded pills), and body/label text throughout was bold
+   everywhere (G5 is normal-weight except headers and headline figures).
+   These rules are intentionally UNSCOPED (no html.theme-dark prefix) — the
+   base .rtab/.msg-bubble/#right-panel rules they override are themselves
+   unscoped and apply to all three themes (Paper/Indigo/Graphite alike), and
+   G5 itself is theme-independent on shape/weight — only color changes
+   between its three variants. Wins by source order (same or higher
+   specificity, later in file).
+   Anoop, 2026-08-05: "make the right panel exactly like G5, overwrite my
+   request [the bold-everywhere ask below at #right-panel] ... there should
+   not be any difference." That line is left in place (history), overridden
+   here — G5 itself only bolds headers/headline figures, not everything.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Right-panel tabs: G5's rounded pill strip instead of full-width underline tabs */
+#right-tabs {
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 10px 10px 6px;
+}
+.rtab {
+  flex: 0 0 auto;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 10px;
+  font-size: 10.5px;
+  font-weight: 700;           /* G5 keeps tab labels bold even though body text isn't */
+  letter-spacing: normal;
+  text-transform: none;
+  border-bottom: 1px solid var(--border);  /* replaces the 2px underline-only border */
+}
+.rtab.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+html.theme-graphite .rtab.active,
+html:not(.theme-dark):not(.theme-graphite) .rtab.active { color: #0b0b0c; } /* Graphite + Paper accents are light — need dark text on the active pill */
+
+/* Right panel: normal weight throughout (supersedes the old blanket bold
+   request above), with only the specific elements G5 itself keeps bold
+   staying bold via their own explicit font-weight rules below/elsewhere. */
+#right-panel { font-weight: 400; }
+.analysis-block .block-title,
+.section-title,
+.block-title { font-weight: 700; letter-spacing: 1px; }
+.level-display { font-weight: 800; }
+.engulf-check-btn { font-weight: 700; }
+
+/* Cards: G5's exact padding/margin rhythm (was 12/10, G5 is 14/14) */
+.analysis-block { padding: 14px; margin-bottom: 14px; }
+html.theme-dark .analysis-block { padding: 14px; margin-bottom: 14px; }
+
+/* Chat bubbles: normal weight (G5's chat text isn't bold; unrelated to the
+   right panel's own weight decision above) */
+.msg-bubble { font-weight: 400; }
+
+/* No hover-lift on cards in any theme — G5's cards are static */
+.analysis-block:hover, .ins-card:hover { transform: none; box-shadow: none; }
+
+/* Framework steps: G5's dotted-divider row instead of numbered circle badges */
+.step-row {
+  justify-content: space-between;
+  padding: 6px 0;
+  border-bottom: 1px dotted var(--border);
+}
+.step-num {
+  width: auto; height: auto; border-radius: 0; background: none;
+  color: var(--text-dim); font-weight: 400; margin-right: 4px;
+}
+.step-num.ok, .step-num.fail { background: none; border: none; }
+.step-value { font-weight: 400; }
+
+/* Check-now / mini action buttons: G5's full-width centered mini-btn */
+.engulf-check-btn {
+  width: 100%;
+  background: var(--surface2);
+  border-radius: 8px;
+  padding: 8px;
+  font-size: 11.5px;
+  text-align: center;
+  margin-top: 6px;
+}
+
+/* Toggle switch: G5's exact 34x18 geometry (was 36x20) */
+.toggle-switch { width: 34px; height: 18px; }
+.toggle-slider::before { width: 12px; height: 12px; left: 2px; top: 2px; }
+.toggle-switch input:checked + .toggle-slider::before { transform: translateX(16px); }

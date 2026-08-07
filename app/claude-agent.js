@@ -1,8 +1,29 @@
 'use strict';
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const Anthropic = require('@anthropic-ai/sdk');
 const mcpBridge = require('./mcp-bridge');
 const booksIndex = require('./books-index');
 const supercompress = require('./supercompress');
+const callLogger = require('./call-logger');
+
+// ── Token-optimization kill switch (2026-08-03) ─────────────────────────────────
+// A local config flag that instantly reverts prompt caching to today's exact
+// behavior (no cache_control, plain string system prompt) — checked fresh on
+// every stream() call, not just once at boot, so flipping it takes effect
+// immediately without restarting the app mid-session. Same config file
+// server.js already reads (~/.mnq-copilot-config.json); this file has no
+// other dependency on server.js, just its own tiny synchronous read.
+const CONFIG_PATH = path.join(os.homedir(), '.mnq-copilot-config.json');
+function isTokenOptDisabled() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    return !!cfg.disableTokenOpt;
+  } catch {
+    return false; // config unreadable/missing → default to token-opt ON (safe: caching degrades transparently on any error)
+  }
+}
 
 // ── Mode-specific rule blocks ──────────────────────────────────────────────────
 const EVAL_RULES = `
@@ -204,6 +225,17 @@ const BOOK_TOOLS = [
   { name: 'search_books', description: 'Search Anoop\'s trading book library (Stock Market Wizards, Trading in the Zone, Intraday Trading Techniques, Prop Trading Secrets, TradeApp\'s Guide to Proprietary Trading) for passages relevant to a topic. Use when grounding a rules violation or coaching point in what one of these books actually says, e.g. "revenge trading", "probabilistic thinking", "position sizing".', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'topic or question to search for' }, book: { type: 'string', description: 'optional — restrict to one: stock_market_wizards, trading_in_the_zone, intraday_trading_techniques, prop_trading_secrets, tradeapp_prop_trading_guide' } }, required: ['query'] } }
 ];
 const ALL_TOOLS = [...TV_TOOLS, ...BOOK_TOOLS];
+// Prompt-caching variant of ALL_TOOLS — identical tools, with a cache_control
+// breakpoint on the last one. Built once at module load (the tool list is
+// static) rather than per-call. Kept as a separate array so token-audit.js's
+// _debug.ALL_TOOLS (used for token counting, not live calls) stays the plain,
+// uncached shape. Standard ephemeral (5-min) TTL only — the SDK pinned here
+// (@anthropic-ai/sdk 0.39.0) has no `ttl` field on CacheControlEphemeral, so
+// the 1-hour TTL option isn't safe to use without an SDK upgrade + live
+// verification first (see TODOS.md: tool-scoping/cache-cadence follow-up).
+const ALL_TOOLS_CACHED = ALL_TOOLS.map((t, i) =>
+  i === ALL_TOOLS.length - 1 ? { ...t, cache_control: { type: 'ephemeral' } } : t
+);
 
 class ClaudeAgent {
   constructor() {
@@ -214,18 +246,42 @@ class ClaudeAgent {
   init(apiKey) {
     this.apiKey = apiKey;
     this.client = new Anthropic({ apiKey });
+    console.log(isTokenOptDisabled()
+      ? '⚠  Token-opt kill switch is ON — prompt caching disabled, using legacy (uncached) calls'
+      : '✓ Token-opt: prompt caching enabled (cache_control on system + tools)');
   }
 
   isReady() { return !!this.client; }
 
-  async stream(messages, { mode = 'funded', onToken, onToolStart, onToolDone, onDone, onError } = {}) {
+  async stream(messages, { mode = 'funded', extraContext, signal, onToken, onToolStart, onToolDone, onDone, onError } = {}) {
     if (!this.client) {
       onError && onError('API key not configured. Please enter your Anthropic API key in Settings.');
       return;
     }
 
-    const systemPrompt = buildSystemPrompt(mode);
+    // extraContext (e.g. recent Alignment-tab entries, server.js) is appended
+    // before caching, so it's simply part of what gets cached — no different
+    // in kind from EVAL_RULES/FUNDED_RULES already being in there. If it
+    // changes between calls (rare — notes don't change every message), that
+    // call pays a cache write instead of a read; self-correcting, not a bug.
+    const systemPrompt = buildSystemPrompt(mode) + (extraContext ? '\n\n' + extraContext : '');
+    // Checked fresh per call (not cached in memory) so the kill switch takes
+    // effect immediately, mid-session, without a restart.
+    const tokenOptOff = isTokenOptDisabled();
+    const systemForRequest = tokenOptOff
+      ? systemPrompt
+      : [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }];
+    const toolsForRequest = tokenOptOff ? ALL_TOOLS : ALL_TOOLS_CACHED;
     const abortCtrl = new AbortController();
+    // 2026-08-06: real end-to-end cancellation. `signal` is an external
+    // AbortSignal server.js creates per reqId and aborts on 'cancel-request'
+    // — reuses the same abortCtrl the 5-min timeout already had, so a user
+    // cancel and a timeout are handled identically (both hit the existing
+    // AbortError branch below).
+    if (signal) {
+      if (signal.aborted) abortCtrl.abort();
+      else signal.addEventListener('abort', () => abortCtrl.abort(), { once: true });
+    }
 
     // 5-minute global timeout — prevents infinite hangs
     const globalTimer = setTimeout(() => {
@@ -239,8 +295,8 @@ class ClaudeAgent {
         stream = await this.client.messages.stream({
           model: 'claude-sonnet-4-6',
           max_tokens: 4096,
-          system: systemPrompt,
-          tools: ALL_TOOLS,
+          system: systemForRequest,
+          tools: toolsForRequest,
           messages: msgs
         }, { signal: abortCtrl.signal });
       } catch (e) {
@@ -285,6 +341,15 @@ class ClaudeAgent {
 
       const finalMsg   = await stream.finalMessage();
       const stopReason = finalMsg.stop_reason;
+
+      // One real billed API call just completed — log it regardless of what
+      // happens next (tool round trip or final answer). See call-logger.js.
+      callLogger.logCall({
+        mode,
+        usage: finalMsg.usage,
+        stopReason,
+        toolCallCount: toolUseBlocks.length,
+      });
 
       if (stopReason === 'tool_use' && toolUseBlocks.length > 0) {
         const assistantContent = finalMsg.content;
@@ -337,3 +402,8 @@ class ClaudeAgent {
 }
 
 module.exports = new ClaudeAgent();
+// Internal-only accessor for token-audit.js (an offline token/cost analysis
+// script, not part of the live app) — namespaced under _debug rather than
+// exported directly on the singleton so nothing else in the app can
+// accidentally come to depend on these implementation details.
+module.exports._debug = { buildSystemPrompt, ALL_TOOLS };
