@@ -1,0 +1,21 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+*.bak
+*.synccheck
+
+# Runtime state — trade/account history, chat transcripts, session recordings.
+DATA/
+data/
+sessions/
+app/.firecrawl/
+.gstack/
+.gbrain-source
+_backup_before_move/
+
+# Secrets — never commit real keys. Config lives at ~/.mnq-copilot-config.json.
+.env
+.env.*
+*.key
+*.pem

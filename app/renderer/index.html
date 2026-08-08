@@ -1,0 +1,1116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Co-Pilot</title>
+  <link rel="stylesheet" href="styles.css">
+  <!-- G5 EXACT PORT (2026-08-08, v3): a literal rule-for-rule port of
+       designs/main-dashboard-20260802/variant-G5-themes.html onto this app's
+       class names. NOT a "polish"/"premium" layer — earlier versions added
+       shadows, sheen and ambient glows that G5 does not have, which is why the
+       result kept landing as only partially matching. G5 is deliberately FLAT.
+       Loads LAST so it wins the cascade. Remove this one line to fully revert. -->
+  <link rel="stylesheet" href="g5-premium.css">
+  <!-- Apply saved theme before paint to avoid a flash of the wrong theme -->
+  <script>(function(){try{var t=localStorage.getItem('copilot-theme');if(t==='dark')document.documentElement.classList.add('theme-dark');else if(t==='graphite')document.documentElement.classList.add('theme-graphite');}catch(e){}})();</script>
+</head>
+<body>
+
+<!-- ── Startup account-confirmation gate (2026-07-21) ────────────────────────
+     Shown on every launch per the trader's request: "on start of the app it
+     should confirm which account i am trading." The app has already loaded
+     the remembered account's real data behind this overlay (see
+     showAccountGate() in app.js) -- this is a confirm/switch step, not a
+     data-loading blocker. ────────────────────────────────────────────────── -->
+<div id="account-gate" style="display:none">
+  <div class="gate-card">
+    <div class="gate-title">Which account are you trading?</div>
+    <div class="gate-current">
+      <div class="gate-current-label" id="gate-current-label">—</div>
+      <div class="gate-current-id" id="gate-current-id">—</div>
+    </div>
+    <button class="gate-confirm-btn" onclick="hideAccountGate()">Confirm — this is correct</button>
+    <div class="gate-switch-label">Or switch account:</div>
+    <div class="gate-account-rows" id="gate-account-rows"></div>
+  </div>
+</div>
+
+<!-- ── Title bar ──────────────────────────────────────────────────────────── -->
+<div id="titlebar">
+  <div class="logo">CO-<span>PILOT</span></div>
+
+  <!-- Mode toggle -->
+  <!-- FIX (2026-07-21): default active state flipped from FUNDED to EVAL. The
+       $50K funded account is blown; the only live account is the $150K eval
+       (account IDs kept out of source control — see Settings/local config).
+       FUNDED tag marked BLOWN so switching into it can never be mistaken for a live account. -->
+  <div class="mode-toggle" id="mode-toggle">
+    <button class="mode-btn active" id="mode-eval-btn"  onclick="switchMode('eval')">EVAL</button>
+    <button class="mode-btn" id="mode-funded-btn" onclick="switchMode('funded')">FUNDED <span class="mode-blown-tag" id="mode-funded-tag" style="display:none">BLOWN</span></button>
+  </div>
+  <!-- FIX (2026-07-21): account-size selector, added alongside the existing
+       Eval/Funded STAGE toggle above -- this picks WHICH account (by size),
+       the toggle above picks which stage of it. Populated/kept in sync from
+       app.js (updateAccountSizeSelector). -->
+  <div class="acct-size-toggle" id="acct-size-toggle">
+    <button class="acct-size-btn" data-size="50k"  onclick="switchAccount('50k', state.mode)">50K</button>
+    <button class="acct-size-btn" data-size="100k" onclick="switchAccount('100k', state.mode)">100K</button>
+    <button class="acct-size-btn active" data-size="150k" onclick="switchAccount('150k', state.mode)">150K</button>
+  </div>
+
+  <!-- Trading mode toggle: Standard vs Scalper (2026-08-01) -->
+  <div class="trading-mode-toggle" id="trading-mode-toggle">
+    <button class="tmode-btn active" id="tmode-standard-btn" onclick="switchTradingMode('standard')">STANDARD</button>
+    <button class="tmode-btn" id="tmode-scalper-btn" onclick="switchTradingMode('scalper')">SCALPER</button>
+  </div>
+
+  <div id="tv-status">
+    <div id="tv-dot"></div>
+    <span id="tv-status-text">Connecting…</span>
+  </div>
+  <div class="session-time" id="session-clock"></div>
+  <!-- Reopen the account picker any time (2026-07-25, the trader: "there should be
+       an option to get to this page if i want to shift my account later on") -->
+  <button class="api-btn" id="switch-acct-btn" onclick="showAccountGate(state.accountSize, state.mode)" title="Switch account — reopen the account picker">⇄ Account</button>
+  <button class="api-btn" id="settings-open-btn">⚙ Settings</button>
+  <div class="theme-switch no-drag" id="theme-switch">
+    <button class="theme-switch-btn" data-theme-btn="dark" onclick="setTheme('dark')">Indigo</button>
+    <button class="theme-switch-btn" data-theme-btn="graphite" onclick="setTheme('graphite')">Graphite</button>
+    <button class="theme-switch-btn" data-theme-btn="light" onclick="setTheme('light')">Paper</button>
+  </div>
+</div>
+
+<!-- ── Alert banner ───────────────────────────────────────────────────────── -->
+<div id="alert-banner"></div>
+
+<!-- ── Engulf notification popup ─────────────────────────────────────────── -->
+<div id="engulf-popup" class="engulf-popup">
+  <div class="engulf-popup-icon" id="engulf-popup-icon">▲</div>
+  <div class="engulf-popup-body">
+    <div class="engulf-popup-title" id="engulf-popup-title">BULLISH ENGULFING — 1H</div>
+    <div class="engulf-popup-sub" id="engulf-popup-sub">Check 15M/5M for entry</div>
+  </div>
+  <button class="engulf-popup-close" onclick="closeEngulfPopup()">✕</button>
+</div>
+
+<!-- ── Main app ───────────────────────────────────────────────────────────── -->
+<div id="app">
+
+  <!-- ── Left panel ─────────────────────────────────────────────────────── -->
+  <div id="left-panel">
+    <div id="left-scroll">
+
+      <!-- Account state — adapts per mode -->
+      <div class="panel-section">
+        <div class="section-title" id="account-section-title">Funded Account</div>
+        <!-- EVAL rows -->
+        <div class="eval-only" style="display:none;">
+          <div class="stat-row">
+            <span class="stat-label">Balance</span>
+            <span class="stat-value white" id="stat-balance-eval">$148,932</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">DD Floor</span>
+            <span class="stat-value" id="stat-floor-eval">$145,500</span>
+          </div>
+          <!-- Buffer row removed from EVAL 2026-07-25 (the trader: "Buffer is not
+               needed in the eval stage") — the DD Floor above is the number
+               that matters. Kept hidden rather than deleted so updateAccountUI
+               has nothing to break on. -->
+          <div class="stat-row" style="display:none;">
+            <span class="stat-label">Buffer</span>
+            <span class="stat-value amber" id="stat-buffer-eval">$3,432</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Target</span>
+            <span class="stat-value green" id="stat-remaining-eval">$53,000</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Day cap</span>
+            <span class="stat-value red" id="stat-daycap-eval">$2,500 MAX</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Day stop</span>
+            <span class="stat-value red" id="stat-daystop-eval">−$300</span>
+          </div>
+        </div>
+        <!-- FUNDED rows -->
+        <div class="funded-only">
+          <div class="stat-row">
+            <span class="stat-label">Balance</span>
+            <span class="stat-value white" id="stat-balance-funded">$50,000</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Hard Floor</span>
+            <span class="stat-value" id="stat-floor-funded">$48,000</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Buffer</span>
+            <span class="stat-value" id="stat-buffer-funded">$2,000</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Day STOP</span>
+            <span class="stat-value red" id="stat-daystop-funded">−$200 HARD</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Day target</span>
+            <span class="stat-value green" id="stat-daytarget-funded">$150–$300</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Next payout</span>
+            <span class="stat-value" id="stat-payout">$52,000</span>
+          </div>
+        </div>
+        <div class="progress-bar" title="MLL buffer used">
+          <div class="progress-fill" id="buffer-bar" style="width:0%"></div>
+        </div>
+      </div>
+
+      <!-- Today's session -->
+      <div class="panel-section">
+        <div class="section-title">Today</div>
+        <div id="gonogo-badge" class="gonogo-badge pending">PENDING CHECK-IN</div>
+        <div class="stat-row">
+          <span class="stat-label">P&L</span>
+          <span class="stat-value" id="stat-pnl">$0</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Trades</span>
+          <span class="stat-value" id="stat-trades">0</span>
+          <span class="stat-label" id="trade-limit-label">/ 20 max</span>
+        </div>
+        <div class="trade-counter" id="trade-pips"></div>
+        <div class="stat-row" style="margin-top:6px;">
+          <span class="stat-label">Size</span>
+          <span class="stat-value white" id="stat-size">20 micros</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Break</span>
+          <span class="stat-value" id="stat-break">—</span>
+        </div>
+      </div>
+
+      <!-- No-Trade Windows (ForexFactory) -->
+      <div class="panel-section">
+        <div class="engulf-header">
+          <div class="section-title" style="margin:0;">No-Trade Windows</div>
+          <div style="display:flex;gap:6px;">
+            <button class="engulf-check-btn" onclick="refreshNews()" title="Re-fetch ForexFactory calendar">↻</button>
+            <button class="engulf-check-btn" onclick="markNewsOnChart()" title="Draw today's red-folder event times on the TradingView chart">📍 Chart</button>
+          </div>
+        </div>
+        <div id="news-blackout-banner" class="gonogo-badge nogo" style="display:none;"></div>
+        <div id="news-list" class="news-list">
+          <span class="no-patterns">Loading calendar…</span>
+        </div>
+      </div>
+
+      <!-- Pattern alerts -->
+      <div class="panel-section">
+        <div class="section-title">Pattern Monitor</div>
+        <div id="pattern-list"><span class="no-patterns">All clear</span></div>
+      </div>
+
+    </div><!-- end left-scroll -->
+
+    <!-- Quick actions -->
+    <div id="quick-actions">
+      <button class="qa-btn primary"  onclick="quickAction('pre-session')"><span class="btn-icon">✓</span> Pre-Session Check</button>
+      <button class="qa-btn"          onclick="quickAction('analyze')"><span class="btn-icon">◎</span> Full Analysis</button>
+      <button class="qa-btn"          onclick="document.getElementById('goodtrade-input').click()"><span class="btn-icon">★</span> Analyze Good Trade</button>
+      <input type="file" id="goodtrade-input" accept="image/*" style="display:none">
+      <button class="qa-btn"          onclick="document.getElementById('csv-file-input').click()"><span class="btn-icon">▤</span> Analyze CSV/PDF</button>
+      <input type="file" id="csv-file-input" accept=".csv,.pdf" multiple style="display:none">
+      <button class="qa-btn"          onclick="runIctPo3()" title="ICT Power of 3 — judges Accumulation / Manipulation / Distribution across 1H/15m/5m, Daily bias gate (weights 15m + 5m most)"><span class="btn-icon">◱</span> Power of 3 (AMD)</button>
+      <button class="qa-btn" id="po3-monitor-btn" onclick="togglePo3Monitor()" title="Mechanical AMD phase monitor — polls 15m every 60s and alerts in chat on ANY phase change (Accumulation / Manipulation / Distribution). No AI call per poll, so no quota use."><span class="btn-icon">◱</span> P3 Monitor</button>
+      <button class="qa-btn"          onclick="quickAction('watchlist')" title='Reads whichever watchlist tab is active in TradingView — switch to "focus" first'><span class="btn-icon">☰</span> Scan Watchlist</button>
+      <button class="qa-btn"          onclick="markLondonLevels()" title="Marks Prev Week High/Low + PDH/PDL + Asia session High/Low on the chart"><span class="btn-icon">📍</span> Mark London Levels</button>
+        <button class="qa-btn" onclick="markNYLevels()" title="Marks current Week High/Low + current Month High/Low on the chart"><span class="btn-icon">📍</span> Mark NY Levels</button>
+      <!-- End Day (2026-07-25): writes this account's dated snapshot into
+           D:\co-pilot DATA\accounts\<slot>\daily\ and flushes every per-account
+           file. Separate from "End Session" (which runs the coaching review). -->
+      <button class="qa-btn"          onclick="endDay()" title="Save today's numbers for THIS account to disk (D:\co-pilot DATA)"><span class="btn-icon">📁</span> End Day &amp; Save</button>
+      <button class="qa-btn danger"   onclick="quickAction('stop-session')"><span class="btn-icon">■</span> End Session</button>
+    </div>
+  </div>
+
+  <!-- Drag handle: left panel ⟷ center -->
+  <div id="resizer-left" class="panel-resizer" title="Drag to resize · double-click to reset"></div>
+
+  <!-- ── Center panel (Chat) ────────────────────────────────────────────── -->
+  <div id="center-panel">
+    <div id="chat-header">
+      <span class="instrument" id="hdr-symbol">MNQ1!</span>
+      <span class="separator">|</span>
+      <span class="price" id="hdr-price">—</span>
+      <span class="separator">|</span>
+      <span class="tf-badge" id="hdr-tf">4H</span>
+      <div class="mode-pill" id="hdr-mode-pill">FUNDED</div>
+      <button id="refresh-price" onclick="refreshPrice()">↻ Refresh</button>
+      <button id="debate-mode-btn" class="active" onclick="toggleDebateMode()" title="Debate: Jessi (discipline) + Analysis (technical) + Power of 3 (AMD) → Expert Judge">⚖ Debate</button>
+      <button id="scalper-agent-btn" onclick="toggleScalperAgent()" title="The Scalper: scalping specialist — per-day hold/gap/size analysis, per-trade feedback, keeps behavioural notes across sessions, enforces size and cooldown">⚡ Scalper</button>
+      <button id="voice-mode-btn" onclick="toggleVoiceMode()" title="Talk to Jesse — voice in, voice out">🎙 Voice</button>
+    </div>
+
+    <div id="messages">
+      <div class="msg system-msg">
+        <div class="msg-bubble">Co-Pilot ready. Use the mode toggle above to switch between EVAL and FUNDED rules. Enable the 1H Engulf Monitor on the left to get notified when an engulfing candle fires on your indicator.</div>
+      </div>
+    </div>
+
+    <div id="typing">
+      <div class="typing-dot"></div>
+      <div class="typing-dot"></div>
+      <div class="typing-dot"></div>
+    </div>
+
+    <!-- ── Voice mode overlay: input AND output both spoken. Hidden unless
+         toggled on via the 🎙 Voice button. Chat panel underneath stays
+         intact so switching back to text just re-shows it. ────────────── -->
+    <div id="voice-overlay" style="display:none;">
+      <div id="voice-orb" class="voice-orb voice-idle">
+        <div class="voice-orb-ring"></div>
+        <span id="voice-orb-icon">🎙</span>
+      </div>
+      <div id="voice-status">Tap to start talking to Jesse</div>
+      <div id="voice-caption"></div>
+      <div id="voice-controls">
+        <button id="voice-start-btn" onclick="voiceStartListening()">Start listening</button>
+        <button id="voice-back-btn" onclick="toggleVoiceMode()">← Back to chat</button>
+      </div>
+    </div>
+    <audio id="voice-player" style="display:none;"></audio>
+
+    <div id="input-area">
+      <div id="input-row">
+        <textarea id="chat-input" placeholder="Ask for analysis, log a trade, check patterns…" rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+        <button id="send-btn"   onclick="sendMessage()"    title="Send (Enter)">↑</button>
+        <button id="cancel-btn" onclick="cancelStreaming()" title="Cancel" style="display:none;">■</button>
+      </div>
+      <div id="input-hints">
+        <span class="hint-chip" onclick="fillInput('Run pre-session check')">pre-session</span>
+        <span class="hint-chip" onclick="fillInput('Analyze MNQ — full top-down')">analyze</span>
+        <span class="hint-chip" onclick="fillInput('What is the 4H bias right now?')">4H bias</span>
+        <span class="hint-chip" onclick="fillInput('Check 1H for engulfing setup')">1H engulf</span>
+        <span class="hint-chip" onclick="fillInput('Set alert at ')">set alert</span>
+        <span class="hint-chip" onclick="fillInput('Trade: LONG entry 21350 stop 21280 target 21490')">log trade</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Drag handle: center ⟷ right panel -->
+  <div id="resizer-right" class="panel-resizer" title="Drag to resize · double-click to reset"></div>
+
+  <!-- ── Right panel ────────────────────────────────────────────────────── -->
+  <div id="right-panel">
+    <div id="right-tabs">
+      <div class="rtab active" data-tab="analysis" onclick="switchTab('analysis')">Analysis</div>
+      <div class="rtab" data-tab="journal"  onclick="switchTab('journal')">Journal</div>
+      <div class="rtab" data-tab="rules"    onclick="switchTab('rules')">Rules</div>
+      <div class="rtab" data-tab="lessons"  onclick="switchTab('lessons')">Lessons</div>
+      <div class="rtab" data-tab="align"    onclick="switchTab('align')">Alignment</div>
+      <div class="rtab" data-tab="ladder"   onclick="switchTab('ladder')">Ladder</div>
+      <div class="rtab" data-tab="checklist" onclick="switchTab('checklist')">Checklist</div>
+      <div class="rtab" data-tab="apprentice" onclick="switchTab('apprentice')">Roadmap</div>
+      <div class="rtab" data-tab="insights" onclick="switchTab('insights')">Insights</div>
+      <div class="rtab" data-tab="cost" onclick="switchTab('cost')">Cost</div>
+    </div>
+
+    <div id="right-content">
+
+      <!-- Analysis tab -->
+      <div id="tab-analysis">
+        <div class="analysis-block">
+          <div class="block-title">Bias</div>
+          <div class="bias-display neutral" id="bias-display">NEUTRAL</div>
+          <div style="font-size:11px;color:var(--text-dim);margin-top:2px;" id="bias-note">Run analysis to update</div>
+        </div>
+        <div class="analysis-block">
+          <div class="block-title">Key Level</div>
+          <div class="level-display" id="level-display">—</div>
+          <div class="level-label" id="level-label">No level identified</div>
+        </div>
+        <div class="analysis-block">
+          <div class="block-title">Framework Steps</div>
+          <div class="step-grid">
+            <div class="step-row"><div class="step-num" id="step-1-num">1</div><span class="step-label">Daily bias</span><span class="step-value" id="step-1-val">—</span></div>
+            <div class="step-row"><div class="step-num" id="step-2-num">2</div><span class="step-label">1H aligns</span><span class="step-value" id="step-2-val">—</span></div>
+            <div class="step-row"><div class="step-num" id="step-3-num">3</div><span class="step-label">Zone reaction</span><span class="step-value" id="step-3-val">—</span></div>
+            <div class="step-row"><div class="step-num" id="step-4-num">4</div><span class="step-label">Trigger candle</span><span class="step-value" id="step-4-val">—</span></div>
+          </div>
+        </div>
+        <div class="analysis-block" id="engulf-analysis-block" style="display:none;">
+          <div class="block-title">Last Engulf Signal</div>
+          <div id="engulf-analysis-content"></div>
+        </div>
+        <div class="analysis-block" id="screenshot-block" onclick="document.getElementById('goodtrade-input').click()" style="cursor:pointer;" title="Click to upload a good trade screenshot for review">
+          <div class="block-title">Good-Trade Review</div>
+          <img id="screenshot-img" alt="Chart screenshot" style="display:none;width:100%;border-radius:4px;border:1px solid var(--border);">
+          <div id="screenshot-placeholder">Click to upload a good trade to review it</div>
+        </div>
+
+        <!-- Engulfing Monitors (1H / 30M / 15M) — consolidated 2026-07-22 into a
+             single roller-style TF switcher. Each TF still runs and holds state
+             independently (toggle, indicator, history) — only the visible panel
+             changes when you tap a roller pill. Playbook B stays separate, below. -->
+        <div class="panel-section engulf-section">
+          <div class="engulf-header">
+            <div class="section-title" style="margin:0;">Engulf Monitor</div>
+          </div>
+          <div class="engulf-roller" id="engulf-roller" role="tablist">
+            <button type="button" class="engulf-roller-tab active" id="engulf-roller-tab-1h" onclick="selectEngulfTF('1h')">1H<span class="engulf-roller-dot off" id="engulf-roller-dot-1h"></span></button>
+            <button type="button" class="engulf-roller-tab" id="engulf-roller-tab-30m" onclick="selectEngulfTF('30m')">30M<span class="engulf-roller-dot off" id="engulf-roller-dot-30m"></span></button>
+            <button type="button" class="engulf-roller-tab" id="engulf-roller-tab-15m" onclick="selectEngulfTF('15m')">15M<span class="engulf-roller-dot off" id="engulf-roller-dot-15m"></span></button>
+          </div>
+
+          <div class="engulf-tf-panel" data-tf-panel="1h">
+            <div class="engulf-header" style="margin-top:8px;">
+              <span class="stat-label" style="font-size:10px;">Watch this timeframe</span>
+              <label class="toggle-switch" title="Enable/disable engulfing candle monitor">
+                <input type="checkbox" id="engulf-toggle-1h" onchange="toggleEngulfMonitor('1h', this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div id="engulf-status-1h" class="engulf-status off">Off — toggle to start watching</div>
+            <div class="engulf-actions">
+              <button class="engulf-check-btn" onclick="checkEngulfNow('1h')" title="Run check now">↻ Check now</button>
+              <div class="engulf-indicator-row">
+                <span class="stat-label" style="font-size:10px;">Indicator</span>
+                <input id="engulf-indicator-1h" class="engulf-indicator-input" placeholder="auto-detect" title="Pine indicator name containing engulf signal (leave blank = auto-detect all)">
+              </div>
+            </div>
+            <div id="engulf-history-1h" class="engulf-history"></div>
+          </div>
+
+          <div class="engulf-tf-panel" data-tf-panel="30m" style="display:none;">
+            <div class="engulf-header" style="margin-top:8px;">
+              <span class="stat-label" style="font-size:10px;">Watch this timeframe</span>
+              <label class="toggle-switch" title="Enable/disable engulfing candle monitor">
+                <input type="checkbox" id="engulf-toggle-30m" onchange="toggleEngulfMonitor('30m', this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div id="engulf-status-30m" class="engulf-status off">Off — toggle to start watching</div>
+            <div class="engulf-actions">
+              <button class="engulf-check-btn" onclick="checkEngulfNow('30m')" title="Run check now">↻ Check now</button>
+              <div class="engulf-indicator-row">
+                <span class="stat-label" style="font-size:10px;">Indicator</span>
+                <input id="engulf-indicator-30m" class="engulf-indicator-input" placeholder="auto-detect" title="Pine indicator name containing engulf signal (leave blank = auto-detect all)">
+              </div>
+            </div>
+            <div id="engulf-history-30m" class="engulf-history"></div>
+          </div>
+
+          <div class="engulf-tf-panel" data-tf-panel="15m" style="display:none;">
+            <div class="engulf-header" style="margin-top:8px;">
+              <span class="stat-label" style="font-size:10px;">Watch this timeframe</span>
+              <label class="toggle-switch" title="Enable/disable engulfing candle monitor">
+                <input type="checkbox" id="engulf-toggle-15m" onchange="toggleEngulfMonitor('15m', this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div id="engulf-status-15m" class="engulf-status off">Off — toggle to start watching</div>
+            <div class="engulf-actions">
+              <button class="engulf-check-btn" onclick="checkEngulfNow('15m')" title="Run check now">↻ Check now</button>
+              <div class="engulf-indicator-row">
+                <span class="stat-label" style="font-size:10px;">Indicator</span>
+                <input id="engulf-indicator-15m" class="engulf-indicator-input" placeholder="auto-detect" title="Pine indicator name containing engulf signal (leave blank = auto-detect all)">
+              </div>
+            </div>
+            <div id="engulf-history-15m" class="engulf-history"></div>
+          </div>
+        </div>
+
+        <!-- FVG Monitor (30M — Playbook B displacement step). Fixed to 30M only,
+             no roller — moved here from the left sidebar 2026-07-28, switched
+             from 15M to 30M same day. -->
+        <div class="panel-section engulf-section">
+          <div class="engulf-header">
+            <div class="section-title" style="margin:0;">FVG Monitor (30M)</div>
+            <label class="toggle-switch" title="Enable/disable fair value gap monitor">
+              <input type="checkbox" id="fvg-toggle-30m" onchange="toggleFVGMonitor('30m', this.checked)">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div id="fvg-status-30m" class="engulf-status off">Off — toggle to start watching</div>
+          <div class="engulf-actions">
+            <button class="engulf-check-btn" onclick="checkFVGNow('30m')" title="Run check now">↻ Check now</button>
+          </div>
+          <div id="fvg-history-30m" class="engulf-history"></div>
+        </div>
+
+        <!-- Playbook B / SFP Monitor (30M — liquidity raid + confirming FVG,
+             closed candles only). Fixed to 30M only. This IS the SFP monitor —
+             labeled "Playbook B" because that's the setup it detects. -->
+        <div class="panel-section engulf-section">
+          <div class="engulf-header">
+            <div class="section-title" style="margin:0;">Playbook B / SFP Monitor (30M)</div>
+            <label class="toggle-switch" title="Enable/disable SFP + FVG (Playbook B) monitor">
+              <input type="checkbox" id="sfp-toggle-30m" onchange="toggleSFPMonitor('30m', this.checked)">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div id="sfp-status-30m" class="engulf-status off">Off — toggle to start watching</div>
+          <div class="engulf-actions">
+            <button class="engulf-check-btn" onclick="checkSFPNow('30m')" title="Run check now">↻ Check now</button>
+          </div>
+          <div id="sfp-history-30m" class="engulf-history"></div>
+        </div>
+      </div>
+
+      <!-- Trades tab -->
+      <!-- Lessons tab (promoted to its own tab 2026-07-28, was a block inside
+           Rules) — global across every account/slot, deliberately NOT in
+           ACCT_LS_KEYS. Write down a lesson the moment you realize it (e.g.
+           "sized up while already down") without waiting for a code change.
+           Writing it here does NOT enforce anything by itself — it's the
+           staging area; promoting a lesson into an actual enforced rule
+           (rules.json + app logic + CLAUDE.md) is still a separate step,
+           same as the existing "Pending Checklist Enhancements" pattern. -->
+      <div id="tab-lessons" style="display:none;padding:12px;">
+        <div class="rules-block" id="lessons-log-block">
+          <div class="rules-title">Lessons Log</div>
+          <div style="font-size:11px;opacity:.65;margin:-2px 0 8px;">Write down what you just learned, the moment you learn it. This does not change any rule by itself — flag it to promote it into an enforced rule.</div>
+          <textarea id="lesson-text" rows="2" placeholder="e.g. I sized up from 5 to 10 lots while already down on the day — that's what blew the account." style="width:100%;box-sizing:border-box;resize:vertical;background:var(--panel-2,#161b22);color:inherit;border:1px solid var(--border,#30363d);border-radius:6px;padding:6px 8px;font:inherit;"></textarea>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:6px;">
+            <button class="engulf-check-btn" onclick="addLesson()">+ Log lesson</button>
+            <span id="lesson-saved" style="font-size:11px;opacity:.7;"></span>
+          </div>
+          <div id="lessons-list" style="margin-top:10px;"></div>
+        </div>
+      </div>
+
+      <!-- Alignment tab (added 2026-07-28, the trader) — closes the gap between
+           "what Jessi/Claude currently thinks the rules and plan are" and
+           "what you're actually thinking day to day." Top half is NOT
+           free-text — it's rendered live from rules.json + state.account, the
+           same source of truth the rest of the app reads, so it can never
+           silently drift the way the Ladder tab and sizeCap did before you
+           caught it. Bottom half is your own dated running log of intent/
+           direction; Claude should read recent entries here at the start of
+           a session rather than assuming continuity. -->
+      <div id="tab-align" style="display:none;padding:12px;">
+        <div class="rules-block">
+          <div class="rules-title">What the app currently enforces (live, not editable here)</div>
+          <div style="font-size:11px;opacity:.65;margin:-2px 0 8px;">Pulled straight from rules.json + the active account's own numbers. If this ever looks wrong, that's a bug to report, not something to work around.</div>
+          <div id="align-live-rules" style="font-size:12px;"></div>
+        </div>
+        <div class="rules-block" style="margin-top:12px;">
+          <div class="rules-title">Where your head's at</div>
+          <div style="font-size:11px;opacity:.65;margin:-2px 0 8px;">Not a lesson, not an incident — just where you are today: what you're focused on, worried about, or planning to change. Dated automatically. Claude reads recent entries here before coaching you.</div>
+          <textarea id="align-text" rows="3" placeholder="e.g. Feeling pulled to oversize after two green days in a row — watching for that." style="width:100%;box-sizing:border-box;resize:vertical;background:var(--panel-2,#161b22);color:inherit;border:1px solid var(--border,#30363d);border-radius:6px;padding:6px 8px;font:inherit;"></textarea>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:6px;">
+            <button class="engulf-check-btn" onclick="addAlignNote()">+ Add entry</button>
+            <span id="align-saved" style="font-size:11px;opacity:.7;"></span>
+          </div>
+          <div id="align-notes-list" style="margin-top:10px;"></div>
+        </div>
+      </div>
+
+      <!-- Rules tab (mode-specific) -->
+      <div id="tab-rules" style="display:none;padding:12px;">
+        <div id="rules-eval" class="eval-only" style="display:none;">
+          <div class="rules-mode-badge eval">EVALUATION MODE</div>
+          <div class="rules-block">
+            <div class="rules-title">Account</div>
+            <div class="rules-item"><span class="rules-key">Target</span><span class="rules-val green">$9,000 → $159,000</span></div>
+            <div class="rules-item"><span class="rules-key">DD Floor</span><span class="rules-val" id="rules-floor-eval">$145,500 (trails)</span></div>
+            <div class="rules-item"><span class="rules-key">MLL locks at</span><span class="rules-val">$150,100 (when bal >$154,600)</span></div>
+          </div>
+          <div class="rules-block">
+            <div class="rules-title">Daily Limits</div>
+            <div class="rules-item"><span class="rules-key">Day CAP</span><span class="rules-val red" id="rules-daycap-eval">$2,500 MAX (consistency)</span></div>
+            <div class="rules-item"><span class="rules-key">Personal stop</span><span class="rules-val red" id="rules-daystop-eval">−$300 → done</span></div>
+            <div class="rules-item"><span class="rules-key">Size</span><span class="rules-val">6 micros (hard cap)</span></div>
+          </div>
+          <div class="rules-block">
+            <div class="rules-title">Trade Limits</div>
+            <div class="rules-item"><span class="rules-key">NY session</span><span class="rules-val">2 trades max</span></div>
+            <div class="rules-item"><span class="rules-key">Per day</span><span class="rules-val">2 trades max</span></div>
+            <div class="rules-item"><span class="rules-key">Break</span><span class="rules-val">15 min after every trade</span></div>
+          </div>
+          <div class="rules-block">
+            <div class="rules-title">Strategy: Marathon</div>
+            <div class="rules-item"><span class="rules-key">Daily target</span><span class="rules-val green">$500–$700</span></div>
+            <div class="rules-item"><span class="rules-key">Path to pass</span><span class="rules-val">~15 green days (~3 wks)</span></div>
+          </div>
+        </div>
+
+        <div id="rules-funded" class="funded-only">
+          <div class="rules-mode-badge funded">FUNDED MODE — LIVE MONEY</div>
+          <div class="rules-block">
+            <div class="rules-title">Account</div>
+            <div class="rules-item"><span class="rules-key">Hard Floor</span><span class="rules-val" id="rules-floor-funded">$48,000 (EOD trailing)</span></div>
+            <div class="rules-item"><span class="rules-key">Floor locks</span><span class="rules-val">$50,100 once bal >$52,100</span></div>
+            <div class="rules-item"><span class="rules-key">Profit split</span><span class="rules-val green">90% the trader / 10% the prop firm</span></div>
+          </div>
+          <div class="rules-block">
+            <div class="rules-title">Daily Limits</div>
+            <div class="rules-item"><span class="rules-key">HARD STOP</span><span class="rules-val red" id="rules-daystop-funded">−$200 → CLOSE TRADOVATE</span></div>
+            <div class="rules-item"><span class="rules-key">Daily target</span><span class="rules-val green" id="rules-daytarget-funded">$150–$300</span></div>
+            <div class="rules-item"><span class="rules-key">Max trades/day</span><span class="rules-val">20 (5+ is a red flag)</span></div>
+          </div>
+          <div class="rules-block">
+            <div class="rules-title">Sizing (Scaling)</div>
+            <div class="rules-item"><span class="rules-key">$0–$999 profit</span><span class="rules-val">20 micros</span></div>
+            <div class="rules-item"><span class="rules-key">$1K–$1.999K</span><span class="rules-val">30 micros</span></div>
+            <div class="rules-item"><span class="rules-key">$2K+</span><span class="rules-val">40 micros</span></div>
+            <div class="rules-item"><span class="rules-key">Per entry HARD CAP</span><span class="rules-val red">2 contracts MAX</span></div>
+          </div>
+          <div class="rules-block">
+            <div class="rules-title">Payout (5 qualifying days)</div>
+            <div class="rules-item"><span class="rules-key">Qualifying day</span><span class="rules-val green">≥$150 P&L</span></div>
+            <div class="rules-item"><span class="rules-key">Request when</span><span class="rules-val" id="rules-payout-funded">Balance ≥$52,000</span></div>
+            <div class="rules-item"><span class="rules-key">Max payout</span><span class="rules-val">50% profit above $50K ($2K cap)</span></div>
+          </div>
+          <div class="rules-block">
+            <div class="rules-title">Strategy: Factory</div>
+            <div class="rules-item"><span class="rules-key">Approach</span><span class="rules-val">Slow. Boring. Consistent.</span></div>
+            <div class="rules-item"><span class="rules-key">$200 stop</span><span class="rules-val red">No exceptions. No "I'll get it back."</span></div>
+          </div>
+        </div>
+
+        <!-- ── Ported from EdgeDesk: full discipline rulebook (shown in both modes) ── -->
+        <div class="edg-rules">
+          <div class="edg-card">
+            <div class="edg-label">8-Rule Risk Protocol — Derived from 6 blown accounts</div>
+            <div class="edg-row"><div class="edg-n">01</div><div><div class="edg-txt">Funded HARD STOP: −$500/day. Close Tradovate. Done. No exceptions.</div><div class="edg-why">LucidFlex EOD trailing drawdown from $50K. Floor locks at $50,100 once balance exceeds $52,100. $500 daily limit — a blown funded is not a blown eval.</div></div><span class="edg-tag">ACCOUNT</span></div>
+            <div class="edg-row"><div class="edg-n">02</div><div><div class="edg-txt">Only trade when 4H and 1H are in the same direction</div><div class="edg-why">Counter-trend entries on 5M without HTF alignment = primary loss source across all blown accounts.</div></div><span class="edg-tag">HTF</span></div>
+            <div class="edg-row"><div class="edg-n">03</div><div><div class="edg-txt">Entry candle must be a closed engulfing on 5M — no anticipation</div><div class="edg-why">Entering on forming candles repeatedly led to stopped-out entries in the wrong direction.</div></div><span class="edg-tag">ENTRY</span></div>
+            <div class="edg-row"><div class="edg-n">04</div><div><div class="edg-txt">No trading 15 minutes before or after high-impact news</div><div class="edg-why">News spikes invalidate structure reads and trigger stops regardless of setup quality.</div></div><span class="edg-tag">NEWS</span></div>
+            <div class="edg-row"><div class="edg-n">05</div><div><div class="edg-txt">PDH and PDL must be marked before session opens</div><div class="edg-why">Marking mid-session is confirmation bias. Pre-mark before first trade, no exceptions.</div></div><span class="edg-tag">PREP</span></div>
+            <div class="edg-row"><div class="edg-n">06</div><div><div class="edg-txt">Liquidity sweep must be visible on HTF before 5M entry</div><div class="edg-why">Entering without confirmed sweep = picking tops/bottoms, not reacting to engineered liquidity.</div></div><span class="edg-tag">LIQ</span></div>
+            <div class="edg-row"><div class="edg-n">07</div><div><div class="edg-txt">Complete all 5 framework steps top-down before any entry</div><div class="edg-why">Skipping Daily or 1H analysis for speed is the most common execution mistake.</div></div><span class="edg-tag">PROCESS</span></div>
+            <div class="edg-row"><div class="edg-n">08</div><div><div class="edg-txt">After 2 consecutive losses — close the platform, stop for the session</div><div class="edg-why">Revenge trading after back-to-back losses caused disproportionate drawdown in 4 of 6 blown accounts.</div></div><span class="edg-tag">PSYCH</span></div>
+          </div>
+
+          <div class="edg-card">
+            <div class="edg-label">Funded Account — Payout &amp; Sizing Rules</div>
+            <div class="edg-row"><div class="edg-n">P1</div><div><div class="edg-txt">Payout requires 5 qualifying days (≥$150 each) before requesting</div><div class="edg-why">Don't request payout before balance reaches $52,000. Each $150 qualifying day = one brick toward payout.</div></div><span class="edg-tag">PAYOUT</span></div>
+            <div class="edg-row"><div class="edg-n">P2</div><div><div class="edg-txt">Payout: min $500 · max 50% of profit above $50K (cap $2,000) · 90% goes to you</div><div class="edg-why">Floor must lock at $50,100 first (happens when balance exceeds $52,100). Request only after floor locks.</div></div><span class="edg-tag">PAYOUT</span></div>
+            <div class="edg-row"><div class="edg-n">S1</div><div><div class="edg-txt">Size scaling: $0–$999 profit = 20 micros · $1K–$1.999K = 30 micros · $2K+ = 40 micros</div><div class="edg-why">Scale up only with confirmed profits, not intraday. Max 2 contracts per entry at all times — no override.</div></div><span class="edg-tag">SIZE</span></div>
+            <div class="edg-row"><div class="edg-n">S2</div><div><div class="edg-txt">Mon/Fri = choppy. Tue/Wed/Thu = best days. Reduce size and expectation on edge days.</div><div class="edg-why">Funded account: every losing day delays payout. The boring days count.</div></div><span class="edg-tag">SESSION</span></div>
+          </div>
+
+          <div class="edg-card">
+            <div class="edg-label">6 Documented Failure Modes — From Your Own History</div>
+            <div class="edg-row"><div class="edg-n">F1</div><div><div class="edg-txt">Trade count escalation — profitable days: 6–12 trades. Blow-up days: 65 trades, 20% win rate</div><div class="edg-why">More trades = more damage. Stop at 2 good trades. Done.</div></div><span class="edg-tag">PATTERN</span></div>
+            <div class="edg-row"><div class="edg-n">F2</div><div><div class="edg-txt">Revenge clusters — rapid re-entries at same zone, increasing size after losses</div><div class="edg-why">Two losses in a row = close platform. Non-negotiable.</div></div><span class="edg-tag">PATTERN</span></div>
+            <div class="edg-row"><div class="edg-n">F3</div><div><div class="edg-txt">Inverted R:R — avg win $15.75, avg loss $246. Cutting winners, holding losers</div><div class="edg-why">Use time stop: exit flat if no move in 60 seconds. Never move stop away.</div></div><span class="edg-tag">PATTERN</span></div>
+            <div class="edg-row"><div class="edg-n">F4</div><div><div class="edg-txt">Holding losers 3+ hours — MGC Mar 31 avg hold 188 minutes</div><div class="edg-why">5-minute rule: if price hasn't moved your way in 5 minutes, exit now.</div></div><span class="edg-tag">PATTERN</span></div>
+            <div class="edg-row"><div class="edg-n">F5</div><div><div class="edg-txt">Multi-instrument bad days — every blow-up shows MNQ AND MGC same day</div><div class="edg-why">One instrument per session. Never switch after a loss.</div></div><span class="edg-tag">PATTERN</span></div>
+            <div class="edg-row"><div class="edg-n">F6</div><div><div class="edg-txt">Account was UP then crashed — Account 6: +$937 then gave back $2,637</div><div class="edg-why">Lock the win. Hit target → stop. A winning day that becomes a losing day is Pattern 6.</div></div><span class="edg-tag">PATTERN</span></div>
+          </div>
+
+          <div class="edg-card">
+            <div class="edg-label">Live Mistake Log — Scalping (from Screen Recording Review)</div>
+            <div class="edg-note">Every mistake you identify goes here. This is your permanent evidence file — not rules, but your own patterns caught on tape.</div>
+            <div class="edg-row"><div class="edg-n">M1</div><div><div class="edg-txt">Entering on 1M — banned</div><div class="edg-why">Screen review confirmed: 1M entries = impulse, not edge. 1M view distorts structure, magnifies noise, and creates false confidence in bad setups.</div></div><span class="edg-tag mistake">MISTAKE</span></div>
+            <div class="edg-row"><div class="edg-n">M2</div><div><div class="edg-txt">Tunnel vision: watching only 1M warps your judgment</div><div class="edg-why">When you're zoomed into 1M for too long, every candle looks like a setup. You need the 15M context first — always.</div></div><span class="edg-tag mistake">MISTAKE</span></div>
+            <div class="edg-row"><div class="edg-n">M3</div><div><div class="edg-txt">TF drill-down order: 15M → 5M or 3M for entry. Never reverse.</div><div class="edg-why">15M gives direction. 5M/3M gives the entry candle. Skipping 15M means you're guessing the direction from the noise layer.</div></div><span class="edg-tag">PROCESS</span></div>
+            <div class="edg-row"><div class="edg-n">M4</div><div><div class="edg-txt">After entry: hold for at least 2–3 closed candles on 3M before deciding</div><div class="edg-why">Exiting after 1 candle because it moved against you is not a decision — it's panic. Give the trade room to breathe: 2–3 closed 3M candles minimum.</div></div><span class="edg-tag">EXIT</span></div>
+            <div class="edg-row"><div class="edg-n">M5</div><div><div class="edg-txt">Hold vs Exit rule: 3 consecutive candles OR 1 clear close in your direction = decision point</div><div class="edg-why">You do NOT need to wait for the next close after every entry. Identify 3 candles OR one decisive close, then make a calm hold/exit call. Not before.</div></div><span class="edg-tag">EXIT</span></div>
+            <div class="edg-row"><div class="edg-n">M6</div><div><div class="edg-txt">The Breakeven Trap: 3M + 1M entries → loss → increase size → breakeven → stop for the day</div><div class="edg-why">This loop wastes hours without real losses — but it IS a loss. Time is capital. Fix: 2 losses = done for the session. No exceptions.</div></div><span class="edg-tag mistake">PATTERN</span></div>
+          </div>
+
+          <div class="edg-card">
+            <div class="edg-label">Core Strategy — Part 1: Top-Down Bias Alignment</div>
+            <div class="edg-note">The foundation of your scalping framework. Every part of your strategy gets added here as it's confirmed by real trading experience.</div>
+            <div class="edg-row"><div class="edg-n">CS1</div><div><div class="edg-txt">When overall bias is confirmed — do NOT trade the opposite direction</div><div class="edg-why">Bias = 4H + 1H alignment. If the urge to trade against it feels strong, that feeling is the contrarian trap. The bias is the filter. Trust it.</div></div><span class="edg-tag strategy">STRATEGY</span></div>
+            <div class="edg-row"><div class="edg-n">CS2</div><div><div class="edg-txt">4H + 1H aligned → move to 15M → wait for 15M to confirm direction</div><div class="edg-why">Only when 4H, 1H, and 15M all point the same way is a trade opportunity valid. Do not enter while 15M is still chopping — wait.</div></div><span class="edg-tag strategy">STRATEGY</span></div>
+            <div class="edg-row"><div class="edg-n">CS3</div><div><div class="edg-txt">15M confirmed → drop to 3M/5M → wait for a clear entry candle in the same direction</div><div class="edg-why">After 3-TF alignment, the 3M or 5M entry candle is your trigger — nothing else. A good candle in the aligned direction is the signal. Not the feeling. Not the impatience.</div></div><span class="edg-tag strategy">STRATEGY</span></div>
+            <div class="edg-row"><div class="edg-n">CS4</div><div><div class="edg-txt">TF ladder: 4H → 1H → 15M → 3M/5M. Entry only at the bottom. Read only at the top.</div><div class="edg-why">Reading at 3M without checking 4H is like reading one word of a paragraph and making a decision. Every step down the ladder confirms the previous one. Skip none.</div></div><span class="edg-tag strategy">STRATEGY</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Ladder tab (target ladder — synced to whichever account is active) -->
+      <div id="tab-ladder" style="display:none;padding:10px;">
+        <div class="rules-mode-badge eval" id="ladder-badge">EVAL — TARGET LADDER</div>
+        <div id="ladder-summary" class="ladder-summary"></div>
+        <div class="ladder-actions">
+          <button class="engulf-check-btn" onclick="resetLadder()" title="Clear all actual entries">↺ Reset actuals</button>
+        </div>
+        <div id="ladder-table-wrap"></div>
+        <div class="ladder-note" id="ladder-note">EOD-trailing floor · consistency 50% · no DLL, no min days. Type each day's real net; balance/floor/cushion auto-update. Saved locally in this app.</div>
+      </div>
+
+      <!-- Checklist tab — ported from Edgedesk (C:\Users\Admin\Claude\Projects\Edgedesk\EdgeDesk.html) -->
+      <div id="tab-checklist" style="display:none;padding:12px;">
+
+        <div class="analysis-block">
+          <div class="block-title">Body Check</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px">
+            <div>
+              <div class="ck-subtitle">Gym Today</div>
+              <div style="display:flex;gap:3px">
+                <button id="ck-gymHigh" class="ck-body-btn" onclick="ckSetBody('gym','high')">🏋️ High</button>
+                <button id="ck-gymLow" class="ck-body-btn" onclick="ckSetBody('gym','low')">😐 Low</button>
+                <button id="ck-gymRest" class="ck-body-btn" onclick="ckSetBody('gym','rest')">— Rest</button>
+              </div>
+            </div>
+            <div>
+              <div class="ck-subtitle">Sleep</div>
+              <div style="display:flex;gap:3px">
+                <button id="ck-sleepGood" class="ck-body-btn" onclick="ckSetBody('sleep','good')">😴 Good</button>
+                <button id="ck-sleepOk" class="ck-body-btn" onclick="ckSetBody('sleep','ok')">😑 OK</button>
+                <button id="ck-sleepPoor" class="ck-body-btn" onclick="ckSetBody('sleep','poor')">😫 Poor</button>
+              </div>
+            </div>
+            <div>
+              <div class="ck-subtitle">Nap Before NY</div>
+              <div style="display:flex;gap:3px">
+                <button id="ck-napYes" class="ck-body-btn" onclick="ckSetBody('nap','yes')">✓ Yes</button>
+                <button id="ck-napNo" class="ck-body-btn" onclick="ckSetBody('nap','no')">✗ No</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="analysis-block">
+          <div class="block-title">Trading Session</div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <button id="ck-sessLondon" class="ck-sess-btn" onclick="ckSetActiveSess('london')">🇬🇧 London <span style="font-size:9px;opacity:.7">1:30–3:00 PM IST</span></button>
+            <button id="ck-sessNy" class="ck-sess-btn" onclick="ckSetActiveSess('ny')">🗽 New York <span style="font-size:9px;opacity:.7">7:00–9:00 PM IST</span></button>
+            <button id="ck-sessNone" class="ck-sess-btn active-none" onclick="ckSetActiveSess('')">— None</button>
+            <button class="engulf-check-btn" style="margin-left:auto" onclick="ckAutoDetectSess()">Auto</button>
+          </div>
+          <div id="ck-sessReminder" style="display:none;margin-top:10px;padding:10px 12px;border-radius:var(--radius-sm);border-left:3px solid var(--border2);background:var(--surface2);font-size:11px;line-height:1.7;color:var(--text-mid)"></div>
+        </div>
+
+        <div class="analysis-block">
+          <div class="block-title">Today's Plan</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:7px">
+            <div>
+              <div class="ck-subtitle">Daily Bias</div>
+              <select class="form-select" id="ck-planBias" onchange="ckSavePlan()" style="width:100%"><option value="">Select…</option><option>Bullish</option><option>Bearish</option><option>Conflicted — wait</option></select>
+            </div>
+            <div>
+              <div class="ck-subtitle">Max Trades</div>
+              <select class="form-select" id="ck-planMaxT" onchange="ckSavePlan()" style="width:100%"><option value="">—</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
+            </div>
+          </div>
+          <div style="margin-bottom:7px">
+            <div class="ck-subtitle">Key Levels (PDH / PDL / any major level)</div>
+            <input class="form-input" id="ck-planLevels" style="width:100%" placeholder="e.g. PDH 21450, PDL 21210, POI 21340" oninput="ckSavePlan()">
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px">
+            <div>
+              <div class="ck-subtitle">First News Event</div>
+              <input class="form-input" id="ck-planNews" style="width:100%" placeholder="e.g. CPI 8:30 AM ET" oninput="ckSavePlan()">
+            </div>
+            <div>
+              <div class="ck-subtitle">Session Focus</div>
+              <input class="form-input" id="ck-planFocus" style="width:100%" placeholder="e.g. London prep, NY only" oninput="ckSavePlan()">
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:7px">
+            <div>
+              <div class="ck-subtitle">4H Bias</div>
+              <select class="form-select" id="ck-planH4" onchange="ckSavePlan()" style="width:100%"><option value="">Select…</option><option>Bullish</option><option>Bearish</option><option>Conflicted</option></select>
+            </div>
+            <div>
+              <div class="ck-subtitle">1H Bias</div>
+              <select class="form-select" id="ck-planH1" onchange="ckSavePlan()" style="width:100%"><option value="">Select…</option><option>Bullish</option><option>Bearish</option><option>Conflicted</option></select>
+            </div>
+          </div>
+          <div style="margin-top:7px">
+            <div class="ck-subtitle">Valid Setups Today</div>
+            <input class="form-input" id="ck-planSetups" style="width:100%" placeholder="e.g. Shorts only at PDH resistance — no longs until H1 reclaims 21300" oninput="ckSavePlan()">
+          </div>
+        </div>
+
+        <div class="analysis-block">
+          <div class="block-title">Playbook</div>
+          <div class="ck-pb-row">
+            <div class="ck-pb-btn" id="ck-pb1" onclick="ckSelPB(1)"><span class="ck-pb-icon">▣</span>Engulfing + TF</div>
+            <div class="ck-pb-btn" id="ck-pb2" onclick="ckSelPB(2)"><span class="ck-pb-icon">◈</span>SFP + FVG</div>
+            <div class="ck-pb-btn" id="ck-pb3" onclick="ckSelPB(3)"><span class="ck-pb-icon">◉</span>Liquidity Raid</div>
+          </div>
+          <div id="ck-pbNote" style="font-size:10px;color:var(--text-dim)">Select a playbook to begin</div>
+        </div>
+
+        <div class="analysis-block">
+          <div class="block-title">5-Step Framework</div>
+          <div class="ck-fw">
+            <div class="ck-fw-step" id="ck-fs0" onclick="ckTogFW(0)"><span class="ck-fw-tf">Daily</span><span class="ck-fw-sub">Bias</span></div>
+            <span class="ck-fw-arr">›</span>
+            <div class="ck-fw-step" id="ck-fs1" onclick="ckTogFW(1)"><span class="ck-fw-tf">1H</span><span class="ck-fw-sub">Structure</span></div>
+            <span class="ck-fw-arr">›</span>
+            <div class="ck-fw-step" id="ck-fs2" onclick="ckTogFW(2)"><span class="ck-fw-tf">4H Zone</span><span class="ck-fw-sub">Key Level</span></div>
+            <span class="ck-fw-arr">›</span>
+            <div class="ck-fw-step" id="ck-fs3" onclick="ckTogFW(3)"><span class="ck-fw-tf">15M/5M</span><span class="ck-fw-sub">Reaction</span></div>
+            <span class="ck-fw-arr">›</span>
+            <div class="ck-fw-step" id="ck-fs4" onclick="ckTogFW(4)"><span class="ck-fw-tf">3M/1M</span><span class="ck-fw-sub">Trigger</span></div>
+          </div>
+          <div id="ck-fwNote" style="font-size:10px;color:var(--text-dim)">Tap each step as you complete top-down analysis</div>
+        </div>
+
+        <div class="analysis-block" id="ck-block-htf">
+          <div class="block-title">HTF Alignment</div>
+          <div class="ck-chk-list">
+            <div class="ck-chk-item" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">Daily bias confirmed</div><div class="ck-csub">Clear directional structure — not consolidation</div></div><span class="ck-ctag">Daily</span></div>
+            <div class="ck-chk-item" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">4H and 1H in the same direction</div><div class="ck-csub">No conflict between the two timeframes — no trade if they disagree</div></div><span class="ck-ctag">4H/1H</span></div>
+            <div class="ck-chk-item" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">Previous day high / low marked</div><div class="ck-csub">PDH and PDL plotted before session open</div></div><span class="ck-ctag">PD</span></div>
+          </div>
+        </div>
+
+        <div class="analysis-block" id="ck-block-liq">
+          <div class="block-title">Liquidity & Structure</div>
+          <div class="ck-chk-list">
+            <div class="ck-chk-item" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">Liquidity sweep confirmed on HTF</div><div class="ck-csub">Price swept a high/low, grabbed stops, rejected back</div></div><span class="ck-ctag">LIQ</span></div>
+            <div class="ck-chk-item" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">Failure pattern reversal present</div><div class="ck-csub">BOS after sweep — market failing to continue in sweep direction</div></div><span class="ck-ctag">FPR</span></div>
+            <div class="ck-chk-item" id="ck-sfp" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">SFP visible — spike beyond prior swing, closed back inside</div><div class="ck-csub">Required for SFP+FVG playbook</div></div><span class="ck-ctag">SFP</span></div>
+            <div class="ck-chk-item" id="ck-fvg" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">FVG identified as entry zone</div><div class="ck-csub">Gap between candle 1 and candle 3 — price returning to fill</div></div><span class="ck-ctag">FVG</span></div>
+          </div>
+        </div>
+
+        <div class="analysis-block" id="ck-block-5m">
+          <div class="block-title">5M Entry</div>
+          <div class="ck-chk-list">
+            <div class="ck-chk-item" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">Engulfing candle closed on 5M</div><div class="ck-csub">Full body engulf — candle is closed, not still forming</div></div><span class="ck-ctag">5M</span></div>
+            <div class="ck-chk-item" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">Direction matches 4H + 1H bias</div><div class="ck-csub">Not counter-trend — engulf is in the direction of HTF alignment</div></div><span class="ck-ctag">DIR</span></div>
+            <div class="ck-chk-item" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">3M / 1M micro-structure aligned</div><div class="ck-csub">Wait for 2–3 consecutive candle closes in direction before entering — don't judge off a single 1M candle</div></div><span class="ck-ctag">1M</span></div>
+          </div>
+        </div>
+
+        <div class="analysis-block" id="ck-block-risk">
+          <div class="block-title">Risk Gate</div>
+          <div class="ck-chk-list">
+            <div class="ck-chk-item" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">Daily loss tier checked before entry</div><div class="ck-csub" id="ck-risk-loss-sub">Eval: no firm daily loss limit — your self-stop is −$300 → flatten & lock the platform. Know where today's P&L sits.</div></div><span class="ck-ctag">RISK</span></div>
+            <div class="ck-chk-item" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">No high-impact news within 15 minutes</div><div class="ck-csub">Check the No-Trade Windows panel on the left — NFP, CPI, FOMC, Fed speakers</div></div><span class="ck-ctag">NEWS</span></div>
+            <div class="ck-chk-item" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">Not after 2 consecutive losses this session</div><div class="ck-csub">2 losses in a row = stop and reassess. Not a revenge setup.</div></div><span class="ck-ctag">PSYCH</span></div>
+            <div class="ck-chk-item" onclick="ckTog(this)"><div class="ck-cbox"><span class="ck-ctick">✓</span></div><div style="flex:1"><div class="ck-clbl">Positions closed per LucidFlex mandatory close time</div><div class="ck-csub">Ported from Edgedesk as "4:45 PM EST" — not in CLAUDE.md, confirm this is still the real LucidFlex rule</div></div><span class="ck-ctag">TIME</span></div>
+          </div>
+        </div>
+
+        <div class="ck-verdict" id="ck-verdict"><div class="ck-vdot"></div><span>Select a playbook and complete the checklist</span></div>
+
+        <div style="display:flex;gap:8px;margin-top:10px;">
+          <button class="btn-save" id="ck-doneBtn" onclick="ckMarkDone()" style="flex:1;background:var(--green);border-color:var(--green);">✓ PRE-TRADE DONE</button>
+          <button class="btn-cancel" onclick="ckResetChecklist()">Reset</button>
+        </div>
+
+        <div id="ck-doneBadge" style="display:none;margin:10px 0;padding:10px 14px;border-radius:var(--radius-sm);background:var(--green-dim);border:1px solid var(--green);">
+          <div style="font-size:11px;color:var(--green);font-weight:700;margin-bottom:4px">✓ PRE-TRADE COMPLETE</div>
+          <div id="ck-doneTime" style="font-size:10px;color:var(--text-dim)"></div>
+          <div id="ck-doneItems" style="font-size:10px;color:var(--text-dim);margin-top:4px;line-height:1.7"></div>
+        </div>
+
+      </div>
+
+      <!-- Roadmap tab — 90-Day Apprenticeship: the prop firm Prop Mastery via the Co-Pilot (added 2026-07-18) -->
+      <div id="tab-apprentice" style="display:none;padding:12px;">
+
+        <div id="plan-stage-banner" class="plan-stage-banner"></div>
+
+        <div class="analysis-block">
+          <div class="block-title">90-Day Apprenticeship — the prop firm Prop Mastery via the Co-Pilot</div>
+          <div class="plan-lede">2026-07-17. One framework. No new ones for 90 days — consuming another guru mid-plan is a rule break, logged like any other.</div>
+          <div class="plan-readnote">Best read pre-session or on your Saturday review — not during the 19:00–20:00 window.</div>
+
+          <div class="plan-sub">The Learning-Science Engine (mapped to app features you already have)</div>
+          <table class="plan-table">
+            <tr><th style="width:16%">Technique</th><th style="width:44%">What it means here</th><th>App mechanism</th></tr>
+            <tr><td><b>Active recall</b></td><td>Before each session, write your rules from memory BEFORE opening the checklist, then check yourself against it</td><td>Checklist tab = the answer key. Score yourself /10 in the plan notes</td></tr>
+            <tr><td><b>Spaced repetition</b></td><td>Rules resurface at expanding intervals: daily (loop focus), weekly (Monday digest), monthly (full review)</td><td>Loop focus banner · scheduled 21:30 reconcile · Insights history</td></tr>
+            <tr><td><b>Feynman technique</b></td><td>After every trade day: explain each trade in ONE sentence a 12-year-old would understand. Can't explain it simply = it wasn't a setup, it was an impulse</td><td>Playbook tagging — a trade you can't tag A/B/C gets tagged as a mistake</td></tr>
+            <tr><td><b>Interleaving</b></td><td>Don't drill one pattern repeatedly; mix regimes — trending day, chop day, news day — in replay so recognition becomes discrimination</td><td>TradingView replay tools (replay_start / replay_step / replay_trade) already wired into your MCP</td></tr>
+          </table>
+        </div>
+
+        <div class="analysis-block">
+          <div class="block-title">Stage 1 — One Clean Rep</div>
+          <div class="plan-goal">Days 1–21 (5-green-day challenge, extended) · 15 sessions where process grade ≥ B. P&amp;L explicitly does not count.</div>
+          <ul class="plan-list">
+            <li><b>Daily:</b> active-recall rules test (60 sec) → checklist → max 2-3 shots, 19:00–20:00 IST, 6 micros flat, one direction → CSV upload → read score + focus → one-sentence Feynman note per trade (2 min, in the day's plan notes).</li>
+            <li><b>Replay drill (3×/week, NOT during session hours):</b> pick a random past NY open in TradingView replay, trade your playbook with replay_trade, 2 shots max. This is where volume-of-reps lives — sim reps are free, live reps cost eval fees.</li>
+            <li><b>Weekly (Saturday, 30 min):</b> Insights review — score trend, avgW:avgL ratio, red-day causes. Write ONE sentence: "next week I will fix ___." One.</li>
+          </ul>
+          <div class="plan-gate"><b>Stage gate:</b> 5-green-day streak achieved + zero direction-flip days in the final week. Pass this and the eval math ($600/day pace) is already handling itself.</div>
+        </div>
+
+        <div class="analysis-block">
+          <div class="block-title">Stage 2 — Size the Winner, Not the Ego</div>
+          <div class="plan-goal">Days 22–50 · avgW:avgL ≥ 1.5x. This is the profitability switch.</div>
+          <ul class="plan-list">
+            <li>Now the <b>MAE/MFE loop</b> matters most: after each session, compute it. Target capture% climbing week over week (35% → 50%+). Method: JadeCap's risk-free add — stop to break-even on entry #1, add only after confirmation, never past 6 total.</li>
+            <li><b>Hold drill:</b> on every winner, hold until either the next level or a 4H/1H candle-close signal — not until the P&amp;L ticker feels good. Replay-drill this 10 times/week; holding is a trainable reflex, not a personality trait.</li>
+            <li><b>Interleave:</b> alternate replay days between trend days and chop days so you learn which days NOT to add.</li>
+          </ul>
+          <div class="plan-gate"><b>Stage gate:</b> eval passed (target $159K) or ≥ $6K cushion with consistency ≤ 50%. Expected around day 35–50 at your clean-day rate.</div>
+        </div>
+
+        <div class="analysis-block">
+          <div class="block-title">Stage 3 — Funded Is a Different Sport</div>
+          <div class="plan-goal">Days 51–90 · first payout. The hot streak that passes evals is statistically followed by a loss cluster — plan for it.</div>
+          <ul class="plan-list">
+            <li><b>First 10 funded days: HALF size (3 micros)</b>, same process. Non-negotiable — this is where funded accounts die.</li>
+            <li><b>Payout rhythm:</b> bank the first payout at the minimum threshold, even if small. A banked $500 rewires more belief than a floating $3K.</li>
+            <li><b>Losing-streak protocol</b> (pre-written now, while calm): 2 red days in a row → next day 2 micros, 1 shot. 3 red days → 1 rest day + replay-only. Streaks are probability; the protocol converts fear into procedure.</li>
+            <li><b>Keep the data sacred:</b> any trade violating the plan gets mistake-tagged and EXCLUDED when judging the edge. Your edge is judged only on system trades.</li>
+          </ul>
+        </div>
+
+        <div class="analysis-block">
+          <div class="block-title">The Rewritten Operating System (daily protocol, ~25 min around a 1-2 hr session)</div>
+          <ol class="plan-steps">
+            <li><b>Sleep ≥ 7h</b> or the app halves your limits — that rule already exists; respect why.</li>
+            <li><b>Pre-session (10 min):</b> rules from memory → checklist → GO/NO-GO. NO-GO means no.</li>
+            <li><b>Session (19:00–20:00):</b> 2-3 shots, one direction, flat size, loser cut at cap, winner held to level.</li>
+            <li><b>Post-session (10 min):</b> CSV upload → read the grade → Feynman sentence per trade → tag playbooks.</li>
+            <li><b>21:30:</b> scheduled reconcile reports the prop firm vs app + streak. Read it, close the screens.</li>
+            <li><b>Social:</b> X only, and only after step 5. Instagram/Snapchat/Facebook deleted from the phone, not "avoided" — friction beats willpower.</li>
+            <li><b>App development:</b> before 16:00 IST only, and from Stage 1 onward the app is FROZEN except bug fixes — building features is your dopamine leak, and the loop only works on a stable instrument.</li>
+          </ol>
+        </div>
+
+        <div class="analysis-block">
+          <div class="block-title">Uncommon Resources (deliberately short — consumption is your risk, not your gap)</div>
+          <ul class="plan-list">
+            <li>Your own <code>data/day_trades.json</code> — the only trading book with your name in it. Reread weekly.</li>
+            <li>TradingView replay on YOUR instrument/window — better than any course, costs nothing.</li>
+            <li>One book total, Stage 2+: <i>Trading in the Zone</i> (Douglas), one chapter per week, Feynman-summarized in 3 sentences each. Nothing else. No new YouTube mentors until day 91.</li>
+          </ul>
+        </div>
+
+        <div class="analysis-block">
+          <div class="block-title">The Only Metric That Defines "Top 1%" Here</div>
+          <div class="plan-metric">Not learning speed. <b>Percentage of sessions traded exactly as planned.</b> The industry's number is under 10%. Yours, measured by the app, target: <b>80% by day 30, 90% by day 90</b>. Everything else — the eval, the payout, the $2M-someday — is downstream of that single number, and the app now measures it every day.</div>
+        </div>
+
+      </div>
+
+      <!-- Insights tab (Tier-3: scorecard / mirror / readiness-vs-outcome / consistency) -->
+      <!-- Journal tab (TradeZella-style: P&L calendar, dashboard stats, equity
+           curve, score radar, trade log, reports) — added 2026-07-25 -->
+      <div id="tab-journal" style="display:none;padding:12px;">
+        <div id="journal-body"><div class="no-trades">Upload a CSV and the journal fills in.</div></div>
+      </div>
+
+      <div id="tab-insights" style="display:none;padding:12px;">
+        <!-- Account breach/clear actions — added 2026-07-22. Static (outside
+             #ins-body) so they survive every renderInsights() re-render. -->
+        <div style="display:flex;gap:8px;margin-bottom:10px;">
+          <button class="engulf-check-btn" style="flex:1;color:var(--red);" onclick="accountBreached()" title="Archives all current trade/insight data to a file, then wipes this account/stage clean for your next attempt">⚠ Account Breached</button>
+          <!-- "Cleared → Funded" removed 2026-07-25 (the trader: "Do not have the
+               account reach the account cleared to funded option in this
+               insight"). Promotion is an account-level event — do it from the
+               ⇄ Account picker by setting that slot's stage to FUNDED, so the
+               slot's identity and its data stay in one place. -->
+        </div>
+        <!-- Trade journal quick-add — free text to Jessi about a trade / state of
+             mind. Not account-scoped, survives breach/clear resets. Added 2026-07-22. -->
+        <div style="display:flex;gap:8px;margin-bottom:10px;">
+          <input type="text" id="journal-input" placeholder="Journal a trade / how you're feeling — Jessi reads this" style="flex:1;">
+          <button class="engulf-check-btn" onclick="journalSubmit()">📝 Save</button>
+        </div>
+        <div id="ins-body"><div class="no-trades">Log a day or two and this fills in.</div></div>
+      </div>
+
+      <!-- Cost tab: lifetime prop-account spend vs payouts -> breakeven -->
+      <div id="tab-cost" style="display:none;padding:12px;">
+        <div id="cost-body"><div class="no-trades">Loading cost ledger…</div></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ── Settings overlay ─────────────────────────────────────────────────── -->
+<div id="settings-overlay">
+  <div id="settings-box">
+    <h2>Settings</h2>
+    <div class="settings-field">
+      <label>Anthropic API Key</label>
+      <input type="password" id="settings-api-key" placeholder="sk-ant-…" autocomplete="off">
+    </div>
+    <div class="settings-field">
+      <label>Gemini API Key (free — Jessi's PRIMARY brain, 250K tokens/min; get one at aistudio.google.com/apikey)</label>
+      <input type="password" id="settings-gemini-key" placeholder="AIza…" autocomplete="off">
+    </div>
+    <div class="settings-field">
+      <label>Groq API Key (free — Jessi's fallback brain + voice speech-to-text/text-to-speech; console.groq.com/keys)</label>
+      <input type="password" id="settings-groq-key" placeholder="gsk_…" autocomplete="off">
+    </div>
+    <div class="settings-field">
+      <label>OmniRoute API Key (optional — high-reasoning primary brain when set; some models route through pooled/shared accounts, see README before enabling)</label>
+      <input type="password" id="settings-omniroute-key" placeholder="sk-…" autocomplete="off">
+    </div>
+    <div class="settings-field">
+      <label>OmniRoute Base URL</label>
+      <input type="text" id="settings-omniroute-url" placeholder="http://localhost:20128" autocomplete="off">
+    </div>
+    <div class="settings-field">
+      <label><input type="checkbox" id="settings-disable-omniroute" style="width:auto;margin-right:6px;vertical-align:middle;">Disable OmniRoute (kill switch — revert to Gemini/Groq only, e.g. if an OmniRoute account gets banned)</label>
+    </div>
+    <div class="settings-field">
+      <label>Speaking voice (how Jessi sounds in Voice mode)</label>
+      <select id="settings-voice-name">
+        <option value="en-IN-NeerjaNeural">Neerja — Indian English, female (neural, default)</option>
+        <option value="en-IN-PrabhatNeural">Prabhat — Indian English, male (neural)</option>
+        <option value="en-US-JennyNeural">Jenny — US English, female (neural)</option>
+        <option value="en-US-GuyNeural">Guy — US English, male (neural)</option>
+        <option value="browser">Browser voice — basic, fully offline</option>
+      </select>
+    </div>
+    <div class="settings-field">
+      <label>Voice brain (who answers in Voice mode)</label>
+      <select id="settings-voice-brain">
+        <option value="gemini">Gemini Flash-Lite — cloud (default, 250K tokens/min)</option>
+        <option value="groq">Groq gpt-oss-20b — cloud, fastest but only 6–8K tokens/min</option>
+        <option value="ollama-llama">Ollama llama3.1:8b — local, unlimited (needs Ollama running)</option>
+        <option value="ollama-qwen">Ollama qwen2.5:3b — local, lighter/faster</option>
+      </select>
+    </div>
+    <div class="settings-field">
+      <label>Account Balance ($)</label>
+      <input type="number" id="settings-balance" placeholder="50000" step="1">
+    </div>
+    <div class="settings-field">
+      <label>Today's Profit/Loss ($) — for size scaling</label>
+      <input type="number" id="settings-profit" placeholder="0" step="1">
+    </div>
+
+    <div class="settings-subhead">Funded Stage</div>
+    <div class="settings-field">
+      <label>Hard Floor ($)</label>
+      <input type="number" id="settings-funded-floor" placeholder="48000" step="1">
+    </div>
+    <div class="settings-field">
+      <label>Day Stop — Hard Cutoff ($)</label>
+      <input type="number" id="settings-funded-daystop" placeholder="200" step="1">
+    </div>
+    <div class="settings-field">
+      <label>Day Target — Min ($) / Max ($)</label>
+      <div style="display:flex;gap:8px;">
+        <input type="number" id="settings-funded-targetmin" placeholder="150" step="1">
+        <input type="number" id="settings-funded-targetmax" placeholder="300" step="1">
+      </div>
+    </div>
+    <div class="settings-field">
+      <label>Next Payout — Balance Target ($)</label>
+      <input type="number" id="settings-payout" placeholder="52000" step="1">
+    </div>
+
+    <div class="settings-subhead">Eval Stage</div>
+    <div class="settings-field">
+      <label>DD Floor ($)</label>
+      <input type="number" id="settings-eval-floor" placeholder="49364" step="1">
+    </div>
+    <div class="settings-field">
+      <label>Day Cap — Consistency Max ($)</label>
+      <input type="number" id="settings-eval-daycap" placeholder="1499" step="1">
+    </div>
+    <div class="settings-field">
+      <label>Day Stop ($)</label>
+      <input type="number" id="settings-eval-daystop" placeholder="400" step="1">
+    </div>
+
+    <div class="settings-subhead">Telegram Bot</div>
+    <div class="settings-field">
+      <label>Telegram Bot Token</label>
+      <input type="password" id="settings-telegram-token" placeholder="from @BotFather" autocomplete="off">
+    </div>
+    <div class="settings-field">
+      <label>Telegram Chat ID (optional)</label>
+      <input type="text" id="settings-telegram-chatid" placeholder="auto-fills on first message if left blank">
+    </div>
+
+    <div class="settings-subhead">Tradovate Live Feed (read-only, optional)</div>
+    <div class="settings-field">
+      <label><input type="checkbox" id="settings-tv-enabled" style="width:auto;margin-right:6px;vertical-align:middle;">Enable live feed — only if the prop firm permits API access</label>
+    </div>
+    <div class="settings-field">
+      <label>Environment</label>
+      <select id="settings-tv-env" class="form-select"><option value="demo">demo</option><option value="live">live</option></select>
+    </div>
+    <div class="settings-field">
+      <label>Tradovate Username</label>
+      <input type="text" id="settings-tv-name" autocomplete="off" placeholder="your Tradovate login">
+    </div>
+    <div class="settings-field">
+      <label>Password</label>
+      <input type="password" id="settings-tv-password" autocomplete="off">
+    </div>
+    <div class="settings-field">
+      <label>App ID</label>
+      <input type="text" id="settings-tv-appid" autocomplete="off" placeholder="MNQ Co-Pilot">
+    </div>
+    <div class="settings-field">
+      <label>API Key (CID) / Secret</label>
+      <div style="display:flex;gap:8px;">
+        <input type="text" id="settings-tv-cid" autocomplete="off" placeholder="cid">
+        <input type="password" id="settings-tv-sec" autocomplete="off" placeholder="secret">
+      </div>
+    </div>
+    <div class="settings-field">
+      <button class="btn-cancel" onclick="testTradovateConn()" style="width:100%">Test Connection</button>
+      <div id="settings-tv-status" style="font-size:11px;margin-top:6px;color:var(--text-dim);line-height:1.5">Not tested. Confirm the prop firm allows API access before enabling.</div>
+    </div>
+
+    <div class="settings-subhead">Token Optimization (Jessi / Claude path)</div>
+    <div class="settings-field">
+      <label><input type="checkbox" id="settings-disable-token-opt" style="width:auto;margin-right:6px;vertical-align:middle;">Disable prompt caching (kill switch — revert to pre-2026-08-06 behavior)</label>
+      <div style="font-size:11px;margin-top:6px;color:var(--text-dim);line-height:1.5">Checked live on every message — takes effect immediately, no restart needed. Use if caching ever behaves unexpectedly mid-session.</div>
+    </div>
+
+    <div class="settings-actions">
+      <button class="btn-cancel" onclick="closeSettings()">Cancel</button>
+      <button class="btn-save" onclick="saveSettings()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- compromise.js (local UMD bundle, no CDN/API call) — used by Alok in app.js
+     for more robust natural-language parsing of numbers/dates in chat than
+     hand-rolled regex alone can cover (e.g. "last five trades" spelled out,
+     "trades from two days ago"). Exposes a global `nlp` function. -->
+<script src="compromise.js"></script>
+<script src="ws-client.js"></script>
+<script src="app.js"></script>
+<!-- Resilience layer — MUST load after app.js. Error traps, stall watchdog,
+     and chat transcript persistence. See renderer/resilience.js. -->
+<script src="resilience.js"></script>
+<script>
+  // Theme cycle: Paper (light) -> Indigo (theme-dark) -> Graphite (theme-graphite) -> Paper.
+  // Approved via /design-shotgun 2026-08-02 (see variant-G5-themes.html in the
+  // design session for the reviewed mockup). Class name 'theme-dark' kept as-is
+  // for Indigo so nothing else keyed off that class needs to change.
+  var THEME_ORDER = ['light', 'dark', 'graphite'];
+  function currentTheme(){
+    if (document.documentElement.classList.contains('theme-dark')) return 'dark';
+    if (document.documentElement.classList.contains('theme-graphite')) return 'graphite';
+    return 'light';
+  }
+  function applyThemeIcon(){
+    var t = currentTheme();
+    document.querySelectorAll('#theme-switch [data-theme-btn]').forEach(function(b){
+      b.classList.toggle('active', b.getAttribute('data-theme-btn') === t);
+    });
+  }
+  function setTheme(t){
+    document.documentElement.classList.remove('theme-dark', 'theme-graphite');
+    if (t === 'dark') document.documentElement.classList.add('theme-dark');
+    else if (t === 'graphite') document.documentElement.classList.add('theme-graphite');
+    try { localStorage.setItem('copilot-theme', t); } catch(e){}
+    applyThemeIcon();
+  }
+  function toggleTheme(){
+    var t = currentTheme();
+    var next = THEME_ORDER[(THEME_ORDER.indexOf(t) + 1) % THEME_ORDER.length];
+    setTheme(next);
+  }
+  (function initTheme(){
+    // G5 default = Indigo (2026-08-08, the trader: "indigo is the most used and it
+    // should feel premium like G5"). Fresh load with no explicit choice opens
+    // in Indigo; Paper/Graphite are still honoured if the user picked one.
+    var saved = null;
+    try { saved = localStorage.getItem('copilot-theme'); } catch(e){}
+    if (saved === 'light' || saved === 'graphite' || saved === 'dark') setTheme(saved);
+    else setTheme('dark');
+  })();
+</script>
+</body>
+</html>

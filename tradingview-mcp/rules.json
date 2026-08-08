@@ -1,0 +1,93 @@
+{
+  "strategy": "swing-trading",
+  "watchlist": {
+    "crypto_pairs": [
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT",
+      "BNBUSDT",
+      "XRPUSDT",
+      "ADAUSDT",
+      "AVAXUSDT",
+      "DOGEUSDT"
+    ],
+    "macro_dominance": [
+      "BTC.D",
+      "ETH.D",
+      "OTHERS.D",
+      "USDT.D"
+    ]
+  },
+  "timeframes": ["1W", "1D", "4H"],
+  "bias": {
+    "bullish": {
+      "ema_position": "price above 50 EMA and 50 EMA above 200 EMA",
+      "rsi_range": "RSI 14 between 50 and 70",
+      "market_structure": "higher highs and higher lows, demand zones holding, no recent structural break to downside"
+    },
+    "bearish": {
+      "ema_position": "price below 50 EMA and 50 EMA below 200 EMA",
+      "rsi_range": "RSI 14 between 30 and 50",
+      "market_structure": "lower highs and lower lows, supply zones holding, recent break of structure to downside"
+    },
+    "neutral": {
+      "ema_position": "price between 50 EMA and 200 EMA or EMAs tangled",
+      "rsi_range": "RSI 14 between 45 and 55",
+      "market_structure": "range-bound price action, no clear directional bias — wait for confirmation"
+    }
+  },
+  "risk_rules": {
+    "max_risk_per_trade_pct": 1.0,
+    "min_reward_to_risk_ratio": 2.0,
+    "max_open_trades": 5,
+    "stop_loss": "below most recent swing low (long) or above most recent swing high (short)",
+    "position_sizing": "risk amount divided by distance to stop loss in percentage terms",
+    "do_not_trade": [
+      "within 30 minutes of major macro news events",
+      "when daily RSI is above 80 (overextended long) or below 20 (overextended short)",
+      "when BTC.D is in extreme flux without clear direction"
+    ]
+  },
+  "indicators": [
+    {
+      "name": "RSI",
+      "period": 14,
+      "overbought": 70,
+      "oversold": 30
+    },
+    {
+      "name": "MACD",
+      "fast": 12,
+      "slow": 26,
+      "signal": 9
+    },
+    {
+      "name": "EMA",
+      "period": 50
+    },
+    {
+      "name": "EMA",
+      "period": 200
+    },
+    {
+      "name": "Volume",
+      "note": "above-average volume required to confirm breakouts and entries"
+    }
+  ],
+  "entry_criteria": {
+    "long": [
+      "bullish bias confirmed on daily and weekly",
+      "4H pullback to 50 EMA or key support with bullish reaction candle",
+      "MACD histogram turning positive on 4H",
+      "RSI bouncing from 40-50 zone on 4H",
+      "volume spike on entry candle"
+    ],
+    "short": [
+      "bearish bias confirmed on daily and weekly",
+      "4H rally into 50 EMA or key resistance with bearish rejection candle",
+      "MACD histogram turning negative on 4H",
+      "RSI rejected from 50-60 zone on 4H",
+      "volume spike on entry candle"
+    ]
+  }
+}

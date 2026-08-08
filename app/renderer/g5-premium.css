@@ -1,0 +1,463 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   G5 EXACT PORT — 2026-08-08  (v3: literal, not "inspired by")
+   Source of truth:
+     C:\Users\Admin\.gstack\projects\MNQ-CoPilot\designs\
+       main-dashboard-20260802\variant-G5-themes.html
+
+   WHY v1/v2 KEPT LANDING "PARTIAL" — read before editing:
+   Both previous versions treated G5 as a mood board and layered EXTRA polish
+   on top: sheen gradients, drop shadows, radial ambient glows, glassy
+   translucent panels. G5 has NONE of those. It is deliberately FLAT — solid
+   card fills, one hairline border, no shadow anywhere. So every pass made the
+   app look "premium-ish" but never actually look like G5, which is what the trader
+   kept reporting. This version stops interpreting and instead ports G5's
+   stylesheet rule-for-rule onto the app's own class names.
+
+   THREE ROOT CAUSES this file fixes (all confirmed in styles.css):
+     1. styles.css:1811 sets body font to 'Outfit'. G5 is 'Inter'. Inter is
+        already @font-face-loaded at styles.css:13-17 but was going unused —
+        that is the "wrong font style" in the trader's screenshot.
+     2. styles.css:1819+ ("floating panel" pass) adds two radial ambient glows,
+        translucent rgba surfaces, and a 12px gap/padding that detaches the
+        columns. G5 columns are solid and flush, separated only by a 6px
+        resizer.
+     3. g5-premium.css v2 re-added shadows/sheen on top of both.
+
+   RULES FOR FUTURE EDITS: no box-shadow, no radial-gradient, no rgba surface
+   fills, no translucency. If a change cannot be traced to a line in
+   variant-G5-themes.html, it does not belong in this file.
+
+   Loads LAST in index.html and is the dedicated override layer. styles.css
+   carries six stacked redesign passes with high-specificity selectors
+   (e.g. `html.theme-dark #left-panel .panel-section`), so source order alone
+   does not win — key declarations are therefore !important. Revert the entire
+   visual pass by deleting the single g5-premium.css <link> line.
+
+   Theme variables already match G5 exactly (styles.css:2222-2264 — #0d0f16,
+   #161925, #1b1f2d, #252a3a, #5b8cff, #3ecf8e, #f0576b, #f0b64c), so this
+   file does not redefine them. It only adds --cyan, which G5 uses for the
+   Scalper button and the app was missing.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 0 · The one missing G5 variable ──────────────────────────────────────
+   G5 :root --cyan. Per-theme values taken from G5's three theme blocks. */
+:root                  { --cyan:#356266; --accent-active-text:#ebe9e2; }  /* Paper   */
+html.theme-dark        { --cyan:#4fd6e8; --accent-active-text:#fff;     }  /* Indigo  */
+html.theme-graphite    { --cyan:#8fb3ba; --accent-active-text:#0b0b0c;  }  /* Graphite*/
+
+/* ── 1 · Typography — G5 line 32-33 ───────────────────────────────────────
+   G5: body font-family:'Inter',...; font-size:13px; antialiased.
+   Overrides styles.css:1811's 'Outfit'. This is the single most visible fix. */
+body{
+  font-family:'Inter','Segoe UI',-apple-system,system-ui,sans-serif !important;
+  font-size:13px !important;
+  -webkit-font-smoothing:antialiased !important;
+}
+/* G5 .mono / numeric fields */
+.stat-row, .rules-val, .ins-v, .msg-bubble code, #hdr-price, .price,
+#titlebar .session-time, .edg-n, .edg-note, .edg-tag,
+#right-panel .level-display{
+  font-family:'JetBrains Mono','Consolas',monospace !important;
+}
+
+/* ── 2 · Canvas — G5 line 32 ──────────────────────────────────────────────
+   G5: background:var(--grad) = a single flat vertical gradient, fixed.
+   Explicitly removes the two radial ambient glows added by styles.css:1819. */
+body{
+  background:linear-gradient(180deg,
+    color-mix(in srgb, var(--surface) 60%, var(--bg)), var(--bg) 62%) !important;
+  background-attachment:fixed !important;
+}
+
+/* ── 3 · Flat flush columns + G5's THREE elevation tiers ───────────────────
+   G5 gets depth from COLOUR, not shadow: page --bg (darkest) < panels/titlebar
+   --bg-elev (mid) < cards --card (lightest). The app had no --bg-elev, so v3
+   set both panels AND cards to var(--surface) — identical fills made every card
+   invisible (dark-on-same-dark). Define --panel as a mix between --bg and
+   --surface so cards (var(--surface), section 5) sit one tier ABOVE the panel
+   and read as real bordered cards. Direction-agnostic: in Paper the mix lands
+   between bg and the lighter surface, so cards still pop. Still no shadow. */
+:root, html.theme-dark, html.theme-graphite{
+  --panel: color-mix(in srgb, var(--surface) 34%, var(--bg));
+}
+#app{ gap:0 !important; padding:0 !important; }
+#left-panel, #right-panel{
+  background:var(--panel) !important;
+  border-radius:0 !important;
+  box-shadow:none !important;
+  backdrop-filter:none !important;
+}
+#center-panel{
+  background:var(--bg) !important;
+  border-radius:0 !important;
+  box-shadow:none !important;
+  backdrop-filter:none !important;
+}
+
+/* ── 4 · Top bar — G5 line 36-48 ──────────────────────────────────────────
+   G5: solid bg-elev, 1px bottom border, no gradient, no shadow. */
+#titlebar{
+  background:var(--panel) !important;
+  border-bottom:1px solid var(--border) !important;
+  box-shadow:none !important;
+  backdrop-filter:none !important;
+}
+#titlebar .logo{ font-weight:800 !important; letter-spacing:.5px !important; font-size:14px !important; }
+
+/* G5 .seg — the segmented pill groups (EVAL/FUNDED, 50K/100K/150K,
+   STANDARD/SCALPER). the trader called out STANDARD/SCALPER by name. */
+.mode-toggle, .acct-size-toggle, .trading-mode-toggle{
+  display:flex !important;
+  background:var(--surface2) !important;
+  border:1px solid var(--border) !important;
+  border-radius:8px !important;
+  padding:2px !important;
+  gap:0 !important;
+  box-shadow:none !important;
+}
+.mode-btn, .acct-size-btn, .tmode-btn{
+  padding:6px 12px !important;
+  border:none !important;
+  background:transparent !important;
+  border-radius:6px !important;
+  font-family:inherit !important;
+  font-size:11px !important;
+  font-weight:700 !important;
+  color:var(--text-dim) !important;
+  box-shadow:none !important;
+}
+/* G5 .seg span.active — solid accent fill, themed contrast text */
+.acct-size-btn.active, .tmode-btn.active{
+  background:var(--accent) !important;
+  color:var(--accent-active-text) !important;
+}
+/* G5 .seg span.active.amber — the EVAL/FUNDED group is the amber one */
+.mode-btn.active{
+  background:var(--amber) !important;
+  color:#231a05 !important;
+}
+
+/* G5 .theme-switch — same pill treatment */
+.theme-switch{
+  background:var(--surface2) !important;
+  border:1px solid var(--border) !important;
+  border-radius:8px !important;
+  padding:2px !important;
+  gap:2px !important;
+  box-shadow:none !important;
+}
+.theme-switch-btn{
+  border:none !important;
+  background:transparent !important;
+  color:var(--text-dim) !important;
+  font-size:11px !important;
+  font-weight:700 !important;
+  padding:6px 12px !important;
+  border-radius:6px !important;
+  font-family:inherit !important;
+}
+.theme-switch-btn.active{
+  background:var(--accent) !important;
+  color:var(--accent-active-text) !important;
+}
+
+/* G5 .iconbtn — Account / Settings */
+#titlebar .api-btn{
+  background:var(--surface2) !important;
+  border:1px solid var(--border) !important;
+  border-radius:7px !important;
+  padding:6px 12px !important;
+  color:var(--text-dim) !important;
+  font-size:12px !important;
+  font-weight:600 !important;
+  box-shadow:none !important;
+}
+
+/* ── 5 · Cards — G5 line 86-87, 143-144 ───────────────────────────────────
+   G5 .acct-card / .r-card: SOLID var(--card), 1px border, radius 14px/12px,
+   NO shadow, NO sheen gradient. This is the biggest v2 correction. */
+#left-panel .panel-section,
+#right-panel .analysis-block,
+#tab-analysis .analysis-block,
+.panel-section, .analysis-block, .ins-card{
+  background:var(--surface) !important;
+  border:1px solid var(--border) !important;
+  border-radius:14px !important;
+  box-shadow:none !important;
+  backdrop-filter:none !important;
+  margin-bottom:14px !important;
+}
+#right-panel .analysis-block, #tab-analysis .analysis-block{ border-radius:12px !important; }
+
+/* G5 .acct-card h4 / .r-card h5 — uppercase eyebrow */
+.section-title, .block-title,
+#right-panel .block-title, .analysis-block .block-title{
+  text-transform:uppercase !important;
+  letter-spacing:1.1px !important;
+  font-weight:700 !important;
+  color:var(--text-dim) !important;
+  font-size:11px !important;
+}
+
+/* ── 6 · Stat rows + P&L pills — G5 line 88-94 ────────────────────────────
+   G5 keeps the fading gradient pill on pos/neg values. Retained verbatim. */
+.stat-label{ color:var(--text-dim) !important; font-size:12.5px !important; letter-spacing:normal !important; text-transform:none !important; }
+.stat-value{ color:var(--text) !important; font-weight:700 !important; }
+.stat-value.green{
+  color:var(--green) !important; padding:2px 8px !important; border-radius:5px !important;
+  background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--green) 14%,transparent) 60%,transparent) !important;
+}
+.stat-value.red{
+  color:var(--red) !important; padding:2px 8px !important; border-radius:5px !important;
+  background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--red) 12%,transparent) 60%,transparent) !important;
+}
+.stat-value.amber{ color:var(--amber) !important; }
+.stat-value.white{ color:var(--text) !important; font-weight:800 !important; }
+
+/* ── 7 · GO / NO-GO / pending — G5 .pending-pill line 96 ──────────────────
+   G5: flat card2 fill, coloured 1px border, coloured text. No gradient lift. */
+.gonogo-badge{
+  border-radius:10px !important; font-weight:700 !important;
+  letter-spacing:normal !important; box-shadow:none !important;
+  background:var(--surface2) !important; text-align:center !important;
+}
+.gonogo-badge.pending{ border:1px solid var(--amber) !important; color:var(--amber) !important; }
+.gonogo-badge.nogo   { border:1px solid var(--red)   !important; color:var(--red)   !important; }
+.gonogo-badge.go     { border:1px solid var(--green) !important; color:var(--green) !important; }
+
+/* ── 8 · Left nav / quick actions — G5 .nav-item line 98-103 ──────────────
+   G5: flat card fill, transparent border, radius 9px. Active = green border
+   plus a left-to-right green wash. No lift, no hover translate. */
+#quick-actions .qa-btn, .qa-btn{
+  display:flex !important; align-items:center !important; gap:10px !important;
+  padding:10px 12px !important;
+  border-radius:9px !important;
+  background:var(--surface2) !important;
+  border:1px solid transparent !important;
+  color:var(--text-dim) !important;
+  font-size:12.5px !important;
+  font-weight:600 !important;
+  box-shadow:none !important;
+  transform:none !important;
+  transition:border-color .12s ease, color .12s ease !important;
+}
+.qa-btn:hover{
+  border-color:var(--border2) !important;
+  color:var(--text) !important;
+  box-shadow:none !important;
+  transform:none !important;
+}
+.qa-btn .btn-icon{ width:16px !important; text-align:center !important; color:var(--text-dim) !important; }
+.qa-btn.primary{
+  border-color:var(--green) !important;
+  color:var(--text) !important;
+  background:linear-gradient(90deg,color-mix(in srgb,var(--green) 14%,transparent),transparent 75%) !important;
+}
+.qa-btn.primary .btn-icon{ color:var(--green) !important; }
+.qa-btn.danger{
+  border-color:var(--red) !important;
+  color:var(--red) !important;
+  background:linear-gradient(90deg,color-mix(in srgb,var(--red) 12%,transparent),transparent 75%) !important;
+}
+.qa-btn.danger .btn-icon{ color:var(--red) !important; }
+
+/* ── 9 · Center header — G5 line 106-114 ──────────────────────────────────
+   G5 .center-header is solid var(--card) with a bottom border. */
+#chat-header{
+  background:var(--surface) !important;
+  border-bottom:1px solid var(--border) !important;
+  box-shadow:none !important;
+  backdrop-filter:none !important;
+}
+#chat-header .instrument{ font-size:17px !important; font-weight:800 !important; }
+#chat-header .price{ font-size:17px !important; font-weight:800 !important; }
+#chat-header .tf-badge{
+  font-size:11px !important; color:var(--text-dim) !important;
+  border:1px solid var(--border) !important; padding:3px 8px !important;
+  border-radius:6px !important; font-weight:400 !important;
+}
+/* G5 .mode-pill — flat card2 + amber hairline, 20px radius */
+#chat-header .mode-pill{
+  background:var(--surface2) !important;
+  color:var(--amber) !important;
+  border:1px solid var(--amber) !important;
+  padding:4px 12px !important;
+  border-radius:20px !important;
+  font-size:11px !important;
+  font-weight:700 !important;
+  box-shadow:none !important;
+  letter-spacing:normal !important;
+}
+
+/* G5 .cbtn — Refresh / Debate / Scalper / Voice.
+   the trader called this row out explicitly: "the scalping refreshment, voice,
+   debate, written style ... I want the same exact thing."
+   G5 assigns FIXED colours by role, not by active-state:
+     .cbtn         → card2 fill, dim text   (Refresh, Debate)
+     .cbtn.scalper → SOLID cyan             (always)
+     .cbtn.voice   → SOLID blue/accent      (always)
+   Previously these were only coloured when .active, which is why the
+   screenshot showed Debate blue / Scalper amber / Voice white. */
+#chat-header button{
+  background:var(--surface2) !important;
+  border:1px solid var(--border) !important;
+  color:var(--text-dim) !important;
+  border-radius:8px !important;
+  padding:7px 12px !important;
+  font-size:11.5px !important;
+  font-weight:700 !important;
+  box-shadow:none !important;
+}
+#chat-header #scalper-agent-btn,
+#chat-header #scalper-agent-btn.active{
+  background:var(--cyan) !important;
+  color:var(--accent-active-text) !important;
+  border-color:var(--cyan) !important;
+}
+#chat-header #voice-mode-btn,
+#chat-header #voice-mode-btn.active{
+  background:var(--accent) !important;
+  color:var(--accent-active-text) !important;
+  border-color:var(--accent) !important;
+}
+/* Debate keeps the neutral .cbtn look; a lit border marks it active without
+   breaking G5's colour language. */
+#chat-header #debate-mode-btn.active{
+  background:var(--surface2) !important;
+  color:var(--text) !important;
+  border-color:var(--accent) !important;
+}
+
+/* ── 10 · Chat bubbles — G5 line 116-119 ──────────────────────────────────
+   G5 .bubble: flat card, 1px border, radius 12px, line-height 1.55, NO shadow.
+   User bubble is simply card2 — no accent tint, no glow. */
+#messages .msg-bubble{
+  background:var(--surface) !important;
+  border:1px solid var(--border) !important;
+  border-radius:12px !important;
+  padding:14px 16px !important;
+  font-size:13px !important;
+  line-height:1.55 !important;
+  box-shadow:none !important;
+  backdrop-filter:none !important;
+}
+#messages .msg.user .msg-bubble{
+  background:var(--surface2) !important;
+  border:1px solid var(--border) !important;
+}
+#messages .msg.assistant .msg-bubble{
+  background:var(--surface) !important;
+  border:1px solid var(--border) !important;
+}
+/* G5 .system-note — centred rounded chip, not a full bubble */
+#messages .msg.system-msg .msg-bubble{
+  font-size:11px !important;
+  color:var(--text-dim) !important;
+  background:var(--surface) !important;
+  border:1px solid var(--border) !important;
+  border-radius:20px !important;
+  padding:6px 14px !important;
+}
+
+/* ── 11 · Input row — G5 line 132-137 ─────────────────────────────────────
+   G5 .chat-input: card2 fill, 1px border, radius 12px, no shadow. */
+#input-area{
+  background:var(--surface) !important;
+  border-top:1px solid var(--border) !important;
+  box-shadow:none !important;
+  backdrop-filter:none !important;
+}
+#input-row{
+  background:var(--surface2) !important;
+  border:1px solid var(--border) !important;
+  border-radius:12px !important;
+  box-shadow:none !important;
+  backdrop-filter:none !important;
+}
+#send-btn{
+  background:var(--accent) !important;
+  color:var(--accent-active-text) !important;
+  border:none !important;
+  border-radius:9px !important;
+  font-weight:800 !important;
+  box-shadow:none !important;
+}
+/* G5 .qtag */
+#input-hints .hint-chip{
+  font-size:11px !important;
+  padding:5px 11px !important;
+  border-radius:14px !important;
+  background:var(--surface2) !important;
+  border:1px solid var(--border) !important;
+  color:var(--text-dim) !important;
+  font-weight:400 !important;
+}
+#input-hints .hint-chip:hover{
+  color:var(--text) !important;
+  border-color:var(--border2) !important;
+}
+
+/* ── 12 · Right-panel tabs — G5 line 139-141 ──────────────────────────────
+   G5 .rtab: 10.5px / 6px 9px / radius 7px / weight 700, wrapping strip.
+   Active = solid accent pill with matching border. */
+#right-tabs{ display:flex !important; flex-wrap:wrap !important; gap:4px !important; }
+#right-tabs .rtab, .rtab{
+  font-size:10.5px !important;
+  padding:6px 9px !important;
+  border-radius:7px !important;
+  background:var(--surface) !important;
+  border:1px solid var(--border) !important;
+  color:var(--text-dim) !important;
+  font-weight:700 !important;
+  letter-spacing:normal !important;
+  margin:0 !important;
+  box-shadow:none !important;
+}
+#right-tabs .rtab.active, .rtab.active{
+  background:var(--accent) !important;
+  color:var(--accent-active-text) !important;
+  border-color:var(--accent) !important;
+  border-radius:7px !important;
+  box-shadow:none !important;
+}
+.rtab.active::after{ display:none !important; }
+
+/* ── 13 · Bias / key level — G5 line 145-147 ──────────────────────────────
+   G5 .r-card for Bias has a faint directional tint; everything else is flat. */
+#right-panel .bias-display{
+  font-size:20px !important; font-weight:800 !important; letter-spacing:normal !important;
+}
+#right-panel .bias-display.bullish{ color:var(--green) !important; }
+#right-panel .bias-display.bearish{ color:var(--red) !important; }
+#right-panel .level-display{ font-size:17px !important; font-weight:800 !important; }
+#tab-analysis .analysis-block:first-child{
+  background:linear-gradient(120deg,color-mix(in srgb,var(--accent) 9%,transparent),transparent 65%),var(--surface) !important;
+}
+
+/* ── 14 · Small buttons — G5 .mini-btn line 153 ───────────────────────────*/
+.engulf-check-btn{
+  background:var(--surface2) !important;
+  border:1px solid var(--border) !important;
+  border-radius:8px !important;
+  padding:8px !important;
+  font-size:11.5px !important;
+  font-weight:700 !important;
+  color:var(--text-dim) !important;
+  box-shadow:none !important;
+}
+.engulf-check-btn:hover{ border-color:var(--border2) !important; color:var(--text) !important; }
+
+/* ── 15 · Scrollbars — G5 line 62-77 ──────────────────────────────────────
+   Invisible track, soft tinted thumb. Replaces the default white OS bar. */
+::-webkit-scrollbar{ width:8px !important; background:transparent !important; }
+::-webkit-scrollbar-track{ background:transparent !important; }
+::-webkit-scrollbar-thumb{
+  background:color-mix(in srgb, var(--text-dim) 45%, transparent) !important;
+  border-radius:8px !important;
+  border:2px solid transparent !important;
+  background-clip:padding-box !important;
+}
+::-webkit-scrollbar-thumb:hover{
+  background:color-mix(in srgb, var(--text-mid) 60%, transparent) !important;
+  background-clip:padding-box !important;
+}
