@@ -1,0 +1,242 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   G5 PREMIUM PASS — 2026-08-08
+   Anoop: "each part of the landing page should be updated ... feel premium
+   like G5 or better." Indigo is now the default theme.
+
+   Isolated on purpose: styles.css already carries six stacked redesign passes,
+   so instead of threading edits through it, this file loads LAST (see the
+   <link> after styles.css in index.html) and wins by cascade. Revert the whole
+   pass by removing that one <link> line — nothing here is destructive.
+
+   Rules are DETAIL-only — backgrounds, borders, shadows, radius, weight,
+   letter-spacing, colour. No width/height/position/flex changes, so it cannot
+   reflow or break the resizable-panel layout. Everything is expressed through
+   the app's own CSS variables (--surface, --accent, --green …) which are
+   already defined per-theme, so Indigo/Graphite/Paper each adapt correctly.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 1 · Canvas: soft vertical gradient + depth, not a flat fill ──────────── */
+body{
+  background:
+    radial-gradient(1200px 600px at 82% -8%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 60%),
+    linear-gradient(180deg, color-mix(in srgb, var(--surface) 55%, var(--bg)), var(--bg) 62%) !important;
+  background-attachment: fixed !important;
+}
+
+/* ── 2 · Cards: hairline top-highlight + soft lift (premium, not heavy) ───── */
+.panel-section,
+.analysis-block,
+#settings-box,
+.ins-card{
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, #fff 8%), var(--surface)) ;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow:
+    0 1px 0 0 color-mix(in srgb, #fff 6%, transparent) inset,
+    0 6px 18px -12px rgba(0,0,0,.55);
+}
+html.theme-light .panel-section,
+html.theme-light .analysis-block,
+html:not(.theme-dark):not(.theme-graphite) .panel-section,
+html:not(.theme-dark):not(.theme-graphite) .analysis-block{
+  /* Paper: lighter lift, no white top-sheen (would wash out on off-white) */
+  background: var(--surface);
+  box-shadow: 0 4px 14px -12px rgba(0,0,0,.35);
+}
+
+/* ── 3 · Section titles: crisp premium eyebrow ───────────────────────────── */
+.section-title,
+.analysis-block .block-title,
+.block-title{
+  text-transform: uppercase;
+  letter-spacing: .12em;
+  font-weight: 700;
+  color: var(--text-dim);
+}
+
+/* ── 4 · Stat rows + the signature gradient P&L pills ─────────────────────── */
+.stat-label{ color: var(--text-dim); letter-spacing:.02em; }
+.stat-value{ font-weight: 700; color: var(--text); }
+.stat-value.green,
+.stat-value.red{
+  padding: 2px 9px;
+  border-radius: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.stat-value.green{
+  color: var(--green);
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--green) 16%, transparent) 60%, transparent);
+}
+.stat-value.red{
+  color: var(--red);
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--red) 15%, transparent) 60%, transparent);
+}
+.stat-value.amber{ color: var(--amber); }
+.stat-value.white{ color: var(--text); font-weight: 800; }
+
+/* ── 5 · GO / NO-GO / pending badges: richer, gradient-lit ────────────────── */
+.gonogo-badge{
+  border-radius: 10px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  box-shadow: 0 6px 16px -12px rgba(0,0,0,.6);
+}
+.gonogo-badge.pending{
+  background: linear-gradient(180deg, color-mix(in srgb, var(--amber) 16%, var(--surface2)), var(--surface2));
+  border: 1px solid color-mix(in srgb, var(--amber) 55%, var(--border));
+  color: var(--amber);
+}
+.gonogo-badge.nogo{
+  background: linear-gradient(180deg, color-mix(in srgb, var(--red) 18%, var(--surface2)), var(--surface2));
+  border: 1px solid color-mix(in srgb, var(--red) 55%, var(--border));
+}
+.gonogo-badge.go{
+  background: linear-gradient(180deg, color-mix(in srgb, var(--green) 18%, var(--surface2)), var(--surface2));
+  border: 1px solid color-mix(in srgb, var(--green) 55%, var(--border));
+}
+
+/* ── 6 · Quick-action buttons: tactile, gradient, accent-lit primary ─────── */
+.qa-btn{
+  background: linear-gradient(180deg, var(--surface2), color-mix(in srgb, var(--surface2) 82%, var(--bg)));
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-weight: 700;
+  color: var(--text-mid);
+  transition: transform .08s ease, border-color .12s ease, box-shadow .12s ease, background .12s ease;
+}
+.qa-btn:hover{
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  box-shadow: 0 8px 20px -14px rgba(0,0,0,.7);
+  transform: translateY(-1px);
+  color: var(--text);
+}
+.qa-btn:active{ transform: translateY(0); }
+.qa-btn .btn-icon{ color: var(--text-dim); }
+.qa-btn.primary{
+  background: linear-gradient(90deg, color-mix(in srgb, var(--green) 16%, var(--surface2)), var(--surface2) 78%);
+  border-color: color-mix(in srgb, var(--green) 60%, var(--border));
+  color: var(--text);
+}
+.qa-btn.primary .btn-icon{ color: var(--green); }
+.qa-btn.primary:hover{ border-color: var(--green); }
+.qa-btn.danger{
+  background: linear-gradient(90deg, color-mix(in srgb, var(--red) 14%, var(--surface2)), var(--surface2) 78%);
+  border-color: color-mix(in srgb, var(--red) 55%, var(--border));
+  color: var(--red);
+}
+.qa-btn.danger .btn-icon{ color: var(--red); }
+
+/* ── 7 · Center header: sharper hierarchy ────────────────────────────────── */
+#chat-header .instrument{ font-weight: 800; letter-spacing: .01em; }
+#chat-header .price{ font-weight: 800; }
+#chat-header .tf-badge{
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-weight: 700;
+}
+#chat-header .mode-pill{
+  border-radius: 20px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--amber) 16%, var(--surface2)), var(--surface2));
+  border: 1px solid color-mix(in srgb, var(--amber) 55%, var(--border));
+  color: var(--amber);
+}
+#chat-header button{
+  border-radius: 9px;
+  font-weight: 700;
+  transition: transform .08s ease, box-shadow .12s ease, border-color .12s ease;
+}
+#chat-header button:hover{ transform: translateY(-1px); box-shadow: 0 8px 18px -14px rgba(0,0,0,.7); }
+#scalper-agent-btn.active{
+  background: var(--accent); color: #fff; border-color: var(--accent);
+}
+#voice-mode-btn.active{
+  background: var(--accent); color: #fff; border-color: var(--accent);
+}
+
+/* ── 8 · Chat bubbles: premium spacing + depth ───────────────────────────── */
+.msg-bubble{
+  border-radius: 14px;
+  line-height: 1.58;
+  box-shadow: 0 6px 20px -16px rgba(0,0,0,.7);
+}
+.msg.user .msg-bubble{
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 14%, var(--surface2)), var(--surface2));
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+}
+.msg.assistant .msg-bubble{
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 94%, #fff 6%), var(--surface));
+  border: 1px solid var(--border);
+}
+
+/* ── 9 · Input row: single premium pill ──────────────────────────────────── */
+#input-row{
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 6px 20px -16px rgba(0,0,0,.7);
+}
+#send-btn{
+  background: var(--accent);
+  color: #fff;
+  border-radius: 10px;
+  font-weight: 800;
+}
+#send-btn:hover{ filter: brightness(1.08); }
+.hint-chip{
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  color: var(--text-dim);
+  font-weight: 600;
+  transition: border-color .12s ease, color .12s ease;
+}
+.hint-chip:hover{ color: var(--text); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+
+/* ── 10 · Right-panel tabs: solid accent pill on active ──────────────────── */
+.rtab{
+  font-weight: 700;
+  letter-spacing: .06em;
+}
+.rtab.active{
+  background: var(--accent);
+  color: #fff;
+  border-radius: 8px;
+  box-shadow: 0 6px 16px -12px color-mix(in srgb, var(--accent) 80%, transparent);
+}
+/* Paper/Graphite accents are light — keep readable dark text on the active pill */
+html.theme-graphite .rtab.active,
+html:not(.theme-dark):not(.theme-graphite) .rtab.active{ color: var(--surface); }
+
+/* ── 11 · Bias + key-level displays: headline treatment ──────────────────── */
+.bias-display{ font-weight: 800; letter-spacing: .01em; }
+.bias-display.bullish{ color: var(--green); }
+.bias-display.bearish{ color: var(--red); }
+.level-display{
+  font-family: 'JetBrains Mono', 'Consolas', monospace;
+  font-weight: 800;
+  letter-spacing: .01em;
+}
+
+/* Bias card gets a faint directional tint so it reads as the hero card */
+#tab-analysis .analysis-block:first-child{
+  background:
+    linear-gradient(120deg, color-mix(in srgb, var(--accent) 8%, transparent), transparent 62%),
+    var(--surface);
+}
+
+/* ── 12 · Small buttons (check-now etc.): consistent premium chip ─────────── */
+.engulf-check-btn{
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-weight: 700;
+  color: var(--text-mid);
+  transition: border-color .12s ease, color .12s ease;
+}
+.engulf-check-btn:hover{
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  color: var(--text);
+}

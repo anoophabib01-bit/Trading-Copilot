@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Co-Pilot</title>
   <link rel="stylesheet" href="styles.css">
+  <!-- G5 PREMIUM PASS (2026-08-08): detail/depth polish over styles.css, loads
+       LAST so it wins the cascade. Remove this one line to fully revert. -->
+  <link rel="stylesheet" href="g5-premium.css">
   <!-- Apply saved theme before paint to avoid a flash of the wrong theme -->
   <script>(function(){try{var t=localStorage.getItem('copilot-theme');if(t==='dark')document.documentElement.classList.add('theme-dark');else if(t==='graphite')document.documentElement.classList.add('theme-graphite');}catch(e){}})();</script>
 </head>
@@ -1096,10 +1099,13 @@
     setTheme(next);
   }
   (function initTheme(){
+    // G5 default = Indigo (2026-08-08, Anoop: "indigo is the most used and it
+    // should feel premium like G5"). Fresh load with no explicit choice opens
+    // in Indigo; Paper/Graphite are still honoured if the user picked one.
     var saved = null;
     try { saved = localStorage.getItem('copilot-theme'); } catch(e){}
-    if (saved === 'dark' || saved === 'graphite') setTheme(saved);
-    else applyThemeIcon();
+    if (saved === 'light' || saved === 'graphite' || saved === 'dark') setTheme(saved);
+    else setTheme('dark');
   })();
 </script>
 </body>

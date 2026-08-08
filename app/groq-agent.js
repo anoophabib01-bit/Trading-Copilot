@@ -82,7 +82,13 @@ const GEMINI_PATH = '/v1beta/openai/chat/completions';
 // end. Host/port are read from config at call time (initOmniRoute), not
 // hardcoded, since this runs on Anoop's machine only.
 const OMNIROUTE_PATH = '/v1/chat/completions';
-const OMNIROUTE_MODEL = 'auto/best-reasoning';
+// 2026-08-07 (revised, same day): Anoop's explicit pick — oc/deepseek-v4-flash-free
+// as the starting model, verified working via a direct curl before wiring in.
+// Was 'auto/best-reasoning'. The shift-down-on-failure "plan" this starts is
+// unchanged: server.js's fallbackChainFor() still degrades OmniRoute -> Gemini
+// (x3 candidates) -> Groq exactly as before — only the OmniRoute starting
+// model changed, not the fail-open chain around it.
+const OMNIROUTE_MODEL = 'oc/deepseek-v4-flash-free';
 
 // Build the HTTP(S) request for whichever provider. Returns the transport
 // module too so the caller uses http for Ollama/OmniRoute (both local), https
@@ -105,7 +111,19 @@ function buildRequest(provider, apiKey, payload, omniRouteBase) {
       mod: http,
       options: {
         hostname: base.host, port: base.port, path: OMNIROUTE_PATH, method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Content-Length': Buffer.byteLength(body) }
+        headers: {
+          'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Content-Length': Buffer.byteLength(body),
+          // 2026-08-07: forces OmniRoute's "stacked" compression pipeline
+          // (RTK -> Caveman, ~78-95% token savings per OmniRoute's own docs)
+          // on every request — Anoop asked to use compression "in a token
+          // optimal way (less)". Per-request header is the HIGHEST-precedence
+          // control OmniRoute exposes (beats dashboard panel defaults and
+          // named profiles), so this guarantees it applies regardless of what
+          // the dashboard's Compression Settings page has configured. The
+          // applied mode echoes back in the response's
+          // X-OmniRoute-Compression header if this ever needs verifying live.
+          'x-omniroute-compression': 'stacked'
+        }
       },
       body
     };
@@ -267,7 +285,14 @@ class GroqAgent {
 
     let settled = false;
     const finishError = (msg) => { if (!settled) { settled = true; onError && onError(msg); } };
-    const finishDone = (fullText) => { if (!settled) { settled = true; onDone && onDone(fullText); } };
+    // 2026-08-07: onDone now also reports WHICH provider/model actually
+    // produced this reply (activeProvider/activeModel reflect wherever the
+    // chain/lap logic above landed by completion time) — added so the UI can
+    // show "answered by: X" instead of model routing being invisible outside
+    // fallback events and server console logs. Kept as a plain object (not
+    // threaded through every caller as a new positional arg) so existing
+    // onDone(fullText) callers that ignore the 2nd arg keep working untouched.
+    const finishDone = (fullText) => { if (!settled) { settled = true; onDone && onDone(fullText, { provider: activeProvider, model: activeModel, label: `${PROVIDER_LABEL[activeProvider] || activeProvider}/${activeModel}` }); } };
 
     // 2026-07-25: was a single fixed `const` 90s timer. Now restartable, because
     // a per-minute-429 wait (up to 30s, below) plus a full retried stream can
@@ -702,6 +727,48 @@ class GroqAgent {
       let detail = await res.text().catch(() => '');
       try { detail = JSON.parse(detail).error.message; } catch {}
       throw new Error(`Groq transcription error (${res.status}): ${detail}`);
+    }
+    const data = await res.json();
+    return (data.text || '').trim();
+  }
+
+  // OmniRoute/Speechmatics STT (2026-08-07) — same shape as transcribeAudio
+  // above (multipart, OpenAI-compatible /v1/audio/transcriptions), just
+  // pointed at the local OmniRoute instance with the speechmatics/enhanced
+  // model. Model id MUST be the full "provider/model" form — OmniRoute
+  // rejects the short "sm/enhanced" alias on this endpoint with a 400
+  // ("Use format: provider/model"), confirmed by hand before wiring this in.
+  // Caller (server.js) is responsible for falling back to transcribeAudio()
+  // above on any failure — this method does not fall back internally.
+  async transcribeAudioOmniRoute(audioBuffer, mimeType) {
+    if (!this.omniRouteApiKey) throw new Error('OmniRoute API key not configured.');
+    const ext = (mimeType || '').includes('mp4') ? 'mp4' : (mimeType || '').includes('ogg') ? 'ogg' : 'webm';
+    const form = new FormData();
+    form.append('file', new Blob([audioBuffer], { type: mimeType || 'audio/webm' }), `voice.${ext}`);
+    form.append('model', 'speechmatics/enhanced');
+    form.append('response_format', 'json');
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    const base = this.omniRouteBase || { host: '127.0.0.1', port: 20128 };
+    let res;
+    try {
+      res = await fetch(`http://${base.host}:${base.port}/v1/audio/transcriptions`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${this.omniRouteApiKey}` },
+        body: form,
+        signal: controller.signal
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') throw new Error('OmniRoute transcription timed out after 20s — network stalled.');
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) {
+      let detail = await res.text().catch(() => '');
+      try { detail = JSON.parse(detail).error.message; } catch {}
+      throw new Error(`OmniRoute transcription error (${res.status}): ${detail}`);
     }
     const data = await res.json();
     return (data.text || '').trim();
