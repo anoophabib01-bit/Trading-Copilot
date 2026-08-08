@@ -1,51 +1,62 @@
-# MNQ Co-Pilot
+# Trading Co-Pilot
 
-A personal trading co-pilot for MNQ (Micro Nasdaq) and MGC (Micro Gold) futures.
-It is a local Node.js server that pairs an AI coaching agent ("Jessi") with a live
-TradingView Desktop chart, and enforces a set of trading-discipline rules defined as
-data. Built for a single trader's own workflow and shared here as-is.
+An AI co-pilot for **TradingView Desktop**. It runs as a local Node.js server, pairs an
+AI coaching agent ("Jessi") with your live TradingView chart over the Chrome DevTools
+Protocol, and enforces trading-discipline rules that are defined as data (so you can edit
+them without touching code).
 
-> **Disclaimer.** This is a personal tool, provided as-is with no warranty. It is not
-> financial advice and not a product. Trading futures carries substantial risk. Use at
-> your own risk.
+Chart any instrument you like — the co-pilot reads whatever symbol/timeframe is on your
+TradingView chart. It ships with example discipline rules and coaching tuned for futures
+scalping (MNQ / MGC), which you adapt to your own instrument and style by editing
+`app/rules.json`. Broader, instrument-agnostic presets and features are on the roadmap.
+
+> **Disclaimer.** Personal tool, provided as-is, no warranty. Not financial advice, not a
+> product. Trading carries substantial risk. Use at your own risk.
+
+## What it does
+
+- Reads your live TradingView chart (price, OHLCV, timeframe, drawings) via a CDP bridge.
+- Runs an AI analysis/coaching agent (Claude, with Groq / Gemini / local / OpenAI-compatible
+  router fallbacks) that can analyze the chart, flag rule violations, and talk through setups.
+- Enforces discipline rules from `app/rules.json` (size caps, trades per session, loss tiers,
+  session windows) — the single source of truth, edit it to fit your instrument.
+- Live monitors that poll the chart and push detections (engulfing, FVG, SFP, Power-of-3).
+- Optional voice mode (speech in, spoken replies).
 
 ## What's in here
 
-- **`app/`** — the product: a Node.js WebSocket/HTTP server that talks to Claude and
-  Groq/Gemini for AI coaching, bridges to a live TradingView Desktop chart via the
-  `tradingview-mcp` subproject, and enforces discipline rules from `rules.json`.
-- **`tradingview-mcp/`** — a standalone MCP server that drives TradingView Desktop over
-  the Chrome DevTools Protocol (CDP). `app/mcp-bridge.js` spawns it as a child process.
+- **`app/`** — the server: a Node.js WebSocket/HTTP app that talks to the AI backends,
+  bridges to TradingView via `tradingview-mcp`, and enforces the rules.
+- **`tradingview-mcp/`** — a standalone MCP server that drives TradingView Desktop over CDP.
   See `tradingview-mcp/README.md`.
 
-Runtime state (trade history, chat transcripts, session recordings) lives in
-`DATA/` and `sessions/` and is **not** part of the repo (gitignored).
+Runtime state (your trade history, chat transcripts, sessions) lives in `DATA/` and
+`sessions/` and is **not** in the repo (gitignored).
 
 ## Requirements
 
-- Windows with **TradingView Desktop** installed (the CDP bridge drives the desktop app).
+- Windows with **TradingView Desktop** (the CDP bridge drives the desktop app).
 - **Node.js 20+**.
-- API keys for at least one AI backend (Anthropic Claude, and/or Groq, Gemini, or a
-  self-hosted OpenAI-compatible router). See Configuration below.
+- An API key for at least one AI backend (Anthropic Claude, and/or Groq, Gemini, or a
+  self-hosted OpenAI-compatible router).
 
 ## Configuration
 
-The server reads a config file at `~/.mnq-copilot-config.json` (your home directory,
-**not** the repo). Copy the example and fill in your own keys:
+The server reads `~/.mnq-copilot-config.json` in your home directory (**not** the repo):
 
 ```bash
 cp app/.mnq-copilot-config.example.json ~/.mnq-copilot-config.json
 ```
 
-Never commit real keys. The config file lives outside the repo by design.
+Fill in your own keys. Never commit real keys — the config lives outside the repo by design.
 
 ## Running
 
-TradingView must be launched with remote debugging enabled (`--remote-debugging-port=9222`)
-**before** the server, or the CDP bridge can't connect. On Windows, `START CO-PILOT.bat`
+TradingView must be launched with remote debugging enabled
+(`--remote-debugging-port=9222`) **before** the server. On Windows, `START CO-PILOT.bat`
 does this in the right order (it hardcodes local paths — edit them for your machine).
 
-To run the server directly:
+Or run the server directly:
 
 ```bash
 cd app
@@ -53,28 +64,24 @@ npm install
 node server.js
 ```
 
-The server listens on `http://localhost:7433`; open that URL in a browser.
+Then open `http://localhost:7433`.
+
+## Adapting it to your instrument
+
+Everything instrument-specific lives in `app/rules.json`: size caps, trades per session,
+daily-loss tiers, and session windows (IST wall-clock minutes since midnight). Edit that
+file — the server reads it at runtime, no code changes needed. The AI coaching personas
+currently reference futures scalping; generalizing those is on the roadmap.
 
 ## Tests
 
 ```bash
-cd app && npm test                 # app unit tests (node --test)
+cd app && npm test                        # app unit tests (node --test)
 cd tradingview-mcp && npm run test:unit   # MCP unit tests (no live TradingView needed)
 ```
 
-## Architecture (brief)
+## Roadmap
 
-- **Rules are data.** `app/rules.json` is the single source of truth for every discipline
-  rule (size caps, trades/session, daily loss tiers, session windows). Loaded at runtime.
-- **Single-process server.** `app/server.js` is a raw `http` server plus a `ws`
-  WebSocketServer. All client↔server messages flow through one handler that dispatches on
-  message type.
-- **Two AI backends.** `app/claude-agent.js` (Anthropic SDK) is the main analysis agent;
-  `app/groq-agent.js` is a multi-provider fallback (Groq / Gemini / local Ollama / an
-  OpenAI-compatible router) used for voice, lighter, and alternate paths.
-- **Live chart monitors** poll TradingView on timers and push detections to the client.
-- **`app/mcp-bridge.js`** owns the `tradingview-mcp` child process and a heartbeat that
-  verifies the CDP connection independently of whether the child process is up.
-
-Note: `app/main.js` + `preload.js` are a legacy Electron shell and are not the primary
-launch path.
+- Instrument-agnostic rule presets (equities, crypto, forex) beyond the futures defaults.
+- Configurable coaching personas not tied to a single trading style.
+- Cleaner setup (fewer hardcoded paths, cross-platform launch).
