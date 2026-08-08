@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 title MNQ Co-Pilot - start everything
 color 0A
 
@@ -51,8 +51,37 @@ if not exist "%TV_EXE%" (
 )
 
 echo.
-echo  [2/3] Waiting for TradingView to boot ^(about 30 seconds^)...
-timeout /t 30 /nobreak >nul
+echo  [2/3] Waiting for TradingView's debug port to actually respond...
+REM FIX 2026-08-06 (Anoop: "the app doesn't get connected to MCP on start
+REM up"): this used to be a blind 30-second sleep. TradingView cold-start
+REM boot time genuinely varies 20-60s+ depending on the machine/day, so a
+REM fixed 30s wait meant the Co-Pilot server sometimes started probing CDP
+REM before TradingView was actually ready — mcp-bridge.js's own heartbeat
+REM recovery logic would eventually catch it, but only after a slow first
+REM connect + a full recovery cycle (up to another ~2min), which read as
+REM "doesn't connect on startup." Poll the real CDP endpoint instead of
+REM guessing a fixed delay: proceed the moment it's actually up, wait
+REM longer (up to 90s) if it's genuinely still booting.
+set "TV_READY=0"
+for /l %%i in (1,1,45) do (
+    if "!TV_READY!"=="0" (
+        powershell -NoProfile -Command "try { (Invoke-WebRequest -Uri 'http://localhost:9222/json/version' -UseBasicParsing -TimeoutSec 2) | Out-Null; exit 0 } catch { exit 1 }" >nul 2>&1
+        if not errorlevel 1 (
+            set "TV_READY=1"
+        ) else (
+            timeout /t 2 /nobreak >nul
+        )
+    )
+)
+if "%TV_READY%"=="1" (
+    echo       TradingView's debug port is up.
+) else (
+    echo       [!] Still not responding after 90s - continuing anyway.
+    echo           mcp-bridge.js will keep retrying on its own heartbeat.
+)
+REM Give the page itself a moment to finish loading the chart even after
+REM the debug port answers - the port can come up before the UI is usable.
+timeout /t 5 /nobreak >nul
 
 REM --------------------------------------------------------------- Co-Pilot ---
 echo.

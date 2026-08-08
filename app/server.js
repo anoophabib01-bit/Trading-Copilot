@@ -59,7 +59,7 @@ const STANDARD_FALLBACK_CHAIN = [
 function primaryProviderModel() {
   const cfg = loadConfig();
   if (!cfg.disableOmniRoute && groqAgent.isOmniRouteReady()) {
-    return { provider: 'omniroute', model: cfg.omniRouteModel || 'auto/best-reasoning' };
+    return { provider: 'omniroute', model: cfg.omniRouteModel || 'oc/deepseek-v4-flash-free' };
   }
   return { provider: 'gemini', model: 'gemini-3.5-flash' };
 }
@@ -1261,7 +1261,7 @@ async function handleJessiChat(ws, msg) {
     onFallback:  (fromM, toM)        => send(ws, { type: 'jessi-chat-fallback',  reqId, from: fromM, to: toM }),
     onWait:      (m, sec)            => send(ws, { type: 'jessi-chat-quota-warn', reqId, message: `${m}: per-minute rate cap — waiting ${sec}s and retrying the same model (not switching).` }),
     onQuota:     (m, quota) => { const w = quotaWarning(m, quota); if (w) send(ws, { type: 'jessi-chat-quota-warn', reqId, message: w }); },
-    onDone:      (fullText)          => send(ws, { type: 'jessi-chat-done',      reqId, fullText }),
+    onDone:      (fullText, answeredBy) => send(ws, { type: 'jessi-chat-done',   reqId, fullText, answeredBy }),
     onError:     (errMsg)            => send(ws, { type: 'jessi-chat-error',     reqId, message: errMsg })
   });
   } finally {
@@ -1356,10 +1356,22 @@ async function gatherAnalysisContext() {
   const appData = jessiAppGetData('all');
   if (appData) parts.push('\n## ACCOUNT & TRADE DATA\n' + appData);
 
+  // 2026-08-07: Alignment ("where his head's at") — was only reaching Jessi/
+  // Scalper/Claude/Post-Session (via buildJessiContext). Anoop asked for it
+  // to be known by ALL agents, this one included, even though Analysis's own
+  // persona stays out of psychology — the data is now visible either way, the
+  // persona's "stay in your lane" instruction still governs what it DOES with it.
+  try {
+    const align = formatAlignmentNotes(2);
+    if (align) parts.push('\n## WHERE HE\'S AT (his own dated reflections — for awareness, not yours to diagnose)\n' + align);
+  } catch (e) {}
+
   return parts.join('\n');
 }
 
-// Run one debate agent (no tools, collect full text)
+// Run one debate agent (no tools, collect full text). Resolves
+// {text, answeredBy} — answeredBy is null on error (no model actually
+// produced a reply in that case).
 function runDebateAgent(systemPrompt, userQuestion, dataContext, signal) {
   return new Promise((resolve) => {
     let fullText = '';
@@ -1375,8 +1387,8 @@ function runDebateAgent(systemPrompt, userQuestion, dataContext, signal) {
         signal,
         fallbackChain: fallbackChainFor(primary),
         onToken: (text) => { fullText += text; },
-        onDone: () => resolve(fullText || '(No argument produced)'),
-        onError: (err) => resolve('(Agent error: ' + err + ')')
+        onDone: (_text, answeredBy) => resolve({ text: fullText || '(No argument produced)', answeredBy }),
+        onError: (err) => resolve({ text: '(Agent error: ' + err + ')', answeredBy: null })
       }
     );
   });
@@ -1423,13 +1435,19 @@ async function handleDebateChat(ws, msg) {
       runDebateAgent(po3SystemPrompt, lastUserText, po3Context, abortCtrl.signal)
     ]);
 
-    // Send all three arguments to the UI
-    send(ws, { type: 'debate-arguments', reqId, jessi: jessiArgument, analysis: analysisArgument, po3: po3Argument });
+    // Send all three arguments to the UI — each carries {text, answeredBy} so
+    // the UI can show which model actually produced that argument.
+    send(ws, {
+      type: 'debate-arguments', reqId,
+      jessi: jessiArgument.text, jessiAnsweredBy: jessiArgument.answeredBy,
+      analysis: analysisArgument.text, analysisAnsweredBy: analysisArgument.answeredBy,
+      po3: po3Argument.text, po3AnsweredBy: po3Argument.answeredBy
+    });
 
     // Phase 3: Judge synthesizes — streamed to user
     send(ws, { type: 'debate-status', reqId, phase: 'judging', message: 'Expert Judge is reviewing both arguments...' });
 
-    const judgeContext = `## JESSI'S ARGUMENT (Discipline & Psychology)\n${jessiArgument}\n\n## ANALYSIS AGENT'S ARGUMENT (Technical & Market)\n${analysisArgument}\n\n## ICT POWER OF 3 ARGUMENT (AMD phase — Accumulation / Manipulation / Distribution)\n${po3Argument}\n\n## ORIGINAL QUESTION\n${lastUserText}`;
+    const judgeContext = `## JESSI'S ARGUMENT (Discipline & Psychology)\n${jessiArgument.text}\n\n## ANALYSIS AGENT'S ARGUMENT (Technical & Market)\n${analysisArgument.text}\n\n## ICT POWER OF 3 ARGUMENT (AMD phase — Accumulation / Manipulation / Distribution)\n${po3Argument.text}\n\n## ORIGINAL QUESTION\n${lastUserText}`;
 
     const judgePrimary = primaryProviderModel();
     await groqAgent.stream(
@@ -1443,8 +1461,8 @@ async function handleDebateChat(ws, msg) {
         signal: abortCtrl.signal,
         fallbackChain: fallbackChainFor(judgePrimary),
         onToken:  (text) => send(ws, { type: 'debate-judge-token', reqId, text }),
-        onDone:   (fullText) => {
-          send(ws, { type: 'debate-judge-done', reqId, fullText });
+        onDone:   (fullText, answeredBy) => {
+          send(ws, { type: 'debate-judge-done', reqId, fullText, answeredBy });
           // Archive the verdict AND the three arguments it was built from —
           // the verdict alone is not reviewable without knowing what each
           // agent actually said. Wrapped so a disk problem can never affect
@@ -2023,6 +2041,14 @@ async function gatherPO3Context() {
   const istNow = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
   parts.push('\n## TIME: ' + istNow + ' IST (London 13:30-15:00, NY 19:00-21:00 IST)');
 
+  // 2026-08-07: same "known by all agents" pass as gatherAnalysisContext —
+  // PO3 stays a mechanical AMD-phase read, this is visibility, not a mandate
+  // to comment on it.
+  try {
+    const align = formatAlignmentNotes(2);
+    if (align) parts.push('\n## WHERE HE\'S AT (his own dated reflections — for awareness, not yours to diagnose)\n' + align);
+  } catch (e) {}
+
   return parts.join('\n');
 }
 
@@ -2048,7 +2074,7 @@ async function handleIctPo3(ws, msg) {
         temperature: 0.4,
         fallbackChain: fallbackChainFor(po3Primary),
         onToken: (text) => send(ws, { type: 'po3-token', reqId, text }),
-        onDone:  (fullText) => send(ws, { type: 'po3-done', reqId, fullText }),
+        onDone:  (fullText, answeredBy) => send(ws, { type: 'po3-done', reqId, fullText, answeredBy }),
         onError: (errMsg) => send(ws, { type: 'po3-error', reqId, message: errMsg })
       }
     );
@@ -2252,8 +2278,8 @@ async function handlePostSessionReview(ws, msg) {
         temperature: 0.8,
         fallbackChain: fallbackChainFor(postSessionPrimary),
         onToken:  (text) => send(ws, { type: 'post-review-token', reqId, text }),
-        onDone:   (fullText) => {
-          send(ws, { type: 'post-review-done', reqId, fullText });
+        onDone:   (fullText, answeredBy) => {
+          send(ws, { type: 'post-review-done', reqId, fullText, answeredBy });
           saveReviewRecord('post-session', fullText, {});
         },
         onError:  (errMsg) => send(ws, { type: 'post-review-error', reqId, message: errMsg })
@@ -2480,8 +2506,9 @@ async function handleScalperChat(ws, msg) {
         onToken: (text) => send(ws, { type: 'scalper-token', reqId, text }),
         onToolStart: (name) => send(ws, { type: 'scalper-tool', reqId, name, phase: 'start' }),
         onToolDone:  (name) => send(ws, { type: 'scalper-tool', reqId, name, phase: 'done' }),
-        onDone: (fullText) => {
-          send(ws, { type: 'scalper-done', reqId, fullText });
+        onFallback: (fromM, toM) => send(ws, { type: 'scalper-fallback', reqId, from: fromM, to: toM }),
+        onDone: (fullText, answeredBy) => {
+          send(ws, { type: 'scalper-done', reqId, fullText, answeredBy });
           saveReviewRecord('scalper', fullText, {});
         },
         onError: (errMsg) => send(ws, { type: 'scalper-error', reqId, message: errMsg })
@@ -2524,9 +2551,15 @@ async function handleJessiVoiceSend(ws, msg) {
     // Groq call at all, so a Gemini-only setup should work. Now only demands
     // a Groq key for the parts that genuinely still go through Groq —
     // server-side Whisper STT, server-side Orpheus TTS, or a Groq brain.
-    const needsGroqStt = !(typeof msg.transcript === 'string' && msg.transcript.trim());
+    // 2026-08-07: server-side STT can now also be satisfied by OmniRoute
+    // (Speechmatics), so the Groq requirement for STT specifically is relaxed
+    // when OmniRoute is configured and enabled — Groq is still required for
+    // TTS (Orpheus) since OmniRoute has no text-to-speech model at all.
+    const stCfg = loadConfig();
+    const omniRouteCanStt = !stCfg.disableOmniRoute && groqAgent.isOmniRouteReady();
+    const needsGroqStt = !(typeof msg.transcript === 'string' && msg.transcript.trim()) && !omniRouteCanStt;
     const needsGroqTts = !clientTts;
-    const brainIsGroq = (loadConfig().voiceBrain || 'gemini') === 'groq';
+    const brainIsGroq = (stCfg.voiceBrain || 'gemini') === 'groq';
     if ((needsGroqStt || needsGroqTts || brainIsGroq) && !groqAgent.isReady()) {
       const why = needsGroqStt ? 'speech-to-text' : needsGroqTts ? 'speech playback' : 'the Groq voice brain';
       send(ws, { type: 'jessi-voice-error', reqId, message: `Groq API key needed for ${why}. Add a free key from console.groq.com in Settings (or switch the voice brain to Gemini and let the browser handle speech).` });
@@ -2546,7 +2579,24 @@ async function handleJessiVoiceSend(ws, msg) {
         send(ws, { type: 'jessi-voice-error', reqId, message: 'No speech received — try again.' });
         return;
       }
-      transcript = await groqAgent.transcribeAudio(audioBuffer, mimeType);
+      // 2026-08-07: OmniRoute/Speechmatics tried first when configured
+      // (Anoop's ask — "omnirouter as primary, groq as second option"),
+      // falling back to Groq Whisper on ANY failure (unreachable, upstream
+      // provider auth error, whatever) — same fail-open pattern as the text
+      // agents. Deliberately not routed through groqAgent.stream()'s chain
+      // machinery since transcription is a one-shot multipart call, not a
+      // streamed chat turn; a simple try/catch covers it.
+      const cfg = loadConfig();
+      if (!cfg.disableOmniRoute && groqAgent.isOmniRouteReady()) {
+        try {
+          transcript = await groqAgent.transcribeAudioOmniRoute(audioBuffer, mimeType);
+        } catch (e) {
+          console.log('[voice] OmniRoute STT failed, falling back to Groq Whisper:', e.message);
+          transcript = await groqAgent.transcribeAudio(audioBuffer, mimeType);
+        }
+      } else {
+        transcript = await groqAgent.transcribeAudio(audioBuffer, mimeType);
+      }
     }
     if (!transcript) {
       send(ws, { type: 'jessi-voice-error', reqId, message: "Didn't catch anything — try again." });
@@ -2593,6 +2643,7 @@ async function handleJessiVoiceSend(ws, msg) {
     const brainChain = brainProvider === 'ollama' ? undefined : fallbackChainFor({ provider: brainProvider, model: brainModel });
 
     let fullReply = '';
+    let replyAnsweredBy = null;
     await new Promise((resolve) => {
       groqAgent.stream(turnMessages, systemPrompt, JESSI_VOICE_TOOLS, {
         provider: brainProvider,
@@ -2605,7 +2656,7 @@ async function handleJessiVoiceSend(ws, msg) {
         onFallback:  (fromM, toM) => send(ws, { type: 'jessi-voice-fallback', reqId, from: fromM, to: toM }),
         onWait:      (m, sec) => send(ws, { type: 'jessi-voice-quota-warn', reqId, message: `${m}: per-minute cap — waiting ${sec}s, same model.` }),
         onQuota:     (m, quota) => { const w = quotaWarning(m, quota); if (w) send(ws, { type: 'jessi-voice-quota-warn', reqId, message: w }); },
-        onDone: (text) => { fullReply = text; resolve(); },
+        onDone: (text, answeredBy) => { fullReply = text; replyAnsweredBy = answeredBy; resolve(); },
         onError: (errMsg) => { send(ws, { type: 'jessi-voice-error', reqId, message: errMsg }); resolve(null); }
       });
     });
@@ -2630,7 +2681,7 @@ async function handleJessiVoiceSend(ws, msg) {
     if (edgeVoice !== 'browser') {
       try {
         const clips = await edgeTts.synthesizeClips(fullReply, edgeVoice);
-        send(ws, { type: 'jessi-voice-audio', reqId, fullText: fullReply, clips, mime: 'audio/mpeg' });
+        send(ws, { type: 'jessi-voice-audio', reqId, fullText: fullReply, clips, mime: 'audio/mpeg', answeredBy: replyAnsweredBy });
         sent = true;
       } catch (e) {
         console.log('Edge TTS failed (falling back):', e.message);
@@ -2638,10 +2689,10 @@ async function handleJessiVoiceSend(ws, msg) {
     }
     if (!sent && clientTts) {
       // Browser speaks it — no server TTS call, no audio payload.
-      send(ws, { type: 'jessi-voice-audio', reqId, fullText: fullReply, clips: [] });
+      send(ws, { type: 'jessi-voice-audio', reqId, fullText: fullReply, clips: [], answeredBy: replyAnsweredBy });
     } else if (!sent) {
       const clips = await groqAgent.synthesizeSpeech(fullReply, 'autumn');
-      send(ws, { type: 'jessi-voice-audio', reqId, fullText: fullReply, clips, mime: 'audio/wav' });
+      send(ws, { type: 'jessi-voice-audio', reqId, fullText: fullReply, clips, mime: 'audio/wav', answeredBy: replyAnsweredBy });
     }
   } catch (e) {
     send(ws, { type: 'jessi-voice-error', reqId, message: e.message });

@@ -134,7 +134,7 @@
       case 'jessi-chat-done':
         if (msg.reqId === currentJessiReqId) {
           currentJessiReqId = null;
-          emit('jessiChat:done', msg.fullText);
+          emit('jessiChat:done', msg.fullText, msg.answeredBy);
         }
         break;
 
@@ -156,10 +156,14 @@
         }
         break;
 
+      case 'scalper-fallback':
+        if (msg.reqId === currentScalperReqId) emit('scalper:fallback', msg.from, msg.to);
+        break;
+
       case 'scalper-done':
         if (msg.reqId === currentScalperReqId) {
           currentScalperReqId = null;
-          emit('scalper:done', msg.fullText);
+          emit('scalper:done', msg.fullText, msg.answeredBy);
         }
         break;
 
@@ -175,7 +179,10 @@
         if (msg.reqId === currentDebateReqId) emit('debate:status', msg.phase);
         break;
       case 'debate-arguments':
-        if (msg.reqId === currentDebateReqId) emit('debate:arguments', msg.jessi, msg.analysis, msg.po3);
+        if (msg.reqId === currentDebateReqId) {
+          emit('debate:arguments', msg.jessi, msg.analysis, msg.po3,
+            { jessi: msg.jessiAnsweredBy, analysis: msg.analysisAnsweredBy, po3: msg.po3AnsweredBy });
+        }
         break;
       case 'debate-judge-token':
         if (msg.reqId === currentDebateReqId) emit('debate:judgeToken', msg.text);
@@ -183,7 +190,7 @@
       case 'debate-judge-done':
         if (msg.reqId === currentDebateReqId) {
           currentDebateReqId = null;
-          emit('debate:judgeDone', msg.fullText);
+          emit('debate:judgeDone', msg.fullText, msg.answeredBy);
         }
         break;
       case 'debate-judge-error':
@@ -203,7 +210,7 @@
       case 'post-review-done':
         if (msg.reqId === currentPostReviewReqId) {
           currentPostReviewReqId = null;
-          emit('postReview:done', msg.fullText);
+          emit('postReview:done', msg.fullText, msg.answeredBy);
         }
         break;
       case 'post-review-error':
@@ -226,7 +233,7 @@
         if (msg.reqId === currentPo3ReqId) emit('po3:token', msg.text);
         break;
       case 'po3-done':
-        if (msg.reqId === currentPo3ReqId) { currentPo3ReqId = null; emit('po3:done', msg.fullText); }
+        if (msg.reqId === currentPo3ReqId) { currentPo3ReqId = null; emit('po3:done', msg.fullText, msg.answeredBy); }
         break;
       case 'po3-error':
         if (msg.reqId === currentPo3ReqId) { currentPo3ReqId = null; emit('po3:error', msg.message); }
@@ -256,7 +263,7 @@
       case 'jessi-voice-audio':
         if (msg.reqId === currentJessiVoiceReqId) {
           currentJessiVoiceReqId = null;
-          emit('jessiVoice:audio', msg.fullText, msg.clips, msg.mime);
+          emit('jessiVoice:audio', msg.fullText, msg.clips, msg.mime, msg.answeredBy);
         }
         break;
 
@@ -503,7 +510,7 @@
         // page reload. 4-minute ceiling (a turn can legitimately include a
         // 30s rate-limit wait + a 90s retried stream + tool rounds).
         const t = setTimeout(() => { cleanup(); reject(new Error('Jessi did not respond within 4 minutes — connection may have dropped. Try again.')); }, 240 * 1000);
-        function onDone(text) { cleanup(); resolve(text); }
+        function onDone(text, answeredBy) { cleanup(); resolve({ text, answeredBy }); }
         function onErr(msg)   { cleanup(); reject(new Error(msg)); }
         function cleanup() {
           clearTimeout(t);
@@ -535,7 +542,7 @@
       rawSend({ type: 'scalper-chat-send', messages, reqId });
       return new Promise((resolve, reject) => {
         const t = setTimeout(() => { cleanup(); reject(new Error('The Scalper did not respond within 4 minutes — connection may have dropped. Try again.')); }, 240 * 1000);
-        function onDone(text) { cleanup(); resolve(text); }
+        function onDone(text, answeredBy) { cleanup(); resolve({ text, answeredBy }); }
         function onErr(msg)   { cleanup(); reject(new Error(msg)); }
         function cleanup() {
           clearTimeout(t);
@@ -554,6 +561,7 @@
     onScalperToken:     (cb) => on('scalper:token',     cb),
     onScalperToolStart: (cb) => on('scalper:toolStart', cb),
     onScalperToolDone:  (cb) => on('scalper:toolDone',  cb),
+    onScalperFallback:  (cb) => on('scalper:fallback',  cb),
     onScalperDone:      (cb) => on('scalper:done',      cb),
     onScalperError:     (cb) => on('scalper:error',     cb),
 
@@ -590,7 +598,7 @@
       rawSend({ type: 'debate-chat-send', messages, reqId });
       return new Promise((resolve, reject) => {
         const t = setTimeout(() => { cleanup(); reject(new Error('Debate timed out (5 min) — connection may have dropped.')); }, 300 * 1000);
-        function onDone(text) { cleanup(); resolve(text); }
+        function onDone(text, answeredBy) { cleanup(); resolve({ text, answeredBy }); }
         function onErr(msg)   { cleanup(); reject(new Error(msg)); }
         function cleanup() {
           clearTimeout(t);
@@ -619,7 +627,7 @@
       rawSend({ type: 'post-session-review', reqId });
       return new Promise((resolve, reject) => {
         const t = setTimeout(() => { cleanup(); reject(new Error('Post-session review timed out (5 min).')); }, 300 * 1000);
-        function onDone(text) { cleanup(); resolve(text); }
+        function onDone(text, answeredBy) { cleanup(); resolve({ text, answeredBy }); }
         function onErr(msg)   { cleanup(); reject(new Error(msg)); }
         function cleanup() {
           clearTimeout(t);
@@ -642,7 +650,7 @@
       rawSend({ type: 'ict-po3', question, reqId });
       return new Promise((resolve, reject) => {
         const t = setTimeout(() => { cleanup(); reject(new Error('Power of 3 analysis timed out (3 min).')); }, 180 * 1000);
-        function onDone(text) { cleanup(); resolve(text); }
+        function onDone(text, answeredBy) { cleanup(); resolve({ text, answeredBy }); }
         function onErr(m)     { cleanup(); reject(new Error(m)); }
         function cleanup() { clearTimeout(t); off('po3:done', onDone); off('po3:error', onErr); }
         on('po3:done', onDone);

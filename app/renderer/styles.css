@@ -1,4 +1,23 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Outfit:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap'); /* DESIGN PASS 4 — must be first rule in the file or browsers ignore it. Inter added 2026-08-02 to match variant-G5 mockup font. */
+/* ── Fonts: bundled LOCALLY (2026-08-08) ──────────────────────────────────────
+   Was a Google Fonts @import over the network. On this desktop app a fresh
+   Chrome window opens every launch, so the network font either flash-swapped
+   or (offline / CDN blocked) never loaded at all — everything fell back to
+   Segoe UI + Consolas, which is heavier and differently-shaped than the
+   approved variant-G5 look ("the thickness and style of the font are very
+   different"). Bundling Inter + JetBrains Mono as local woff2 (renderer/fonts/)
+   makes the mockup fonts render identically on every launch with zero network
+   dependency. Outfit was dropped — the final cascade uses Inter for body and
+   JetBrains Mono for figures; Outfit was only referenced by rules that are
+   themselves overridden. font-display:swap keeps text visible during the
+   (now instant, local) load. */
+@font-face{font-family:'Inter';font-style:normal;font-weight:400;font-display:swap;src:url('fonts/inter-400.woff2') format('woff2')}
+@font-face{font-family:'Inter';font-style:normal;font-weight:500;font-display:swap;src:url('fonts/inter-500.woff2') format('woff2')}
+@font-face{font-family:'Inter';font-style:normal;font-weight:600;font-display:swap;src:url('fonts/inter-600.woff2') format('woff2')}
+@font-face{font-family:'Inter';font-style:normal;font-weight:700;font-display:swap;src:url('fonts/inter-700.woff2') format('woff2')}
+@font-face{font-family:'Inter';font-style:normal;font-weight:800;font-display:swap;src:url('fonts/inter-800.woff2') format('woff2')}
+@font-face{font-family:'JetBrains Mono';font-style:normal;font-weight:400;font-display:swap;src:url('fonts/jbmono-400.woff2') format('woff2')}
+@font-face{font-family:'JetBrains Mono';font-style:normal;font-weight:500;font-display:swap;src:url('fonts/jbmono-500.woff2') format('woff2')}
+@font-face{font-family:'JetBrains Mono';font-style:normal;font-weight:600;font-display:swap;src:url('fonts/jbmono-600.woff2') format('woff2')}
 /* ── Reset & Base ─────────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -1557,6 +1576,9 @@ html.theme-dark ::-webkit-scrollbar-thumb:hover{background:#4a4f5c;}
 .debate-arg-header.po3{color:#a78bfa;}
 .debate-judge-header{font-weight:600;font-size:0.78rem;text-transform:uppercase;letter-spacing:0.5px;color:var(--amber,#f59e0b);margin-bottom:4px;}
 .debate-status-pill{display:inline-block;font-size:0.72rem;color:var(--muted,#94a3b8);padding:2px 8px;border:1px solid var(--border,#334155);border-radius:12px;margin:4px 0;}
+/* 2026-08-07: "answered by" badge — small, muted, non-intrusive by design
+   (see app.js modelBadgeHtml comment for why this exists now). */
+.model-answered-by{font-size:0.68rem;color:var(--muted,#94a3b8);margin-top:6px;opacity:0.75;}
 #voice-mode-btn{margin-left:6px;}
 #voice-mode-btn.active{background:var(--accent,#3b82f6);color:#fff;border-color:var(--accent,#3b82f6);}
 #voice-overlay{

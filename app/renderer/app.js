@@ -2693,16 +2693,17 @@ async function sendDebateMessage(text) {
 
   // Phase 2: side-by-side arguments
   let argEl = null;
-  const offArgs = window.api.onDebateArguments((jessiArg, analysisArg, po3Arg) => {
+  const offArgs = window.api.onDebateArguments((jessiArg, analysisArg, po3Arg, answeredBy) => {
+    answeredBy = answeredBy || {};
     statusEl.remove(); // remove status pill
     argEl = document.createElement('div');
     argEl.className = 'msg assistant';
     // Three debaters as of 2026-07-28 — Power of 3 joined as a full participant.
     let html = '<div class="debate-arguments">' +
-      '<div class="debate-arg"><div class="debate-arg-header jessi">Jessi (Discipline)</div>' + escHtml(jessiArg || '').replace(/\n/g, '<br>') + '</div>' +
-      '<div class="debate-arg"><div class="debate-arg-header analysis">Analysis (Technical)</div>' + escHtml(analysisArg || '').replace(/\n/g, '<br>') + '</div>';
+      '<div class="debate-arg"><div class="debate-arg-header jessi">Jessi (Discipline)</div>' + escHtml(jessiArg || '').replace(/\n/g, '<br>') + modelBadgeHtml(answeredBy.jessi) + '</div>' +
+      '<div class="debate-arg"><div class="debate-arg-header analysis">Analysis (Technical)</div>' + escHtml(analysisArg || '').replace(/\n/g, '<br>') + modelBadgeHtml(answeredBy.analysis) + '</div>';
     if (po3Arg) {
-      html += '<div class="debate-arg"><div class="debate-arg-header po3">Power of 3 (AMD)</div>' + escHtml(po3Arg).replace(/\n/g, '<br>') + '</div>';
+      html += '<div class="debate-arg"><div class="debate-arg-header po3">Power of 3 (AMD)</div>' + escHtml(po3Arg).replace(/\n/g, '<br>') + modelBadgeHtml(answeredBy.po3) + '</div>';
     }
     html += '</div>';
     argEl.innerHTML = html;
@@ -2719,8 +2720,8 @@ async function sendDebateMessage(text) {
   const offToken = window.api.onDebateJudgeToken((t) => { appendToCurrentBubble(t); });
 
   try {
-    const fullText = await window.api.sendDebateChat(state.messages.slice(-20));
-    finalizeAssistantBubble(fullText, '<div class="debate-judge-header">⚖ Expert Judge</div>');
+    const { text: fullText, answeredBy } = await window.api.sendDebateChat(state.messages.slice(-20));
+    finalizeAssistantBubble(fullText, '<div class="debate-judge-header">⚖ Expert Judge</div>', answeredBy);
   } catch (e) {
     if (state.currentAssistantBubble) {
       state.currentAssistantBubble.parentElement.remove();
@@ -2780,9 +2781,9 @@ async function runIctPo3(question) {
   const offToken = window.api.onPo3Token((t) => appendToCurrentBubble(t));
 
   try {
-    const fullText = await window.api.sendIctPo3(question || '');
+    const { text: fullText, answeredBy } = await window.api.sendIctPo3(question || '');
     statusEl.remove();
-    finalizeAssistantBubble(fullText, HDR);
+    finalizeAssistantBubble(fullText, HDR, answeredBy);
   } catch (e) {
     statusEl.remove();
     if (state.currentAssistantBubble) {
@@ -2839,9 +2840,9 @@ async function runPostSessionReview(retriesLeft) {
   const offToken = window.api.onPostReviewToken((t) => { appendToCurrentBubble(t); });
 
   try {
-    const fullText = await window.api.sendPostSessionReview();
+    const { text: fullText, answeredBy } = await window.api.sendPostSessionReview();
     statusEl.remove();
-    finalizeAssistantBubble(fullText, '<div class="debate-judge-header" style="color:var(--green,#22c55e)">📋 Post-Session Review</div>');
+    finalizeAssistantBubble(fullText, '<div class="debate-judge-header" style="color:var(--green,#22c55e)">📋 Post-Session Review</div>', answeredBy);
   } catch (e) {
     statusEl.remove();
     if (state.currentAssistantBubble) {
@@ -2883,6 +2884,7 @@ async function sendMessage(presetText) {
     setStreaming(true);
     startNewAssistantBubble();
     let gotTok = false;
+    let scalperAnsweredBy = null;
     const offTok = window.api.onScalperToken((t) => { gotTok = true; appendToCurrentBubble(t); });
     const offTs = window.api.onScalperToolStart((name) => { state.toolCallCount++; console.debug('[Scalper tool]', name); });
     const offTd = window.api.onScalperToolDone((name) => { console.debug('[Scalper tool done]', name); });
@@ -2902,14 +2904,14 @@ async function sendMessage(presetText) {
         }
         return { role: m.role, content: String(m.content || '') };
       });
-      const reply = await window.api.sendScalperChat(safeMessages);
+      const { text: reply, answeredBy } = await window.api.sendScalperChat(safeMessages);
+      scalperAnsweredBy = answeredBy;
       if (!gotTok && reply) appendToCurrentBubble(reply);
-      state.messages.push({ role: 'assistant', content: reply || '' });
     } catch (e) {
       addSystemMessage('⚠ Scalper failed: ' + (e && e.message ? e.message : e));
     } finally {
       offTok && offTok(); offTs && offTs(); offTd && offTd();
-      finalizeAssistantBubble();
+      finalizeAssistantBubble(undefined, null, scalperAnsweredBy);
       setStreaming(false);
     }
     return;
@@ -2963,8 +2965,8 @@ async function sendMessage(presetText) {
   // live rate-limit headers). 2026-07-27: console only, same reasoning as above.
   const offQuotaWarn = window.api.onJessiChatQuotaWarn((message) => console.debug('[Jessi quota]', message));
   try {
-    const fullText = await window.api.sendJessiChat(state.messages.slice(-20));
-    finalizeAssistantBubble(fullText);
+    const { text: fullText, answeredBy } = await window.api.sendJessiChat(state.messages.slice(-20));
+    finalizeAssistantBubble(fullText, null, answeredBy);
     appendFinalToolTick(); // single "Analysis complete ✓" tick, same as main chat — replaces the removed per-tool bubbles
   } catch (e) {
     // Groq failed mid-flight — remove the empty streaming bubble (if nothing
@@ -3179,10 +3181,11 @@ function wireVoiceListeners() {
   voiceState.offQuotaWarn = window.api.onJessiVoiceQuotaWarn((message) => {
     setVoicePhase('thinking', '⏳ Running low — ' + message, document.getElementById('voice-caption').textContent);
   });
-  voiceState.offAudio = window.api.onJessiVoiceAudio((fullText, clips, mime) => {
+  voiceState.offAudio = window.api.onJessiVoiceAudio((fullText, clips, mime, answeredBy) => {
     clearVoiceWatchdog();
     state.messages.push({ role: 'assistant', content: fullText });
-    setVoicePhase('speaking', 'Jesse is speaking…', 'Jesse: ' + fullText);
+    const brainNote = answeredBy && answeredBy.label ? ' (' + answeredBy.label + ')' : '';
+    setVoicePhase('speaking', 'Jesse is speaking…' + brainNote, 'Jesse: ' + fullText);
     // Clips present → server-synthesized audio (Edge TTS mp3, or legacy Groq
     // wav — mime says which). No clips → browser speechSynthesis fallback.
     if (clips && clips.length) voicePlayClips(clips, mime);
@@ -3560,6 +3563,22 @@ function getSizeFromProfit(profit) {
 let ttsPlayer = null;
 let ttsQueue = [];
 let ttsActiveBtn = null;
+// 2026-08-07: the read-aloud button was producing SILENCE for Anoop despite
+// the server returning valid TTS clips. Root cause: Chrome's autoplay policy
+// blocks <audio>.play() after the network round-trip (the click "gesture"
+// expires while we wait for the server), and ttsPlayNext's play().catch() only
+// logged + advanced the queue — it never fell back to the browser's own
+// speechSynthesis the way VOICE MODE does. Voice mode is reliable precisely
+// because (with browser STT present) it speaks replies via window.speechSynthesis,
+// which is immune to the audio-element autoplay policy. So read-aloud now
+// mirrors that: try the nicer neural clip, but the instant the FIRST clip is
+// blocked/fails, speak the whole reply via speechSynthesis so there is ALWAYS
+// sound on a click. ttsCurrentText holds the text for that fallback;
+// ttsStartedPlaying distinguishes "first clip never played (autoplay blocked →
+// browser voice)" from "a later clip hiccuped after audio already worked (just
+// advance)".
+let ttsCurrentText = '';
+let ttsStartedPlaying = false;
 
 // Strips markdown syntax and decorative symbols/emoji before handing text to
 // TTS. Anoop's ask: "i don't want the voice to read any symbols as they are
@@ -3586,32 +3605,94 @@ function getTtsPlayer() {
     ttsPlayer = document.createElement('audio');
     ttsPlayer.style.display = 'none';
     document.body.appendChild(ttsPlayer);
-    ttsPlayer.onended = ttsPlayNext;
-    ttsPlayer.onerror = ttsPlayNext;
+    // NOTE: BOTH onended and onerror are armed PER-CLIP inside ttsPlayNext, not
+    // persistently here, so the synchronous autoplay-"unlock" probe clip and the
+    // intentional src teardown in ttsStop() (which clear both handlers) can never
+    // touch playback state — no spurious queue-advance/reset and no phantom
+    // browser-voice fallback. Handlers exist only while a real clip is playing.
   }
   return ttsPlayer;
+}
+// One place that decides what a clip failure means, shared by BOTH the
+// <audio>.play() promise rejection (autoplay block) and the element's onerror
+// event (decode failure). If nothing has audibly played yet, the neural path
+// is unusable this click → speak the whole reply via the browser voice so
+// there is always sound. If audio was already playing, it's a mid-stream blip
+// → just advance to the next clip.
+function ttsHandleClipFailure(why) {
+  console.error('[read-aloud] clip failure:', why && why.name ? (why.name + ' ' + (why.message || '')) : (why || 'media error'));
+  // Disarm the element handlers first — a blocked clip can fire BOTH the play()
+  // promise rejection and the element's onerror; without this the second event
+  // would re-enter and restart the browser-voice fallback. ttsPlayNext re-arms
+  // them for the next clip in the advance branch below.
+  if (ttsPlayer) { ttsPlayer.onended = null; ttsPlayer.onerror = null; }
+  if (!ttsStartedPlaying) {
+    ttsQueue = [];
+    ttsSpeakViaBrowser(ttsCurrentText, ttsActiveBtn);
+  } else {
+    ttsPlayNext();
+  }
+}
+// Guaranteed, network-free, autoplay-immune speech — the SAME engine voice
+// mode uses to reliably speak replies. This is the backstop that makes the
+// read-aloud button always produce sound, even when the neural <audio> clips
+// are blocked by Chrome's autoplay policy. Returns true if it started speaking.
+function ttsSpeakViaBrowser(text, btn) {
+  try {
+    const synth = window.speechSynthesis;
+    if (!synth) { ttsStopUI(); return false; }
+    const clean = sanitizeForSpeech(text);
+    if (!clean) { ttsStopUI(); return false; }
+    synth.cancel();
+    const u = new SpeechSynthesisUtterance(clean);
+    const v = (typeof voicePickVoice === 'function') ? voicePickVoice() : null;
+    if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = 'en-IN'; }
+    u.rate = 1.0; u.pitch = 1.0;
+    u.onend = ttsStopUI;
+    u.onerror = ttsStopUI;
+    if (btn) btn.textContent = '⏹';
+    synth.speak(u);
+    return true;
+  } catch (e) {
+    console.error('[read-aloud] browser speechSynthesis failed:', e);
+    ttsStopUI();
+    return false;
+  }
 }
 function ttsPlayNext() {
   const next = ttsQueue.shift();
   if (!next) { ttsStopUI(); return; }
   const player = getTtsPlayer();
+  player.onended = ttsPlayNext;          // arm ONLY for this real clip
+  player.onerror = ttsHandleClipFailure; // arm ONLY for this real clip
   player.src = 'data:' + next.mime + ';base64,' + next.clip;
   const pr = player.play();
-  if (pr && pr.catch) pr.catch((err) => {
-    // Was `.catch(ttsPlayNext)` — a blocked/failed play silently advanced
-    // through every clip and ended in silence with no explanation. Log the
-    // real reason (autoplay block vs decode error) before moving on.
-    console.error('[read-aloud] playback failed:', err && err.name, err && err.message);
-    ttsPlayNext();
-  });
+  if (pr && pr.then) pr.then(() => { ttsStartedPlaying = true; }).catch(() => {});
+  // play() rejection (Chrome autoplay block after the network round-trip) and
+  // the element's onerror (decode failure) both route through the one shared
+  // handler so a first-clip failure ALWAYS falls back to the browser voice.
+  if (pr && pr.catch) pr.catch((err) => ttsHandleClipFailure(err));
 }
 function ttsStopUI() {
   if (ttsActiveBtn) { ttsActiveBtn.classList.remove('speaking'); ttsActiveBtn.textContent = '🔊'; }
+  if (ttsPlayer) { ttsPlayer.onended = null; ttsPlayer.onerror = null; } // disarm — no clip is playing now
   ttsActiveBtn = null;
   ttsQueue = [];
+  ttsStartedPlaying = false;
+  ttsCurrentText = '';
 }
 function ttsStop() {
-  try { const p = getTtsPlayer(); p.pause(); p.src = ''; } catch (e) {}
+  // Disarm onerror BEFORE tearing down src — clearing the source fires an
+  // error event on the element, which must NOT be treated as a clip failure
+  // (that would spuriously kick off the browser-voice fallback). removeAttribute
+  // + load() resets the element cleanly instead of pointing it at an empty URL.
+  try {
+    const p = getTtsPlayer();
+    p.onended = null; p.onerror = null;
+    p.pause();
+    p.removeAttribute('src');
+    p.load();
+  } catch (e) {}
   // Also cancel browser speechSynthesis — read-aloud falls back to it when
   // Edge TTS is unavailable, and without this the stop button did nothing
   // during a fallback playback.
@@ -3623,6 +3704,8 @@ async function ttsToggle(btn, text) {
   if (ttsActiveBtn === btn) { ttsStop(); return; }
   ttsStop(); // stop whatever else was playing first
   ttsActiveBtn = btn;
+  ttsCurrentText = text;       // stashed so any playback failure can fall back to browser speech
+  ttsStartedPlaying = false;
   btn.classList.add('speaking');
   btn.textContent = '⏳';
 
@@ -3633,9 +3716,12 @@ async function ttsToggle(btn, text) {
   // be judged stale and play() then rejects silently — button looks dead, no
   // sound, no error. Playing a 0-length silent clip here while we're still
   // provably inside the user gesture marks the element as user-initiated, so
-  // the later play() is always allowed.
+  // the later play() is always allowed. 2026-08-07: even when this fails,
+  // ttsPlayNext now falls back to browser speech, so silence is no longer a
+  // possible outcome.
   try {
     const p = getTtsPlayer();
+    p.onended = null; p.onerror = null; // the unlock's silent probe clip must not touch playback state
     p.src = 'data:audio/mpeg;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAACcQCA';
     const pr = p.play();
     if (pr && pr.then) pr.then(() => { try { p.pause(); } catch (e) {} }).catch(() => {});
@@ -3645,35 +3731,20 @@ async function ttsToggle(btn, text) {
     if (!clean) { ttsStopUI(); return; }
     const { clips, mime } = await window.api.speakText(clean);
     if (ttsActiveBtn !== btn) return; // user switched to another message while we waited
-    if (!clips || !clips.length) { ttsStopUI(); return; }
+    // No clips from the server (both server voices down) — go straight to the
+    // browser voice rather than falling silent.
+    if (!clips || !clips.length) { ttsSpeakViaBrowser(text, btn); return; }
     btn.textContent = '⏹';
     ttsQueue = clips.map(c => ({ clip: c, mime: mime || 'audio/mpeg' }));
     ttsPlayNext();
   } catch (e) {
-    // FALLBACK (2026-07-28): Edge TTS is an UNOFFICIAL Microsoft endpoint —
-    // it returned 403 for Anoop mid-session when MS added a token
-    // requirement, and it can break again without notice. Voice mode always
-    // had a browser-speechSynthesis fallback; read-aloud didn't, so it failed
-    // hard and looked broken. Now it degrades to the browser voice (en-IN
-    // preferred) instead of dying. Anoop's requirement was explicit: this must
-    // not disturb him during trading hours.
-    console.error('[read-aloud] Edge TTS failed, falling back to browser voice:', e);
+    // Server TTS threw (e.g. Edge's unofficial endpoint 403'd AND local
+    // Windows SAPI was unavailable, or the request timed out). Voice mode
+    // always had a browser-speechSynthesis fallback; read-aloud now shares the
+    // exact same guaranteed path so it never fails hard during trading hours.
+    console.error('[read-aloud] server TTS failed, using browser voice:', e && e.message ? e.message : e);
     if (ttsActiveBtn !== btn) return;
-    try {
-      const synth = window.speechSynthesis;
-      if (!synth) throw new Error('no speechSynthesis in this browser');
-      synth.cancel();
-      const u = new SpeechSynthesisUtterance(sanitizeForSpeech(text));
-      const v = (typeof voicePickVoice === 'function') ? voicePickVoice() : null;
-      if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = 'en-IN'; }
-      u.rate = 1.0; u.pitch = 1.0;
-      u.onend = ttsStopUI;
-      u.onerror = ttsStopUI;
-      btn.textContent = '⏹';
-      synth.speak(u);
-    } catch (e2) {
-      console.error('[read-aloud] browser fallback also failed:', e2);
-      ttsStopUI();
+    if (!ttsSpeakViaBrowser(text, btn)) {
       addSystemMessage('⚠ Read-aloud unavailable: ' + (e && e.message ? e.message : e));
     }
   }
@@ -3727,10 +3798,27 @@ function appendToCurrentBubble(text) {
   scrollToBottom();
 }
 
-function finalizeAssistantBubble(fullText, htmlPrefix) {
+// 2026-08-07: small "answered by: X" badge — added per Anoop's ask after
+// OmniRoute joined the provider chain as primary brain. Previously model
+// routing was deliberately invisible (2026-07-27: "Jessi's business, not
+// something that interrupts the conversation on screen") — this supersedes
+// that for a narrower reason: OmniRoute can fail/get banned silently, and a
+// downgrade to Gemini/Groq with zero visible signal is a real risk worth
+// surfacing. Kept as a small caption-style line, not a bubble, so it doesn't
+// re-introduce the interruption the earlier decision was avoiding.
+function modelBadgeHtml(answeredBy) {
+  if (!answeredBy || !answeredBy.label) return '';
+  const icon = answeredBy.provider === 'omniroute' ? '⚡'
+    : answeredBy.provider === 'groq' ? '🟢'
+    : answeredBy.provider === 'gemini' ? '🔷'
+    : answeredBy.provider === 'ollama' ? '💻' : '';
+  return `<div class="model-answered-by" title="This reply was generated by ${escHtml(answeredBy.label)}">${icon} ${escHtml(answeredBy.label)}</div>`;
+}
+
+function finalizeAssistantBubble(fullText, htmlPrefix, answeredBy) {
   if (state.currentAssistantBubble) {
     const text = fullText || state.streamBuffer;
-    state.currentAssistantBubble.innerHTML = (htmlPrefix || '') + renderMarkdown(text);
+    state.currentAssistantBubble.innerHTML = (htmlPrefix || '') + renderMarkdown(text) + modelBadgeHtml(answeredBy);
     if (isWarningText(text)) state.currentAssistantBubble.classList.add('warning');
     else if (isCautionText(text)) state.currentAssistantBubble.classList.add('caution');
     attachSpeakButton(state.currentAssistantBubble.parentElement, text);
@@ -5088,7 +5176,24 @@ document.getElementById('settings-open-btn').addEventListener('click', openSetti
     try {
       if (window.api && window.api.dataLoad) {
         const remote = await window.api.dataLoad('align_notes');
-        if (Array.isArray(remote)) { cache = remote; loaded = true; localStorage.setItem(AKEY, JSON.stringify(remote)); return cache; }
+        if (Array.isArray(remote) && remote.length) { cache = remote; loaded = true; localStorage.setItem(AKEY, JSON.stringify(remote)); return cache; }
+        // 2026-08-07 FIX: entries saved BEFORE the 2026-08-06 server-persistence
+        // fix landed are still sitting only in localStorage — they display fine
+        // (this function falls back to the local cache below) but no agent has
+        // ever been able to read them, since formatAlignmentNotes() only reads
+        // the server file. The UI looked correct while being functionally
+        // inert — exactly Anoop's "the alignment tab is just UI" complaint.
+        // One-time migration: if the server has nothing but the local cache
+        // does, push the local cache up so the server file catches up.
+        if (Array.isArray(remote) && !remote.length) {
+          let local = [];
+          try { local = JSON.parse(localStorage.getItem(AKEY)) || []; } catch (e) { local = []; }
+          if (local.length) {
+            console.log('[Alignment] migrating', local.length, 'local-only entries to server');
+            try { if (window.api.dataSave) await window.api.dataSave('align_notes', local); } catch (e) { console.error('Alignment migration failed:', e.message); }
+            cache = local; loaded = true; return cache;
+          }
+        }
       }
     } catch (e) { console.error('Alignment load failed, using local cache:', e.message); }
     try { cache = JSON.parse(localStorage.getItem(AKEY)) || []; } catch (e) { cache = []; }
