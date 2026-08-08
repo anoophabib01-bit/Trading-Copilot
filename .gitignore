@@ -11,3 +11,4 @@ sessions/
 _backup_before_move/
 .gbrain-source
 app/.firecrawl/
+.gstack/

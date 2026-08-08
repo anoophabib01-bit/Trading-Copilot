@@ -5,8 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Co-Pilot</title>
   <link rel="stylesheet" href="styles.css">
-  <!-- G5 PREMIUM PASS (2026-08-08): detail/depth polish over styles.css, loads
-       LAST so it wins the cascade. Remove this one line to fully revert. -->
+  <!-- G5 EXACT PORT (2026-08-08, v3): a literal rule-for-rule port of
+       designs/main-dashboard-20260802/variant-G5-themes.html onto this app's
+       class names. NOT a "polish"/"premium" layer — earlier versions added
+       shadows, sheen and ambient glows that G5 does not have, which is why the
+       result kept landing as only partially matching. G5 is deliberately FLAT.
+       Loads LAST so it wins the cascade. Remove this one line to fully revert. -->
   <link rel="stylesheet" href="g5-premium.css">
   <!-- Apply saved theme before paint to avoid a flash of the wrong theme -->
   <script>(function(){try{var t=localStorage.getItem('copilot-theme');if(t==='dark')document.documentElement.classList.add('theme-dark');else if(t==='graphite')document.documentElement.classList.add('theme-graphite');}catch(e){}})();</script>
