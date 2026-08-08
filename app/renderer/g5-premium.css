@@ -1,242 +1,208 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   G5 PREMIUM PASS — 2026-08-08
-   Anoop: "each part of the landing page should be updated ... feel premium
-   like G5 or better." Indigo is now the default theme.
+   G5 PREMIUM PASS — 2026-08-08  (v2: specificity-hardened)
+   Anoop: "each part of the landing page should feel premium like G5 or better."
+   Indigo is the default theme.
 
-   Isolated on purpose: styles.css already carries six stacked redesign passes,
-   so instead of threading edits through it, this file loads LAST (see the
-   <link> after styles.css in index.html) and wins by cascade. Revert the whole
-   pass by removing that one <link> line — nothing here is destructive.
-
-   Rules are DETAIL-only — backgrounds, borders, shadows, radius, weight,
-   letter-spacing, colour. No width/height/position/flex changes, so it cannot
-   reflow or break the resizable-panel layout. Everything is expressed through
-   the app's own CSS variables (--surface, --accent, --green …) which are
-   already defined per-theme, so Indigo/Graphite/Paper each adapt correctly.
+   Loads LAST (after styles.css in index.html) and is the dedicated OVERRIDE
+   layer. styles.css carries six stacked redesign passes whose selectors are
+   high-specificity (e.g. `html.theme-dark #left-panel .panel-section`), so
+   source-order alone does NOT win — v1 lost the cascade. This layer therefore
+   marks its key visual declarations `!important` so it reliably wins regardless
+   of the existing specificity. It is DETAIL-only (background / border / shadow /
+   radius / weight / colour) — no width/height/position/flex — so it cannot
+   reflow or break the resizable-panel layout. Revert the whole thing by
+   deleting the single g5-premium.css <link> line. All values come from the
+   app's own per-theme variables, so Indigo / Graphite / Paper each adapt.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* ── 1 · Canvas: soft vertical gradient + depth, not a flat fill ──────────── */
+/* ── 1 · Canvas: soft vertical gradient + faint accent glow ───────────────── */
 body{
   background:
-    radial-gradient(1200px 600px at 82% -8%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 60%),
+    radial-gradient(1200px 620px at 84% -10%, color-mix(in srgb, var(--accent) 9%, transparent), transparent 60%),
     linear-gradient(180deg, color-mix(in srgb, var(--surface) 55%, var(--bg)), var(--bg) 62%) !important;
   background-attachment: fixed !important;
 }
 
-/* ── 2 · Cards: hairline top-highlight + soft lift (premium, not heavy) ───── */
+/* ── 2 · Cards: real bordered, lifted panels (the biggest G5 tell) ────────── */
+#left-panel .panel-section,
+#right-panel .analysis-block,
+#tab-analysis .analysis-block,
 .panel-section,
 .analysis-block,
-#settings-box,
 .ins-card{
-  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, #fff 8%), var(--surface)) ;
-  border: 1px solid var(--border);
-  border-radius: 14px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 90%, #ffffff 10%), var(--surface)) !important;
+  border: 1px solid var(--border2) !important;
+  border-radius: 14px !important;
   box-shadow:
-    0 1px 0 0 color-mix(in srgb, #fff 6%, transparent) inset,
-    0 6px 18px -12px rgba(0,0,0,.55);
+    0 1px 0 0 color-mix(in srgb, #ffffff 7%, transparent) inset,
+    0 8px 22px -14px rgba(0,0,0,.6) !important;
+  margin-bottom: 14px !important;
 }
-html.theme-light .panel-section,
-html.theme-light .analysis-block,
-html:not(.theme-dark):not(.theme-graphite) .panel-section,
-html:not(.theme-dark):not(.theme-graphite) .analysis-block{
-  /* Paper: lighter lift, no white top-sheen (would wash out on off-white) */
-  background: var(--surface);
-  box-shadow: 0 4px 14px -12px rgba(0,0,0,.35);
+/* Paper: no white top-sheen (washes out on off-white), lighter lift */
+html:not(.theme-dark):not(.theme-graphite) #left-panel .panel-section,
+html:not(.theme-dark):not(.theme-graphite) .analysis-block,
+html:not(.theme-dark):not(.theme-graphite) .ins-card{
+  background: var(--surface) !important;
+  box-shadow: 0 4px 14px -12px rgba(0,0,0,.3) !important;
 }
 
 /* ── 3 · Section titles: crisp premium eyebrow ───────────────────────────── */
 .section-title,
+#right-panel .block-title,
 .analysis-block .block-title,
 .block-title{
-  text-transform: uppercase;
-  letter-spacing: .12em;
-  font-weight: 700;
-  color: var(--text-dim);
+  text-transform: uppercase !important;
+  letter-spacing: .13em !important;
+  font-weight: 700 !important;
+  color: var(--text-dim) !important;
 }
 
 /* ── 4 · Stat rows + the signature gradient P&L pills ─────────────────────── */
-.stat-label{ color: var(--text-dim); letter-spacing:.02em; }
-.stat-value{ font-weight: 700; color: var(--text); }
-.stat-value.green,
-.stat-value.red{
-  padding: 2px 9px;
-  border-radius: 6px;
-  font-variant-numeric: tabular-nums;
-}
+.stat-label{ color: var(--text-dim) !important; }
+.stat-value{ font-weight: 700 !important; color: var(--text) !important; }
 .stat-value.green{
-  color: var(--green);
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--green) 16%, transparent) 60%, transparent);
+  color: var(--green) !important;
+  padding: 2px 9px !important; border-radius: 6px !important;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--green) 18%, transparent) 60%, transparent) !important;
 }
 .stat-value.red{
-  color: var(--red);
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--red) 15%, transparent) 60%, transparent);
+  color: var(--red) !important;
+  padding: 2px 9px !important; border-radius: 6px !important;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--red) 16%, transparent) 60%, transparent) !important;
 }
-.stat-value.amber{ color: var(--amber); }
-.stat-value.white{ color: var(--text); font-weight: 800; }
+.stat-value.amber{ color: var(--amber) !important; }
+.stat-value.white{ color: var(--text) !important; font-weight: 800 !important; }
 
-/* ── 5 · GO / NO-GO / pending badges: richer, gradient-lit ────────────────── */
+/* ── 5 · GO / NO-GO / pending badges: gradient-lit ───────────────────────── */
 .gonogo-badge{
-  border-radius: 10px;
-  font-weight: 800;
-  letter-spacing: .04em;
-  box-shadow: 0 6px 16px -12px rgba(0,0,0,.6);
+  border-radius: 10px !important; font-weight: 800 !important; letter-spacing: .04em !important;
+  box-shadow: 0 6px 16px -12px rgba(0,0,0,.6) !important;
 }
 .gonogo-badge.pending{
-  background: linear-gradient(180deg, color-mix(in srgb, var(--amber) 16%, var(--surface2)), var(--surface2));
-  border: 1px solid color-mix(in srgb, var(--amber) 55%, var(--border));
-  color: var(--amber);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--amber) 18%, var(--surface2)), var(--surface2)) !important;
+  border: 1px solid color-mix(in srgb, var(--amber) 55%, var(--border)) !important;
+  color: var(--amber) !important;
 }
 .gonogo-badge.nogo{
-  background: linear-gradient(180deg, color-mix(in srgb, var(--red) 18%, var(--surface2)), var(--surface2));
-  border: 1px solid color-mix(in srgb, var(--red) 55%, var(--border));
+  background: linear-gradient(180deg, color-mix(in srgb, var(--red) 20%, var(--surface2)), var(--surface2)) !important;
+  border: 1px solid color-mix(in srgb, var(--red) 55%, var(--border)) !important;
 }
 .gonogo-badge.go{
-  background: linear-gradient(180deg, color-mix(in srgb, var(--green) 18%, var(--surface2)), var(--surface2));
-  border: 1px solid color-mix(in srgb, var(--green) 55%, var(--border));
+  background: linear-gradient(180deg, color-mix(in srgb, var(--green) 20%, var(--surface2)), var(--surface2)) !important;
+  border: 1px solid color-mix(in srgb, var(--green) 55%, var(--border)) !important;
 }
 
-/* ── 6 · Quick-action buttons: tactile, gradient, accent-lit primary ─────── */
+/* ── 6 · Quick-action buttons: tactile, gradient, accent-lit ─────────────── */
+#quick-actions .qa-btn,
 .qa-btn{
-  background: linear-gradient(180deg, var(--surface2), color-mix(in srgb, var(--surface2) 82%, var(--bg)));
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  font-weight: 700;
-  color: var(--text-mid);
-  transition: transform .08s ease, border-color .12s ease, box-shadow .12s ease, background .12s ease;
+  background: linear-gradient(180deg, var(--surface2), color-mix(in srgb, var(--surface2) 80%, var(--bg))) !important;
+  border: 1px solid var(--border2) !important;
+  border-radius: 10px !important;
+  font-weight: 700 !important;
+  color: var(--text-mid) !important;
+  transition: transform .08s ease, border-color .12s ease, box-shadow .12s ease !important;
 }
 .qa-btn:hover{
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
-  box-shadow: 0 8px 20px -14px rgba(0,0,0,.7);
-  transform: translateY(-1px);
-  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border)) !important;
+  box-shadow: 0 8px 20px -14px rgba(0,0,0,.7) !important;
+  transform: translateY(-1px) !important;
+  color: var(--text) !important;
 }
-.qa-btn:active{ transform: translateY(0); }
-.qa-btn .btn-icon{ color: var(--text-dim); }
+.qa-btn .btn-icon{ color: var(--text-dim) !important; }
 .qa-btn.primary{
-  background: linear-gradient(90deg, color-mix(in srgb, var(--green) 16%, var(--surface2)), var(--surface2) 78%);
-  border-color: color-mix(in srgb, var(--green) 60%, var(--border));
-  color: var(--text);
+  background: linear-gradient(90deg, color-mix(in srgb, var(--green) 18%, var(--surface2)), var(--surface2) 78%) !important;
+  border-color: color-mix(in srgb, var(--green) 60%, var(--border)) !important;
+  color: var(--text) !important;
 }
-.qa-btn.primary .btn-icon{ color: var(--green); }
-.qa-btn.primary:hover{ border-color: var(--green); }
+.qa-btn.primary .btn-icon{ color: var(--green) !important; }
 .qa-btn.danger{
-  background: linear-gradient(90deg, color-mix(in srgb, var(--red) 14%, var(--surface2)), var(--surface2) 78%);
-  border-color: color-mix(in srgb, var(--red) 55%, var(--border));
-  color: var(--red);
+  background: linear-gradient(90deg, color-mix(in srgb, var(--red) 16%, var(--surface2)), var(--surface2) 78%) !important;
+  border-color: color-mix(in srgb, var(--red) 55%, var(--border)) !important;
+  color: var(--red) !important;
 }
-.qa-btn.danger .btn-icon{ color: var(--red); }
+.qa-btn.danger .btn-icon{ color: var(--red) !important; }
 
 /* ── 7 · Center header: sharper hierarchy ────────────────────────────────── */
-#chat-header .instrument{ font-weight: 800; letter-spacing: .01em; }
-#chat-header .price{ font-weight: 800; }
+#chat-header .instrument{ font-weight: 800 !important; }
+#chat-header .price{ font-weight: 800 !important; }
 #chat-header .tf-badge{
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-dim);
-  font-weight: 700;
+  border: 1px solid var(--border2) !important; border-radius: 6px !important;
+  color: var(--text-dim) !important; font-weight: 700 !important;
 }
 #chat-header .mode-pill{
-  border-radius: 20px;
-  font-weight: 800;
-  letter-spacing: .04em;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--amber) 16%, var(--surface2)), var(--surface2));
-  border: 1px solid color-mix(in srgb, var(--amber) 55%, var(--border));
-  color: var(--amber);
+  border-radius: 20px !important; font-weight: 800 !important; letter-spacing: .04em !important;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--amber) 18%, var(--surface2)), var(--surface2)) !important;
+  border: 1px solid color-mix(in srgb, var(--amber) 55%, var(--border)) !important;
+  color: var(--amber) !important;
 }
-#chat-header button{
-  border-radius: 9px;
-  font-weight: 700;
-  transition: transform .08s ease, box-shadow .12s ease, border-color .12s ease;
-}
-#chat-header button:hover{ transform: translateY(-1px); box-shadow: 0 8px 18px -14px rgba(0,0,0,.7); }
-#scalper-agent-btn.active{
-  background: var(--accent); color: #fff; border-color: var(--accent);
-}
-#voice-mode-btn.active{
-  background: var(--accent); color: #fff; border-color: var(--accent);
+#chat-header button{ border-radius: 9px !important; font-weight: 700 !important; }
+#scalper-agent-btn.active,
+#voice-mode-btn.active,
+#debate-mode-btn.active{
+  background: var(--accent) !important; color: #fff !important; border-color: var(--accent) !important;
 }
 
-/* ── 8 · Chat bubbles: premium spacing + depth ───────────────────────────── */
-.msg-bubble{
-  border-radius: 14px;
-  line-height: 1.58;
-  box-shadow: 0 6px 20px -16px rgba(0,0,0,.7);
+/* ── 8 · Chat bubbles: premium depth + tint ──────────────────────────────── */
+#messages .msg-bubble{
+  border-radius: 14px !important; line-height: 1.58 !important;
+  box-shadow: 0 6px 20px -16px rgba(0,0,0,.7) !important;
 }
-.msg.user .msg-bubble{
-  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 14%, var(--surface2)), var(--surface2));
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+#messages .msg.user .msg-bubble{
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 16%, var(--surface2)), var(--surface2)) !important;
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border)) !important;
 }
-.msg.assistant .msg-bubble{
-  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 94%, #fff 6%), var(--surface));
-  border: 1px solid var(--border);
+#messages .msg.assistant .msg-bubble{
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, #ffffff 8%), var(--surface)) !important;
+  border: 1px solid var(--border2) !important;
+}
+html:not(.theme-dark):not(.theme-graphite) #messages .msg.assistant .msg-bubble{
+  background: var(--surface) !important;
 }
 
 /* ── 9 · Input row: single premium pill ──────────────────────────────────── */
 #input-row{
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  box-shadow: 0 6px 20px -16px rgba(0,0,0,.7);
+  background: var(--surface2) !important;
+  border: 1px solid var(--border2) !important;
+  border-radius: 14px !important;
+  box-shadow: 0 6px 20px -16px rgba(0,0,0,.7) !important;
 }
-#send-btn{
-  background: var(--accent);
-  color: #fff;
-  border-radius: 10px;
-  font-weight: 800;
+#send-btn{ background: var(--accent) !important; color: #fff !important; border-radius: 10px !important; font-weight: 800 !important; }
+#input-hints .hint-chip{
+  background: var(--surface2) !important; border: 1px solid var(--border) !important;
+  border-radius: 14px !important; color: var(--text-dim) !important; font-weight: 600 !important;
 }
-#send-btn:hover{ filter: brightness(1.08); }
-.hint-chip{
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  color: var(--text-dim);
-  font-weight: 600;
-  transition: border-color .12s ease, color .12s ease;
-}
-.hint-chip:hover{ color: var(--text); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+#input-hints .hint-chip:hover{ color: var(--text) !important; border-color: color-mix(in srgb, var(--accent) 45%, var(--border)) !important; }
 
 /* ── 10 · Right-panel tabs: solid accent pill on active ──────────────────── */
-.rtab{
-  font-weight: 700;
-  letter-spacing: .06em;
+#right-tabs .rtab{ font-weight: 700 !important; letter-spacing: .05em !important; }
+#right-tabs .rtab.active{
+  background: var(--accent) !important;
+  color: #fff !important;
+  border-radius: 8px !important;
+  border-bottom-color: transparent !important;
+  box-shadow: 0 6px 16px -12px color-mix(in srgb, var(--accent) 80%, transparent) !important;
 }
-.rtab.active{
-  background: var(--accent);
-  color: #fff;
-  border-radius: 8px;
-  box-shadow: 0 6px 16px -12px color-mix(in srgb, var(--accent) 80%, transparent);
-}
-/* Paper/Graphite accents are light — keep readable dark text on the active pill */
-html.theme-graphite .rtab.active,
-html:not(.theme-dark):not(.theme-graphite) .rtab.active{ color: var(--surface); }
+html.theme-graphite #right-tabs .rtab.active,
+html:not(.theme-dark):not(.theme-graphite) #right-tabs .rtab.active{ color: var(--surface) !important; }
 
 /* ── 11 · Bias + key-level displays: headline treatment ──────────────────── */
-.bias-display{ font-weight: 800; letter-spacing: .01em; }
-.bias-display.bullish{ color: var(--green); }
-.bias-display.bearish{ color: var(--red); }
-.level-display{
-  font-family: 'JetBrains Mono', 'Consolas', monospace;
-  font-weight: 800;
-  letter-spacing: .01em;
+#right-panel .bias-display{ font-weight: 800 !important; letter-spacing: .01em !important; }
+#right-panel .bias-display.bullish{ color: var(--green) !important; }
+#right-panel .bias-display.bearish{ color: var(--red) !important; }
+#right-panel .level-display{
+  font-family: 'JetBrains Mono','Consolas',monospace !important;
+  font-weight: 800 !important;
 }
-
-/* Bias card gets a faint directional tint so it reads as the hero card */
+/* Hero Bias card: faint directional tint */
 #tab-analysis .analysis-block:first-child{
   background:
-    linear-gradient(120deg, color-mix(in srgb, var(--accent) 8%, transparent), transparent 62%),
-    var(--surface);
+    linear-gradient(120deg, color-mix(in srgb, var(--accent) 10%, transparent), transparent 62%),
+    var(--surface) !important;
 }
 
-/* ── 12 · Small buttons (check-now etc.): consistent premium chip ─────────── */
+/* ── 12 · Small chips / check-now buttons: consistent premium ─────────────── */
 .engulf-check-btn{
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-weight: 700;
-  color: var(--text-mid);
-  transition: border-color .12s ease, color .12s ease;
+  background: var(--surface2) !important; border: 1px solid var(--border2) !important;
+  border-radius: 8px !important; font-weight: 700 !important; color: var(--text-mid) !important;
 }
-.engulf-check-btn:hover{
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-  color: var(--text);
-}
+.engulf-check-btn:hover{ border-color: color-mix(in srgb, var(--accent) 45%, var(--border)) !important; color: var(--text) !important; }
