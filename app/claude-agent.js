@@ -25,6 +25,29 @@ function isTokenOptDisabled() {
   }
 }
 
+// 2026-08-11: the model used to be hardcoded 'claude-sonnet-4-6' at the call
+// site, which meant changing it required editing this file. Anoop is funding
+// this from a small prepaid balance and needs to trade cost against quality
+// himself, so it now reads `claudeModel` from ~/.mnq-copilot-config.json.
+//
+// Default is Haiku 4.5, chosen deliberately: roughly a third of Sonnet's input
+// price, and — unlike the free models that broke the app on 08-10 — it is a
+// first-party model with reliable tool-calling, which is non-negotiable here
+// (Jessi is useless if she can't actually invoke app_get_data).
+// If coaching quality feels thin, set "claudeModel": "claude-sonnet-4-6" in that
+// config file and restart. No code change needed.
+// Note: Haiku 3.5 is NOT a valid option — it was retired on the first-party API
+// (Bedrock/Vertex only). Requesting it returns a model-not-found error.
+const DEFAULT_CLAUDE_MODEL = 'claude-haiku-4-5';
+function claudeModel() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    return cfg.claudeModel || DEFAULT_CLAUDE_MODEL;
+  } catch {
+    return DEFAULT_CLAUDE_MODEL;
+  }
+}
+
 // ── Mode-specific rule blocks ──────────────────────────────────────────────────
 const EVAL_RULES = `
 ## CURRENT MODE: EVALUATION (Stage 1)
@@ -181,15 +204,27 @@ The app itself (not you) marks current Week High/Low and current Month High/Low 
 11. chart_set_timeframe("240") → restore to 4H
 Always output: bias direction, key level, setup validity NOW, what to wait for.
 
-Today is 2026-07-02. London Session: 1:30–3:00 PM IST (prep/small-size). NY Session: 7:00–9:00 PM IST (13:30–15:30 UTC, primary).
+London Session: 1:30–3:00 PM IST (prep/small-size). NY Session: 7:00–9:00 PM IST (13:30–15:30 UTC, primary).
 Primary: MNQ1!. Secondary: MGC (NEVER both on the same day, even across sessions).
-Long-term mission: erase $10,784.50 lifetime losses → payouts → 3 evals simultaneously → copy trading.
+Long-term mission: erase $10,784.50 lifetime losses → payouts → 3 evals simultaneously → copy trading.`;
 
-NOTE TO SELF: "Today is" above is a static string — it will go stale again. When reasoning about dates, prefer the actual current date from context/tools over this hardcoded value if they ever disagree.`;
+// Current date/time in IST, computed fresh per request. REPLACES a previously
+// hardcoded date line that sat in SHARED_RULES and went ~6 weeks stale — the AI
+// thought it was July when it was August, so every "today"/"yesterday" and
+// day-of-week was wrong. All app data and uploaded Tradovate reports are IST
+// wall-clock, so anchor the model in IST explicitly. Never hardcode a date here
+// again — app/test/date-anchor.test.js fails the build if a fixed date returns.
+function istDateLine() {
+  const now = new Date();
+  const date = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });        // YYYY-MM-DD
+  const weekday = now.toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata', weekday: 'long' });
+  const time = now.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false });
+  return `CURRENT DATE/TIME: Today is ${date} (${weekday}), ${time} IST. Everything in this app and in every uploaded trade report (Tradovate CSV) is Indian Standard Time (IST, UTC+5:30) — the trader is in India trading the US market. Resolve "today", "yesterday", and any day-of-week strictly in IST from this anchor. Never guess the date or day-of-week; use this line.`;
+}
 
 function buildSystemPrompt(mode) {
   const modeBlock = mode === 'eval' ? EVAL_RULES : FUNDED_RULES;
-  return `You are Anoop Habib's real-time trading co-pilot. You have live access to his TradingView Desktop chart via MCP tools. Your job: analyze live charts, enforce rules, call out violations, guide entries, and log sessions.\n${modeBlock}\n${SHARED_RULES}`;
+  return `You are Anoop Habib's real-time trading co-pilot. You have live access to his TradingView Desktop chart via MCP tools. Your job: analyze live charts, enforce rules, call out violations, guide entries, and log sessions.\n${istDateLine()}\n${modeBlock}\n${SHARED_RULES}`;
 }
 
 // ── TradingView tools ──────────────────────────────────────────────────────────
@@ -229,12 +264,29 @@ const ALL_TOOLS = [...TV_TOOLS, ...BOOK_TOOLS];
 // breakpoint on the last one. Built once at module load (the tool list is
 // static) rather than per-call. Kept as a separate array so token-audit.js's
 // _debug.ALL_TOOLS (used for token counting, not live calls) stays the plain,
-// uncached shape. Standard ephemeral (5-min) TTL only — the SDK pinned here
-// (@anthropic-ai/sdk 0.39.0) has no `ttl` field on CacheControlEphemeral, so
-// the 1-hour TTL option isn't safe to use without an SDK upgrade + live
-// verification first (see TODOS.md: tool-scoping/cache-cadence follow-up).
+// uncached shape.
+//
+// 2026-08-11 — 1-HOUR TTL NOW ENABLED (was the 5-minute default).
+// The old note here said the pinned SDK 0.39.0 had no `ttl` field on
+// CacheControlEphemeral, so 1h wasn't safe to use. That's resolved: the SDK is
+// now 0.116.0, where CacheControlEphemeral declares `ttl?: '5m' | '1h'` on the
+// main (non-beta) messages resource — no beta header required. Verified against
+// the installed type definitions before flipping this on.
+//
+// Why it matters for Anoop specifically: the cached block is ~19.6K tokens
+// (system prompt + 23 tool schemas) and is byte-identical on every call. On the
+// 5m TTL his usage pattern — a burst of questions, then a long gap watching the
+// chart, then another burst — expired the cache between bursts, so most calls
+// paid a full-price cache WRITE instead of a 0.1x READ. A 1h window covers a
+// whole London or NY session in one cache lifetime.
+// Trade-off, deliberately accepted: a 1h cache write costs 2x base input vs
+// 1.25x for 5m. So this is a LOSS if he asks one question and closes the app,
+// and a large win from roughly the third call onward in a session. Given a
+// session is 20+ calls, that's the right side of the bet.
+const CACHE_TTL = '1h';
+const CACHE_CONTROL = { type: 'ephemeral', ttl: CACHE_TTL };
 const ALL_TOOLS_CACHED = ALL_TOOLS.map((t, i) =>
-  i === ALL_TOOLS.length - 1 ? { ...t, cache_control: { type: 'ephemeral' } } : t
+  i === ALL_TOOLS.length - 1 ? { ...t, cache_control: { ...CACHE_CONTROL } } : t
 );
 
 class ClaudeAgent {
@@ -270,7 +322,7 @@ class ClaudeAgent {
     const tokenOptOff = isTokenOptDisabled();
     const systemForRequest = tokenOptOff
       ? systemPrompt
-      : [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }];
+      : [{ type: 'text', text: systemPrompt, cache_control: { ...CACHE_CONTROL } }];
     const toolsForRequest = tokenOptOff ? ALL_TOOLS : ALL_TOOLS_CACHED;
     const abortCtrl = new AbortController();
     // 2026-08-06: real end-to-end cancellation. `signal` is an external
@@ -293,7 +345,7 @@ class ClaudeAgent {
       let stream;
       try {
         stream = await this.client.messages.stream({
-          model: 'claude-sonnet-4-6',
+          model: claudeModel(),
           max_tokens: 4096,
           system: systemForRequest,
           tools: toolsForRequest,
@@ -350,6 +402,26 @@ class ClaudeAgent {
         stopReason,
         toolCallCount: toolUseBlocks.length,
       });
+
+      // 2026-08-11: print the cache outcome of every call to the server console.
+      // Anoop asked "where do I check prompt caching is enabled?" — the startup
+      // banner only proves the kill switch is OFF, it does NOT prove the API
+      // actually cached anything. These are the API's own reported numbers, so
+      // they're the real evidence:
+      //   WRITE = first call of a cache lifetime (billed 2x input at 1h TTL)
+      //   READ  = a hit (billed 0.1x input) — this is where the money is saved
+      //   MISS  = neither, i.e. caching silently not working — investigate
+      // Expect one WRITE then READs for the rest of the hour. If you only ever
+      // see WRITE, the cached prefix is changing between calls and the 1h TTL
+      // is buying nothing.
+      try {
+        const u = finalMsg.usage || {};
+        const wrote = u.cache_creation_input_tokens || 0;
+        const read  = u.cache_read_input_tokens || 0;
+        const fresh = u.input_tokens || 0;
+        const tag = read ? `READ ${read}` : (wrote ? `WRITE ${wrote}` : 'MISS');
+        console.log(`[cache ${CACHE_TTL}] ${tag} · uncached-in ${fresh} · out ${u.output_tokens || 0}`);
+      } catch (e) {}
 
       if (stopReason === 'tool_use' && toolUseBlocks.length > 0) {
         const assistantContent = finalMsg.content;
