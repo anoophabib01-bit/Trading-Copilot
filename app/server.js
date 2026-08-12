@@ -56,18 +56,160 @@ const STANDARD_FALLBACK_CHAIN = [
   { provider: 'gemini', model: 'gemini-2.5-flash' },
   { provider: 'groq',   model: 'openai/gpt-oss-20b' }
 ];
+// 2026-08-10 (revised — reverted the 08-10 Scalper-only-model experiment
+// above this comment): Anoop wants ONE shared code path across Jessi/
+// Scalper/Debate/PO3, not a Scalper-specific carve-out — and OmniRoute
+// itself is the fix, not a reason to route around it. Confirmed directly in
+// the OmniRoute dashboard (Combos page): OmniRoute ships a built-in
+// "auto-routing catalog" of 17 template IDs, "resolved dynamically from
+// connected providers... use any of these IDs as the model field, no setup
+// needed." 'auto/best-free' is tagged specifically for free-tier routing —
+// with only OpenCode Free connected right now, it spreads load across that
+// provider's 6 active built-in models (deepseek-v4-flash, mimo-v2.5, hy3,
+// nemotron-3-ultra, north-mini-code, big-pickle) instead of pinning every
+// request to the single deepseek-v4-flash-free model that choked on the
+// oversized Scalper request. That's real multi-model resilience, not a
+// single-model illusion of it — the previous default was one free model
+// wearing an "OmniRoute" label.
+// Left deliberately at 'auto/best-free', not 'auto/best-reasoning' or
+// 'auto/claude-opus' (both exist in the same catalog and would be the
+// genuine heavy-reasoning tier): those two are tagged "premium" in the
+// catalog, and this OmniRoute instance has zero premium/paid/OAuth
+// providers connected (Providers page: OAuth 0/20, no API-key-compatible
+// providers added) — routing to them today would very likely resolve to no
+// usable candidate and fail the same way the old chain did. Connecting a
+// paid or OAuth provider in OmniRoute unlocks those tiers; that's a
+// provider-connection action Anoop would do himself in the OmniRoute UI.
+// 2026-08-10 (later same day — superseded 'auto/best-free' above): Anoop
+// asked for auto/smart-style quality-first routing but "only free models in
+// his category" as a hard constraint. Plain 'auto/smart' was rejected
+// because its candidate pool spans ALL connected providers with no free
+// filter — this instance also has Novita AI/Pollinations/ZenMux/Segmind/
+// Freepik connected, none of them vetted for chat completions or confirmed
+// free-only, so auto/smart could legally route a live-trading Jessi/Scalper
+// call to a paid model with zero warning.
+// Built a custom persisted combo instead — 'free-quality-first' (OmniRoute
+// dashboard → Combos), "Intelligent Auto" strategy, "Quality First" mode
+// pack (OmniRoute's own built-in weighting, not hand-rolled) — with three
+// independent layers restricting it to free-only:
+//   1. Candidate Pool scoped to exactly 3 providers (GitHub Models,
+//      OpenCode Free, OpenRouter) — excludes the 5 unvetted/irrelevant ones.
+//   2. An explicit 11-model Model Sequence, hand-picked for confirmed
+//      "-free"/":free"-tagged or zero-cost slugs only: GitHub Models'
+//      deepseek-r1-0528, llama-4-maverick-17b-128e-instruct-fp8,
+//      mistral-medium-2505, gpt-5, o3, phi-4-reasoning (all free on GitHub
+//      Models — its only paid items are 2 unused embedding models);
+//      OpenRouter's nvidia/nemotron-3-ultra-550b-a55b:free,
+//      nemotron-3-super-120b-a12b:free, nemotron-3-nano-omni-30b-a3b-
+//      reasoning:free; OpenCode Free's deepseek-v4-flash-free and
+//      nemotron-3-ultra-free. Deliberately excluded OpenCode Free's
+//      claude-opus-5/gpt-5.5-pro/grok-4.5/etc. — same "OpenCode Free"
+//      connection, but those model names carry no free-tier marking and are
+//      almost certainly paid, so leaving them out of the step list is the
+//      safer default until Anoop confirms otherwise.
+//   3. A $0.001/request Budget Cap as a hard technical backstop — even if
+//      (1) or (2) ever admit a mispriced entry, the cap should exclude it
+//      before it can bill. (The field silently reset to "no limit" on a
+//      literal 0, so 0.001 is the practical floor, not 0.)
+// Verified empirically, not just configured: fired a real completion
+// through 'free-quality-first' via /v1/chat/completions from the OmniRoute
+// dashboard's own origin — HTTP 200, x-selected-model came back
+// 'deepseek-v4-flash-free', i.e. routing stayed inside the curated free set
+// on the very first live call. First call took ~35-40s (cold start, no
+// cached provider health/quota yet); untested whether steady-state latency
+// during a live session is materially better — worth a real smoke test per
+// the Prompt/LLM changes checklist above before leaning on this in a
+// session that matters.
+// 2026-08-10 (same day — HOLD above lifted, ~20min later): Anoop re-authed
+// the OpenRouter connection in OmniRoute (was sending no key at all — see the
+// HOLD note this replaces, kept in git history). Re-ran POST /api/combos/test
+// {comboName:'free-quality-first'} to confirm rather than trusting the UI fix
+// blindly: all 3 OpenRouter steps now come back status:"ok" (2.9s/4.1s/14.6s),
+// resolvedBy landed on step 7 (nvidia/nemotron-3-ultra-550b-a55b:free).
+// Still broken, unchanged from the HOLD note, both external to this fix:
+// GitHub Models' 6 steps still 410 "scheduled retirement brownout" (GitHub's
+// side — re-test later, don't chase it here), OpenCode Free's 2 steps still
+// flat 20s timeouts with no error message (cause still unknown — worth a
+// closer look if it hasn't cleared on its own next time this is re-tested).
+// Net effect: right now this combo is functionally "OpenRouter's 3 free
+// Nemotron models," not the full 11-candidate pool it was designed as — real
+// resilience, but reduced. That's still strictly better than the 100%-failure
+// state the HOLD was protecting against, and better than auto/best-free's
+// keyless-scraper fallback (see HOLD note in git history), so re-enabling.
+// 2026-08-10 (same day, ~15min later): GitHub Models' "brownout" was never
+// coming back — checked, the whole service was permanently retired 2026-07-30
+// (github.blog/changelog). Removed its 6 dead steps from the free-quality-
+// first combo itself (OmniRoute dashboard, not this file — the combo's model
+// list lives server-side in OmniRoute). Combo is now 5 steps: OpenRouter's 3
+// free Nemotron models + OpenCode Free's 2. Re-tested after trimming:
+// resolves on the first step now (~14s, that's Nemotron Ultra 550B's real
+// response time, not dead-step latency) instead of walking 6 guaranteed
+// failures first. OpenCode Free's 20s timeout is still unexplained and still
+// there — not urgent since OpenRouter covers the combo on its own, but if
+// this gets revisited, that's the one loose end left.
+//
+// ── 2026-08-10 21:00 IST — REVERTED. Read this before re-enabling OmniRoute. ──
+// Everything above this line was a mistake, and it broke Anoop's app during a
+// live evening. Symptoms he hit within ~2h of the change: "Debate failed:
+// Jessi (OmniRoute) timed out after 90s", the PO3 agent erroring out, and
+// Jessi emitting a raw `{"section":"insights"}` blob into the chat instead of
+// actually calling the tool.
+// Root cause, and the lesson: I validated the combo with a ONE-WORD prompt
+// ("Reply with exactly one word: OK") and treated 14-20s as acceptable. It is
+// not. Jessi/Debate/PO3 send a large system prompt plus tool schemas plus
+// account context, and they need real tool-calling. Free-tier Nemotron models
+// are far too slow for that (90s timeout blown) and unreliable at structured
+// tool-use (hence the raw JSON leaking into the UI). A latency figure from a
+// trivial prompt says nothing about behavior under the real agent workload —
+// do not accept one as validation again.
+// Reverting to the pre-2026-08-10 behavior: Gemini primary, with the
+// STANDARD_FALLBACK_CHAIN behind it. Paid API keys, known latency, proven
+// tool-calling. OmniRoute is bypassed entirely (this deliberately ignores
+// cfg.disableOmniRoute rather than depending on a config file that may not
+// have the flag set).
+// Before ANY future attempt to route these agents through free models: test
+// with a real Jessi-sized payload (full system prompt + tool schemas + context)
+// and confirm tool-calling works end-to-end, not a toy prompt. Honestly, the
+// better answer is probably to stop chasing $0 inference for a live-money
+// trading tool at all — one paid provider removes this whole class of failure.
+// ── 2026-08-11 (evening): ANTHROPIC IS NOW PRIMARY FOR ALL NINE CALL SITES ──
+// The interim "everything on Gemini" state above did its job — it made the app
+// behave in one direction so it stopped being a mystery — but the goal was
+// always Anthropic everywhere. groq-agent.js now speaks 'anthropic' (via
+// Anthropic's OpenAI-compatible endpoint, so the existing SSE/tool pipeline is
+// unchanged), so this one function switches the whole app.
+//
+// Model default is Haiku 4.5: first-party, reliable tool-calling — the property
+// the free models catastrophically lacked on 08-10 — at roughly a third of
+// Sonnet's input price. Override with "agentModel" in
+// ~/.mnq-copilot-config.json without touching code.
+//
+// FAIL-OPEN IS PRESERVED, and that matters more than the provider choice: if
+// the Anthropic key is missing, the balance runs out mid-session, or the API
+// errors, fallbackChainFor() drops straight through to Gemini and then Groq —
+// the same chain that has been carrying this app for weeks. A dead prepaid
+// balance must never mean a dead co-pilot in the middle of a session.
 function primaryProviderModel() {
   const cfg = loadConfig();
-  if (!cfg.disableOmniRoute && groqAgent.isOmniRouteReady()) {
-    return { provider: 'omniroute', model: cfg.omniRouteModel || 'oc/deepseek-v4-flash-free' };
+  if (cfg.apiKey && !cfg.disableAnthropic) {
+    return { provider: 'anthropic', model: cfg.agentModel || 'claude-haiku-4-5' };
   }
   return { provider: 'gemini', model: 'gemini-3.5-flash' };
 }
 // When OmniRoute is primary, Gemini's own default model rejoins the chain as
 // the first fallback step (it was the primary before OmniRoute existed);
 // otherwise the chain is unchanged from before this feature was added.
+// 2026-08-11: 'anthropic' joins 'omniroute' in getting gemini-3.5-flash spliced
+// in as the FIRST fallback step. Caught while wiring Anthropic in: without
+// this, an Anthropic failure fell straight to STANDARD_FALLBACK_CHAIN, whose
+// first two entries are gemini-3.1-flash-lite and gemini-2.5-flash — and this
+// file's own notes record that Google closed the 2.5 line to new accounts
+// (a live 404). So the chain would have burned two steps on possibly-dead
+// model IDs before reaching Groq, at exactly the moment the primary had
+// already failed. gemini-3.5-flash is the model that has actually been serving
+// this app, so it belongs at the front of any fail-open path.
 function fallbackChainFor(primary) {
-  return primary.provider === 'omniroute'
+  return (primary.provider === 'omniroute' || primary.provider === 'anthropic')
     ? [{ provider: 'gemini', model: 'gemini-3.5-flash' }, ...STANDARD_FALLBACK_CHAIN]
     : STANDARD_FALLBACK_CHAIN;
 }
@@ -639,8 +781,9 @@ function handleConfigSet(ws, msg) {
   if (msg.key === 'apiKey') claudeAgent.init(msg.value);
   if (msg.key === 'groqApiKey') groqAgent.init(msg.value);
   if (msg.key === 'geminiApiKey') groqAgent.initGemini(msg.value);
-  if (msg.key === 'omniRouteApiKey') groqAgent.initOmniRoute(msg.value, cfg.omniRouteBaseUrl);
-  if (msg.key === 'omniRouteBaseUrl') groqAgent.initOmniRoute(cfg.omniRouteApiKey, msg.value);
+  if (msg.key === 'apiKey') groqAgent.initAnthropic(msg.value);
+  if (msg.key === 'omniRouteApiKey') { groqAgent.initOmniRoute(msg.value, cfg.omniRouteBaseUrl); groqAgent.probeOmniRouteHealth(); }
+  if (msg.key === 'omniRouteBaseUrl') { groqAgent.initOmniRoute(cfg.omniRouteApiKey, msg.value); groqAgent.probeOmniRouteHealth(); }
   if (msg.key === 'tvEnabled') startTradovate();
   send(ws, { type: 'config-saved', key: msg.key });
 }
@@ -674,10 +817,40 @@ async function handleChat(ws, msg) {
 
   const abortCtrl = registerRequest(reqId);
   try {
-    await claudeAgent.stream(messages, {
-      mode: currentMode,
-      extraContext,
+    // ── 2026-08-11: ONE PROVIDER, ONE DIRECTION ──────────────────────────────
+    // Until today this single handler was the ONLY one of the app's nine AI
+    // call sites that used Anthropic (via claude-agent.js); the other eight all
+    // went through groq-agent.js on Gemini. Nothing surfaced that split in the
+    // UI, so "which model am I talking to?" had no answer you could see — and
+    // it cost Anoop hours of confusion trying to work out whether his Anthropic
+    // key was live.
+    //
+    // handleChat now uses the SAME groqAgent.stream() + primaryProviderModel()
+    // path as every other agent, so switching provider is one function, in one
+    // place, for the whole app. claude-agent.js is deliberately NOT deleted —
+    // it holds the working native-Anthropic implementation (prompt caching, 1h
+    // TTL, tool loop) that the forthcoming Anthropic adapter for groq-agent.js
+    // will be modelled on. Its system prompt and tool definitions are reused
+    // here via its _debug export so there is still exactly one copy of the
+    // Claude-path persona and toolset in the codebase.
+    //
+    // Tool-shape note: claude-agent's ALL_TOOLS are Anthropic-shaped
+    // ({name, description, input_schema}); groq-agent speaks OpenAI shape
+    // ({type:'function', function:{name, description, parameters}}). Converted
+    // inline below. This conversion disappears once the native adapter lands.
+    const systemPrompt = claudeAgent._debug.buildSystemPrompt(currentMode)
+      + (extraContext ? '\n\n' + extraContext : '');
+    const chatTools = claudeAgent._debug.ALL_TOOLS.map(t => ({
+      type: 'function',
+      function: { name: t.name, description: t.description, parameters: t.input_schema }
+    }));
+    const primary = primaryProviderModel();
+    await groqAgent.stream(messages, systemPrompt, chatTools, {
+      provider: primary.provider,
+      model: primary.model,
+      temperature: 0.85,
       signal: abortCtrl.signal,
+      fallbackChain: fallbackChainFor(primary),
       onToken:    (text)              => send(ws, { type: 'chat-token',     reqId, text }),
       onToolStart:(name, id)          => send(ws, { type: 'chat-tool-start',reqId, name, id }),
       onToolDone: (name, id, ok, res) => send(ws, { type: 'chat-tool-done', reqId, name, id, ok, result: res }),
@@ -697,7 +870,38 @@ async function handleChat(ws, msg) {
 // message when it looks needed — not a standing background poll).
 const JESSI_PERSONA = `You are Jessi Livermore — Anoop Habib's accountability coach and psychological companion for prop-firm trading, built into his MNQ Co-Pilot app. Named after the trader Jesse Livermore (Anoop's own spelling, not corrected).
 
-Who you're talking to: Anoop Habib, Hubballi, Karnataka, India (IST). Trades MNQ (Micro Nasdaq) and MGC (Micro Gold) as a Lucid Trading prop-firm scalper. Lifetime losses to recover: ~$10,784.50 across blown accounts and eval fees. He has blown 16 prop accounts before this one — every single one hit its Max Loss Limit, and every post-mortem shows the same handful of failure modes (trade-count escalation, revenge clusters, inverted R:R, holding losers, multi-instrument days, giving back gains after being up). You know this history. Reference it plainly when it's relevant — don't soften it.
+Who you're talking to: Anoop Habib, Hubballi, Karnataka, India (IST). Trades MNQ (Micro Nasdaq) and MGC (Micro Gold) as a Lucid Trading prop-firm scalper. He has blown 16 prop accounts before this one — every single one hit its Max Loss Limit, and every post-mortem shows the same handful of failure modes (trade-count escalation, revenge clusters, inverted R:R, holding losers, multi-instrument days, giving back gains after being up). You know this history. Reference it plainly when it's relevant — don't soften it.
+## COACHING PROTOCOL (added 2026-08-11 at Anoop's request — follow this every reply)
+Anoop's words: "It is just pointing out to me that I am making the mistake. There is no
+motivation... it should motivate me to keep calm, relax, and trade when needed."
+He is right. Until now you were only ever handed losses, violations and blown accounts,
+so every reply read like a prosecution. You now also receive a PROCESS section
+(app_get_data "process"). Use it. The rules:
+
+1. LEAD WITH WHAT IS WORKING. Open with something true and specific he did right —
+   a clean day, a discipline streak, a loss he cut properly, a day he chose not to
+   trade. Pull it from the PROCESS data, never invent it. If there is genuinely
+   nothing, say so plainly and move on — do not manufacture praise.
+2. A RED DAY WITH CLEAN RULES IS A WIN. Say it in those words. Process is the score,
+   P&L is the weather.
+3. NOT TRADING IS A RESULT, NOT A GAP. Waiting, standing down, and stopping early are
+   the skill itself. Never imply he "did nothing" on a no-trade day.
+4. SAY YES WHEN IT IS YES. If conditions genuinely align and his process is clean, say
+   so clearly and without hedging. A coach who only ever says no carries no information —
+   his NO stops meaning anything, and he starts ignoring both. This matters for his
+   safety, not his mood.
+5. ONE correction per reply, maximum. Name the single highest-leverage thing. Do not
+   stack every failure mode into one message — a list of everything wrong is not
+   coaching, it is noise, and he stops reading.
+6. AFTER A LOSING DAY, DO NOT PILE ON. He already knows. Acknowledge it once, then go to
+   what he controls tomorrow. Never re-litigate a closed day he has already accepted.
+7. NEVER talk him INTO a trade. Motivation here means calm, patience and staying in his
+   own rules — never urgency, never making back losses, never "conditions look good, go".
+   Encouraging entry is the one thing this protocol does not authorise.
+8. TONE: calm and steady. He is not lazy or reckless — he is a trader with a specific,
+   identified impulse-control failure under loss. Treat him as capable of fixing it.
+
+MONEY FIGURES: never quote a lifetime-spend, payout or breakeven number from memory. The live figures are in the COST line of the ACCOUNT & TRADE DATA block below (fed straight from his Cost tab). Quote those and nothing else. A hardcoded total was removed from this prompt on 2026-08-11 precisely because it had drifted out of sync with that tab and agents were repeating the stale number as fact.
 
 Your role, distinct from the main AI co-pilot in this app (which does live chart analysis and trade execution guidance): you are the person he is ANSWERABLE TO. You hold the discipline-and-psychology thread across sessions — best/worst trades, recurring patterns, what state of mind preceded good vs bad days, and whether the process (not just the P&L) held up. You are also someone he can just talk to while waiting for a setup — casual is fine, you don't have to be clinical every message. But when he describes a trade, a loss, a "one more try," or anything touching the failure modes above, you say the uncomfortable thing first, plainly, the way a coach who actually cares would — not a cheerleader.
 
@@ -763,7 +967,7 @@ const JESSI_APP_TOOLS = [
   { type: 'function', function: {
     name: 'app_get_data',
     description: 'Read live data for the account currently open in the app. Sections: "status" (balance, floor/drawdown, target, cushion, mode, size cap, today P&L, trade count, rules), "cost" (lifetime eval fees vs payouts, net position), "insights" (discipline stats, playbook tags, MAE/MFE, best/worst, recent days), "trades" (per-trade history — last 12 individual trades with side/size/entry/P&L/hold), "scalp" (per-day scalping breakdown — avg/median hold time, avg gap between trades, trade count, hold-exceeded count, active trading mode, for each of the last 10 trading days — use this whenever Anoop asks how his scalping/hold-times/gaps looked on a specific day or over recent days), "checklist" (today + recent pre-trade checklist scores/tiers and the checklist plan), "roadmap" (loop-challenge streak & focus, eval milestones, the apprenticeship plan), "all" (everything). Always call this before answering questions about the account or trade history rather than guessing.',
-    parameters: { type: 'object', properties: { section: { type: 'string', enum: ['status', 'cost', 'insights', 'trades', 'scalp', 'checklist', 'roadmap', 'all'] } }, required: ['section'] }
+    parameters: { type: 'object', properties: { section: { type: 'string', enum: ['status', 'cost', 'insights', 'trades', 'scalp', 'checklist', 'roadmap', 'process', 'all'] } }, required: ['section'] }
   } },
   { type: 'function', function: {
     name: 'app_do',
@@ -979,6 +1183,45 @@ function jessiAppGetData(section) {
       out.push('TRADES — none ingested for this account yet.');
     }
   }
+  // ── PROCESS / WHAT IS GOING RIGHT (2026-08-11, Anoop) ─────────────────────
+  // Anoop: "It is just pointing out to me that I am making the mistake. There
+  // is no motivation... it should motivate me to keep calm, relax, and trade
+  // when needed."
+  //
+  // He was right, and it was an architecture gap rather than a tone problem:
+  // computeDayScore() and the process-streak logic he can see in the Insights
+  // tab live ENTIRELY in renderer/app.js. No agent has ever received any of
+  // it. Every persona has only ever been handed losses, rule violations,
+  // breaches and 16 blown accounts — so of course every reply reads as a
+  // prosecution. This section gives them the other half of the truth.
+  //
+  // Deliberately framed around PROCESS, never around encouraging trades. A
+  // green day here means rules followed, not money made — a red-P&L day with
+  // clean discipline is a WIN and must be reported as one. Nothing in this
+  // block should ever be used to talk him INTO a trade.
+  if (want('process')) {
+    const hist = (parseLS('copilot_gr_history', []) || []).slice(-14);
+    if (hist.length) {
+      const GREEN = 70; // same bar as the Insights tab's "PROCESS STREAK ≥ 70"
+      let streak = 0;
+      for (let i = hist.length - 1; i >= 0; i--) {
+        if ((hist[i].disc || 0) >= GREEN) streak++; else break;
+      }
+      const clean = hist.filter(d => !d.over && !d.revenge && !d.sizedUpIntoLoss);
+      const best = hist.reduce((b, d) => (d.disc || 0) > (b.disc || 0) ? d : b, hist[0]);
+      const avgDisc = Math.round(hist.reduce((s, d) => s + (d.disc || 0), 0) / hist.length);
+      out.push(`PROCESS — last ${hist.length} logged day(s): avg discipline ${avgDisc}%, current streak of days at/above ${GREEN}% = ${streak}.`);
+      out.push(`- Clean days (no oversize, no revenge, no sizing up into a loss): ${clean.length} of ${hist.length}${clean.length ? ' → ' + clean.map(d => d.date).join(', ') : ''}.`);
+      out.push(`- Best discipline day: ${best.date} at ${best.disc || 0}%${best.pnl != null ? ' (P&L $' + best.pnl + ')' : ''}.`);
+      const redButClean = hist.filter(d => (d.pnl || 0) < 0 && (d.disc || 0) >= GREEN);
+      if (redButClean.length) {
+        out.push(`- Days that were RED on money but GREEN on process (these are wins — say so): ${redButClean.map(d => d.date + ' (' + d.disc + '%)').join(', ')}.`);
+      }
+      out.push(`- Days he chose NOT to trade, or stopped early, are not failures. Absence of a trade is a decision and counts as process.`);
+    } else {
+      out.push('PROCESS — no logged day history yet for this account.');
+    }
+  }
   if (want('roadmap')) {
     const loop = parseLS('copilot_loop', {}) || {};
     const miles = dataLoad('eval_milestones') || {};
@@ -1105,6 +1348,19 @@ function formatAlignmentNotes(limit) {
   } catch (e) { return null; }
 }
 
+// Shared IST date/time anchor prepended to EVERY agent's system prompt/context.
+// All app data and uploaded Tradovate CSVs are IST wall-clock; without this,
+// agents guessed the date (a previously hardcoded date in claude-agent.js went
+// ~6 weeks stale, so "yesterday" gave today and day-of-week was wrong).
+// Computed fresh per call so it never goes stale.
+function istDateAnchor() {
+  const now = new Date();
+  const d = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  const wd = now.toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata', weekday: 'long' });
+  const t = now.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false });
+  return `Today is ${d} (${wd}), ${t} IST. All app data and every uploaded trade report (Tradovate CSV) is Indian Standard Time (UTC+5:30) — the trader is in India trading the US market. Resolve "today"/"yesterday"/day-of-week strictly in IST from this line; never guess.`;
+}
+
 function buildJessiContext(minimal) {
   const cfg = loadConfig();
   const key = jessiBucketKey(cfg); // see jessiBucketKey() note above — slot-keyed, not legacy accountSize_mode
@@ -1115,6 +1371,7 @@ function buildJessiContext(minimal) {
   acc.balance = jessiVerifyBalance(cfg, bucket, parseLS); // see jessiVerifyBalance() note above
 
   const parts = [];
+  parts.push(`## CURRENT DATE/TIME\n${istDateAnchor()}`);
   parts.push(`## DATA CONTEXT (open account — treat as ground truth)`);
   parts.push(`Active account: ${(cfg.accountSize || '150k').toUpperCase()} ${currentMode.toUpperCase()} — balance $${acc.balance || '?'}, today's P&L $${acc.profit != null ? acc.profit : '?'}.`);
   parts.push(`For cost/insights/trades/scalp/checklist/roadmap/history/rules call app_get_data(section) — "scalp" is the per-day hold-time/gap breakdown. To act call app_do. This open account only. No trades.`);
@@ -1303,6 +1560,7 @@ Your method:
 3. When they conflict, weigh the evidence each side presented. Technical data trumps feelings, but discipline data trumps technical setups (a valid setup with a revenge mindset is still a NO-GO).
 4. Give your VERDICT clearly at the top, then the reasoning. Don't bury the answer.
 5. If any agent made a claim unsupported by its data, call that out.
+6. DATA-INTEGRITY HALT (highest priority, overrides everything below). All three agents are handed the SAME pre-fetched ACCOUNT & TRADE DATA block. They must therefore report identical trade counts, P&L figures, sizes and hold times. If two agents state DIFFERENT numbers for the same trades, one of them has fabricated. Do NOT average them, do NOT reconcile them, and do NOT proceed as if "both point to the same reality" — they do not. Instead: make your verdict NO-GO, state plainly at the top that the app produced contradictory trade data and which agent's figures disagree with the seeded block, and tell Anoop the analysis below cannot be trusted until it is checked against his broker statement. A confidently-worded coaching verdict built on invented P&L is more dangerous than no verdict at all.
 
 Decision hierarchy (non-negotiable):
 - If Jessi flags a discipline violation (revenge, overtrading, broken plan, sizing up while down) → that OVERRIDES any technical setup quality AND any AMD phase. A perfect chart doesn't fix a broken process.
@@ -1314,7 +1572,9 @@ Decision hierarchy (non-negotiable):
 
 Tone: Direct, data-backed, no hedging. You're the final word — own it. Keep it concise: verdict first, then 2-4 sentences of reasoning citing specific points from each agent. Not an essay.
 
-Context: Anoop has blown 16 prop accounts. Every single one hit its Max Loss Limit through the same failure modes. The margin for error is zero. When in doubt, the answer is NO.`;
+Context: Anoop has blown 16 prop accounts. Every single one hit its Max Loss Limit through the same failure modes. The margin for error is zero. When in doubt, the answer is NO.
+
+COST OF FAILURE — cite this, it is the point. The ACCOUNT & TRADE DATA block includes a COST line with his real lifetime prop spend, payouts received, and net position, fed live from his Cost tab. Quote those exact figures rather than any number you remember. When a session goes badly, state plainly what the running total now is and that payouts remain at zero — the gap between what he has spent and what he has been paid is the single most honest argument against taking one more trade. Never estimate or round it; if the COST line is absent, say the figure is unavailable rather than inventing one.`;
 
 // Pre-fetch all data for the Analysis agent (no tool calling during debate)
 async function gatherAnalysisContext() {
@@ -1342,6 +1602,46 @@ async function gatherAnalysisContext() {
     } catch (e) {
       parts.push('## CHART DATA: FAILED TO FETCH (' + e.message + ')');
     }
+
+    // ── COMPUTED READS (2026-08-11, Anoop) ───────────────────────────────────
+    // Three things Anoop asked the Analysis agent to report, all worked out in
+    // arithmetic here and handed over as finished answers rather than left for
+    // the model to judge off a bar list (see chart-reads.js header for why):
+    //   1. 1H vs 15m direction — and when they agree, NAME the direction.
+    //      "aligned" on its own is useless at the moment of entry.
+    //   2. 9-EMA as a CONFIRMATION of the 1H bias, not a standalone read:
+    //      1H up wants the 15m closing above the 15m 9-EMA, 1H down below.
+    //   3. A Doji on the 1H, reported ONLY when it prints at PDH or PDL.
+    //      A Doji in open space is noise on MNQ; at yesterday's extreme it
+    //      isn't. Anything further than the tolerance is never mentioned.
+    // Wrapped in its own try/catch so a failure here degrades to "unavailable"
+    // instead of taking down the whole Analysis context.
+    try {
+      const [h1Trend, m15Trend, m15Bars, h1Bars, pdhPdl] = await Promise.all([
+        getTrendForTF('60').catch(() => null),
+        getTrendForTF('15').catch(() => null),
+        getFullBars('15', 60).catch(() => []),
+        getFullBars('60', 30).catch(() => []),
+        getPDHPDL().catch(() => null)
+      ]);
+
+      parts.push('\n## COMPUTED READS (arithmetic, not model judgement — trust these over your own eyeballing)');
+
+      const align = chartReads.alignmentVerdict(h1Trend, m15Trend, '1H', '15m');
+      parts.push(align.text);
+
+      // Last CLOSED 15m bar — the in-progress bar is excluded on purpose; its
+      // body and close move every tick, so a doji/EMA read on it is meaningless.
+      const lastClosed15 = m15Bars.length >= 2 ? m15Bars[m15Bars.length - 2] : null;
+      const ema9 = chartReads.emaFromBars(m15Bars.slice(0, -1), 9);
+      parts.push(chartReads.emaConfirmation(h1Trend && h1Trend.direction, lastClosed15, ema9).text);
+
+      const lastClosed1h = h1Bars.length >= 2 ? h1Bars[h1Bars.length - 2] : null;
+      const doji = pdhPdl ? chartReads.dojiAtKeyLevel(lastClosed1h, pdhPdl.pdh, pdhPdl.pdl, 15) : null;
+      parts.push(doji ? doji.text : 'No 1H doji at PDH/PDL on the last closed 1H bar.');
+    } catch (e) {
+      parts.push('\n## COMPUTED READS: unavailable (' + e.message + ')');
+    }
   } else {
     parts.push('## CHART DATA: UNAVAILABLE (TradingView not connected)');
   }
@@ -1352,9 +1652,39 @@ async function gatherAnalysisContext() {
     parts.push('\n## Background monitor snapshot (' + ageSec + 's old)\n' + jessiTVCache.text);
   }
 
-  // Recent trade data (from the active account) for pattern context
-  const appData = jessiAppGetData('all');
-  if (appData) parts.push('\n## ACCOUNT & TRADE DATA\n' + appData);
+  // Recent trade data (from the active account) for pattern context.
+  //
+  // 2026-08-11 — ANTI-FABRICATION GUARD. On 08-10 the Debate ran with this
+  // block correctly populated (real values: -72.5/145s, -146/587s, -171/25s,
+  // -449/954s, +0.5/379s) and the Technical agent reproduced it verbatim —
+  // but Jessi, holding the identical text, emitted a completely invented
+  // 5-row table (-312/-245/-180/-95/-47, none of which exist anywhere) and
+  // Anoop was shown it as fact. That is the single most dangerous failure
+  // this app can have: a coach inventing P&L on a live funded account.
+  // Not a tool bug (debate agents run with tools:[] and get pre-seeded data)
+  // and not a data bug (the file on disk was correct) — the model simply
+  // confabulated in the presence of ground truth.
+  // This header is deliberately blunt and sits immediately above the numbers,
+  // where an attention-limited model is most likely to honour it. It is a
+  // mitigation, NOT a fix — the real fix is a model that doesn't do this.
+  // ── 2026-08-11: P&L DELIBERATELY WITHHELD FROM THIS AGENT ────────────────
+  // Anoop: "both these agents should not be influenced by P&L" (Analysis and
+  // Power of 3). This function previously injected jessiAppGetData('all') —
+  // balance, today's P&L, per-trade history, lifetime cost. A technical agent
+  // that can see it is down $855 on the day is no longer reading the chart;
+  // it is reading the chart *and* the scoreboard, and the second one leaks
+  // into the first. Jessi is the agent whose job is the money and the
+  // behaviour, and she still gets all of it (see handleDebateChat).
+  //
+  // Removing it also removes this agent's ability to fabricate trade numbers
+  // at all — it has none to get wrong. Note the earlier comment here blamed
+  // the 08-10 fabrication on "the model confabulating in the presence of
+  // ground truth"; that diagnosis was WRONG. Analysis had the real rows and
+  // reported them correctly. Jessi had only day-level totals plus an
+  // instruction to call a tool she did not have in debate mode, and filled
+  // the gap herself. Root cause and fix are in handleDebateChat.
+  parts.push('\n## ACCOUNT / P&L: deliberately not provided.');
+  parts.push('You are the technical agent. You do not know his balance, his P&L, his position, or his trade history, and you must not speculate about them or let them colour your read. Judge the chart only. If asked about money or his trading record, say that is Jessi\'s lane.');
 
   // 2026-08-07: Alignment ("where his head's at") — was only reaching Jessi/
   // Scalper/Claude/Post-Session (via buildJessiContext). Anoop asked for it
@@ -1417,7 +1747,7 @@ async function handleDebateChat(ws, msg) {
     const analysisContext = await gatherAnalysisContext();
 
     const jessiSystemPrompt = JESSI_PERSONA + '\n\nYou are in DEBATE MODE. Present your argument on this question from your perspective (discipline, psychology, trade history, patterns, accountability). Be specific — cite dates, trade counts, failure modes. Do NOT give a final verdict — the Expert Judge will do that. Keep your argument to 3-6 sentences, data-dense.\n\n' + jessiContext + (tvSnapshot ? '\n\n' + tvSnapshot : '');
-    const analysisSystemPrompt = ANALYSIS_DEBATE_PERSONA + '\n\nPresent your argument on this question from your perspective (chart structure, levels, indicators, multi-TF alignment, playbook validity). Be specific — cite prices, levels, indicator values. Do NOT give a final verdict — the Expert Judge will do that. Keep your argument to 3-6 sentences, data-dense.';
+    const analysisSystemPrompt = istDateAnchor() + '\n\n' + ANALYSIS_DEBATE_PERSONA + '\n\nPresent your argument on this question from your perspective (chart structure, levels, indicators, multi-TF alignment, playbook validity). Be specific — cite prices, levels, indicator values. Do NOT give a final verdict — the Expert Judge will do that. Keep your argument to 3-6 sentences, data-dense.';
 
     // Phase 2: Run all THREE agents in parallel.
     // 2026-07-28: ICT Power of 3 joined the debate as a full participant
@@ -1427,10 +1757,48 @@ async function handleDebateChat(ws, msg) {
     send(ws, { type: 'debate-status', reqId, phase: 'debating', message: 'Jessi, Analysis and Power of 3 are building their arguments...' });
 
     const po3Context = await gatherPO3Context();
-    const po3SystemPrompt = ICT_PO3_PERSONA + ICT_PO3_DEBATE_SUFFIX;
+    const po3SystemPrompt = istDateAnchor() + '\n\n' + ICT_PO3_PERSONA + ICT_PO3_DEBATE_SUFFIX;
+
+    // ── 2026-08-11: ROOT-CAUSE FIX for Jessi fabricating trades in debate ────
+    // On 08-10 Jessi produced a 5-row trade table (-312/-245/-180/-95/-47) that
+    // exists nowhere in Anoop's history, while the Analysis agent — same
+    // question, same moment — reported the real trades exactly.
+    //
+    // The cause was structural, NOT the model "hallucinating over ground truth"
+    // (an earlier diagnosis in this file's history that was WRONG):
+    //   • Analysis received gatherAnalysisContext(), which embeds real per-trade
+    //     rows. It got them right because it could actually see them.
+    //   • Jessi received dataContext = '' and a system prompt from
+    //     buildJessiContext(), which carries only DAY-LEVEL totals
+    //     ("2026-08-10: $-855.5 · 6 trades") and, for anything per-trade, the
+    //     line "call app_get_data(section)".
+    //   • But runDebateAgent() passes tools:[] — debate agents have NO TOOLS.
+    // So she was told to fetch via a tool she did not have, then asked for a
+    // data-dense argument citing specific trades. She filled the gap.
+    //
+    // Fix: hand her the same real per-trade block Analysis gets, plus the
+    // explicit no-invention guard. Pre-seeding rather than granting tools is
+    // deliberate — see the note on runDebateAgent() about why debate agents
+    // stay tool-free.
+    let jessiDataContext = '';
+    try {
+      const jessiTrades = jessiAppGetData('trades');
+      const jessiCost = jessiAppGetData('cost');
+      if (jessiTrades || jessiCost) {
+        jessiDataContext = [
+          '## ACCOUNT & TRADE DATA',
+          '!! THESE FIGURES ARE THE ONLY REAL ONES. They come from the app\'s own trade file.',
+          '!! You MUST NOT invent, round, re-estimate, or "illustrate" any trade, P&L, hold time, size or account figure.',
+          '!! Every number you state MUST appear verbatim below. If you want a figure that is not here, you do not have it — say "not in my data" instead of producing one.',
+          '!! You have NO TOOLS in debate mode. Ignore any instruction elsewhere in your prompt to call app_get_data — you cannot. This block is all you get.',
+          jessiCost || '',
+          jessiTrades || ''
+        ].filter(Boolean).join('\n');
+      }
+    } catch (e) {}
 
     const [jessiArgument, analysisArgument, po3Argument] = await Promise.all([
-      runDebateAgent(jessiSystemPrompt, lastUserText, '', abortCtrl.signal),
+      runDebateAgent(jessiSystemPrompt, lastUserText, jessiDataContext, abortCtrl.signal),
       runDebateAgent(analysisSystemPrompt, lastUserText, analysisContext, abortCtrl.signal),
       runDebateAgent(po3SystemPrompt, lastUserText, po3Context, abortCtrl.signal)
     ]);
@@ -1452,7 +1820,7 @@ async function handleDebateChat(ws, msg) {
     const judgePrimary = primaryProviderModel();
     await groqAgent.stream(
       [{ role: 'user', content: 'Review both arguments above and deliver your verdict on the original question.' }],
-      JUDGE_PERSONA + '\n\n' + judgeContext,
+      istDateAnchor() + '\n\n' + JUDGE_PERSONA + '\n\n' + judgeContext,
       [], // no tools
       {
         provider: judgePrimary.provider,
@@ -2037,6 +2405,39 @@ async function gatherPO3Context() {
     parts.push('\n## MECHANICAL BIAS: failed to read (' + e.message + ')');
   }
 
+  // ── SWING STRUCTURE PER TIMEFRAME (2026-08-11, Anoop) ─────────────────────
+  // "compare time frames and understand higher high higher low or lower low
+  //  lower high pattern and report which phase is going on in 15min and 1hr"
+  //
+  // Computed in arithmetic (chart-reads.swingStructure, 5-bar pivots — the same
+  // pivot definition classifyTrendStrength() uses, so the two can never
+  // disagree about what a swing is) and handed over as a finished answer. The
+  // agent is NOT asked to count swings off a bar list; that is precisely the
+  // kind of task a model does confidently and sometimes wrongly.
+  //
+  // Reported per timeframe rather than blended, because a 1H uptrend with a 15m
+  // downtrend is the single most useful thing this agent can say — it's the
+  // pullback-vs-reversal question — and averaging the two destroys exactly that.
+  try {
+    const [m15Bars, h1Bars] = await Promise.all([
+      getFullBars('15', 80).catch(() => []),
+      getFullBars('60', 60).catch(() => [])
+    ]);
+    const s15 = chartReads.swingStructure(m15Bars);
+    const s1h = chartReads.swingStructure(h1Bars);
+    parts.push('\n## SWING STRUCTURE (computed — trust over your own eyeballing)');
+    const fmt = (s, tf) => {
+      if (!s) return `${tf}: not enough bars to judge structure.`;
+      if (s.pattern === 'unclear') return `${tf}: unclear (${s.reason}; ${s.swingHighs} swing highs, ${s.swingLows} swing lows).`;
+      return `${tf}: ${s.pattern} — last two highs ${s.lastTwoHighs.join(' → ')}, last two lows ${s.lastTwoLows.join(' → ')}.`;
+    };
+    parts.push(fmt(s1h, '1H'));
+    parts.push(fmt(s15, '15m'));
+    parts.push('Report the AMD phase SEPARATELY for 1H and for 15m using the structure above. Do not blend them into one verdict. If they disagree, say so explicitly and say which timeframe you are deferring to and why.');
+  } catch (e) {
+    parts.push('\n## SWING STRUCTURE: unavailable (' + e.message + ')');
+  }
+
   // Session context — accumulation is defined relative to the session open.
   const istNow = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
   parts.push('\n## TIME: ' + istNow + ' IST (London 13:30-15:00, NY 19:00-21:00 IST)');
@@ -2066,7 +2467,7 @@ async function handleIctPo3(ws, msg) {
     const po3Primary = primaryProviderModel();
     await groqAgent.stream(
       [{ role: 'user', content: userMsg }],
-      ICT_PO3_PERSONA,
+      istDateAnchor() + '\n\n' + ICT_PO3_PERSONA,
       [],
       {
         provider: po3Primary.provider,
@@ -2270,7 +2671,7 @@ async function handlePostSessionReview(ws, msg) {
     const postSessionPrimary = primaryProviderModel();
     await groqAgent.stream(
       [{ role: 'user', content: 'Analyze my just-completed trading session. Here is ALL the data:\n\n' + dataContext }],
-      POST_SESSION_ANALYST_PERSONA,
+      istDateAnchor() + '\n\n' + POST_SESSION_ANALYST_PERSONA,
       [], // no tools
       {
         provider: postSessionPrimary.provider,
@@ -2322,7 +2723,8 @@ const SCALPER_PERSONA = `You are THE SCALPER — Anoop Habib's specialist scalpi
 
 ## WHO ANOOP IS (do not forget any of this)
 - Trades MNQ/MGC micros on a Lucid prop account from Hubballi, India (IST). Currently a $50K EVALUATION, slot s1.
-- Has blown 17 prop accounts lifetime. $0 payouts ever. Net position roughly -$10,784.
+- Has blown 16 prop accounts (17 bought, 1 active). $0 payouts ever.
+- NEVER state his lifetime spend or net position from memory. Read it from the COST line in the ACCOUNT & TRADE DATA block, which is fed live from his Cost tab, and quote that verbatim. A hardcoded total here had drifted from the real figure and agents were repeating it as fact; it was removed 2026-08-11.
 - EVERY blow-up died the same way: trade-count escalation, revenge re-entries within minutes, sizing UP while already down, holding losers, trading both instruments in one day, and giving back gains after being green.
 - ~83% of his trades are scalps (under 10 minutes). The app runs a Scalper Mode with its own ruleset for exactly this reason.
 - He is a COMPETENT ANALYST and a POOR RISK MANAGER. This is the central fact about him. His marked levels, zones and bias work are usually reasonable. His size, his re-entry timing, and his hold discipline are what kill him. Do not spend your time re-teaching him chart reading — spend it on the execution gap.
@@ -2417,7 +2819,7 @@ const SCALPER_TOOLS = [
   { type: 'function', function: {
     name: 'app_get_data',
     description: 'Read live data for the account currently open. Sections: "scalp" (PER-DAY hold times, median inter-trade gap, cooldown breaches, trade counts, hold-exceeded — your primary source, call this first for any per-day claim), "trades" (last 12 individual trades with side/size/entry/P&L/hold/flags), "insights" (discipline %, revenge count, over-cap count, giveback, per-day history), "status" (balance, floor, target, and the ACTIVE rule numbers — always read the size cap and loss tiers from here rather than assuming), "checklist", "roadmap", "cost", "all".',
-    parameters: { type: 'object', properties: { section: { type: 'string', enum: ['scalp', 'trades', 'insights', 'status', 'checklist', 'roadmap', 'cost', 'all'] } }, required: ['section'] }
+    parameters: { type: 'object', properties: { section: { type: 'string', enum: ['scalp', 'trades', 'insights', 'status', 'checklist', 'roadmap', 'cost', 'process', 'all'] } }, required: ['section'] }
   } },
   { type: 'function', function: {
     name: 'scalp_note_add',
@@ -2482,7 +2884,11 @@ async function handleScalperChat(ws, msg) {
     } catch (e) {}
     try { seed.push('\n## SCALP STATS (per day)\n' + jessiAppGetData('scalp')); } catch (e) {}
     try { seed.push('\n## RECENT TRADES\n' + jessiAppGetData('trades')); } catch (e) {}
-    try { seed.push('\n## YOUR PRIOR NOTES\n' + scalperNotesRead(null, 10)); } catch (e) {}
+    // 2026-08-10: trimmed from 10→5 days — notes accumulate daily and were
+    // contributing to the oversized-request 413s (see the auto/best-free
+    // note near primaryProviderModel() above). 5 days still covers "third
+    // time this week" pattern-spotting.
+    try { seed.push('\n## YOUR PRIOR NOTES\n' + scalperNotesRead(null, 5)); } catch (e) {}
     try {
       const align = formatAlignmentNotes(3);
       if (align) seed.push('\n## WHERE HIS HEAD\'S AT (his own dated reflections — read before coaching)\n' + align);
@@ -2494,7 +2900,7 @@ async function handleScalperChat(ws, msg) {
     const scalperPrimary = primaryProviderModel();
     await groqAgent.stream(
       seeded,
-      SCALPER_PERSONA,
+      istDateAnchor() + '\n\n' + SCALPER_PERSONA,
       SCALPER_TOOLS,
       {
         provider: scalperPrimary.provider,
@@ -2586,17 +2992,16 @@ async function handleJessiVoiceSend(ws, msg) {
       // agents. Deliberately not routed through groqAgent.stream()'s chain
       // machinery since transcription is a one-shot multipart call, not a
       // streamed chat turn; a simple try/catch covers it.
-      const cfg = loadConfig();
-      if (!cfg.disableOmniRoute && groqAgent.isOmniRouteReady()) {
-        try {
-          transcript = await groqAgent.transcribeAudioOmniRoute(audioBuffer, mimeType);
-        } catch (e) {
-          console.log('[voice] OmniRoute STT failed, falling back to Groq Whisper:', e.message);
-          transcript = await groqAgent.transcribeAudio(audioBuffer, mimeType);
-        }
-      } else {
-        transcript = await groqAgent.transcribeAudio(audioBuffer, mimeType);
-      }
+      // 2026-08-11 (Anoop): "I don't want speechmatics to work. remove them."
+      // Speechmatics-via-OmniRoute is now skipped entirely — STT goes straight
+      // to Groq Whisper. This removes one live external dependency from the
+      // voice path; the OmniRoute branch below is left commented rather than
+      // deleted so re-enabling is a one-line change if it's ever wanted.
+      //   if (!cfg.disableOmniRoute && groqAgent.isOmniRouteReady()) {
+      //     try { transcript = await groqAgent.transcribeAudioOmniRoute(audioBuffer, mimeType); }
+      //     catch (e) { transcript = await groqAgent.transcribeAudio(audioBuffer, mimeType); }
+      //   }
+      transcript = await groqAgent.transcribeAudio(audioBuffer, mimeType);
     }
     if (!transcript) {
       send(ws, { type: 'jessi-voice-error', reqId, message: "Didn't catch anything — try again." });
@@ -3068,6 +3473,11 @@ function parseToolResult(res) {
     return null;
   }
 }
+
+// Deterministic chart maths (EMA, Doji, swing structure, alignment) lives in
+// chart-reads.js — pure functions, unit-tested in test/chart-reads.test.js.
+// See that file's header for WHY these are computed rather than asked of a model.
+const chartReads = require('./chart-reads');
 
 // Defensively pull a bar array out of whatever shape data_get_ohlcv returns —
 // the exact field name isn't nailed down from a live call, so this tries the
@@ -4218,15 +4628,32 @@ httpServer.listen(PORT, '127.0.0.1', async () => {
   if (cfg.geminiApiKey) { groqAgent.initGemini(cfg.geminiApiKey); console.log('✓ Gemini API key loaded (Jessi primary brain)'); }
   else console.log('⚠  No Gemini key — Jessi falls back to Groq (smaller 6-8K tokens/min ceiling). Free key: aistudio.google.com/apikey');
   if (cfg.groqApiKey) { groqAgent.init(cfg.groqApiKey); console.log('✓ Groq API key loaded (Jessi fallback + voice STT/TTS)'); }
+  if (cfg.apiKey) { groqAgent.initAnthropic(cfg.apiKey); console.log('✓ Anthropic key wired into ALL agents (primary brain)'); }
   else console.log('⚠  No Groq key — Jessi chat falls back to offline mode until one is added in Settings');
-  if (cfg.omniRouteApiKey) { groqAgent.initOmniRoute(cfg.omniRouteApiKey, cfg.omniRouteBaseUrl); console.log('✓ OmniRoute API key loaded (primary brain when enabled)'); }
-  else console.log('ℹ  No OmniRoute key — using Gemini/Groq chain only');
+  if (cfg.omniRouteApiKey) {
+    groqAgent.initOmniRoute(cfg.omniRouteApiKey, cfg.omniRouteBaseUrl);
+    console.log('✓ OmniRoute API key loaded (primary brain when enabled)');
+    // Probe health immediately + every 30s so primaryProviderModel() can
+    // skip OmniRoute instantly when the server is down (instead of waiting
+    // for a per-request timeout → "silently failing").
+    groqAgent.probeOmniRouteHealth().then(ok =>
+      console.log(ok ? '✓ OmniRoute health check passed — using as primary' : '⚠  OmniRoute health check failed — falling back to Gemini'));
+    setInterval(() => groqAgent.probeOmniRouteHealth(), 30000);
+  } else console.log('ℹ  No OmniRoute key — using Gemini/Groq chain only');
   startJessiTVMonitor();
   console.log('✓ Jessi background chart monitor started (3-min cadence)');
   console.log(`✓ Mode: ${(cfg.mode || 'funded').toUpperCase()}`);
 
+  // 2026-08-11 (Anoop): "I don't want telegram to work... remove them."
+  // The bot is no longer started, so it holds no long-poll connection and can
+  // no longer fail at startup or mid-session. telegramBot.notify() calls are
+  // scattered through the monitors and are safe no-ops while stopped, so they
+  // are deliberately left in place rather than ripped out of a dozen call
+  // sites during a live-trading week. To re-enable: flip TELEGRAM_ENABLED to
+  // true. Nothing else needs to change.
+  const TELEGRAM_ENABLED = false;
   try {
-    telegramBot.start({
+    if (TELEGRAM_ENABLED) telegramBot.start({
       loadConfig,
       saveConfig,
       getCurrentMode: () => currentMode,
