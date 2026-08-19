@@ -105,17 +105,27 @@ const ACCOUNT_PROFILES = {
   '50k': {
     label: '$50K',
     eval:   { startBalance: 50000,  target: 3000,  maxLoss: 2000,  accountId: null, placeholder: false, notOpened: false },
-    funded: { startBalance: 50000,  floorBuffer: 2000, dayStop: 200, targetMin: 150, targetMax: 300, payoutTarget: 52000,  accountId: null, placeholder: false, notOpened: false }
+    // 2026-08-12: `blown` is DATA, not a hardcoded size check. Two places below
+    // read `state.accountSize === '50k' && mode === 'funded'` to decide the
+    // account was dead. That was true of the OLD $50K funded account. Anoop's
+    // NEW Lucid funded account is ALSO $50K, so the app branded a live account
+    // a corpse — and every Judge verdict inherited it, reasoning off historical
+    // numbers. Set to false on evidence: DATA/accounts/s3 has six days of real
+    // trading (2026-08-05 .. 2026-08-12) whose net sums to -997, reconciling
+    // exactly to the 49,003 balance on screen. A traded account is not blown.
+    // Flip this to true the day an account actually breaches — do NOT go back
+    // to inferring it from the size.
+    funded: { startBalance: 50000,  floorBuffer: 2000, dayStop: 200, targetMin: 150, targetMax: 300, payoutTarget: 52000,  accountId: null, placeholder: false, notOpened: false, blown: false }
   },
   '100k': {
     label: '$100K',
     eval:   { startBalance: 100000, target: 6000,  maxLoss: 3000,  accountId: null, placeholder: false, notOpened: true },
-    funded: { startBalance: 100000, floorBuffer: 4000, dayStop: 250, targetMin: 200, targetMax: 400, payoutTarget: 104000, accountId: null, placeholder: false, notOpened: true }
+    funded: { startBalance: 100000, floorBuffer: 4000, dayStop: 250, targetMin: 200, targetMax: 400, payoutTarget: 104000, accountId: null, placeholder: false, notOpened: true,  blown: false }
   },
   '150k': {
     label: '$150K',
     eval:   { startBalance: 150000, target: 9000,  maxLoss: 4500,  accountId: null, placeholder: false, notOpened: false },
-    funded: { startBalance: 150000, floorBuffer: 4500, dayStop: 300, targetMin: 250, targetMax: 600, payoutTarget: 154500, accountId: null, placeholder: false, notOpened: false }
+    funded: { startBalance: 150000, floorBuffer: 4500, dayStop: 300, targetMin: 250, targetMax: 600, payoutTarget: 154500, accountId: null, placeholder: false, notOpened: false, blown: false }
   }
 };
 
@@ -382,6 +392,63 @@ function saveActiveBucket() {
   ACCT_LS_KEYS.forEach(k => { blob.ls[k] = localStorage.getItem(k); });
   acctBucketCache[key] = blob;
   try { window.api.setConfig('acctBucket__' + key, blob); } catch (e) {}
+  // 2026-08-18: also mirror the account-defining datasets to
+  // accounts/<slot>/*.json. Previously only csvApply()/archive() wrote these,
+  // so anything that changed the ledger by another route lived ONLY in
+  // localStorage + the config blob — and loadAccountBucket() would happily
+  // delete it. Disk is what overlaySlotDiskData() restores from, so writing
+  // here is what actually makes a save durable across restarts and switches.
+  mirrorSlotDataToDisk();
+}
+
+// Fire-and-forget mirror of the per-slot datasets to disk. Never blocks the
+// UI and never throws into a caller — a disk problem must not interrupt a
+// live trading session.
+function mirrorSlotDataToDisk() {
+  if (!window.api || !window.api.dataSave || !activeSlotId) return;
+  const pairs = [
+    ['gr_history', 'copilot_gr_history'],
+    ['balance_ledger', 'copilot_balance_ledger'],
+    ['day_trades', 'copilot_day_trades'],
+    ['pb_tags', 'copilot_pb_tags'],
+    ['maemfe', 'copilot_maemfe'],
+    ['loop_state', 'copilot_loop'],
+    ['ck_history', 'copilot_ck_history'],
+    ['eval_milestones', 'copilot_eval_milestones'],
+  ];
+  pairs.forEach(([key, lsKey]) => {
+    try {
+      const raw = localStorage.getItem(lsKey);
+      if (!raw) return; // never overwrite a good disk file with nothing
+      const parsed = JSON.parse(raw);
+      const nonEmpty = parsed && (Array.isArray(parsed) ? parsed.length : Object.keys(parsed).length);
+      if (!nonEmpty) return;
+      Promise.resolve(window.api.dataSave(slotDataKey(key), parsed)).catch(() => {});
+    } catch (e) {}
+  });
+}
+
+// ── Autosave (2026-08-18, Anoop: "I want the data to autosave") ────────────
+// saveActiveBucket() previously ran only on an explicit account switch and a
+// couple of one-off moments. Closing the tab, a browser crash, or a server
+// restart mid-session therefore lost everything since the last switch — and
+// because the stale blob was what loadAccountBucket() trusted, the loss then
+// looked like "the account reset itself". These three hooks make a save
+// happen on a timer, when the page is hidden, and on unload.
+let _autosaveTimer = null;
+function startAccountAutosave() {
+  if (_autosaveTimer) return;
+  _autosaveTimer = setInterval(() => {
+    try { saveActiveBucket(); } catch (e) {}
+  }, 30000);
+  window.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') { try { saveActiveBucket(); } catch (e) {} }
+  });
+  // pagehide is the reliable one on modern browsers; beforeunload kept as a
+  // belt-and-braces fallback. Both are sync — setConfig/dataSave are
+  // fire-and-forget over the open WebSocket, which survives long enough.
+  window.addEventListener('pagehide', () => { try { saveActiveBucket(); } catch (e) {} });
+  window.addEventListener('beforeunload', () => { try { saveActiveBucket(); } catch (e) {} });
 }
 
 // Load a bucket's data into state.account + the same flat localStorage keys
@@ -421,8 +488,54 @@ async function loadAccountBucket(size, stage) {
     const v = blob && blob.ls ? blob.ls[k] : null;
     if (v != null) localStorage.setItem(k, v); else localStorage.removeItem(k);
   });
+
+  // ── 2026-08-18 BUG FIX: "every account I previously traded shows from the
+  // start." ──────────────────────────────────────────────────────────────
+  // The config blob above is NOT the authoritative record — accounts/<slot>/
+  // *.json is (restoreFromDisk() recomputes the balance from it on boot, and
+  // csvApply/archive() mirror every change into it). But restoreFromDisk()
+  // only ever ran ONCE, at boot, for whichever slot was active then. Every
+  // slot switch after that restored from the config blob alone — and the
+  // removeItem() above actively DELETED copilot_balance_ledger /
+  // copilot_day_trades / copilot_gr_history whenever the blob happened to
+  // lack them. enforceAccountInvariant() then correctly recomputed the
+  // balance from an empty ledger and got the pristine start balance. A
+  // traded account therefore came back as fresh, and the emptied state was
+  // written straight back over the blob by the next saveActiveBucket().
+  // (Confirmed on disk: accounts/s2 held a real -$211.50 day while
+  // acctBucket__s2 had no ledger key at all.)
+  //
+  // Fix: overlay the per-slot disk mirror on EVERY load, not just at boot.
+  // Disk wins only where it has real data — a genuinely wiped slot has no
+  // file, so "Start fresh" still works.
+  await overlaySlotDiskData();
+
   enforceAccountInvariant(size, stage);
   return !!blob;
+}
+
+// Reads accounts/<activeSlotId>/*.json back into the flat localStorage keys
+// the rest of the app already uses. Safe to call repeatedly. Only non-empty
+// datasets are applied, so this can never blank out good in-memory state.
+async function overlaySlotDiskData() {
+  if (!window.api || !window.api.dataLoad || !activeSlotId) return;
+  const pairs = [
+    ['gr_history', 'copilot_gr_history'],
+    ['balance_ledger', 'copilot_balance_ledger'],
+    ['day_trades', 'copilot_day_trades'],
+    ['pb_tags', 'copilot_pb_tags'],
+    ['maemfe', 'copilot_maemfe'],
+    ['loop_state', 'copilot_loop'],
+    ['ck_history', 'copilot_ck_history'],
+    ['eval_milestones', 'copilot_eval_milestones'],
+  ];
+  for (const [key, lsKey] of pairs) {
+    try {
+      const v = await window.api.dataLoad(slotDataKey(key));
+      const nonEmpty = v && (Array.isArray(v) ? v.length : Object.keys(v).length);
+      if (nonEmpty) localStorage.setItem(lsKey, JSON.stringify(v));
+    } catch (e) {}
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -453,33 +566,67 @@ function enforceAccountInvariant(size, stage) {
   try { ledger = JSON.parse(localStorage.getItem('copilot_balance_ledger') || '{}') || {}; } catch (e) {}
   const days = Object.keys(ledger).sort();
 
-  // Recompute balance + EOD-trailing floor straight from the ledger.
+  // 2026-08-17 (Anoop: "let the HUD give information to left panel... CSV
+  // should be optional"): if today has no CSV entry yet, but the live broker
+  // feed is connected, fold today's live P&L into THIS SAME computation as
+  // an extra day — still one canonical ledger-is-truth calculation, just
+  // extended to accept live data for TODAY when CSV hasn't filled it in yet.
+  // Deliberately NOT written into copilot_balance_ledger — recomputed fresh
+  // every call, so a bad live read can never corrupt the real CSV record,
+  // and a CSV upload for today always wins over it (checked first, below).
+  const todayKey = csvDayKey();
+  let liveTodayNet = null;
+  if (!ledger[todayKey]) {
+    try {
+      const gs = JSON.parse(localStorage.getItem('copilot_guardrail_v1') || 'null');
+      if (gs && gs.live && gs.live.connected) liveTodayNet = gs.live.dayPnl || 0;
+    } catch (e) {}
+  }
+
+  // Recompute balance + EOD-trailing floor straight from the ledger (+ live today, if applicable).
   const lockFloorValue = start + 100;
   let bal = start, floor = start - buffer;
   days.forEach(d => {
     bal += (ledger[d] && ledger[d].net) || 0;
     floor = Math.min(lockFloorValue, Math.max(floor, bal - buffer));
   });
+  const usingLiveToday = liveTodayNet != null;
+  if (usingLiveToday) {
+    bal += liveTodayNet;
+    floor = Math.min(lockFloorValue, Math.max(floor, bal - buffer));
+  }
   bal = Math.round(bal * 100) / 100;
 
   const acc = state.account;
   const before = acc.balance;
   acc.balance = bal;
+  acc.balanceSource = usingLiveToday ? 'live' : 'csv'; // 2026-08-17: read by updateAccountUI for a source label
   if (isEval) acc.evalFloor = Math.round(floor); else acc.fundedFloor = Math.round(floor);
   // Deterministic-from-terms fields — never trusted from storage.
   const d = acctDefaults(size, stage);
   if (isEval) { acc.evalTarget = d.evalTarget; acc.evalDayCap = d.evalDayCap; }
   else { acc.payoutTarget = d.payoutTarget; acc.fundedDayStop = d.fundedDayStop; }
-  if (!days.length) acc.profit = 0;   // no days logged → today's P&L can't be non-zero
+  if (usingLiveToday) acc.profit = Math.round(liveTodayNet);
+  else if (!days.length) acc.profit = 0;   // no days logged, no live today → today's P&L can't be non-zero
 
-  // Keep the global config keys in step so a reload can't resurrect the old value.
-  try {
-    window.api.setConfig('balance', bal);
-    if (isEval) window.api.setConfig('evalFloor', Math.round(floor)); else window.api.setConfig('fundedFloor', Math.round(floor));
-    if (!days.length) window.api.setConfig('profit', 0);
-  } catch (e) {}
+  // Keep the global config keys in step so a reload can't resurrect the old
+  // value — but ONLY for a CSV-derived balance. A live-derived one is an
+  // estimate, not a confirmed ledger fact, and should not survive a restart
+  // as if it were; a fresh live update re-applies within ~10s anyway once
+  // the feed reconnects.
+  if (!usingLiveToday) {
+    try {
+      window.api.setConfig('balance', bal);
+      if (isEval) window.api.setConfig('evalFloor', Math.round(floor)); else window.api.setConfig('fundedFloor', Math.round(floor));
+      if (!days.length) window.api.setConfig('profit', 0);
+    } catch (e) {}
+  }
 
-  if (before != null && Math.abs(before - bal) > 0.01 && typeof addSystemMessage === 'function') {
+  // Don't fire the "corrected" chat message for an expected live-vs-ledger
+  // difference (dayPnl legitimately moves every poll) — only warn when the
+  // CSV-only computation itself disagreed with storage, the real
+  // drift/corruption case this was built to catch.
+  if (!usingLiveToday && before != null && Math.abs(before - bal) > 0.01 && typeof addSystemMessage === 'function') {
     addSystemMessage(`Corrected balance from the ledger: $${Math.round(before).toLocaleString()} → $${Math.round(bal).toLocaleString()} (${days.length} day${days.length === 1 ? '' : 's'} logged). The ledger is the source of truth.`);
   }
 }
@@ -502,6 +649,18 @@ async function switchAccount(size, stage, opts) {
   state.accountSize = size; state.mode = stage;
   { const sl = acctSlot(); sl.size = size; sl.stage = stage; persistSlots(); }
   const hadData = await loadAccountBucket(size, stage);
+  // 2026-08-16: opening a genuinely fresh eval slot IS "starting a new
+  // evaluation" (journey-tracker.js) — this is the one place every path that
+  // begins a new eval attempt funnels through (the account gate, the titlebar
+  // toggle, and the post-breach re-open all call switchAccount). The
+  // opts.promoted branch is excluded: that transition is recorded explicitly
+  // by slotClearedToFunded, on the SAME journey, not a new one.
+  if (!hadData && stage === 'eval' && !opts.promoted) {
+    try {
+      const sl = acctSlot();
+      window.api.journeyAction('start', { slotId: sl.id, size: size, startBalance: state.account.balance }).catch(() => {});
+    } catch (e) {}
+  }
   window.api.setConfig('accountSize', size);
   window.api.setConfig('mode', stage);
   _renderMode(stage);
@@ -579,20 +738,29 @@ function buildLessons(ls) {
   };
 }
 
-async function archiveActiveBucket(eventType) {
-  const size = state.accountSize, stage = state.mode;
-  const prof = ACCOUNT_PROFILES[size][stage];
+// 2026-08-13 REFACTOR — was hardcoded to state.account/state.mode (the ACTIVE
+// slot only). Anoop asked for breach/clear buttons "beside the account" in
+// the ⇄ Account picker rows, which must work on ANY slot, not just whichever
+// one happens to be loaded. Generalized to take the slot + its account/ls data
+// explicitly; the ACTIVE-slot callers below pass state.account + live
+// localStorage, everything else passes the slot's cached bucket.
+function buildArchiveRecord(slot, accountData, lsData, eventType) {
+  const prof = ACCOUNT_PROFILES[slot.size][slot.stage];
   const record = {
     archivedAt: new Date().toISOString(),
     event: eventType, // 'breached' | 'cleared'
-    size, stage,
-    label: ACCOUNT_PROFILES[size].label + ' ' + stage.toUpperCase(),
+    size: slot.size, stage: slot.stage,
+    label: (slot.name || ACCOUNT_PROFILES[slot.size].label) + ' ' + slot.stage.toUpperCase(),
     accountId: prof.accountId || null,
-    account: Object.assign({}, state.account),
-    ls: {}
+    slotId: slot.id,
+    account: Object.assign({}, accountData),
+    ls: Object.assign({}, lsData)
   };
-  ACCT_LS_KEYS.forEach(k => { record.ls[k] = localStorage.getItem(k); });
   record.lessons = buildLessons(record.ls);
+  return record;
+}
+
+async function persistArchiveRecord(record) {
   let archives = [];
   try {
     if (window.api && window.api.dataLoad) archives = await window.api.dataLoad('account_archives');
@@ -604,86 +772,242 @@ async function archiveActiveBucket(eventType) {
   return record;
 }
 
-// Force-clears a persisted bucket (cache + saved config) WITHOUT touching
-// live localStorage — safe to call on a bucket that isn't currently active.
-// Explicitly SETS acctBucketCache[key] = null (does not delete the key) so
-// loadAccountBucket() recognizes this as a known-empty bucket rather than an
-// unchecked one — see the FIX comment in loadAccountBucket() for why a plain
-// delete would have silently resurrected the stale pre-clear data via
-// getConfig()'s cache within the same running session.
-async function clearPersistedBucket(size, stage) {
-  const key = size + '_' + stage;
-  acctBucketCache[key] = null;
-  try { await window.api.setConfig('acctBucket__' + key, null); } catch (e) {}
+// Read a slot's account+ls data WITHOUT assuming it's the active one. Active
+// slot's real data is live (state.account + localStorage); any other slot's
+// data lives only in the bucket cache/config.
+async function readSlotBucketData(slot) {
+  if (slot.id === activeSlotId) {
+    const ls = {};
+    ACCT_LS_KEYS.forEach(k => { ls[k] = localStorage.getItem(k); });
+    return { account: Object.assign({}, state.account), ls: ls };
+  }
+  let blob = acctBucketCache[slot.id];
+  if (blob === undefined) {
+    let cfg = {};
+    try { cfg = (await window.api.getConfig()) || {}; } catch (e) {}
+    blob = cfg['acctBucket__' + slot.id] || null;
+  }
+  return { account: (blob && blob.account) || acctDefaults(slot.size, slot.stage), ls: (blob && blob.ls) || {} };
 }
 
-// Insights tab: "Account Breached" button. Archives the ACTIVE bucket's full
-// trade/insight history to data/account_archives.json, then resets THIS SAME
-// size+stage bucket to fresh — ready for a new eval of the same size.
-//
-// Deliberately does NOT route through switchAccount(..., {force:true}) —
-// switchAccount() unconditionally calls saveActiveBucket() first, which
-// would re-persist the CURRENT (still-dirty, pre-clear) live localStorage
-// right back into this exact bucket key before any reload happens, undoing
-// the clear. Since source key === target key here (same bucket, same
-// session), the reset is done directly instead, then the same re-render
-// calls switchAccount() would have made are run by hand.
-async function accountBreached() {
-  const label = ACCOUNT_PROFILES[state.accountSize].label + ' ' + state.mode.toUpperCase();
+// BUG FIX 2026-08-13 (found while wiring per-account breach/clear buttons —
+// same bug flagged in that morning's /plan-eng-review as B1): the OLD
+// clearPersistedBucket(size, stage) built key = size + '_' + stage, a LEGACY
+// scheme from before the 2026-07-25 slot system. Every real bucket read/write
+// is keyed by SLOT ID (see acctBucketKey(), loadAccountBucket()) — a slot's
+// bucket key never changes when its `stage` field changes. So the old clear
+// calls in accountClearedToFunded() were pure no-ops: they cleared a key
+// nothing ever reads, while the slot's REAL bucket (still keyed by slot.id)
+// kept its full eval ledger. switchAccount() would then load that same
+// uncleaned bucket under the 'funded' label, and enforceAccountInvariant()
+// would compute funded balance = fundedStart + sum(every eval day) — a wrong,
+// inflated floor on a live funded account. This resets the ACTUAL key.
+async function resetSlotBucket(slot) {
+  const fresh = { account: acctDefaults(slot.size, slot.stage), ls: {} };
+  acctBucketCache[slot.id] = fresh;
+  try { await window.api.setConfig('acctBucket__' + slot.id, fresh); } catch (e) {}
+  return fresh.account;
+}
+
+// Refresh whatever's currently on screen after a breach/clear action —
+// active-slot panels if it was the loaded one, always the account gate rows
+// (breach/clear can be triggered on the loaded OR an unloaded slot).
+function refreshAfterSlotAction(wasActive) {
+  if (wasActive) {
+    updateAccountUI();
+    if (typeof updateRulesTab === 'function') updateRulesTab();
+    if (typeof grRender === 'function') grRender();
+    if (typeof renderInsights === 'function') renderInsights();
+  }
+  const gateEl = document.getElementById('account-gate');
+  if (gateEl && gateEl.style.display !== 'none') showAccountGate(state.accountSize, state.mode);
+}
+
+// Mark ANY slot BREACHED — works whether or not it's the currently active
+// account. Archives its full trade/insight history to account_archives.json,
+// marks it breached in the Cost tab, then resets that SAME slot to fresh
+// (same size+stage) so it's ready for a new attempt. Does not retire/hide the
+// slot — that's the separate auto-detect path in retireSlot(), which fires
+// when the LEDGER itself shows a breach; this is the manual "I know it's
+// gone, record it now" action.
+// 2026-08-13 (autoplan Design review, finding #2): this is a 4-step async
+// chain (archive read → archive write → cost-tab update → bucket reset)
+// against a real-money account slot, and the button stayed clickable the
+// entire time — a second click before the first finished ran the whole
+// pipeline twice (two archive records, two cost-tab writes). ckButtonBusy()
+// disables the actual clicked element for the duration; try/finally
+// guarantees it re-enables even if something in the chain throws.
+function ckButtonBusy(ev, busyLabel, fn) {
+  const btn = ev && ev.currentTarget;
+  const original = btn ? btn.textContent : null;
+  if (btn) { btn.disabled = true; btn.textContent = busyLabel; }
+  return Promise.resolve(fn()).finally(() => {
+    if (btn) { btn.disabled = false; btn.textContent = original; }
+  });
+}
+
+async function slotBreached(slot, ev) {
+  const label = (slot.name || ACCOUNT_PROFILES[slot.size].label) + ' ' + slot.stage.toUpperCase();
+  const kind = slot.stage === 'eval' ? 'Evaluation' : 'Funded';
   if (!confirm(`Mark ${label} as BREACHED?\n\nThis archives all current trade/insight data (with mistakes/positives noted) to a file, marks it breached in the Cost tab, then wipes this account's slate clean for your next attempt. This cannot be undone from here.`)) return;
-  const record = await archiveActiveBucket('breached');
-  const size = state.accountSize, stage = state.mode;
-  const costRes = await costMarkAccountBreached(size, stage, record.archivedAt);
-  state.account = acctDefaults(size, stage);
-  ACCT_LS_KEYS.forEach(k => localStorage.removeItem(k));
-  const key = acctBucketKey(size, stage);
-  acctBucketCache[key] = { account: Object.assign({}, state.account), ls: {} };
-  try { await window.api.setConfig('acctBucket__' + key, acctBucketCache[key]); } catch (e) {}
-  updateAccountUI();
-  if (typeof updateRulesTab === 'function') updateRulesTab();
-  if (typeof grRender === 'function') grRender();
-  if (typeof renderInsights === 'function') renderInsights();
-  const costNote = costRes.matched
-    ? ' Cost tab entry marked BLOWN.'
-    : ' ⚠ No matching fee row found in Cost tab — add/confirm it there so lifetime spend stays accurate.';
-  addSystemMessage(`📉 ${label} marked BREACHED. History + mistakes/positives archived (see Insights → Past Accounts).${costNote} Starting fresh — this account/stage has no data now. Update ACCOUNT_PROFILES with the new account's real ID once you have it.`);
+
+  await ckButtonBusy(ev, 'Archiving…', async () => {
+    const wasActive = slot.id === activeSlotId;
+    const { account: accountData, ls: lsData } = await readSlotBucketData(slot);
+    const record = await persistArchiveRecord(buildArchiveRecord(slot, accountData, lsData, 'breached'));
+    const costRes = await costMarkAccountBreached(slot.size, slot.stage, record.archivedAt);
+
+    const freshAccount = await resetSlotBucket(slot);
+    if (wasActive) {
+      state.account = freshAccount;
+      ACCT_LS_KEYS.forEach(k => localStorage.removeItem(k));
+    }
+    refreshAfterSlotAction(wasActive);
+
+    // 2026-08-16: single-dataset journey record (see journey-tracker.js) —
+    // fire-and-forget, same as every other archive write in this function;
+    // must never be the thing that blocks the actual breach action.
+    try {
+      window.api.journeyAction(slot.stage === 'eval' ? 'eval-breach' : 'funded-breach', {
+        slotId: slot.id, finalBalance: (accountData && accountData.balance) || null
+      }).then(() => { if (typeof renderInsights === 'function') renderInsights(); }).catch(() => {});
+    } catch (e) {}
+
+    const costNote = costRes.matched
+      ? ' Cost tab entry marked BLOWN.'
+      : ' ⚠ No matching fee row found in Cost tab — add/confirm it there so lifetime spend stays accurate.';
+    addSystemMessage(`📉 ${kind} breached — ${label}. History + mistakes/positives archived (see Insights → Past Accounts).${costNote} Starting fresh — this account/stage has no data now.`);
+  });
 }
 
-// Insights tab: "Account Cleared -> Moved to Funded" button. Manual
-// counterpart to the automatic promotion in checkAutoPromotion() below — use
-// this if auto-detect missed it, or to force the move explicitly.
-//
-// Order matters here too, though the hazard is different from
-// accountBreached() above: switching size+stage FROM eval TO funded means
-// switchAccount()'s saveActiveBucket() call persists under the EVAL key
-// (harmless — that data's already archived by this point) while
-// loadAccountBucket() reads the FUNDED key, so pre-clearing FUNDED before the
-// switch is safe (no same-key clobber). The EVAL bucket itself is only
-// cleared AFTER the switch completes and state.mode is 'funded' — clearing
-// it beforehand, while eval is still the active key, would hit the exact
-// same clobber problem accountBreached() works around above.
-async function accountClearedToFunded() {
-  if (state.mode !== 'eval') { addSystemMessage('Already on FUNDED — nothing to promote.'); return; }
-  const label = ACCOUNT_PROFILES[state.accountSize].label;
-  if (!confirm(`Mark ${label} EVAL as CLEARED and move to FUNDED?\n\nThis archives all current eval data (with mistakes/positives noted) to a file, marks it passed in the Cost tab, then starts FUNDED with a clean slate.`)) return;
-  const record = await archiveActiveBucket('cleared');
-  const size = state.accountSize;
-  await costMarkAccountPassed(size, 'eval', record.archivedAt);
-  await clearPersistedBucket(size, 'funded');
-  await switchAccount(size, 'funded', { promoted: true });
-  await clearPersistedBucket(size, 'eval');
+// Mark a FUNDED slot's FIRST PAYOUT — the third terminal outcome alongside
+// breach/clear (eval → breach|clear; funded → breach|payout). A payout is not
+// a loss of the account: the slot keeps trading funded afterward, so this
+// archives the payout period's history (same buildArchiveRecord/persistArchiveRecord
+// path breach/clear use, event='payout') and resets the ledger fresh for the
+// NEXT payout period, rather than retiring the slot.
+async function slotPaidOut(slot, ev) {
+  if (slot.stage !== 'funded') { addSystemMessage('Payouts apply to FUNDED accounts only.'); return; }
+  const label = slot.name || ACCOUNT_PROFILES[slot.size].label;
+  if (!confirm(`Record FIRST PAYOUT for ${label} FUNDED?\n\nThis archives the current funded period's data (with mistakes/positives noted) to a file, marks it paid-out in the Cost tab, then starts the next funded period with a clean ledger. This account stays FUNDED.`)) return;
+
+  await ckButtonBusy(ev, 'Recording payout…', async () => {
+    const wasActive = slot.id === activeSlotId;
+    const { account: accountData, ls: lsData } = await readSlotBucketData(slot);
+    const record = await persistArchiveRecord(buildArchiveRecord(slot, accountData, lsData, 'payout'));
+    const costRes = await costMarkAccountPaidOut(slot.size, slot.stage, record.archivedAt);
+
+    slot.payoutAt = record.archivedAt;
+    slot.payoutCount = (slot.payoutCount || 0) + 1;
+    persistSlots();
+    const freshAccount = await resetSlotBucket(slot);
+    if (wasActive) {
+      state.account = freshAccount;
+      ACCT_LS_KEYS.forEach(k => localStorage.removeItem(k));
+    }
+    refreshAfterSlotAction(wasActive);
+
+    try {
+      window.api.journeyAction('funded-payout', {
+        slotId: slot.id, finalBalance: (accountData && accountData.balance) || null, payoutCount: slot.payoutCount
+      }).then(() => { if (typeof renderInsights === 'function') renderInsights(); }).catch(() => {});
+    } catch (e) {}
+
+    const costNote = costRes.matched
+      ? ' Cost tab entry marked PAID OUT.'
+      : ' ⚠ No matching fee row found in Cost tab — add/confirm it there so lifetime spend stays accurate.';
+    addSystemMessage(`💰 First payout recorded — ${label}. History archived (see Insights → Past Accounts).${costNote} Still FUNDED — ledger reset for the next period.`);
+  });
 }
+
+// Mark an EVAL slot CLEARED and move it to FUNDED — works on the active slot
+// or any other. Archives eval history, marks it passed in the Cost tab, then
+// starts FUNDED on that SAME slot with a clean slate (does not inherit the
+// eval ledger — see resetSlotBucket's bug-fix note above for why the old path
+// silently failed to guarantee that).
+// Shared core: archive eval history, mark Cost tab passed, transition the
+// slot to funded, reset its bucket fresh. Used by BOTH the manual "EVAL
+// CLEARED" button (slotClearedToFunded, after a confirm dialog) and the
+// automatic promotion that fires the moment a live eval balance crosses
+// target (checkAutoPromotion).
+// FIX (2026-08-18): checkAutoPromotion() previously called switchAccount()
+// directly and skipped every step here — the same bug class as B2 from the
+// 2026-08-13 review, just surfaced in the AUTOMATIC path instead of the
+// manual button. Since auto-promotion is the path that actually fires on a
+// live target hit, every real eval→funded promotion was silently discarding
+// the eval history bundle (no archive, no Cost-tab passed mark, no journey
+// record) instead of the manual button's correct behavior.
+async function promoteSlotToFunded(slot) {
+  const wasActive = slot.id === activeSlotId;
+  const { account: accountData, ls: lsData } = await readSlotBucketData(slot);
+  const record = await persistArchiveRecord(buildArchiveRecord(slot, accountData, lsData, 'cleared'));
+  await costMarkAccountPassed(slot.size, 'eval', record.archivedAt);
+
+  slot.stage = 'funded';
+  persistSlots();
+  const freshAccount = await resetSlotBucket(slot); // resets under the SAME slot.id, now stage='funded'
+
+  // 2026-08-16: closes the eval phase AND opens funded on the SAME journey
+  // record (journey-tracker.js) — the fix for the eval/funded data
+  // cross-contamination found in the old per-click archive mechanism.
+  try {
+    window.api.journeyAction('eval-cleared', {
+      slotId: slot.id, finalBalance: (accountData && accountData.balance) || null,
+      fundedStartBalance: freshAccount ? freshAccount.balance : null
+    }).then(() => { if (typeof renderInsights === 'function') renderInsights(); }).catch(() => {});
+  } catch (e) {}
+
+  return { wasActive, accountData };
+}
+
+async function slotClearedToFunded(slot, ev) {
+  if (slot.stage !== 'eval') { addSystemMessage('Already FUNDED — nothing to promote.'); return; }
+  const label = slot.name || ACCOUNT_PROFILES[slot.size].label;
+  if (!confirm(`Mark ${label} EVAL as CLEARED and move to FUNDED?\n\nThis archives all current eval data (with mistakes/positives noted) to a file, marks it passed in the Cost tab, then starts FUNDED with a clean slate.`)) return;
+
+  await ckButtonBusy(ev, 'Promoting…', async () => {
+    const { wasActive } = await promoteSlotToFunded(slot);
+    if (wasActive) {
+      // switchAccount() re-runs loadAccountBucket() (reloads what resetSlotBucket
+      // just wrote — genuinely fresh, per the bug fix above) and does the full
+      // state.mode/UI/config sync + the "auto-promoted" system message.
+      await switchAccount(slot.size, 'funded', { promoted: true });
+    } else {
+      refreshAfterSlotAction(false);
+      addSystemMessage(`🎯 ${label} EVAL CLEARED — moved to FUNDED. Funded rules now active for this account. Eval history archived (see Insights → Past Accounts).`);
+    }
+  });
+}
+
+// Insights tab buttons still operate on whichever slot is currently loaded —
+// thin wrappers over the slot-scoped functions above so there is exactly one
+// implementation, not two that can drift.
+async function accountBreached(ev) { await slotBreached(acctSlot(), ev); }
+async function accountClearedToFunded(ev) { await slotClearedToFunded(acctSlot(), ev); }
+async function accountPaidOut(ev) { await slotPaidOut(acctSlot(), ev); }
 
 // After every balance recompute (csvApply), check whether the ACTIVE eval
 // account just cleared its target. If so, auto-promote to funded per Anoop's
 // explicit instruction: "once i reach target of evaluation it should start
 // for funded with funded rules." Funded starts genuinely empty — it does NOT
-// carry over the eval stage's trade history/ledger.
+// carry over the eval stage's trade history/ledger (that history goes through
+// promoteSlotToFunded's archive step instead, same as the manual button).
+// promotionInFlight guards the same double-fire race ckButtonBusy guards on
+// the manual path: state.mode only flips to 'funded' once switchAccount()
+// resolves at the end of the chain, so a second balance tick arriving before
+// that (e.g. two ticks a poll interval apart) would otherwise re-enter and
+// archive/promote twice.
+let promotionInFlight = false;
 function checkAutoPromotion() {
-  if (state.mode !== 'eval') return;
+  if (state.mode !== 'eval' || promotionInFlight) return;
   const prof = ACCOUNT_PROFILES[state.accountSize].eval;
   if (state.account.balance >= prof.startBalance + prof.target) {
-    switchAccount(state.accountSize, 'funded', { promoted: true });
+    promotionInFlight = true;
+    const slot = acctSlot();
+    promoteSlotToFunded(slot)
+      .then(() => switchAccount(state.accountSize, 'funded', { promoted: true }))
+      .catch(e => console.error('Auto-promotion failed:', e.message))
+      .finally(() => { promotionInFlight = false; });
   }
 }
 
@@ -807,7 +1131,16 @@ async function showAccountGate(size, stage) {
     const go = document.createElement('button');
     go.className = 'gate-slot-go';
     go.textContent = isCurrent ? 'Continue' : 'Trade this';
-    go.onclick = async (ev) => { ev.stopPropagation(); await switchSlot(slot.id, { force: isCurrent }); hideAccountGate(); };
+    go.onclick = async (ev) => {
+      ev.stopPropagation();
+      await switchSlot(slot.id, { force: isCurrent });
+      hideAccountGate();
+      // 2026-08-13 (Anoop): "it should open up and should be done as first step
+      // after choosing account type. After that, all the other tasks come."
+      // Picking the account is the moment the session starts, so this is where
+      // the checklist gets the first word.
+      try { if (typeof ckAfterAccountChosen === 'function') ckAfterAccountChosen(); } catch (e) {}
+    };
     row.appendChild(go);
 
     if (peek) {
@@ -842,6 +1175,39 @@ async function showAccountGate(size, stage) {
       };
       row.appendChild(fresh);
     }
+
+    // 2026-08-13 (Anoop): "a button... beside the account in a minimalist
+    // style" that indicates/marks breach or eval→funded clearance, per slot,
+    // right in the picker row. Stage-scoped: eval gets BOTH actions (it can
+    // fail OR pass), funded gets only breach (there's no further stage to
+    // clear into). Always shown, even on an empty/fresh slot — this is a
+    // manual declaration, not something gated on ledger state.
+    const status = document.createElement('div');
+    status.className = 'gate-status-actions';
+    if (slot.stage === 'eval') {
+      const breachBtn = document.createElement('button');
+      breachBtn.className = 'gate-status-btn gate-status-breach';
+      breachBtn.textContent = 'Eval breached';
+      breachBtn.title = 'Mark this evaluation account breached — archives its data and resets it fresh';
+      breachBtn.onclick = (ev) => { ev.stopPropagation(); slotBreached(slot, ev); };
+      status.appendChild(breachBtn);
+
+      const clearBtn = document.createElement('button');
+      clearBtn.className = 'gate-status-btn gate-status-clear';
+      clearBtn.textContent = 'Cleared → Funded';
+      clearBtn.title = 'Mark this evaluation cleared and move it to FUNDED — archives eval data, starts funded fresh';
+      clearBtn.onclick = (ev) => { ev.stopPropagation(); slotClearedToFunded(slot, ev); };
+      status.appendChild(clearBtn);
+    } else {
+      const breachBtn = document.createElement('button');
+      breachBtn.className = 'gate-status-btn gate-status-breach';
+      breachBtn.textContent = 'Funded breached';
+      breachBtn.title = 'Mark this funded account breached — archives its data and resets it fresh';
+      breachBtn.onclick = (ev) => { ev.stopPropagation(); slotBreached(slot, ev); };
+      status.appendChild(breachBtn);
+    }
+    row.appendChild(status);
+
     rowsEl.appendChild(row);
   });
 
@@ -924,6 +1290,13 @@ function showBrowserNotification(title, body, urgent = false) {
 }
 
 // ── Clock ──────────────────────────────────────────────────────────────────────
+// 2026-08-15 (Anoop): "just as a reminder before new york session it should
+// remind me to redo checklist via chat" — fires once, 10 min before the 7 PM
+// IST NY session, ONLY if today's checklist gate isn't already open. Guarded
+// by ckToday() (not a plain Date key) so it respects the same 03:30 IST
+// rollover as the gate itself, and by a per-day flag so the once-a-second
+// clock tick can't fire it twice.
+let ckNySessionReminderDate = null;
 function startClock() {
   function tick() {
     const now  = new Date();
@@ -933,9 +1306,169 @@ function startClock() {
     const isNY = h === 19 || h === 20;  // NY session: 7:00–9:00 PM IST
     document.getElementById('session-clock').textContent =
       `${p(h)}:${p(m)}:${p(s)} IST${isNY ? '  ● NY LIVE' : ''}`;
+
+    if (h === 18 && m === 50) {
+      const today = (typeof ckToday === 'function') ? ckToday() : null;
+      if (today && ckNySessionReminderDate !== today) {
+        ckNySessionReminderDate = today;
+        try {
+          if (!ckGateIsOpen() && typeof addSystemMessage === 'function') {
+            addSystemMessage('📋 NY session starts in 10 minutes — pre-trade checklist is not done yet. Redo it now before you trade.');
+          }
+        } catch (e) {}
+      }
+    }
   }
   tick(); setInterval(tick, 1000);
 }
+
+// ── TradingView connection audio alerts (2026-08-11) ───────────────────────────
+// Anoop's ask, after losing a session on 08-10 to a disconnect he never noticed:
+// "when tradingview disconnects from the app there should be a sound along with
+// the red dot which is already present. even when connected or disconnected it
+// should work."
+//
+// Tones are synthesised with WebAudio rather than shipped as .mp3/.wav files on
+// purpose — no asset to load, no 404, no extra file that can go missing from a
+// folder move. One less thing that can silently fail, which is the whole point
+// of this feature.
+//
+// The disconnect alarm REPEATS every 30s while still disconnected (capped at 20
+// reps / 10 min so it can't shriek all night if he's walked away). A single beep
+// is exactly what gets missed when you're staring at a DOM — repetition is the
+// feature, not an oversight. Any click silences the current run.
+// 2026-08-12 — the visual half of the disconnect alert. The audio half can be
+// blocked by the browser or muted by Windows; the visual half must therefore
+// stand alone and be impossible to miss, not merely present. See #tv-dead-bar.
+function setTvDeadVisual(dead) {
+  try {
+    const chip = document.getElementById('tv-status');
+    const bar  = document.getElementById('tv-dead-bar');
+    if (chip) chip.classList.toggle('tv-dead', !!dead);
+    if (bar)  bar.classList.toggle('show', !!dead);
+    // Title bleeds into the taskbar, so it reaches him even when the app is
+    // behind TradingView on another monitor.
+    document.title = dead ? '\u26A0 TV DISCONNECTED — Co-Pilot' : 'Co-Pilot';
+  } catch (e) { /* the alert must never be the thing that breaks the UI */ }
+}
+
+const tvAudio = {
+  ctx: null,
+  repeatTimer: null,
+  repeats: 0,
+  MAX_REPEATS: 20,
+  blockedWarned: false,
+
+  // Browsers refuse to start an AudioContext without a user gesture. We create
+  // it lazily and try to resume; if the app has been sitting untouched since
+  // load, the first alert may be silently swallowed — so we surface that in the
+  // chat log rather than letting Anoop believe the alarm is armed when it isn't.
+  ensureCtx() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        this.ctx = new AC();
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+      return this.ctx;
+    } catch (e) { return null; }
+  },
+
+  // 2026-08-12 — THE REASON THE ALARM WAS SILENT.
+  // ensureCtx() calls resume(), but resume() is ASYNCHRONOUS. The callers below
+  // then read ctx.state on the very next line, where it is still 'suspended',
+  // and bail to warnBlocked(). The first disconnect alarm therefore suppressed
+  // itself every single time — precisely the alarm that matters most.
+  //
+  // The fix is to stop resuming at alarm time and instead unlock the context on
+  // Anoop's first click/keypress anywhere in the app, which always happens long
+  // before a disconnect. By the time an alarm fires the context is already
+  // running, so no race exists to lose.
+  armOnFirstGesture() {
+    if (this._armed) return;
+    this._armed = true;
+    const unlock = () => {
+      try {
+        const ctx = this.ensureCtx();
+        if (ctx && ctx.state === 'running') {
+          this._unlocked = true;
+          document.removeEventListener('pointerdown', unlock, true);
+          document.removeEventListener('keydown', unlock, true);
+        }
+      } catch (e) { /* an unusable AudioContext must never break the UI */ }
+    };
+    document.addEventListener('pointerdown', unlock, true);
+    document.addEventListener('keydown', unlock, true);
+  },
+
+  tone(freq, startAt, durSec, gainPeak) {
+    const ctx = this.ctx;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(freq, ctx.currentTime + startAt);
+    // Short attack/release ramps — a raw gate on a square wave clicks audibly.
+    gain.gain.setValueAtTime(0.0001, ctx.currentTime + startAt);
+    gain.gain.exponentialRampToValueAtTime(gainPeak, ctx.currentTime + startAt + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + startAt + durSec);
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.start(ctx.currentTime + startAt);
+    osc.stop(ctx.currentTime + startAt + durSec + 0.02);
+  },
+
+  // Descending, urgent, deliberately unpleasant. This one means "stop".
+  playDisconnect() {
+    const ctx = this.ensureCtx();
+    if (!ctx) return this.warnBlocked();
+    if (ctx.state === 'suspended') return this.warnBlocked();
+    this.tone(880, 0.00, 0.18, 0.25);
+    this.tone(660, 0.22, 0.18, 0.25);
+    this.tone(440, 0.44, 0.34, 0.28);
+  },
+
+  // Ascending, brief, quiet. Confirmation only — must not sound like a reward.
+  playConnect() {
+    const ctx = this.ensureCtx();
+    if (!ctx || ctx.state === 'suspended') return;
+    this.tone(660, 0.00, 0.10, 0.12);
+    this.tone(880, 0.12, 0.14, 0.12);
+  },
+
+  warnBlocked() {
+    if (this.blockedWarned) return;
+    this.blockedWarned = true;
+    try {
+      addSystemMessage('⚠ Audio alerts are blocked by the browser until you click once anywhere in this window. Click now to arm the TradingView disconnect alarm.');
+    } catch (e) {}
+  },
+
+  startAlarm() {
+    this.stopAlarm();
+    this.repeats = 0;
+    this.playDisconnect();
+    this.repeatTimer = setInterval(() => {
+      if (++this.repeats >= this.MAX_REPEATS) return this.stopAlarm();
+      this.playDisconnect();
+    }, 30000);
+  },
+
+  stopAlarm() {
+    if (this.repeatTimer) { clearInterval(this.repeatTimer); this.repeatTimer = null; }
+    this.repeats = 0;
+  }
+};
+
+// Unlock WebAudio on Anoop's first interaction so the disconnect alarm is
+// already armed when it is needed. See armOnFirstGesture() for why.
+try { tvAudio.armOnFirstGesture(); } catch (e) {}
+
+// Any click both satisfies the browser's autoplay gesture requirement and
+// silences an in-progress alarm — he has acknowledged it by then.
+document.addEventListener('click', () => {
+  tvAudio.ensureCtx();
+  if (tvAudio.repeatTimer) tvAudio.stopAlarm();
+});
 
 // ── WebSocket events ───────────────────────────────────────────────────────────
 function setupWsEvents() {
@@ -945,22 +1478,82 @@ function setupWsEvents() {
   });
 
   window.api.onMcpConnected(() => {
+    const wasDisconnected = state.tvConnected === false;
     state.tvConnected = true;
+    tvAudio.stopAlarm();
+    if (wasDisconnected) tvAudio.playConnect();
     document.getElementById('tv-dot').className = 'connected';
     document.getElementById('tv-status-text').textContent = 'TradingView connected';
+    setTvDeadVisual(false);
     refreshPrice();
     window.api.requestMechanicalCheck();
+    // Deliberately do NOT clear the NO-GO here. Reconnecting restores the feed
+    // but not a fresh read — the verdict stays blocked until the next
+    // mechanical analysis actually lands and computeMechanicalGoNogo() sees
+    // non-stale data. Re-running it now just re-labels the reason accurately.
+    if (wasDisconnected) addSystemMessage('TradingView reconnected — waiting on a fresh Daily/1H read before the verdict can clear.');
+    computeMechanicalGoNogo();
   });
 
+  // 2026-08-11: a disconnect used to change nothing but a small grey line of
+  // text in the header — quieter than a cooldown timer, and easy to miss for a
+  // whole session (Anoop did, on 08-10, and kept trading). A dropped market
+  // feed is at least as serious as a cooldown, so it now gets a red alert
+  // banner, a chat-log line, and an immediate NO-GO recompute (the freshness
+  // check in computeMechanicalGoNogo() turns !tvConnected into a hard block).
   window.api.onMcpDisconnected(({ message } = {}) => {
+    const wasConnected = state.tvConnected;
     state.tvConnected = false;
     document.getElementById('tv-dot').className = 'error';
     document.getElementById('tv-status-text').textContent = message || 'TradingView offline';
+    setTvDeadVisual(true);
+    if (wasConnected) {
+      tvAudio.startAlarm();
+      if (typeof showAlertBanner === 'function') {
+        showAlertBanner('⚠ TRADINGVIEW DISCONNECTED — no live chart data. NO-GO until it reconnects. Do not enter on remembered levels.', 'red');
+      }
+      addSystemMessage('⚠ TradingView disconnected' + (message ? ' (' + message + ')' : '') + ' — chart data is now stale. Verdict forced to NO-GO. If you are in a position, manage it on the broker DOM; do not open anything new.');
+    }
+    computeMechanicalGoNogo();
   });
 
   window.api.onMcpStatus(msg => {
     document.getElementById('tv-status-text').textContent = String(msg).slice(0, 45);
   });
+
+  // 2026-08-19 (SEMI_AUTONOMOUS_SYSTEM_PLAN.md item 2): persistent, always-
+  // visible self-test line — updated in place on every result (initial boot
+  // AND every reconnect re-test), never a toast that can be missed.
+  if (window.api && window.api.onLiveFeedSelfTest) {
+    window.api.onLiveFeedSelfTest((msg) => {
+      const el = document.getElementById('live-feed-selftest');
+      if (!el) return;
+      const passed = msg && msg.passed, total = (msg && msg.total) || 3;
+      const failures = (msg && msg.failures) || [];
+      el.style.display = 'block';
+      if (passed === total) {
+        el.textContent = `Live feed: ${passed}/${total} checks passed`;
+        el.style.color = 'var(--green, #3ecf8e)';
+      } else {
+        el.textContent = `Live feed: ${passed}/${total} checks passed — ` + failures.join(' | ');
+        el.style.color = 'var(--red, #ff5c5c)';
+      }
+    });
+  }
+
+  // 2026-08-19 (Anoop's request, first slice — see SEMI_AUTONOMOUS_SYSTEM_PLAN.md
+  // "Next requested: live mistake-tracking feedback loop"): a live pattern
+  // match against his own documented failure history. F1 (trade-count
+  // escalation) first, advisory only per his explicit decision — a banner +
+  // a permanent chat-log line, NOT a hard stop. Fires once per day
+  // (server-side gated), so this only ever shows once, not spammed.
+  if (window.api && window.api.onMistakePattern) {
+    window.api.onMistakePattern((msg) => {
+      if (!msg || !msg.message) return;
+      showAlertBanner('🎯 ' + msg.message, 'amber');
+      if (typeof addSystemMessage === 'function') addSystemMessage('🎯 ' + msg.message);
+    });
+  }
 
   // ── Power of 3 phase-change alerts (2026-07-29) ──────────────────────────
   // Mechanical detector on the server fires these; DISTRIBUTION is the
@@ -1014,6 +1607,124 @@ function setupWsEvents() {
   });
 
   window.api.onModeUpdate(mode => switchAccount(state.accountSize, mode));
+  // 2026-08-16 (Pattern 03 voting variant): registered ONCE here, not inside
+  // sendDebateMessage() — this can legitimately arrive seconds after a debate
+  // call has already returned (a second independent pass trying to refute a
+  // GO verdict), so it must outlive any single call's lifetime. Registering
+  // it per-call with no matching unsubscribe would stack a new listener on
+  // every debate and fire the same refutation multiple times after a few
+  // rounds. Silent server-side when nothing was found, so this only ever
+  // fires with something worth reading.
+  if (window.api.onDebateRefutation) {
+    window.api.onDebateRefutation((text) => {
+      addSystemMessage('🔍 Second-opinion check on that GO: ' + text);
+    });
+  }
+  // Phase 2b (2026-08-17): registered once, same reasoning as
+  // onDebateRefutation above — a ticket can arrive after the debate call's
+  // own promise already resolved.
+  if (window.api.onTradeTicketSuggested) {
+    window.api.onTradeTicketSuggested((msg) => renderTradeTicketCard(msg));
+  }
+  if (window.api.onTradeConfirmResult) {
+    window.api.onTradeConfirmResult((msg) => tcHandleResult(msg, null));
+  }
+  if (window.api.onTradeConfirmRejected) {
+    window.api.onTradeConfirmRejected((msg) => tcHandleResult(null, msg));
+  }
+
+  // ── Auto-triggered Debate (2026-08-17) ────────────────────────────────
+  // Anoop: "i wanted it to keep a watch for me full time... tell me when
+  // the setup appears." The server's PO3 monitor now auto-runs a full
+  // Debate when price leaves ACCUMULATION (see server.js autoTriggerDebate)
+  // and broadcasts the same debate-status/arguments/judge-token/judge-done
+  // events a manual debate uses — routed here through a SEPARATE reqId
+  // channel (debate:auto*) so it can never collide with a debate Anoop is
+  // actively running by hand. Uses its own local bubble/buffer, not
+  // state.currentAssistantBubble, for the same reason.
+  let autoDebateStatusEl = null, autoDebateBubble = null, autoDebateBuffer = '';
+  if (window.api.onDebateAutoTriggered) {
+    window.api.onDebateAutoTriggered((msg) => {
+      const msgs = document.getElementById('messages');
+      if (!msgs) return;
+      autoDebateStatusEl = document.createElement('div');
+      autoDebateStatusEl.className = 'msg assistant';
+      autoDebateStatusEl.innerHTML = '<div class="debate-status-pill">🤖 Auto-watch: ' + escHtml(msg.reason || 'phase changed, checking...') + '</div>';
+      msgs.appendChild(autoDebateStatusEl);
+      scrollToBottom();
+    });
+  }
+  if (window.api.onDebateAutoStatus) {
+    window.api.onDebateAutoStatus((phase) => {
+      const pill = autoDebateStatusEl && autoDebateStatusEl.querySelector('.debate-status-pill');
+      if (pill) pill.textContent = phase === 'debating' ? '🤖 Auto-watch: Jessi, Analysis & Power of 3 are debating…' : '🤖 Auto-watch: ' + phase;
+    });
+  }
+  if (window.api.onDebateAutoArguments) {
+    window.api.onDebateAutoArguments((jessiArg, analysisArg, po3Arg, answeredBy) => {
+      answeredBy = answeredBy || {};
+      if (autoDebateStatusEl) { autoDebateStatusEl.remove(); autoDebateStatusEl = null; }
+      const msgs = document.getElementById('messages');
+      if (!msgs) return;
+      const argEl = document.createElement('div');
+      argEl.className = 'msg assistant';
+      let html = '<div class="debate-arguments">' +
+        '<div class="debate-arg"><div class="debate-arg-header jessi">Jessi (Discipline)</div>' + escHtml(jessiArg || '').replace(/\n/g, '<br>') + modelBadgeHtml(answeredBy.jessi) + '</div>' +
+        '<div class="debate-arg"><div class="debate-arg-header analysis">Analysis (Technical)</div>' + escHtml(analysisArg || '').replace(/\n/g, '<br>') + modelBadgeHtml(answeredBy.analysis) + '</div>';
+      if (po3Arg) {
+        html += '<div class="debate-arg"><div class="debate-arg-header po3">Power of 3 (AMD)</div>' + escHtml(po3Arg).replace(/\n/g, '<br>') + modelBadgeHtml(answeredBy.po3) + '</div>';
+      }
+      html += '</div>';
+      argEl.innerHTML = html;
+      msgs.appendChild(argEl);
+      scrollToBottom();
+
+      // New bubble for the judge's streamed verdict, independent of the
+      // main chat's state.currentAssistantBubble.
+      const msgs2 = document.getElementById('messages');
+      const d = document.createElement('div');
+      d.className = 'msg assistant';
+      autoDebateBubble = document.createElement('div');
+      autoDebateBubble.className = 'msg-bubble';
+      autoDebateBubble.innerHTML = '<div class="debate-judge-header">🤖⚖ Expert Judge (auto-watch)</div>';
+      d.appendChild(autoDebateBubble);
+      msgs2.appendChild(d);
+      autoDebateBuffer = '';
+      scrollToBottom();
+    });
+  }
+  if (window.api.onDebateAutoJudgeToken) {
+    window.api.onDebateAutoJudgeToken((t) => {
+      if (!autoDebateBubble) return;
+      autoDebateBuffer += t;
+      autoDebateBubble.innerHTML = '<div class="debate-judge-header">🤖⚖ Expert Judge (auto-watch)</div>' + renderMarkdown(autoDebateBuffer);
+      scrollToBottom();
+    });
+  }
+  if (window.api.onDebateAutoJudgeDone) {
+    window.api.onDebateAutoJudgeDone((fullText, answeredBy) => {
+      if (autoDebateBubble) {
+        const text = fullText || autoDebateBuffer;
+        autoDebateBubble.innerHTML = '<div class="debate-judge-header">🤖⚖ Expert Judge (auto-watch)</div>' + renderMarkdown(text) + modelBadgeHtml(answeredBy);
+        if (isWarningText(text)) autoDebateBubble.classList.add('warning');
+        else if (isCautionText(text)) autoDebateBubble.classList.add('caution');
+        attachSpeakButton(autoDebateBubble.parentElement, text);
+      }
+      autoDebateBubble = null; autoDebateBuffer = '';
+    });
+  }
+  if (window.api.onDebateAutoJudgeError) {
+    window.api.onDebateAutoJudgeError((message) => {
+      if (autoDebateStatusEl) { autoDebateStatusEl.remove(); autoDebateStatusEl = null; }
+      addSystemMessage('⚠ Auto-watch debate failed: ' + message);
+      autoDebateBubble = null; autoDebateBuffer = '';
+    });
+  }
+  if (window.api.onBiasNote) {
+    window.api.onBiasNote(msg => {
+      if (msg && msg.text && typeof addSystemMessage === 'function') addSystemMessage(msg.text);
+    });
+  }
 
   window.api.onEngulfMonStatus(msg => {
     const tf = (msg && msg.tf) || '1h';
@@ -1116,6 +1827,7 @@ function setupWsEvents() {
   });
 
   window.api.onNewsStatus(status => renderNewsPanel(status));
+  window.api.onEndDayAutoTrigger(msg => { handleEndDayAutoTrigger(msg && msg.date); });
   window.api.onTradovateTestResult(r => { const st = document.getElementById('settings-tv-status'); if (!st) return; if (r.ok) { st.style.color = 'var(--green)'; st.textContent = '\u2713 Connected (' + r.env + '). Accounts: ' + ((r.accounts||[]).join(', ') || 'none'); } else { st.style.color = 'var(--red)'; st.textContent = '\u2717 ' + (r.error || 'connection failed'); } });
 
   window.api.onNewsChartMarks(res => {
@@ -1125,8 +1837,18 @@ function setupWsEvents() {
   });
 
   // ── Mechanical HTF alignment / key level (no LLM, always-on) ───────────────
+  // 2026-08-11: a failed read (TV offline / error) used to `return` here, which
+  // silently LEFT THE PREVIOUS READ IN PLACE. state.mechanical kept its last
+  // dailyTrend/hourTrend forever, so computeMechanicalGoNogo() went on scoring
+  // alignment against a chart snapshot from before the disconnect and could
+  // still render GO. That is what happened on 2026-08-10. Now a failure marks
+  // the read stale and immediately re-runs the verdict, which forces NO-GO.
   window.api.onMechanicalAnalysis(msg => {
-    if (!msg || !msg.ok) return;
+    if (!msg || !msg.ok) {
+      if (state.mechanical) state.mechanical.failed = (msg && msg.status) || 'read failed';
+      computeMechanicalGoNogo();
+      return;
+    }
     state.mechanical = {
       dailyTrend: msg.dailyTrend, hourTrend: msg.hourTrend, aligned: msg.aligned,
       dailyLabel: msg.dailyLabel, hourLabel: msg.hourLabel,
@@ -1199,8 +1921,16 @@ async function handleCsvFileSelected(ev) {
   // dates are keyed, so overlapping days overwrite instead of double-counting.
   for (const f of files) {
     const isPdf = /\.pdf$/i.test(f.name);
+    // 2026-08-17: "Update file" extended beyond CSV/PDF — .xlsx/.xls route
+    // through server-side extraction (same pattern as PDF), everything else
+    // (.csv, .txt, .tsv, or no/unknown extension) goes through the existing
+    // text path, which now also auto-detects comma/tab/semicolon delimiters
+    // (see splitCsvLine) instead of assuming comma — so a tab-delimited
+    // broker export just works without needing its own branch here.
+    const isXlsx = /\.xlsx?$/i.test(f.name);
     try {
       if (isPdf) { await handlePdfFile(f); }
+      else if (isXlsx) { await handleXlsxFile(f); }
       else { const text = await readFile(f); csvIngest(f.name, text); }
     }
     catch (e) { addSystemMessage('Could not read ' + f.name + (e && e.message ? ' — ' + e.message : '')); }
@@ -1297,6 +2027,28 @@ async function handlePdfFile(f) {
   csvIngest(f.name, csvText);
 }
 
+// ── Excel upload path (added 2026-08-17) — extends handleCsvFileSelected's
+// routing above, same "extract → convert to CSV → reuse csvIngest" pattern
+// as handlePdfFile just above. Extraction happens server-side (SheetJS,
+// via ws-client's xlsxExtract — see server.js's 'xlsx-extract' handler),
+// converting the workbook's FIRST sheet straight to CSV text — no new
+// row-parsing logic, the existing (already fuzzy-header-matching)
+// csvParseTrades() handles whatever comes back exactly like a real CSV
+// upload. Only the first sheet is read; a multi-sheet export with trades on
+// a later tab would need a different sheet picked — not handled here, keep
+// it simple until that's actually a real case.
+async function handleXlsxFile(f) {
+  addUserMessage('📊 Extracting ' + f.name + ' (server-side, first sheet)…');
+  const buf = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(new Error('read failed')); r.readAsArrayBuffer(f); });
+  const base64 = arrayBufferToBase64(buf);
+  const csvText = await window.api.xlsxExtract(base64);
+  if (!csvText || !csvText.trim()) {
+    addSystemMessage('Could not extract any data from ' + f.name + ' — the first sheet may be empty, or trades may be on a different sheet.');
+    return;
+  }
+  csvIngest(f.name, csvText);
+}
+
 // ── Deterministic CSV discipline scorer (no LLM) ────────────────────────────
 // Column names vary across Tradovate CSV export types (Orders vs Fills vs
 // Performance tab), so this maps columns fuzzily by header keyword instead
@@ -1305,28 +2057,50 @@ async function handlePdfFile(f) {
 // that isn't there. Verified against a real Tradovate "Performance" export
 // (headers: symbol, qty, buyPrice, sellPrice, pnl, boughtTimestamp,
 // soldTimestamp, duration) on 2026-07-06 — see notes on each fix below.
-function splitCsvLine(line) {
+function splitCsvLine(line, delimiter) {
   // Quote-aware split — Tradovate's own export doesn't quote fields, but a
   // pnl value like "$1,234.00" would otherwise misalign every column after
-  // it on a naive comma-split.
+  // it on a naive comma-split. `delimiter` defaults to comma — every
+  // existing CSV caller is unaffected; only parseCsvRows below ever passes
+  // something else (2026-08-17, for .txt/.tsv support).
+  const d = delimiter || ',';
   const cells = [];
   let cur = '', inQuotes = false;
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
     if (c === '"') { inQuotes = !inQuotes; continue; }
-    if (c === ',' && !inQuotes) { cells.push(cur); cur = ''; continue; }
+    if (c === d && !inQuotes) { cells.push(cur); cur = ''; continue; }
     cur += c;
   }
   cells.push(cur);
   return cells.map(c => c.trim());
 }
 
+// 2026-08-17: "Update file" needs to handle plain .txt/.tsv broker exports
+// too, which are usually tab- or semicolon-delimited, not comma. Detected
+// from the HEADER line only (outside quotes) — whichever of , / \t / ;
+// appears most often wins; comma is the default/tiebreak, matching every
+// CSV export this already worked against.
+function detectDelimiter(headerLine) {
+  const counts = { ',': 0, '\t': 0, ';': 0 };
+  let inQuotes = false;
+  for (let i = 0; i < headerLine.length; i++) {
+    const c = headerLine[i];
+    if (c === '"') { inQuotes = !inQuotes; continue; }
+    if (!inQuotes && counts[c] !== undefined) counts[c]++;
+  }
+  let best = ',', bestCount = counts[','];
+  for (const d of ['\t', ';']) { if (counts[d] > bestCount) { best = d; bestCount = counts[d]; } }
+  return best;
+}
+
 function parseCsvRows(csvText) {
   const lines = csvText.split(/\r?\n/).filter(l => l.trim().length);
   if (lines.length < 2) return { headers: [], rows: [] };
-  const headers = splitCsvLine(lines[0]);
+  const delimiter = detectDelimiter(lines[0]);
+  const headers = splitCsvLine(lines[0], delimiter);
   const rows = lines.slice(1).map(line => {
-    const cells = splitCsvLine(line);
+    const cells = splitCsvLine(line, delimiter);
     const row = {};
     headers.forEach((h, i) => { row[h] = cells[i]; });
     return row;
@@ -1696,7 +2470,7 @@ function _renderMode(mode) {
     const sizeLabel = ACCOUNT_PROFILES[state.accountSize] ? ACCOUNT_PROFILES[state.accountSize].label : '';
     let statusNote = '';
     if (prof && prof.notOpened) statusNote = ' (not opened yet)';
-    else if (state.accountSize === '50k' && mode === 'funded') statusNote = ' (BLOWN — historical reference only)';
+    else if (prof && prof.blown) statusNote = ' (BLOWN — historical reference only)';
     else if (prof && prof.placeholder) statusNote = ' (terms unconfirmed)';
     document.getElementById('account-section-title').textContent =
       `${sizeLabel} ${mode === 'eval' ? 'Eval' : 'Funded'} Account${statusNote}`;
@@ -1727,7 +2501,8 @@ function updateAccountSizeSelector(mode) {
   const tag = document.getElementById('mode-funded-tag');
   if (!tag) return;
   const fundedProf = ACCOUNT_PROFILES[state.accountSize].funded;
-  if (mode === 'funded' && state.accountSize === '50k') {
+  // 2026-08-12: was `state.accountSize === '50k'` — see ACCOUNT_PROFILES.
+  if (mode === 'funded' && fundedProf.blown) {
     tag.textContent = 'BLOWN'; tag.style.display = '';
   } else if (fundedProf.notOpened) {
     tag.textContent = 'N/A'; tag.style.display = '';
@@ -2458,7 +3233,7 @@ function alokAnswerCore(raw) {
   }
 
   const all = alokAllTradesSorted();
-  if (!all.length) return "No trade data ingested yet — upload a CSV or PDF in Analyze CSV/PDF first, then ask me about it.";
+  if (!all.length) return "No trade data ingested yet — upload a report in Update File first, then ask me about it.";
 
   const dateKey = alokDateKeyword(ql);
   const n = alokLastN(ql);
@@ -2479,7 +3254,7 @@ function alokAnswerCore(raw) {
     const list = dateKey && all.some(t => t.date === dateKey)
       ? all.filter(t => t.date === dateKey)
       : all.slice(-(n || 10));
-    if (!list.length) return 'No trades ingested yet — upload a Performance CSV in Analyze CSV/PDF first.';
+    if (!list.length) return 'No trades ingested yet — upload a Performance report in Update File first.';
     return 'Last ' + list.length + ' trade' + (list.length === 1 ? '' : 's') + ':\n' + list.map(alokFmtTrade).join('\n');
   }
 
@@ -2799,7 +3574,10 @@ async function runIctPo3(question) {
   }
 }
 
-// ── Post-Session Analyst: auto-fires after CSV ingest ─────────────────────
+// ── Post-Session Analyst ──────────────────────────────────────────────────
+// 2026-08-12: NO LONGER auto-fires after CSV ingest. Runs on request only —
+// via the chat trigger ("post session review"), End Day & Save, or
+// window.runPostSessionReview(). See rules.json autoPostSessionReview.
 async function runPostSessionReview(retriesLeft) {
   // FIX (2026-07-28): was an unbounded self-reschedule — if something upstream
   // stayed stuck (e.g. the debate/debrief hang this was found alongside),
@@ -2876,6 +3654,18 @@ async function sendMessage(presetText) {
 
   addUserMessage(text);
   state.messages.push({ role: 'user', content: text });
+
+  // ── On-demand full Post-Session report (2026-08-12) ─────────────────────
+  // It no longer auto-fires on CSV upload (see csvApply / rules.json
+  // autoPostSessionReview). This is how you ask for it when you actually want
+  // the detail — checked FIRST so it can't be swallowed by the Scalper/Debate/
+  // Alok ladder below. Matched loosely because the point is that it's easy to
+  // reach, not that it's typed exactly.
+  if (/^\s*(run\s+)?(the\s+)?post[\s-]?session(\s+(review|report|analysis))?\s*$/i.test(text)) {
+    try { runPostSessionReview(); }
+    catch (e) { addSystemMessage('Could not start the post-session report: ' + e.message); }
+    return;
+  }
 
   // The Scalper (2026-08-01) — scalping specialist. Checked BEFORE debate mode
   // because it's the more specific intent: when Anoop turns the Scalper on he
@@ -2964,6 +3754,11 @@ async function sendMessage(presetText) {
   // 2026-07-23: proactive warning BEFORE a 413/429 actually happens (Groq's
   // live rate-limit headers). 2026-07-27: console only, same reasoning as above.
   const offQuotaWarn = window.api.onJessiChatQuotaWarn((message) => console.debug('[Jessi quota]', message));
+  // 2026-08-16 (Pattern 02, assistive routing — chat-intent.js): the ONE
+  // system-message case in this whole listener block that's meant to be
+  // visible, not console-only — it's a direct suggestion for Anoop to act on
+  // ("switch to Scalper mode?"), not internal model-routing mechanics.
+  const offModeHint = window.api.onJessiChatModeHint((message) => addSystemMessage('💡 ' + message));
   try {
     const { text: fullText, answeredBy } = await window.api.sendJessiChat(state.messages.slice(-20));
     finalizeAssistantBubble(fullText, null, answeredBy);
@@ -2998,6 +3793,7 @@ async function sendMessage(presetText) {
     offToolDone();
     offFallback();
     offQuotaWarn();
+    offModeHint();
     setStreaming(false);
   }
 }
@@ -3458,6 +4254,17 @@ window.jessiExecuteAppAction = async function (action, args) {
         });
         await costPersist();
         if (typeof renderCost === 'function') renderCost();
+        // 2026-08-16: mirror onto the active slot's journey record (does NOT
+        // close it — funded stays active for the next payout, journey-tracker.js).
+        // Best-effort against whichever slot is currently open; account_fees.json
+        // (above) remains the authoritative lifetime figure Jessi quotes from.
+        try {
+          const sl = acctSlot();
+          window.api.journeyAction('funded-payout', {
+            slotId: sl.id, amount: amt,
+            date: (args.date && /^\d{4}-\d{2}-\d{2}$/.test(args.date)) ? args.date : undefined
+          }).then(() => { if (typeof renderInsights === 'function') renderInsights(); }).catch(() => {});
+        } catch (e) {}
         return { ok: true, result: `Logged payout of $${amt}. First payout ever would be a real milestone — check the Cost tab.` };
       }
 
@@ -3839,6 +4646,141 @@ function addSystemMessage(text) {
   scrollToBottom();
 }
 
+// ── Phase 2b: trade ticket card (2026-08-17) ─────────────────────────────
+// Rendered when the Judge's verdict carries a TRADE_TICKET line (see
+// trade-ticket-parse.js). Editable size/stop/target, Confirm sends a
+// trade-confirm-request — the server (handleTradeConfirm in server.js) is
+// the ONLY place that actually enforces sizeCap/dayStop/size-freeze and
+// calls placeMarketOrder; nothing here can bypass that by construction, it
+// just sends a request and renders whatever the server decides.
+// 2026-08-17: tracked separately from the DOM so the HUD pill (always
+// visible, unlike the chat panel which scrolls) can reflect "is there a
+// ticket waiting" from anywhere in the app — GO verdicts can be rare, so a
+// pending one is easy to miss if it only ever showed inside the chat.
+window._pendingTicketIds = window._pendingTicketIds || new Set();
+function updateTicketPill() {
+  const pill = document.getElementById('gr-ticket-pill');
+  if (!pill) return;
+  const n = window._pendingTicketIds.size;
+  pill.style.display = n > 0 ? '' : 'none';
+  pill.textContent = n > 1 ? ('⚡ ' + n + ' TRADE TICKETS PENDING') : '⚡ TRADE TICKET PENDING';
+}
+window.tcScrollToPending = function () {
+  const id = window._pendingTicketIds.values().next().value;
+  const el = id && document.getElementById(id);
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+};
+
+function renderTradeTicketCard(msg) {
+  const id = 'tc-' + String(msg.sourceVerdictId || Date.now()).replace(/[^a-zA-Z0-9_-]/g, '');
+  if (document.getElementById(id)) return; // one card per verdict
+  window._pendingTicketIds.add(id);
+  updateTicketPill();
+  const msgs = document.getElementById('messages');
+  if (!msgs) return;
+  const d = document.createElement('div');
+  d.className = 'msg system-msg trade-ticket-card';
+  d.id = id;
+  d.dataset.side = msg.side || '';
+  d.dataset.symbol = msg.symbol || '';
+  d.dataset.sourceVerdictId = msg.sourceVerdictId || '';
+  const sideLabel = String(msg.side || '').toUpperCase();
+  const symbolLabel = msg.symbol ? escHtml(msg.symbol) : '<span style="opacity:.6">resolving symbol…</span>';
+  // Attribute-interpolated values are forced through Number(...) first —
+  // a finite number's toString() can never contain a quote/bracket
+  // character, so this can't break out of the attribute regardless of what
+  // arrives over the WS message, independent of escHtml's own text-escaping.
+  const safeNum = (v) => (v != null && Number.isFinite(Number(v))) ? Number(v) : '';
+  d.innerHTML = `<div class="msg-bubble trade-ticket-bubble">
+    <div class="tt-header">⚡ Trade ticket — ${escHtml(sideLabel)} ${symbolLabel}</div>
+    <div class="tt-row"><label>Size</label><input type="number" min="1" class="gr-in" id="${id}-size" value="${safeNum(msg.size)}"></div>
+    <div class="tt-row"><label>Stop (optional)</label><input type="number" step="0.25" class="gr-in" id="${id}-stop" value="${safeNum(msg.stopPrice)}"></div>
+    <div class="tt-row"><label>Target (optional)</label><input type="number" step="0.25" class="gr-in" id="${id}-target" value="${safeNum(msg.targetPrice)}"></div>
+    <div class="tt-actions">
+      <button class="gr-btn" onclick="tcConfirm('${id}')">Confirm &amp; Execute</button>
+      <button class="gr-btn gr-reset" onclick="tcDismiss('${id}')">Dismiss</button>
+    </div>
+    <div class="tt-result" id="${id}-result"></div>
+  </div>`;
+  msgs.appendChild(d);
+  scrollToBottom();
+}
+
+window.tcDismiss = function (id) {
+  const el = document.getElementById(id);
+  if (el) el.remove();
+  window._pendingTicketIds.delete(id);
+  updateTicketPill();
+};
+
+window.tcConfirm = function (id) {
+  const card = document.getElementById(id);
+  if (!card) return;
+  const sizeEl = document.getElementById(id + '-size');
+  const stopEl = document.getElementById(id + '-stop');
+  const targetEl = document.getElementById(id + '-target');
+  const resultEl = document.getElementById(id + '-result');
+  const size = parseInt(sizeEl.value, 10);
+  if (!size || size <= 0) { sizeEl.style.borderColor = 'var(--red)'; return; }
+  sizeEl.style.borderColor = '';
+  const stopVal = stopEl.value !== '' ? parseFloat(stopEl.value) : null;
+  const targetVal = targetEl.value !== '' ? parseFloat(targetEl.value) : null;
+  card.querySelectorAll('button, input').forEach((el) => { el.disabled = true; });
+  if (resultEl) resultEl.textContent = 'Submitting…';
+  const requestId = window.api.sendTradeConfirm({
+    sourceVerdictId: card.dataset.sourceVerdictId || null,
+    side: card.dataset.side,
+    symbol: card.dataset.symbol || undefined,
+    qty: size,
+    stopPrice: stopVal,
+    targetPrice: targetVal
+  });
+  card.dataset.pendingRequestId = requestId;
+};
+
+// One handler for both trade-confirm-result (passed/failed at execution) and
+// trade-confirm-rejected (blocked by the server-side rules check before
+// ever reaching placeMarketOrder) — same card lookup, different messaging.
+function tcHandleResult(resultMsg, rejectedMsg) {
+  const msg = resultMsg || rejectedMsg;
+  if (!msg || !msg.requestId) return;
+  // CSS.escape guards the selector against a requestId containing a quote
+  // or bracket — requestId is normally self-generated in ws-client.js
+  // (tc-<digits>-<base36>) so this is defense-in-depth, not a known bug.
+  const safeReqId = (typeof CSS !== 'undefined' && CSS.escape) ? CSS.escape(msg.requestId) : String(msg.requestId).replace(/["\\\]]/g, '');
+  const card = document.querySelector('.trade-ticket-card[data-pending-request-id="' + safeReqId + '"]');
+  if (!card) return;
+  const resultEl = document.getElementById(card.id + '-result');
+  if (rejectedMsg) {
+    if (resultEl) resultEl.textContent = '🚫 BLOCKED: ' + (rejectedMsg.reason || 'rejected by server-side rules check');
+    card.querySelectorAll('button, input').forEach((el) => { el.disabled = false; });
+    return;
+  }
+  if (resultMsg.success) {
+    // 2026-08-19: placeMarketOrder()'s post-submit readback (verified/
+    // verifyDetail) now reaches this far — don't present an unconfirmed
+    // submit with the same flat "✅" a confirmed one gets. verified===false
+    // means the click fired but neither a matching position nor a Working/
+    // Filled order was found within the readback window — worth a manual
+    // look at the broker panel, not a silent "all good."
+    if (resultMsg.verified === false) {
+      if (resultEl) resultEl.innerHTML = '⚠️ Order submitted but NOT CONFIRMED: ' + escHtml(resultMsg.submittedLabel || '') + ' — check the broker panel manually.';
+      addSystemMessage('Trade submitted (' + (resultMsg.submittedLabel || (card.dataset.side + ' ' + card.dataset.symbol)) + ') but could not be confirmed against the broker\'s positions/orders within the readback window — verify manually before assuming it went through.');
+    } else {
+      if (resultEl) resultEl.innerHTML = '✅ Order submitted: ' + escHtml(resultMsg.submittedLabel || '') + (resultMsg.verifyDetail ? ' (' + escHtml(resultMsg.verifyDetail) + ')' : '');
+      addSystemMessage('Trade confirmed and executed: ' + (resultMsg.submittedLabel || (card.dataset.side + ' ' + card.dataset.symbol)));
+    }
+    // Resolved — no longer pending. A rejection/failure above deliberately
+    // does NOT clear this: the card re-enables for another attempt, so it
+    // should stay lit until Anoop either succeeds or explicitly dismisses it.
+    window._pendingTicketIds.delete(card.id);
+    updateTicketPill();
+  } else {
+    if (resultEl) resultEl.textContent = '❌ ' + (resultMsg.error || 'order failed');
+    card.querySelectorAll('button, input').forEach((el) => { el.disabled = false; });
+  }
+}
+
 // Compact single-line status pill for deterministic (non-chat) quick actions
 // — marking chart levels, marking news times, starting a monitor. Anoop:
 // "action taken about marking and every other thing to be small and not
@@ -3934,8 +4876,16 @@ function renderMarkdown(text) {
   html = html.replace(/^[•\-*] (.+)$/gm, '<div class="md-li">$1</div>');
   html = html.replace(/^\d+\. (.+)$/gm, '<div class="md-li">$1</div>');
   html = html.replace(/^---+$/gm,        '<hr class="md-sep">');
-  html = html.replace(/\bGO\b(?!-)/g,    '<span class="badge-go">GO</span>');
-  html = html.replace(/\bNO-GO\b/g,      '<span class="badge-nogo">NO-GO</span>');
+  // 2026-08-12 P0: these were two passes with GO FIRST, so 'NO-GO' became
+  // 'NO-<span class="badge-go">GO</span>' — a NO-GO verdict rendered a GREEN GO
+  // chip, and the NO-GO pass then found nothing left to match. Every NO-GO Anoop
+  // has ever been shown was coloured as its opposite. One alternating pass now:
+  // NO-GO is listed first so the regex engine prefers it, and because it is a
+  // single pass the substituted markup is never rescanned.
+  html = html.replace(/\bNO-GO\b|\bGO\b/g, (m) =>
+    m === 'NO-GO'
+      ? '<span class="badge-nogo">NO-GO</span>'
+      : '<span class="badge-go">GO</span>');
   // FIX (2026-07-27): md-li/md-h3/hr are already block elements — each one
   // creates its own line break. A blank line next to one (very common in
   // AI-generated markdown, one blank line between every bullet) used to
@@ -4268,13 +5218,93 @@ function computeMechanicalGoNogo() {
   const newsBlackout = !!(state.news && state.news.inBlackout);
   const dayStopHit = acc.profit <= dailyStop;
   const overTradeLimit = acc.tradeCount >= tradeLim;
+
+  // ── PRE-SESSION CHECKLIST GATE (2026-08-12, task #33) ──────────────────────
+  // Until now the checklist was ADVISORY. Nothing anywhere stopped Anoop
+  // trading without it — the Insights tab nagged ("do the checklist BEFORE the
+  // first trade — it is 10% of your score") and that was the whole enforcement.
+  //
+  // On 2026-08-10 he skipped it and lost $855.50. He named it himself
+  // afterwards as the thing he was supposed to do and didn't. It is the one
+  // input entirely under his control, it costs ninety seconds, and it happens
+  // BEFORE the first entry — which is the only moment in the whole sequence
+  // where a decision is still cheap.
+  //
+  // So it is now a HARD reason, ranked with the daily stop. Deliberately NOT a
+  // soft/pending one: soft reasons render as "PENDING CHECK-IN", which is
+  // exactly the ignorable amber state that let this slide for months.
+  //
+  // Config, not code: rules.json → requireChecklist (default true). If this
+  // ever becomes obstructive he can switch it off in one place rather than
+  // deleting the enforcement, which is what actually happens to guards that
+  // can't be turned off.
+  const requireChecklist = getRules().requireChecklist !== false;
+  let checklistDoneToday = false;
+  try {
+    const ckh = JSON.parse(localStorage.getItem('copilot_ck_history') || '[]');
+    const t = (typeof today === 'function') ? today() : new Date().toISOString().slice(0, 10);
+    checklistDoneToday = ckh.some(e => e && e.date === t);
+  } catch (e) {
+    // Unreadable history must not silently unlock trading — fail CLOSED.
+    checklistDoneToday = false;
+  }
+
   const m = state.mechanical;
-  const alignedKnown = m && m.dailyTrend && m.hourTrend;
+  // ── Chart-data freshness (added 2026-08-11) ────────────────────────────────
+  // Until today this function had NO notion of whether the chart read was
+  // current. On 2026-08-10 TradingView dropped mid-session, state.mechanical
+  // kept its last-known trends, and the badge could still say GO from a
+  // pre-disconnect snapshot. Stale chart data is now a HARD block, ranked with
+  // the daily stop, because "I don't know what the chart is doing" must never
+  // resolve to GO. Server re-runs the read every 90s (server.js
+  // mechanicalInterval), so 4 minutes tolerates two missed cycles plus slack
+  // before it trips. Keep these two in sync if that interval ever changes.
+  const MECH_MAX_AGE_MS = 4 * 60 * 1000;
+  const mechAgeMs = (m && m.at) ? (Date.now() - Date.parse(m.at)) : Infinity;
+  const mechStale = !m || !m.at || !isFinite(mechAgeMs) || mechAgeMs > MECH_MAX_AGE_MS;
+  const alignedKnown = m && m.dailyTrend && m.hourTrend && !m.failed && !mechStale;
   const notAligned = alignedKnown && !m.aligned;
 
   const hardReasons = [];
   if (dayStopHit) hardReasons.push('Daily stop hit');
   if (overTradeLimit) hardReasons.push(`Trade limit reached (${acc.tradeCount}/${tradeLim})`);
+  if (requireChecklist && !checklistDoneToday) hardReasons.push('Pre-trade checklist not completed today — Checklist tab, then ✓ PRE-TRADE DONE');
+
+  // ── GUARDRAIL STOP BRIDGE (2026-08-16) ────────────────────────────────────
+  // Until now this function had no idea the guardrail's own stop-overlay
+  // (size-up while losing, size-up right after a loss, daily stop logged
+  // manually) had fired — two independent systems computing "is today over"
+  // with no connection between them. Acknowledging the overlay ("I am done")
+  // only hides the modal, it does not clear s.stopped, so this stays a HARD
+  // reason for the rest of the day exactly like the overlay itself does.
+  if (typeof window.grIsStopped === 'function' && window.grIsStopped()) {
+    hardReasons.push('Guardrail stop active today — size-up-after-a-loss or daily-stop pattern logged (see HUD)');
+  }
+
+  // ── CONTRACTS-PER-DAY (2026-08-12) ────────────────────────────────────────
+  // A hard block, alongside the daily stop. Anoop's own logged days split on
+  // total contracts: 10/11 traded green, 24/29 cost $879 and $572. Nothing
+  // enforced the total before — sizeCap governs each ENTRY (2) and
+  // tradesPerDay governs COUNT (10), so ten legal 2-lot trades is twenty
+  // contracts with every individual trade inside the rules.
+  // Reads the guardrail's own trade log (grTodayTrades), the same source the
+  // HUD counts from, so the badge and the bar can never disagree.
+  try {
+    const vcfg = getRules().contractsPerDay || {};
+    if (vcfg.enabled && window.VolumeBudget) {
+      const todayTrades = (typeof window.grTodayTrades === 'function') ? window.grTodayTrades() : [];
+      const used = window.VolumeBudget.contractsUsed(todayTrades);
+      const vs = window.VolumeBudget.volumeStatus(used, vcfg);
+      if (vs.level === 'stop') hardReasons.push(`Contract volume cap hit (${used}/${vs.cap} today)`);
+    }
+  } catch (e) { /* never let this throw and take the whole verdict with it */ }
+  if (!state.tvConnected) hardReasons.push('TradingView disconnected — no live chart data');
+  else if (m && m.failed) hardReasons.push(`Chart read failing (${m.failed})`);
+  else if (mechStale) hardReasons.push(
+    isFinite(mechAgeMs)
+      ? `Chart data stale (${Math.round(mechAgeMs / 60000)} min old)`
+      : 'No chart data yet — never read'
+  );
 
   const softReasons = [];
   if (!session) softReasons.push('Outside session window (London 1:30–3PM / NY 7–9PM IST)');
@@ -4391,8 +5421,17 @@ function updateAccountUI() {
   if (typeof enforceAccountInvariant === 'function') enforceAccountInvariant();
   const mllPct = Math.max(0, Math.min(100, ((mllSize - buffer) / mllSize) * 100));
 
+  // 2026-08-17: "● " prefix when today's balance is live-derived (no CSV
+  // uploaded yet today) — same visual language as the bottom HUD's own
+  // "● LIVE ·" tag, so a live-vs-CSV number is never presented as identical
+  // in confidence to a CSV-confirmed one.
+  const balPrefix = acc.balanceSource === 'live' ? '● ' : '';
+  const balTitle = acc.balanceSource === 'live'
+    ? 'Live estimate from the TradingView broker feed — no CSV uploaded for today yet. Upload a CSV to lock in the commission-accurate number.'
+    : 'From your uploaded CSV ledger.';
+
   // Funded rows
-  document.getElementById('stat-balance-funded').textContent = '$' + acc.balance.toLocaleString();
+  { const el = document.getElementById('stat-balance-funded'); el.textContent = balPrefix + '$' + acc.balance.toLocaleString(); el.title = balTitle; }
   document.getElementById('stat-floor-funded').textContent   = '$' + acc.fundedFloor.toLocaleString();
   document.getElementById('stat-buffer-funded').textContent  = '$' + fundedBuffer.toLocaleString();
   document.getElementById('stat-payout').textContent         = '$' + acc.payoutTarget.toLocaleString();
@@ -4401,7 +5440,7 @@ function updateAccountUI() {
     '$' + acc.fundedTargetMin.toLocaleString() + '–$' + acc.fundedTargetMax.toLocaleString();
 
   // Eval rows
-  document.getElementById('stat-balance-eval').textContent   = '$' + acc.balance.toLocaleString();
+  { const el = document.getElementById('stat-balance-eval'); el.textContent = balPrefix + '$' + acc.balance.toLocaleString(); el.title = balTitle; }
   document.getElementById('stat-floor-eval').textContent     = '$' + acc.evalFloor.toLocaleString();
   { const be = document.getElementById('stat-buffer-eval'); if (be) be.textContent = '$' + evalBuffer.toLocaleString(); }
   document.getElementById('stat-daycap-eval').textContent    = '$' + acc.evalDayCap.toLocaleString() + ' MAX';
@@ -4598,6 +5637,25 @@ async function viewSession(date) {
 
 // ── Tabs ───────────────────────────────────────────────────────────────────────
 function switchTab(tabId) {
+  // 2026-08-13 checklist gate. Wrapped in its own try/catch and placed BEFORE
+  // any DOM mutation: if this throws, we fall through and switch the tab
+  // normally. switchTab() previously had no error handling at all, so a throw
+  // in here would have left every panel hidden with no way back — the same
+  // silent-failure class as the ckPlanRead recursion, except this one would
+  // brick the UI mid-session instead of degrading quietly.
+  try {
+    if (typeof ckGateIsOpen === 'function' && CK_GATED_TABS.indexOf(tabId) !== -1 && !ckGateIsOpen()) {
+      switchTab('checklist');
+      const hint = document.getElementById('ck-gate-hint');
+      if (hint) {
+        hint.style.display = 'block';
+        hint.textContent = 'The ' + tabId.toUpperCase() + ' tab unlocks once the pre-trade checklist is done. Chat stays open — ask Jessi to help you finish it.';
+        setTimeout(() => { try { hint.style.display = 'none'; } catch (e) {} }, 6000);
+      }
+      return;
+    }
+  } catch (e) { /* fail OPEN — never trap the user in a locked panel */ }
+
   document.querySelectorAll('.rtab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabId));
   document.querySelectorAll('#right-content > div').forEach(d => {
     d.style.display = d.id === 'tab-' + tabId ? '' : 'none';
@@ -4699,6 +5757,59 @@ async function costMarkAccountFeeStatus(size, stage, newStatus, archiveId) {
 }
 function costMarkAccountBreached(size, stage, archiveId) { return costMarkAccountFeeStatus(size, stage, 'blown', archiveId); }
 function costMarkAccountPassed(size, stage, archiveId) { return costMarkAccountFeeStatus(size, stage, 'passed', archiveId); }
+function costMarkAccountPaidOut(size, stage, archiveId) { return costMarkAccountFeeStatus(size, stage, 'paid_out', archiveId); }
+
+// 2026-08-13 (Anoop): "gather all the information of all the accounts and
+// make one database to analyse." Rebuilds DATA/account_database.json
+// server-side (account-db.js) from every slot's own files, then shows the
+// summary right here — no need to open the file to see it worked.
+async function accountDbRebuildAndShow() {
+  const btn = document.getElementById('account-db-rebuild-btn');
+  const out = document.getElementById('account-db-summary');
+  if (btn) { btn.disabled = true; btn.textContent = 'Rebuilding…'; }
+  try {
+    const res = await window.api.accountDbRebuild();
+    if (out) {
+      out.style.display = 'block';
+      out.textContent = res && res.ok
+        ? res.summary
+        : 'Rebuild failed: ' + ((res && res.error) || 'unknown error');
+    }
+    if (res && res.ok && typeof addSystemMessage === 'function') {
+      addSystemMessage('📊 Account report ready — opened in a new tab, and saved to DATA/account_report.html + account_trades.csv + account_database.json (' + res.db.summary.totalAccounts + ' accounts, ' + res.db.summary.totalTrades + ' trades combined).');
+    }
+    // 2026-08-13 (Anoop: "why is the data unreadable to a normal person"):
+    // open the HTML report directly — no download, no file to go find, it's
+    // just readable right there the moment he clicks the button.
+    if (res && res.ok && res.html) {
+      try {
+        const blob = new Blob([res.html], { type: 'text/html;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        window.open(url, '_blank');
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+      } catch (e) { console.error('Report open failed:', e.message); }
+    }
+    // Also trigger a real download of the CSV, for anyone who wants the raw
+    // rows in Excel specifically — lands straight in Downloads.
+    if (res && res.ok && res.csv) {
+      try {
+        const blob = new Blob([res.csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'mnq-copilot-all-trades-' + ckToday() + '.csv';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (e) { console.error('CSV download failed:', e.message); }
+    }
+  } catch (e) {
+    if (out) { out.style.display = 'block'; out.textContent = 'Rebuild failed: ' + e.message; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Rebuild database'; }
+  }
+}
 
 async function renderCost() {
   const el = document.getElementById('cost-body');
@@ -5268,7 +6379,15 @@ document.getElementById('settings-open-btn').addEventListener('click', openSetti
 // no dependency on Edgedesk's per-account key namespacing, its localhost:7373
 // bridge, or its Notion sync, none of which exist in this app. All ids/fns
 // prefixed ck- / ck to avoid any collision with the rest of app.js.
+// 2026-08-13: delegates to the ONE trading-day definition (IST) in
+// checklist-logic.js. This used to build a browser-LOCAL date while the
+// go/no-go gate at ~4513 compared against a UTC string and endDay used
+// Asia/Kolkata — three answers to "what day is it". Between 00:00 and 05:30
+// IST they disagree, so a checklist finished at 01:00 IST could never satisfy
+// the gate that requires it. Falls back to the old local computation only if
+// the module failed to load, so the tab can never go blank over this.
 function ckToday() {
+  if (window.ChecklistLogic) return window.ChecklistLogic.tradingDayIST();
   const d = new Date();
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 }
@@ -5277,16 +6396,31 @@ const CK_PLAN_KEY = 'copilot_checklist_plan';
 // AUDIT FIX 2026-07-25: several checklist functions parsed this key with NO
 // try/catch — one corrupted localStorage value would throw and kill the whole
 // checklist tab render. All CK_PLAN_KEY reads now go through this.
-function ckPlanRead() { try { return ckPlanRead() || {}; } catch (e) { return {}; } }
+// BUG FIX 2026-08-13 — this line read `return ckPlanRead() || {}`, i.e. it
+// called ITSELF. Every call blew the stack, the RangeError was swallowed by
+// its own catch, and the function returned {} every single time. Effects,
+// all silent (no console error survives the catch):
+//   - ckSetBody/ckSetActiveSess read {}, so each one wrote a blob containing
+//     ONLY its own field — every tick erased the previous tick. Anoop's exact
+//     report: "only one tick in one tab is accepted".
+//   - ckSavePlan's `existing` was always {}, so typing in Today's Plan wiped
+//     the body check and the session selection.
+//   - ckLoadPlan saw no date, bailed at the staleness check, and left the
+//     form blank on every open.
+// Live since 2026-07-25, which is why the checklist has never been completed
+// once. Restores the read the original AUDIT FIX comment below intended.
+function ckPlanRead() {
+  try { return JSON.parse(localStorage.getItem(CK_PLAN_KEY) || '{}') || {}; }
+  catch (e) { return {}; }
+}
 const CK_BODY_GROUPS = { gym: ['high', 'low', 'rest'], sleep: ['good', 'ok', 'poor'], nap: ['yes', 'no'] };
 
 function ckSetBody(type, val) {
-  const p = ckPlanRead();
-  if (!p.body) p.body = {};
-  p.body[type] = val;
-  if (!p.date) p.date = ckToday();
-  localStorage.setItem(CK_PLAN_KEY, JSON.stringify(p));
-  ckRenderBodyCheck(p.body);
+  const body = Object.assign({}, ckPlanRead().body || {});
+  body[type] = val;
+  ckPlanWrite({ body: body });
+  ckRenderBodyCheck(body);
+  ckUpdateVerdict();
 }
 
 function ckRenderBodyCheck(body) {
@@ -5299,46 +6433,169 @@ function ckRenderBodyCheck(body) {
   });
 }
 
+// Single writer for the whole checklist blob. Every mutation goes through
+// here and MERGES onto what's on disk, so no writer can drop a sibling field.
+// The old ckSavePlan rebuilt the object literal from the form and had to
+// hand-carry activeSess/body forward; anything not in that literal (ticks,
+// stress, preTradeDone) would have been silently lost even after the
+// ckPlanRead fix above.
+function ckPlanWrite(patch) {
+  const p = ckPlanRead();
+  Object.assign(p, patch || {});
+  if (!p.date) p.date = ckToday();
+  try { localStorage.setItem(CK_PLAN_KEY, JSON.stringify(p)); } catch (e) {}
+  return p;
+}
+
 function ckSavePlan() {
-  const existing = ckPlanRead();
   const get = id => document.getElementById(id)?.value || '';
-  const plan = {
+  ckPlanWrite({
     bias: get('ck-planBias'), maxT: get('ck-planMaxT'), levels: get('ck-planLevels'),
     news: get('ck-planNews'), focus: get('ck-planFocus'), h4: get('ck-planH4'),
     h1: get('ck-planH1'), setups: get('ck-planSetups'),
-    activeSess: existing.activeSess || '', body: existing.body || {}, date: ckToday()
-  };
-  localStorage.setItem(CK_PLAN_KEY, JSON.stringify(plan));
+    date: ckToday()
+  });
 }
 
 function ckLoadPlan() {
   const p = ckPlanRead();
-  if (p.date !== ckToday()) return; // stale — new day, leave the form blank
+  // MIDNIGHT ROLLOVER (2026-08-13): a stale blob used to just `return`, leaving
+  // yesterday's preTradeDone/preTradeScore/preTradeTier sitting in storage. The
+  // gate reads ck_history (date-matched, so it was never fooled), but anything
+  // reading plan.preTradeDone would have believed a session left open overnight
+  // was still "done". Actively clear it instead of returning early.
+  if (p.date !== ckToday()) {
+    ckPlanWrite({
+      date: ckToday(), preTradeDone: null, preTradeDoneAt: null,
+      preTradeScore: null, preTradeTier: null,
+      ticks: [], fw: [], pb: null, body: {}, stress: {}, activeSess: ''
+    });
+    ckResetChecklistUI();
+    ckRenderGate();
+    return;
+  }
   const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
   set('ck-planBias', p.bias); set('ck-planMaxT', p.maxT); set('ck-planLevels', p.levels);
   set('ck-planNews', p.news); set('ck-planFocus', p.focus); set('ck-planH4', p.h4);
   set('ck-planH1', p.h1); set('ck-planSetups', p.setups);
   ckRenderActiveSess(p.activeSess || '');
   ckRenderBodyCheck(p.body || {});
+  ckRenderStress(p.stress || {});
+  ckRestoreTicks(p);
+  ckUpdateVerdict();
+  ckRenderGate();
+  ckRenderWeekly();
+}
+
+// The visual half of a reset, with no confirm and no storage write — used by
+// the midnight-rollover path above, and by ckResetChecklist() after its confirm.
+function ckResetChecklistUI() {
+  [1, 2, 3].forEach(i => document.getElementById('ck-pb' + i)?.classList.remove('on'));
+  const pbNote = document.getElementById('ck-pbNote');
+  if (pbNote) pbNote.textContent = 'Select a playbook to begin';
+  [0, 1, 2, 3, 4].forEach(i => document.getElementById('ck-fs' + i)?.classList.remove('done'));
+  const fwNote = document.getElementById('ck-fwNote');
+  if (fwNote) fwNote.textContent = 'Tap each step as you complete top-down analysis';
+  document.querySelectorAll('#tab-checklist .ck-chk-item').forEach(el => el.classList.remove('on'));
+  const badge = document.getElementById('ck-doneBadge');
+  if (badge) badge.style.display = 'none';
+  const btn = document.getElementById('ck-doneBtn');
+  if (btn) { btn.textContent = '✓ PRE-TRADE DONE'; btn.style.opacity = '1'; btn.onclick = ckMarkDone; }
+  ckUpdateVerdict();
+}
+
+// ── Stress routine (2026-08-13) ───────────────────────────────────────────────
+// Anoop: "Routine to keep stress low during trading hours."
+// Ticks, not a timer: a mid-session interrupt would fire while he is in a
+// position, which is the worst possible moment to add an input.
+const CK_STRESS_ITEMS = [
+  ['rec', '🔴 Screen recording started'],
+  ['breath', '🌬️ 2 minutes of slow breathing'],
+  ['phone', '📵 Phone out of reach, notifications off']
+];
+
+function ckSetStress(key) {
+  const stress = Object.assign({}, ckPlanRead().stress || {});
+  stress[key] = !stress[key];
+  ckPlanWrite({ stress: stress });
+  ckRenderStress(stress);
+}
+
+function ckRenderStress(stress) {
+  stress = stress || {};
+  CK_STRESS_ITEMS.forEach(([key]) => {
+    const btn = document.getElementById('ck-stress-' + key);
+    if (btn) btn.className = 'ck-body-btn' + (stress[key] ? ' active-good' : '');
+  });
+}
+
+// ── Weekend screen time (2026-08-13) ──────────────────────────────────────────
+// Anoop: "track weekend screen time to reduce it".
+// Deliberately OUTSIDE the daily plan blob and outside the gate: markets are
+// shut at the weekend, so anything behind the pre-trade gate would never fire
+// on the day it is about. Keyed by ISO week in its own storage key.
+const CK_WEEKLY_KEY = 'copilot_ck_weekly';
+
+function ckWeeklyRead() {
+  try { return JSON.parse(localStorage.getItem(CK_WEEKLY_KEY) || '{}') || {}; }
+  catch (e) { return {}; }
+}
+
+function ckSaveWeekly() {
+  const el = document.getElementById('ck-weekly-hours');
+  if (!el || !window.ChecklistLogic) return;
+  const wk = window.ChecklistLogic.isoWeekKey();
+  const w = ckWeeklyRead();
+  const v = parseFloat(el.value);
+  if (isNaN(v) || v < 0) { delete w[wk]; } else { w[wk] = Math.round(v * 10) / 10; }
+  try { localStorage.setItem(CK_WEEKLY_KEY, JSON.stringify(w)); } catch (e) {}
+  ckRenderWeekly();
+}
+
+function ckRenderWeekly() {
+  if (!window.ChecklistLogic) return;
+  const w = ckWeeklyRead();
+  const wk = window.ChecklistLogic.isoWeekKey();
+  const input = document.getElementById('ck-weekly-hours');
+  if (input && document.activeElement !== input) input.value = (w[wk] != null ? w[wk] : '');
+  const trend = document.getElementById('ck-weekly-trend');
+  if (!trend) return;
+  const keys = Object.keys(w).sort().slice(-4);
+  if (!keys.length) { trend.textContent = 'No weeks logged yet.'; return; }
+  const max = Math.max.apply(null, keys.map(k => w[k])) || 1;
+  const rows = keys.map(k => {
+    const v = w[k];
+    const bars = '█'.repeat(Math.max(1, Math.round((v / max) * 12)));
+    return k + '  ' + bars + '  ' + v + 'h';
+  });
+  const first = w[keys[0]], last = w[keys[keys.length - 1]];
+  const delta = (keys.length > 1)
+    ? (last < first ? '  ↓ down ' + Math.round((first - last) * 10) / 10 + 'h vs ' + keys[0]
+      : (last > first ? '  ↑ up ' + Math.round((last - first) * 10) / 10 + 'h vs ' + keys[0] : '  → flat'))
+    : '';
+  trend.textContent = rows.join('\n') + (delta ? '\n' + delta : '');
 }
 
 // Session windows match CLAUDE.md rule #6 (reactivated 2026-07-02): London
 // 1:30–3:00 PM IST / 8:00–9:30 UTC (prep only), NY 7:00–9:00 PM IST /
 // 13:30–15:30 UTC (main session) — NOT Edgedesk's own wider windows
 // (12:30–6:00 PM / 7:00–9:30 PM IST), which don't match this project's rules.
+// 2026-08-13: moved into checklist-logic.js and boundary-tested. The version
+// that lived here also returned 'london'/'ny' on Saturdays and Sundays, so
+// "Auto" on a weekend told him to start a screen recording for a shut market.
 function ckSessFromUTC() {
+  if (window.ChecklistLogic) return window.ChecklistLogic.sessionFromUTC();
   const now = new Date();
   const tot = now.getUTCHours() * 60 + now.getUTCMinutes();
-  if (tot >= 480 && tot < 570) return 'london'; // 08:00–09:30 UTC
-  if (tot >= 810 && tot < 930) return 'ny';      // 13:30–15:30 UTC
+  if (tot >= 480 && tot < 570) return 'london';
+  if (tot >= 810 && tot < 930) return 'ny';
   return '';
 }
 
 function ckSetActiveSess(sess) {
-  const p = ckPlanRead();
-  p.activeSess = sess;
-  if (!p.date) p.date = ckToday();
-  localStorage.setItem(CK_PLAN_KEY, JSON.stringify(p));
+  // Routed through ckPlanWrite 2026-08-13 — this was one of two remaining raw
+  // setItem writers that bypassed the single merging writer.
+  ckPlanWrite({ activeSess: sess });
   ckRenderActiveSess(sess);
   const rem = document.getElementById('ck-sessReminder');
   if (!rem) return;
@@ -5376,8 +6633,40 @@ function ckAutoDetectSess() {
   ckSetActiveSess(ckSessFromUTC() || '');
 }
 
+// 2026-08-13: ticks are now PERSISTED. Until today the entire checklist state
+// lived in CSS classes (.on / .done / .active-*) with no model behind it, so
+// every tick died on reload and nothing could be written into the record.
+// Each item is identified by its index within #tab-checklist, which is stable
+// as long as items are appended rather than reordered; ckRestoreTicks() bounds
+// -checks so a future edit to index.html can at worst lose a restore, never
+// throw and blank the tab.
+function ckAllChkItems() {
+  return Array.prototype.slice.call(document.querySelectorAll('#tab-checklist .ck-chk-item'));
+}
+
+function ckPersistTicks() {
+  const items = ckAllChkItems();
+  const on = [];
+  items.forEach((el, i) => { if (el.classList.contains('on')) on.push(i); });
+  ckPlanWrite({
+    ticks: on,
+    fw: [0, 1, 2, 3, 4].filter(n => document.getElementById('ck-fs' + n)?.classList.contains('done')),
+    pb: [1, 2, 3].find(i => document.getElementById('ck-pb' + i)?.classList.contains('on')) || null
+  });
+}
+
+function ckRestoreTicks(p) {
+  try {
+    const items = ckAllChkItems();
+    (p.ticks || []).forEach(i => { if (items[i]) items[i].classList.add('on'); });
+    (p.fw || []).forEach(n => document.getElementById('ck-fs' + n)?.classList.add('done'));
+    if (p.pb) { const el = document.getElementById('ck-pb' + p.pb); if (el) el.classList.add('on'); }
+  } catch (e) {}
+}
+
 function ckTog(el) {
   el.classList.toggle('on');
+  ckPersistTicks();
   ckUpdateVerdict();
 }
 
@@ -5385,6 +6674,7 @@ function ckTogFW(i) {
   const el = document.getElementById('ck-fs' + i);
   if (!el) return;
   el.classList.toggle('done');
+  ckPersistTicks();
   const done = [0, 1, 2, 3, 4].filter(n => document.getElementById('ck-fs' + n)?.classList.contains('done')).length;
   const note = document.getElementById('ck-fwNote');
   if (note) note.textContent = done === 5 ? 'All 5 steps complete — cleared for entry' : done + '/5 steps complete';
@@ -5416,47 +6706,61 @@ function ckUpdateVerdict() {
     verdict.innerHTML = '<div class="ck-vdot"></div><span>Select a playbook and complete the checklist</span>';
     return;
   }
+  // 2026-08-13: the counts still come from the DOM (that IS the live state),
+  // but the arithmetic and the tier now come from ckScore() so this banner and
+  // the score written into the permanent record can never disagree again. The
+  // old code here hardcoded the risk-item count as 4 while ckMarkDone read it
+  // from the DOM — one edit to index.html and they diverged silently.
+  const r = window.ChecklistLogic.ckScore(ckReadCounts());
+  if (r.done === r.total) {
+    verdict.className = 'ck-verdict go';
+    verdict.innerHTML = '<div class="ck-vdot"></div><span>✓ Cleared — ' + r.label + ', all steps confirmed</span>';
+  } else {
+    verdict.className = 'ck-verdict partial';
+    verdict.innerHTML = '<div class="ck-vdot"></div><span>' + r.label + ' — ' + r.done + '/' + r.total + ' items confirmed</span>';
+  }
+  ckRenderStickyHeader(r);
+}
+
+// Single DOM→counts reader. Both the live verdict and the saved record go
+// through this, so there is exactly one place that knows how the checklist is
+// laid out in index.html.
+function ckReadCounts() {
   const isOn = id => document.getElementById(id)?.classList.contains('on');
-  const htfDone = document.querySelectorAll('#ck-block-htf .ck-chk-item.on').length;
-  const riskDone = document.querySelectorAll('#ck-block-risk .ck-chk-item.on').length;
-  let structDone, structTotal, label;
+  const selPb = [1, 2, 3].find(i => document.getElementById('ck-pb' + i)?.classList.contains('on'));
+  let structDone = 0;
   if (selPb === 1) {
     structDone = document.querySelectorAll('#ck-block-5m .ck-chk-item.on').length;
-    structTotal = 3; label = 'Engulfing + TF';
   } else if (selPb === 2) {
     structDone = (isOn('ck-sfp') ? 1 : 0) + (isOn('ck-fvg') ? 1 : 0)
       + document.querySelectorAll('#ck-block-liq .ck-chk-item.on:not(#ck-sfp):not(#ck-fvg)').length;
-    structTotal = 4; label = 'SFP + FVG';
-  } else {
+  } else if (selPb === 3) {
     structDone = document.querySelectorAll('#ck-block-liq .ck-chk-item.on:not(#ck-sfp):not(#ck-fvg)').length;
-    structTotal = 2; label = 'Liquidity Raid';
   }
-  const fwDone = [0, 1, 2, 3, 4].filter(n => document.getElementById('ck-fs' + n)?.classList.contains('done')).length;
-  const done = htfDone + structDone + riskDone + fwDone;
-  const total = 3 + structTotal + 4 + 5;
-  if (done === total) {
-    verdict.className = 'ck-verdict go';
-    verdict.innerHTML = '<div class="ck-vdot"></div><span>✓ Cleared — ' + label + ', all steps confirmed</span>';
-  } else {
-    verdict.className = 'ck-verdict partial';
-    verdict.innerHTML = '<div class="ck-vdot"></div><span>' + label + ' — ' + done + '/' + total + ' items confirmed</span>';
-  }
+  return {
+    selPb: selPb,
+    htfDone: document.querySelectorAll('#ck-block-htf .ck-chk-item.on').length,
+    structDone: structDone,
+    riskDone: document.querySelectorAll('#ck-block-risk .ck-chk-item.on').length,
+    riskTotal: document.querySelectorAll('#ck-block-risk .ck-chk-item').length,
+    fwDone: [0, 1, 2, 3, 4].filter(n => document.getElementById('ck-fs' + n)?.classList.contains('done')).length,
+    blackout: !!window.grInBlackout
+  };
 }
 
 function ckResetChecklist() {
   if (!confirm('Reset the pre-trade checklist? This clears playbook, framework steps, and all checked items (plan fields and body check are kept).')) return;
-  [1, 2, 3].forEach(i => document.getElementById('ck-pb' + i)?.classList.remove('on'));
-  const pbNote = document.getElementById('ck-pbNote');
-  if (pbNote) pbNote.textContent = 'Select a playbook to begin';
-  [0, 1, 2, 3, 4].forEach(i => document.getElementById('ck-fs' + i)?.classList.remove('done'));
-  const fwNote = document.getElementById('ck-fwNote');
-  if (fwNote) fwNote.textContent = 'Tap each step as you complete top-down analysis';
-  document.querySelectorAll('#tab-checklist .ck-chk-item').forEach(el => el.classList.remove('on'));
-  const badge = document.getElementById('ck-doneBadge');
-  if (badge) badge.style.display = 'none';
-  const btn = document.getElementById('ck-doneBtn');
-  if (btn) { btn.textContent = '✓ PRE-TRADE DONE'; btn.style.opacity = '1'; btn.onclick = ckMarkDone; }
-  ckUpdateVerdict();
+  ckResetChecklistUI();
+  // 2026-08-13: Reset used to clear the SCREEN only. The persisted ticks and
+  // today's ck_history entry survived, so a reset checklist still read as
+  // "done" to the gate — a visibly empty form that had silently already let
+  // him through. Clear both, and re-render the gate so the lock comes back.
+  ckPlanWrite({ ticks: [], fw: [], pb: null, preTradeDone: null, preTradeDoneAt: null, preTradeScore: null, preTradeTier: null });
+  try {
+    const ckh = ckHistoryRead().filter(e => e && e.date !== ckToday());
+    localStorage.setItem('copilot_ck_history', JSON.stringify(ckh));
+  } catch (e) {}
+  ckRenderGate();
 }
 
 function ckMarkDone() {
@@ -5465,54 +6769,24 @@ function ckMarkDone() {
   const ap = hh >= 12 ? 'PM' : 'AM', h12 = hh % 12 || 12;
   const timeStr = h12 + ':' + (mm < 10 ? '0' : '') + mm + ' ' + ap;
 
-  // Score is playbook-aware: it measures the items the SELECTED playbook needs,
-  // so a fully-satisfied setup can reach 10/10 (mirrors ckUpdateVerdict).
-  const selPb = [1, 2, 3].find(i => document.getElementById('ck-pb' + i)?.classList.contains('on'));
-  const isOn = id => document.getElementById(id)?.classList.contains('on');
-  const htfDone = document.querySelectorAll('#ck-block-htf .ck-chk-item.on').length;
-  const riskTotal = document.querySelectorAll('#ck-block-risk .ck-chk-item').length;
-  const riskDone = document.querySelectorAll('#ck-block-risk .ck-chk-item.on').length;
-  const riskFull = riskTotal > 0 && riskDone === riskTotal;
-  const fwDone = [0, 1, 2, 3, 4].filter(n => document.getElementById('ck-fs' + n)?.classList.contains('done')).length;
-
-  let structDone = 0, structTotal = 0, label = '';
-  if (selPb === 1) {
-    structDone = document.querySelectorAll('#ck-block-5m .ck-chk-item.on').length;
-    structTotal = 3; label = 'Engulfing + TF';
-  } else if (selPb === 2) {
-    structDone = (isOn('ck-sfp') ? 1 : 0) + (isOn('ck-fvg') ? 1 : 0)
-      + document.querySelectorAll('#ck-block-liq .ck-chk-item.on:not(#ck-sfp):not(#ck-fvg)').length;
-    structTotal = 4; label = 'SFP + FVG';
-  } else if (selPb === 3) {
-    structDone = document.querySelectorAll('#ck-block-liq .ck-chk-item.on:not(#ck-sfp):not(#ck-fvg)').length;
-    structTotal = 2; label = 'Liquidity Raid';
-  }
-
-  const done = htfDone + structDone + riskDone + fwDone;
-  const total = 3 + structTotal + riskTotal + 5;
-  const score = (selPb && total) ? Math.round((done / total) * 10) : 0;
-
-  // Risk Gate is a hard gate: any missing risk item = NO-GO regardless of score.
-  let tier, tierColor, tierBg, verdictTxt;
-  if (window.grInBlackout) {
-    tier = 'NO-GO'; tierColor = 'var(--red)'; tierBg = 'var(--red-dim)';
-    verdictTxt = 'High-impact news blackout — no entries until the window clears.';
-  } else if (!selPb) {
-    tier = 'NO-GO'; tierColor = 'var(--red)'; tierBg = 'var(--red-dim)';
-    verdictTxt = 'No playbook selected — pick one before scoring.';
-  } else if (!riskFull) {
-    tier = 'NO-GO'; tierColor = 'var(--red)'; tierBg = 'var(--red-dim)';
-    verdictTxt = 'Risk Gate incomplete (' + riskDone + '/' + riskTotal + ') — do NOT trade until every risk item is checked.';
-  } else if (score >= 8) {
-    tier = 'GO'; tierColor = 'var(--green)'; tierBg = 'var(--green-dim)';
-    verdictTxt = 'High-conviction ' + label + ' setup. 6 MNQ cap, one of your 2 trades, hold it 5+ min.';
-  } else if (score >= 5) {
-    tier = 'CAUTION'; tierColor = 'var(--amber)'; tierBg = 'var(--amber-dim)';
-    verdictTxt = 'Partial ' + label + ' setup — only trade if the missing items are non-essential; otherwise wait.';
-  } else {
-    tier = 'NO-GO'; tierColor = 'var(--red)'; tierBg = 'var(--red-dim)';
-    verdictTxt = 'Too few conditions met — this is not a setup. Stand down.';
-  }
+  // 2026-08-13: score + tier now come from ckScore() in checklist-logic.js —
+  // the same call the live verdict banner makes. See ckReadCounts().
+  //
+  // The old copy here recomputed the whole thing with a second formula. Note
+  // the GO text it produced was also stale: "6 MNQ cap, one of your 2 trades"
+  // hardcoded a size cap of 6 and a trade limit of 2, both superseded in
+  // rules.json (sizeCap is 2; tradesPerSession is 5). Per CLAUDE.md, numbers
+  // that live in rules.json must never be hardcoded in a string — ckScore's
+  // verdict text now says "size per rules" instead of naming a stale number.
+  const counts = ckReadCounts();
+  const r = window.ChecklistLogic.ckScore(counts);
+  const selPb = counts.selPb, riskDone = counts.riskDone, riskTotal = counts.riskTotal;
+  const score = r.score, tier = r.tier, label = r.label;
+  const done = r.done, total = r.total, riskFull = r.riskFull;
+  const fwDone = counts.fwDone;
+  const verdictTxt = r.verdict;
+  const tierColor = tier === 'GO' ? 'var(--green)' : (tier === 'CAUTION' ? 'var(--amber)' : 'var(--red)');
+  const tierBg = tier === 'GO' ? 'var(--green-dim)' : (tier === 'CAUTION' ? 'var(--amber-dim)' : 'var(--red-dim)');
 
   const badge = document.getElementById('ck-doneBadge');
   const timeEl = document.getElementById('ck-doneTime');
@@ -5535,12 +6809,311 @@ function ckMarkDone() {
     if (plan.levels) lines.push('Key levels: ' + plan.levels);
     itemsEl.innerHTML = lines.map(l => '· ' + l).join('<br>');
   }
-  const p = ckPlanRead();
-  p.preTradeDone = timeStr; p.preTradeDoneAt = Date.now(); p.preTradeScore = score; p.preTradeTier = tier;
-  localStorage.setItem(CK_PLAN_KEY, JSON.stringify(p));
-  try { var ckh = JSON.parse(localStorage.getItem('copilot_ck_history') || '[]'); ckh = ckh.filter(function(e){return e.date !== ckToday();}); ckh.push({ date: ckToday(), score: selPb ? score : null, tier: tier }); localStorage.setItem('copilot_ck_history', JSON.stringify(ckh.slice(-90))); } catch (e) {}
+  const p = ckPlanWrite({
+    preTradeDone: timeStr, preTradeDoneAt: Date.now(),
+    preTradeScore: score, preTradeTier: tier
+  });
+  const entry = ckWriteRecord({
+    score: selPb ? score : null, tier: tier, done: true,
+    label: label, itemsDone: done, itemsTotal: total,
+    riskDone: riskDone, riskTotal: riskTotal, fwDone: fwDone,
+    timeStr: timeStr, plan: p
+  });
+  ckRenderGate();
+  // 2026-08-13 (Anoop): "This is a reminder that you should give me on the chat
+  // after I complete the checklist." The server owns it — it has the full
+  // ck_history + day_trades matrix on disk and can cite real precedent days.
+  try { if (window.api && window.api.checklistDone) window.api.checklistDone(entry); } catch (e) {}
   const btn = document.getElementById('ck-doneBtn');
   if (btn) { btn.textContent = selPb ? ('✓ ' + tier + ' ' + score + '/10 · ' + timeStr) : ('✓ ' + tier + ' · ' + timeStr); btn.style.opacity = '0.85'; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHECKLIST RECORD + GATE (2026-08-13)
+//
+// Anoop: "after completing, it is done for my record and saved in same location
+// as trade details… this is just for my psychological satisfaction and
+// discipline purpose. as you can see i have not used it once."
+//
+// He had not used it because ckPlanRead() was throwing away every tick since
+// 2026-07-25 (see the fix at the top of this section), not because he skipped it.
+//
+//   ckMarkDone ──┐
+//   ckSkipToday ─┴─> ckWriteRecord ──> localStorage copilot_ck_history (90 days)
+//                                 └──> dataSave('ck_history__<slot>')  [immediate]
+//                                      = DATA/accounts/<slot>/ck_history.json
+//                                        (same folder as day_trades.json)
+//
+// The disk write no longer waits for End Day: a day he completes but never
+// formally closes used to leave no durable record at all.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Decided 2026-08-13 (Anoop): ONE checklist per day, covering every account.
+// The checklist is about him and the market, not about which slot is open —
+// and switching slots runs loadAccountBucket(), which removeItem()s every
+// ACCT_LS_KEYS entry (including copilot_ck_history). Without this, completing
+// the checklist and then switching accounts mid-session would drop him back
+// into an empty, locked checklist. Mirrored to EVERY slot's folder so each
+// account's dataset still carries its own copy of the day's record.
+function ckWriteRecord(rec) {
+  const date = ckToday();
+  const plan = rec.plan || ckPlanRead();
+  const entry = {
+    date: date,
+    score: rec.score, tier: rec.tier, done: rec.done === true,
+    label: rec.label || '', itemsDone: rec.itemsDone, itemsTotal: rec.itemsTotal,
+    riskDone: rec.riskDone, riskTotal: rec.riskTotal, fwDone: rec.fwDone,
+    completedAt: rec.timeStr || '', completedAtMs: Date.now(),
+    ticks: ckReadTicks(),
+    bias: plan.bias || '', h4: plan.h4 || '', h1: plan.h1 || '',
+    levels: plan.levels || '', news: plan.news || '', focus: plan.focus || '',
+    setups: plan.setups || '', maxT: plan.maxT || '',
+    body: plan.body || {}, stress: plan.stress || {}, session: plan.activeSess || '',
+    slotId: (typeof activeSlotId !== 'undefined') ? activeSlotId : null
+  };
+  let ckh = [];
+  try { ckh = JSON.parse(localStorage.getItem('copilot_ck_history') || '[]') || []; } catch (e) { ckh = []; }
+  if (!Array.isArray(ckh)) ckh = [];
+  ckh = ckh.filter(e => e && e.date !== date);
+  ckh.push(entry);
+  ckh = ckh.slice(-90);
+  let wrote = false;
+  try { localStorage.setItem('copilot_ck_history', JSON.stringify(ckh)); wrote = true; } catch (e) {}
+  // The original bug was invisible for 19 days because every failure was
+  // swallowed. A record that cannot be written is the one thing that must be
+  // loud — silence here is what he already lived through.
+  ckSetSaveError(!wrote);
+
+  // BUG FIX 2026-08-13 (Anoop: "once I have confirmed it once... now again it
+  // is asking me" — after a restart, same day, no account switch in between).
+  // `copilot_ck_history` is in ACCT_LS_KEYS, so the FAST boot path
+  // (applyConfig() -> loadAccountBucket(), synchronous, no delay) restores it
+  // from the CACHED BUCKET CONFIG, not from localStorage or the disk mirror
+  // below. That config is only ever refreshed by saveActiveBucket(), which
+  // nothing was calling here — so a completion sat correctly in localStorage
+  // for the rest of THIS session, but the config a restart reads from was
+  // still the pre-completion snapshot. The disk mirror further down WOULD
+  // eventually self-correct it (restoreFromDisk, 800ms-2.5s after boot) — but
+  // nothing re-renders the checklist gate when that lands either, so even the
+  // self-correction was invisible. This call makes the fast path correct
+  // immediately, which is what actually runs before he ever sees the gate.
+  try { if (typeof saveActiveBucket === 'function') saveActiveBucket(); } catch (e) {}
+
+  // Mirror to disk for every slot, immediately. Fire-and-forget: a disk problem
+  // must never block the UI he is standing in front of before a session.
+  // ALSO updates each OTHER slot's cached bucket in memory (not just disk) so
+  // switching to a different account later in the same session sees today's
+  // completion too — "one checklist per day, all accounts" (his call,
+  // 2026-08-13) means every slot's fast-path cache needs it, not just the one
+  // that was active when he pressed DONE. A slot whose cache was never loaded
+  // this session is left alone; it picks up the correct value from its own
+  // disk file the first time it's actually opened.
+  try {
+    const slots = (typeof acctSlots !== 'undefined' && Array.isArray(acctSlots)) ? acctSlots : [];
+    slots.forEach(s => {
+      if (!s || s.retired) return;
+      Promise.resolve(window.api.dataSave('ck_history__' + s.id, ckh)).catch(() => {});
+      if (s.id !== activeSlotId && typeof acctBucketCache !== 'undefined' && acctBucketCache[s.id]) {
+        acctBucketCache[s.id].ls = acctBucketCache[s.id].ls || {};
+        acctBucketCache[s.id].ls['copilot_ck_history'] = JSON.stringify(ckh);
+        try { window.api.setConfig('acctBucket__' + s.id, acctBucketCache[s.id]); } catch (e) {}
+      }
+    });
+  } catch (e) {}
+  return entry;
+}
+
+// Serializes which items are actually ticked, so the record answers "what did I
+// confirm that day", not just "I scored 8". The old record stored {date, score,
+// tier} and nothing else — the part worth looking back on was never kept.
+function ckReadTicks() {
+  const out = { items: [], framework: [], playbook: null };
+  try {
+    document.querySelectorAll('#tab-checklist .ck-chk-item.on').forEach(el => {
+      const lbl = el.querySelector('.ck-clbl');
+      if (lbl) out.items.push(lbl.textContent.trim());
+    });
+    [0, 1, 2, 3, 4].forEach(n => {
+      if (document.getElementById('ck-fs' + n)?.classList.contains('done')) out.framework.push(n);
+    });
+    const pb = [1, 2, 3].find(i => document.getElementById('ck-pb' + i)?.classList.contains('on'));
+    out.playbook = pb || null;
+  } catch (e) {}
+  return out;
+}
+
+function ckHistoryRead() {
+  try {
+    const h = JSON.parse(localStorage.getItem('copilot_ck_history') || '[]');
+    return Array.isArray(h) ? h : [];
+  } catch (e) { return []; }
+}
+
+// The escape hatch. Deliberately real: it opens the gate immediately, with no
+// friction beyond one confirm. What it costs is visible rather than blocking —
+// the day is recorded SKIPPED, the streak breaks, and a banner stays up.
+// A door he can always open is a door he will not rip off its hinges.
+function ckSkipToday() {
+  if (!confirm('Skip the pre-trade checklist today?\n\nThis is recorded as SKIPPED, it breaks your streak, and a banner stays up for the session. You can still complete it later — that turns it into LATE and keeps the record honest.')) return;
+  ckWriteRecord({ score: null, tier: 'SKIPPED', done: false, label: '', timeStr: '' });
+  ckRenderGate();
+  if (typeof addSystemMessage === 'function') {
+    addSystemMessage('⚠️ Pre-trade checklist SKIPPED for ' + ckToday() + '. Recorded. Complete it any time today to turn it into LATE.');
+  }
+}
+
+let ckSaveErrored = false;
+function ckSetSaveError(on) {
+  ckSaveErrored = !!on;
+  const el = document.getElementById('ck-save-error');
+  if (el) el.style.display = on ? 'block' : 'none';
+}
+
+// ── The gate ──────────────────────────────────────────────────────────────────
+// Locks the trade-relevant right-panel tabs until the checklist is completed or
+// explicitly skipped. THREE deliberate safety properties, because this is the
+// only mechanism in the app that can take away access to his own tool during a
+// live session:
+//
+//   1. FAILS OPEN. ckGateOpen() returns true on anything malformed, and the
+//      whole body here is wrapped so a throw unlocks rather than locks. This is
+//      the opposite of the go/no-go badge's fail-closed choice, correctly: the
+//      badge only advises, so erring toward NO-GO is free.
+//   2. CHAT IS NEVER LOCKED. Jessi is the tool that helps him FINISH the
+//      checklist (read the chart, confirm 4H/1H, name PDH/PDL). Gating the
+//      assistant behind the task it assists with is the one lock that would
+//      make the feature worth resenting.
+//   3. THE SKIP BUTTON IS STATIC HTML. It is never rendered by this code path,
+//      so an exception here can't take the escape hatch with it.
+//
+// Weekends are exempt outright — no market, nothing to be disciplined about.
+// The tabs that are ABOUT trading. Verified against the .rtab strip in
+// index.html: analysis, journal, rules, lessons, align, ladder, checklist,
+// apprentice, insights, cost.
+//
+// Deliberately NOT gated:
+//   checklist              — obviously
+//   rules, lessons, align  — the material that helps him comply. Locking the
+//                            rulebook behind the discipline gate is backwards.
+//   chat                   — not a right-panel tab at all (it is the main
+//                            panel), so Jessi is structurally always reachable.
+//                            That was the whole objection to the hard lock.
+const CK_GATED_TABS = ['analysis', 'journal', 'ladder', 'apprentice', 'insights', 'cost'];
+
+// 2026-08-13 (autoplan Design review, severity 2/10 — the most severe finding
+// of the whole review): ckGateIsOpen() collapsed three DIFFERENT reasons for
+// "open" into one boolean — a genuine completed checklist looked IDENTICAL to
+// a silent fail-open (missing module, save error, or an exception). That is
+// the exact bug SHAPE this app has already shipped once (ckPlanRead()'s
+// self-recursion swallowed every tick for 19 days with zero visible sign).
+// Failing open was still the right safety call — this app must never trap
+// Anoop behind a locked panel — but failing open INVISIBLY defeats the whole
+// point of a discipline gate. This function now tells the difference.
+// Returns: null (gate genuinely evaluated — real pass or real lock) or a
+// short reason string ('module-missing' | 'save-error' | 'exception') when
+// the "open" state came from a safety fallback, not a real completion.
+// Weekend is NOT degraded — that is an intentional, correct exemption, not a
+// failure, and must not alarm the user every Saturday.
+function ckGateDegradedReason() {
+  try {
+    if (window.ChecklistLogic && window.ChecklistLogic.isWeekendIST()) return null;
+    if (!window.ChecklistLogic) return 'module-missing';
+    if (ckSaveErrored) return 'save-error';
+    window.ChecklistLogic.ckGateOpen(ckHistoryRead(), ckToday()); // exercise it; throw surfaces below
+    return null;
+  } catch (e) { return 'exception'; }
+}
+
+function ckGateIsOpen() {
+  try {
+    if (window.ChecklistLogic && window.ChecklistLogic.isWeekendIST()) return true;
+    if (!window.ChecklistLogic) return true; // module missing → never lock
+    if (ckSaveErrored) return true;          // can't record → don't gate
+    return window.ChecklistLogic.ckGateOpen(ckHistoryRead(), ckToday());
+  } catch (e) { return true; }
+}
+
+function ckRenderGate() {
+  try {
+    const open = ckGateIsOpen();
+    const counts = (typeof ckReadCounts === 'function') ? ckReadCounts() : null;
+    const r = (counts && window.ChecklistLogic) ? window.ChecklistLogic.ckScore(counts) : null;
+    document.querySelectorAll('.rtab').forEach(t => {
+      const id = t.dataset.tab;
+      const locked = !open && CK_GATED_TABS.indexOf(id) !== -1;
+      t.classList.toggle('rtab-locked', locked);
+      if (locked && r) t.title = 'Checklist ' + r.done + '/' + r.total + ' — finish it to unlock';
+      else if (!locked) t.title = '';
+    });
+    const banner = document.getElementById('ck-global-banner');
+    if (banner) {
+      const today = ckHistoryRead().filter(e => e && e.date === ckToday())[0];
+      const degraded = open ? ckGateDegradedReason() : null;
+      if (today && today.tier === 'SKIPPED') {
+        banner.style.display = 'block';
+        banner.className = 'ck-banner ck-banner-skip';
+        banner.textContent = '⚠️ Pre-trade checklist SKIPPED today — trading off-process. Complete it to clear this.';
+      } else if (!open) {
+        banner.style.display = 'block';
+        banner.className = 'ck-banner ck-banner-todo';
+        banner.textContent = '📋 Pre-trade checklist not done — finish it before you trade.';
+      } else if (degraded) {
+        // The tabs are unlocked, but NOT because the checklist was completed —
+        // a safety fallback fired instead. Must look visibly different from a
+        // real pass, or this defeats the gate as silently as the ckPlanRead
+        // recursion bug did.
+        banner.style.display = 'block';
+        banner.className = 'ck-banner ck-banner-degraded';
+        banner.textContent = '⚠ Checklist enforcement unavailable (' + degraded + ') — tabs unlocked as a safety fallback, not because it was completed. Do the checklist manually.';
+      } else {
+        banner.style.display = 'none';
+      }
+    }
+    ckRenderStreak();
+  } catch (e) {
+    // Never let a gate-render problem be the thing that bricks the panel.
+    try { document.querySelectorAll('.rtab').forEach(t => t.classList.remove('rtab-locked')); } catch (e2) {}
+  }
+}
+
+// Called the moment an account is chosen — the start of a session.
+// Weekend: no market, so it does not demand the daily checklist; it opens the
+// tab on the weekly screen-time block instead, which is the thing that IS
+// actionable on a Saturday.
+function ckAfterAccountChosen() {
+  try {
+    ckLoadPlan();
+    ckRenderGate();
+    if (window.ChecklistLogic && window.ChecklistLogic.isWeekendIST()) {
+      switchTab('checklist');
+      if (typeof addSystemMessage === 'function') {
+        addSystemMessage('Weekend — no pre-trade checklist needed. Log your weekend screen time in the Checklist tab.');
+      }
+      return;
+    }
+    switchTab('checklist');
+    if (!ckGateIsOpen() && typeof addSystemMessage === 'function') {
+      addSystemMessage('📋 Pre-trade checklist first. Analysis, Journal, Insights, Ladder, Roadmap and Cost unlock when it is done — chat stays open, so ask me to help you work through it.');
+    }
+  } catch (e) {}
+}
+
+function ckRenderStreak() {
+  const el = document.getElementById('ck-streak');
+  if (!el || !window.ChecklistLogic) return;
+  const n = window.ChecklistLogic.ckStreak(ckHistoryRead(), ckToday());
+  el.textContent = n > 0 ? ('🔥 Day ' + n) : '';
+  el.style.display = n > 0 ? 'inline-block' : 'none';
+}
+
+function ckRenderStickyHeader(r) {
+  const el = document.getElementById('ck-sticky-progress');
+  if (el && r) el.textContent = r.done + '/' + r.total;
+  const v = document.getElementById('ck-sticky-tier');
+  if (v && r) {
+    v.textContent = r.tier;
+    v.className = 'ck-sticky-tier ' + (r.tier === 'GO' ? 'is-go' : (r.tier === 'CAUTION' ? 'is-caution' : 'is-nogo'));
+  }
 }
 
 
@@ -5560,6 +7133,58 @@ window.grInBlackout = false;
     COOLDOWN_MS = (r.cooldownMinutes || 15) * 60 * 1000;
   }
   grApplyRules(window.RULES);
+
+  // 2026-08-16: dedicated alarm for the guardrail stop overlay — deliberately
+  // NOT tvAudio (the existing TradingView-disconnect alarm). tvAudio is
+  // silenced by a single document-wide click handler (any click anywhere
+  // silences it, on the theory that a click means "I've seen it"). Reusing
+  // that here would let this alarm die on an unrelated click — switching
+  // tabs, scrolling the chart — long before he's actually acknowledged the
+  // stop. This has its own lifecycle, silenced ONLY by grAckStop() succeeding
+  // or grResetDay(). Reuses tvAudio's ensureCtx()/tone() (same AudioContext,
+  // already unlocked via tvAudio.armOnFirstGesture()) rather than duplicating
+  // the browser-autoplay-unlock handling, which was the exact bug (2026-08-12
+  // note above tvAudio.armOnFirstGesture) that made the disconnect alarm
+  // silently fail once already.
+  const stopAlarm = {
+    timer: null,
+    repeats: 0,
+    running: false,
+    // Sharp double-beep, both tones HIGHER than tvAudio's descending
+    // disconnect tone — deliberately distinct so which alarm is firing is
+    // identifiable by ear alone, without looking at the screen.
+    playTone(phase) {
+      const ctx = tvAudio.ensureCtx();
+      if (!ctx || ctx.state === 'suspended') return;
+      const peak = phase === 2 ? 0.32 : 0.24; // phase 2 is louder, not just faster
+      tvAudio.tone(1046, 0.00, 0.12, peak);
+      tvAudio.tone(1046, 0.16, 0.12, peak);
+      if (phase === 2) tvAudio.tone(1318, 0.32, 0.16, peak);
+    },
+    scheduleNext() {
+      const delay = window.StopAlarm ? window.StopAlarm.nextAlarmDelayMs(this.repeats) : 30000;
+      this.timer = setTimeout(() => {
+        const canContinue = window.StopAlarm ? window.StopAlarm.shouldContinueAlarm(this.repeats) : this.repeats < 30;
+        if (!this.running || !canContinue) { this.stop(); return; }
+        this.repeats++;
+        this.playTone(window.StopAlarm ? window.StopAlarm.alarmPhase(this.repeats) : 1);
+        this.scheduleNext();
+      }, delay);
+    },
+    start() {
+      if (this.running) return; // idempotent — grShowStop() calls this every render tick
+      this.running = true;
+      this.repeats = 0;
+      this.playTone(1);
+      this.scheduleNext();
+    },
+    stop() {
+      if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+      this.running = false;
+      this.repeats = 0;
+    }
+  };
+
   let grNewsStatus = null;
   const money = n => (n < 0 ? '-$' : '$') + Math.abs(Math.round(n)).toLocaleString();
   const mmss = ms => { const s = Math.max(0, Math.ceil(ms / 1000)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
@@ -5576,24 +7201,107 @@ window.grInBlackout = false;
   function load() {
     let s; try { s = JSON.parse(localStorage.getItem(GKEY)); } catch (e) {}
     if (s && s.date && s.date !== today() && s.trades && s.trades.length) archive(summarize(s));
-    if (!s || s.date !== today()) s = { date: today(), trades: [], cooldownUntil: 0, stopped: false, acked: false, live: null, lastLossSeen: 0 };
+    if (!s || s.date !== today()) s = { date: today(), trades: [], cooldownUntil: 0, stopped: false, stoppedAt: 0, acked: false, live: null, lastLossSeen: 0 };
+    // A day carried over from before stoppedAt existed: stop-alarm.js's
+    // ackDelayRemainingMs() fails OPEN (returns 0) on a missing timestamp, so
+    // this is a display nicety, not a safety requirement. MUST persist the
+    // stamp immediately, not just set it on the in-memory object — load() is
+    // called fresh on every render tick, and an unpersisted stamp would be
+    // recomputed to "now" every single call, making the countdown never
+    // advance (every render would see a brand-new stoppedAt and report the
+    // full delay remaining, forever).
+    if (s.stopped && !s.stoppedAt) { s.stoppedAt = Date.now(); save(s); }
     return s;
   }
   function save(s) { localStorage.setItem(GKEY, JSON.stringify(s)); }
   window.grHistory = function () { try { return JSON.parse(localStorage.getItem(HKEY) || '[]'); } catch (e) { return []; } };
   window.grToday = function () { return summarize(load()); };
   window.grTodayTrades = function () { return load().trades; };
+  // 2026-08-16: computeMechanicalGoNogo() previously had no notion of this
+  // guardrail's own stop state — a HARD STOP banner + the full-screen
+  // #gr-stop-overlay could fire here while the separate GO/NO-GO badge kept
+  // showing GO or PENDING seconds later, because the two systems never
+  // talked to each other. This is the bridge.
+  window.grIsStopped = function () { return !!load().stopped; };
 
   function bodyReduced() { try { const b = (JSON.parse(localStorage.getItem('copilot_checklist_plan') || '{}').body) || {}; return b.sleep === 'poor' || b.nap === 'no'; } catch (e) { return false; } }
   // CHANGED 2026-07-28 (Anoop): was eval:2/funded:20 — now flat 10/day
   // (5/session × 2 sessions), same in both modes.
   const baseLimit = () => getRules().tradesPerDay || 10;
   const limit = () => bodyReduced() ? (baseLimit() <= 2 ? 1 : Math.ceil(baseLimit() / 2)) : baseLimit();
-  const dayStop = () => {
+  // Tracks the last ratchet level shown so the banner fires on CHANGE only,
+  // rather than on every HUD render (which runs on a timer).
+  let grLastRatchetLevel = 'ok';
+  let grLastVolumeLevel = 'ok';
+  const baseDayStop = () => {
     const a = (typeof state !== 'undefined' && state.account) || {};
     const ds = (getRules().dayStop) || { eval: 300, funded: 200 };
     return state.mode === 'eval' ? (a.evalDayStop || ds.eval || 300) : (a.fundedDayStop || ds.funded || 200);
   };
+
+  // ── LOSS RATCHET (2026-08-12, Anoop's own rule) ────────────────────────────
+  // "If I make $500 profit today, tomorrow the maximum loss I should face is
+  //  $500, not $600, $700 or $800."
+  // Aimed squarely at the failure mode he named: a run of green days, then one
+  // day that takes all of it back and ends the account.
+  //
+  // Implemented as min(normal stop, yesterday's profit) — see
+  // renderer/loss-ratchet.js for why the literal version would have LOOSENED
+  // risk after a big green day rather than tightening it.
+  //
+  // dayStop() keeps its old name and signature so every existing caller (the
+  // HUD, the live-feed ingest, computeMechanicalGoNogo) picks the ratchet up
+  // with no change — there is exactly ONE definition of "today's limit" in the
+  // app, and this is it.
+  // BUG FIX 2026-08-12, same day as the ratchet shipped — found by replaying it
+  // against Anoop's real data. It read ONLY gr_history, but the two persistence
+  // pipelines are independent:
+  //   • gr_history      — written by the guardrail HUD when a day is ended/saved
+  //   • balance_ledger  — written by the CSV/broker import
+  // On the live account gr_history held ONE entry (last 2026-08-05) while
+  // balance_ledger had five days through 2026-08-11. So "yesterday's profit"
+  // would have been read from six days earlier — a cap computed from the wrong
+  // day, silently. On a rule whose entire job is to stop him at the right
+  // number, silently using stale input is worse than not having the rule.
+  //
+  // Now takes the most recent PRIOR day found in EITHER source. Prefers
+  // balance_ledger's `net` when both have the same date, because net is
+  // after commissions and that is the number that actually left the account —
+  // the same gross-vs-net gap that made the HUD read -$637 while the broker
+  // said -$855.50 on 08-10.
+  const yesterdayPnl = () => {
+    const candidates = [];
+    try {
+      const h = (window.grHistory ? window.grHistory() : []) || [];
+      for (const d of h) if (d && d.date) candidates.push({ date: d.date, pnl: d.pnl || 0, src: 'gr' });
+    } catch (e) {}
+    try {
+      const led = JSON.parse(localStorage.getItem('copilot_balance_ledger') || '{}') || {};
+      for (const date of Object.keys(led)) {
+        const v = led[date] || {};
+        const pnl = (v.net != null) ? v.net : (v.gross != null ? v.gross : null);
+        if (pnl != null) candidates.push({ date, pnl, src: 'ledger' });
+      }
+    } catch (e) {}
+    const t = today();
+    const prior = candidates.filter(c => c.date && c.date < t);
+    if (!prior.length) return 0;
+    // Latest date wins; on a tie the ledger (net, post-commission) wins.
+    prior.sort((a, b) => a.date === b.date
+      ? (a.src === 'ledger' ? 1 : -1)
+      : (a.date < b.date ? -1 : 1));
+    return prior[prior.length - 1].pnl || 0;
+  };
+  const ratchetInfo = () => {
+    const cfg = (getRules().lossRatchet) || {};
+    if (!window.LossRatchet) {
+      // Fail SAFE, not open: if the module didn't load, fall back to the normal
+      // stop rather than silently running with no cap at all.
+      return { cap: baseDayStop(), capNegative: -baseDayStop(), tightened: false, source: 'dayStop', reason: 'loss-ratchet.js not loaded' };
+    }
+    return window.LossRatchet.computeCap(yesterdayPnl(), baseDayStop(), cfg);
+  };
+  const dayStop = () => ratchetInfo().cap;
   const banner = (t, c) => { if (typeof showAlertBanner === 'function') showAlertBanner(t, c); };
   function sessWindow() { const n = new Date(); const t = n.getUTCHours() * 60 + n.getUTCMinutes(); if (t >= 480 && t < 570) return 'london'; if (t >= 810 && t < 930) return 'ny'; return ''; }
   function gradeTrade(size, wasCooldown, inWin, blackout, holdSec) {
@@ -5634,41 +7342,201 @@ window.grInBlackout = false;
     const prevTrade = s.trades[s.trades.length - 1];
     const runningBeforeThis = s.trades.reduce((a, t) => a + t.pnl, 0);
     const sizedUpWhileLosing = !!(prevTrade && size > prevTrade.size && runningBeforeThis < 0);
+    // 2026-08-16 (Anoop, after the six-workflow-patterns build): distinct from
+    // sizedUpWhileLosing above, which only fires when the DAY's cumulative
+    // P&L is negative. This catches size rising right after the PRECEDING
+    // trade specifically, even on a day that's still net positive from
+    // earlier wins — the exact shape his own trade data showed drove more of
+    // the funded drawdown than any single other pattern (trade immediately
+    // after a loss: 42% win rate, -$1,197 net, avg size 3.6c vs 2.1c on the
+    // day's first trade). See size-freeze-guard.js.
+    const sizedUpAfterLoss = window.SizeFreezeGuard ? window.SizeFreezeGuard.sizeUpAfterLossViolation(s.trades, size) : false;
     s.trades.push({ t: Date.now(), size: size, pnl: pnl, g: grade.g, pts: grade.pts, flags: grade.flags });
     if (pnl < 0) s.cooldownUntil = Date.now() + COOLDOWN_MS;
     const dayPnl = s.trades.reduce((a, t) => a + t.pnl, 0);
+    const wasStopped = s.stopped;
     if (dayPnl <= -dayStop()) s.stopped = true;
     if (sizedUpWhileLosing) s.stopped = true;
+    if (sizedUpAfterLoss) s.stopped = true;
+    if (s.stopped && !wasStopped) s.stoppedAt = Date.now();
     save(s); pnlEl.value = ''; sizeEl.value = ''; grRender();
     banner('Trade graded ' + grade.g + ' (' + grade.pts + '/4)' + (grade.flags.length ? ' — ' + grade.flags.join(', ') : ' — clean'), grade.pts >= 3 ? 'green' : grade.pts === 2 ? 'amber' : 'red');
     if (blackout) banner('You logged a trade during a NEWS BLACKOUT — the flash-crash setup.', 'red');
     if (size > SIZE_CAP) banner('SIZE VIOLATION — ' + size + ' > ' + SIZE_CAP + ' cap. The pattern that blew 8 accounts.', 'red');
     if (sizedUpWhileLosing) banner('SIZE-UP WHILE LOSING — ' + size + ' contracts after ' + prevTrade.size + ', day P&L ' + money(runningBeforeThis) + '. This is exactly what blew the 150K eval on 07-21. HARD STOP.', 'red');
+    else if (sizedUpAfterLoss) banner('SIZE-UP RIGHT AFTER A LOSS — ' + size + ' contracts after a ' + money(prevTrade.pnl) + ' loss on ' + prevTrade.size + '. This is the single pattern that cost the most on the funded account. HARD STOP.', 'red');
     if (inCooldown) banner('Logged during the 15-min cooldown — the revenge re-entry that cost you.', 'red');
-    if (s.stopped) { grShowStop(s); if (!sizedUpWhileLosing) banner('DAILY STOP HIT (' + money(dayPnl) + ') — flatten and close Tradovate now.', 'red'); }
+    if (s.stopped) { grShowStop(s); if (!sizedUpWhileLosing && !sizedUpAfterLoss) banner('DAILY STOP HIT (' + money(dayPnl) + ') — flatten and close Tradovate now.', 'red'); }
     else if (s.trades.length > limit()) banner('OVER LIMIT — ' + s.trades.length + ' trades, cap ' + limit() + '. Stop.', 'red');
     else if (s.trades.length === limit()) banner(limit() + ' trades used — you are DONE for the day.', 'red');
     else if (pnl < 0) banner('Loss logged — 15-min cooldown started. No re-entry.', 'amber');
   };
 
   // Tier-3: live-feed ingest. Server sends aggregated today numbers from real
-  // Tradovate fills; the SAME guards fire automatically (no manual logging).
+  // fills (Tradovate REST, or — 2026-08-17 — the TradingView broker feed via
+  // tv-broker-feed.js's balance-delta-at-flat fold); the SAME guards fire
+  // automatically (no manual logging).
   window.grIngestLive = function (data) {
     const s = load();
+    // 2026-08-18: data.success===false means the chart/CDP connection is up
+    // but the broker Trading Panel itself isn't readable (not open / not
+    // linked) — previously this silently produced the same s.live=null as a
+    // normal "no trades yet" tick, so the feed could be dead for a whole
+    // session with no visible signal. Surface it once per state transition.
+    if (data && data.success === false) {
+      if (!s.brokerFeedDown) {
+        banner('LIVE BROKER FEED NOT READING — ' + (data.reason || 'Trading Panel not open or broker not linked') + '. Trades will not be tracked live until this is fixed.', 'red');
+      }
+      s.brokerFeedDown = true;
+    } else if (data && data.connected) {
+      s.brokerFeedDown = false;
+    }
     s.live = data && data.connected ? { connected: true, tradeCount: data.tradeCount || 0, dayPnl: data.dayPnl || 0, maxSize: data.maxSize || 0, at: Date.now() } : null;
     if (s.live) {
-      if (s.live.dayPnl <= -dayStop() && !s.stopped) { s.stopped = true; banner('DAILY STOP HIT (' + money(s.live.dayPnl) + ') — flatten and close Tradovate now.', 'red'); }
+      if (s.live.dayPnl <= -dayStop() && !s.stopped) { s.stopped = true; s.stoppedAt = Date.now(); banner('DAILY STOP HIT (' + money(s.live.dayPnl) + ') — flatten and close Tradovate now.', 'red'); }
       if (data.lastLossTs && data.lastLossTs > (s.lastLossSeen || 0)) { s.lastLossSeen = data.lastLossTs; s.cooldownUntil = data.lastLossTs + COOLDOWN_MS; banner('Live loss — 15-min cooldown started.', 'amber'); }
       if (s.live.maxSize > SIZE_CAP) banner('LIVE SIZE VIOLATION — ' + s.live.maxSize + ' > ' + SIZE_CAP + ' cap.', 'red');
       if (s.live.tradeCount >= limit()) banner(s.live.tradeCount + ' trades (live) — cap ' + limit() + '. Done.', 'red');
     }
+    // 2026-08-17: size-freeze-guard now runs against LIVE-detected trades too,
+    // not just manually logged ones — this closes the exact gap the CEO
+    // review flagged ("you built a way to enter trades before finishing the
+    // way to stop yourself"). data.trades is today's full ordered list from
+    // the server fold; s.liveTrades is what this client has already scored.
+    // Only the newly-arrived tail is ever evaluated against the guard, each
+    // one checked against the trade immediately before it, in order —
+    // mirrors grLog()'s sizedUpAfterLoss check exactly.
+    if (Array.isArray(data && data.trades)) {
+      const already = Array.isArray(s.liveTrades) ? s.liveTrades : [];
+      if (data.trades.length > already.length) {
+        let liveTrades = already.slice();
+        for (let i = already.length; i < data.trades.length; i++) {
+          const trade = data.trades[i];
+          const violation = window.SizeFreezeGuard ? window.SizeFreezeGuard.sizeUpAfterLossViolation(liveTrades, trade.size) : false;
+          liveTrades = liveTrades.concat([trade]);
+          if (violation && !s.stopped) {
+            s.stopped = true; s.stoppedAt = Date.now();
+            const prevTrade = liveTrades[liveTrades.length - 2];
+            banner('LIVE SIZE-UP RIGHT AFTER A LOSS — ' + trade.size + ' contracts after a ' + money(prevTrade.pnl) + ' loss on ' + prevTrade.size + '. HARD STOP.', 'red');
+          }
+        }
+        s.liveTrades = liveTrades;
+      }
+    }
+    // ── 2026-08-18 (Anoop: "let it read my DOM from TradingView ... it is
+    // wrong every time") ─────────────────────────────────────────────────
+    // The displayed account balance was NEVER read from TradingView's DOM —
+    // it is always RECOMPUTED as startBalance + sum(ledger days) [+ today's
+    // live P&L], by design (enforceAccountInvariant's "ledger wins"
+    // invariant, added 2026-07-25 after a real corruption bug). That
+    // invariant is correct and stays: this app tracks 5 independent virtual
+    // slots that can share one real broker account, so blindly displaying
+    // TradingView's raw total balance in place of a slot's own computed
+    // number would break slot isolation the moment two slots point at the
+    // same funded account.
+    //
+    // But "correct by design" isn't the same as "matches reality" — the
+    // recompute can drift from what TradingView's own DOM literally shows
+    // (commissions not in the CSV, a trade the fold missed, a timing gap).
+    // Anoop keeps three monitors open specifically to catch this. Rather
+    // than silently trust either number, surface both and flag a mismatch
+    // loudly instead of letting him find it by eyeballing three screens.
+    const domBalanceRaw = data && data.summary && data.summary.header && data.summary.header.balance;
+    const domBalance = (typeof domBalanceRaw === 'string')
+      ? Number(domBalanceRaw.replace(/−/g, '-').replace(/[^0-9.\-]/g, ''))
+      : null;
+    if (domBalance != null && Number.isFinite(domBalance) && state.account && typeof state.account.balance === 'number') {
+      const diff = Math.round((state.account.balance - domBalance) * 100) / 100;
+      s.domBalance = domBalance;
+      s.domBalanceDiff = diff;
+      s.domBalanceAt = Date.now();
+      // $1 tolerance for rounding; a real drift is usually tens of dollars
+      // (a missed trade, unlogged commission), not cents.
+      if (Math.abs(diff) > 1) {
+        if (!s.domMismatchNotified) {
+          banner('LIVE FEED MISMATCH — TradingView\'s account balance reads ' + money(domBalance)
+            + ', Co-Pilot\'s ledger math says ' + money(state.account.balance) + ' (off by ' + money(diff)
+            + '). Trusting the ledger for THIS slot\'s numbers by design (5 slots can share one real account) — but check for a missing trade or commission.', 'amber');
+          s.domMismatchNotified = true;
+        }
+      } else {
+        s.domMismatchNotified = false;
+      }
+    }
+    // 2026-08-19 (SEMI_AUTONOMOUS_SYSTEM_PLAN.md item 3, trade-count leg):
+    // same style/philosophy as the balance mismatch banner above — VISIBILITY
+    // only, s.live.tradeCount (used for enforcement) is untouched below.
+    if (typeof data.tradeCountMismatch === 'boolean') {
+      s.tradeCountMismatch = data.tradeCountMismatch;
+      s.brokerFilledCount = data.brokerFilledCount;
+      s.foldTradeCount = data.foldTradeCount;
+      if (data.tradeCountMismatch) {
+        if (!s.tradeCountMismatchNotified) {
+          banner('LIVE FEED MISMATCH — broker\'s filled-order count reads ' + data.brokerFilledCount
+            + ', Co-Pilot\'s trade tracker says ' + data.foldTradeCount
+            + '. Not changing enforcement on this — but a real trade or fold miscount may be hiding here, check the orders table.', 'amber');
+          s.tradeCountMismatchNotified = true;
+        }
+      } else {
+        s.tradeCountMismatchNotified = false;
+      }
+    }
     save(s); grRender();
+    // 2026-08-17: left panel (Balance/DD-Floor/Target) now also reacts to
+    // every live tick — enforceAccountInvariant() (called inside
+    // updateAccountUI) picks up today's live P&L from the SAME
+    // copilot_guardrail_v1 state save() just wrote, when no CSV exists yet
+    // for today. See enforceAccountInvariant's 2026-08-17 comment.
+    if (typeof updateAccountUI === 'function') updateAccountUI();
   };
 
-  window.grResetDay = function () { if (confirm('Reset today\'s guardrail counters (trades, cooldown, stop)?')) { const s = load(); const keep = s.live; localStorage.removeItem(GKEY); const ns = load(); ns.live = keep; save(ns); grRender(); const ov = document.getElementById('gr-stop-overlay'); if (ov) ov.style.display = 'none'; } };
-  window.grAckStop = function () { const inp = document.getElementById('gr-stop-ack'); if (inp && inp.value.trim().toLowerCase() === 'i am done') { const s = load(); s.acked = true; save(s); const ov = document.getElementById('gr-stop-overlay'); if (ov) ov.style.display = 'none'; } else if (inp) { inp.style.borderColor = 'var(--red)'; } };
+  // 2026-08-19 (SEMI_AUTONOMOUS_SYSTEM_PLAN.md item 5a): flagged twice as too
+  // easy to hit accidentally — a single confirm() dialog wiped the hardened
+  // stop (and the size-freeze-guard's trade history it reads for
+  // sizeUpAfterLossViolation) with one misclick. When there's an ACTIVE
+  // stopped state to clear, this now requires typing the same confirmation
+  // phrase used by the daily-stop ack overlay ("i am done", grAckStop above)
+  // instead of a single-click browser confirm — a plain reset with nothing
+  // active to lose (day hasn't hit stop) stays a lightweight confirm(), since
+  // there's nothing consequential being discarded in that case.
+  window.grResetDay = function () {
+    const cur = load();
+    if (cur && cur.stopped) {
+      const typed = prompt('This day is STOPPED. Resetting now clears the hardened stop AND today\'s size-freeze-guard trade history — a size-up-after-loss violation would no longer be caught for trades already logged.\n\nType "i am done" to confirm the reset:');
+      if (!typed || typed.trim().toLowerCase() !== 'i am done') { banner('Reset cancelled — confirmation phrase did not match.', 'amber'); return; }
+    } else if (!confirm('Reset today\'s guardrail counters (trades, cooldown, stop)?')) {
+      return;
+    }
+    stopAlarm.stop(); const s = load(); const keep = s.live; localStorage.removeItem(GKEY); const ns = load(); ns.live = keep; save(ns); grRender(); const ov = document.getElementById('gr-stop-overlay'); if (ov) ov.style.display = 'none';
+  };
+  window.grAckStop = function () {
+    const inp = document.getElementById('gr-stop-ack');
+    if (inp && inp.disabled) return; // still inside the mandatory pause — see grShowStop()
+    if (inp && inp.value.trim().toLowerCase() === 'i am done') {
+      stopAlarm.stop();
+      const s = load(); s.acked = true; save(s);
+      const ov = document.getElementById('gr-stop-overlay'); if (ov) ov.style.display = 'none';
+    } else if (inp) { inp.style.borderColor = 'var(--red)'; }
+  };
   window.grNews = function (status) { grNewsStatus = status; window.grInBlackout = !!(status && status.inBlackout); grRender(); };
-  function grShowStop(s) { const ov = document.getElementById('gr-stop-overlay'); if (!ov) return; ov.style.display = s.acked ? 'none' : 'flex'; }
+  // 2026-08-16: now drives the alarm and the mandatory ack-delay countdown,
+  // on top of just toggling visibility. Called every render tick (~1s) while
+  // a stop is active and unacked — start() is idempotent so this does not
+  // restart the alarm's escalation timer on every call.
+  function grShowStop(s) {
+    const ov = document.getElementById('gr-stop-overlay'); if (!ov) return;
+    ov.style.display = s.acked ? 'none' : 'flex';
+    if (s.acked) { stopAlarm.stop(); return; }
+    stopAlarm.start();
+    const inp = document.getElementById('gr-stop-ack');
+    const btn = document.getElementById('gr-stop-btn');
+    const cd = document.getElementById('gr-stop-countdown');
+    const remaining = window.StopAlarm ? window.StopAlarm.ackDelayRemainingMs(s.stoppedAt, Date.now()) : 0;
+    const locked = remaining > 0;
+    if (inp) inp.disabled = locked;
+    if (btn) btn.disabled = locked;
+    if (cd) cd.textContent = locked ? ('Read this. Acknowledgment unlocks in ' + Math.ceil(remaining / 1000) + 's…') : '';
+  }
 
   window.grRender = function () {
     const bar = document.getElementById('gr-hud'); if (!bar) return;
@@ -5704,22 +7572,102 @@ window.grInBlackout = false;
         if (ls.goalDays) scTxt += ' · 🔁' + (ls.streak || 0) + '/' + ls.goalDays;
       }
     } catch (e) {}
-    document.getElementById('gr-meta').textContent = 'Day ' + money(dayPnl) + ' · stop ' + money(-dayStop()) + ' · size ' + (maxSize || 0) + '/' + SIZE_CAP + (disc !== null ? ' · disc ' + disc + '%' : '') + scTxt + (nn ? ' · ' + nn : '');
+    // 2026-08-11: label the SOURCE of the day number. On 08-10 the HUD read
+    // "Day -$637" while the broker CSV said -$855.50 — because this figure is
+    // the sum of trades Anoop typed in by hand, and two of the six never got
+    // logged. The HUD cannot know about a trade it was never told about, but it
+    // can stop presenting a hand-entered figure with the same authority as a
+    // broker-verified one. '(manual — unverified)' is the honest label; the
+    // '● LIVE' prefix already marks the broker-fed case. Fixing the underlying
+    // gap needs the Tradovate feed validated (see tradovate.js NEEDS-VALIDATION
+    // and task #29) — until then, assume this number is the floor, not the truth.
+    const srcTag = live ? '' : ' · manual — unverified';
+
+    // ── Loss-ratchet readout + warning (2026-08-12) ─────────────────────────
+    // Anoop asked for "a warning when it reached previous day profit into loss".
+    // Three tiers rather than a single hard stop, deliberately: a stop that
+    // only speaks at the limit gives no moment to stand down BEFORE the
+    // decision is taken out of his hands — and that window (down, not yet
+    // stopped) is exactly where the 9-lot went on on 08-10.
+    // The banner fires only on a level CHANGE, so it doesn't spam every render.
+    // ── Contracts-per-day readout + warning (2026-08-12) ────────────────────
+    // The variable his own five days actually split on. Shown next to size so
+    // "2/2 per entry" can never again look fine while the day is at 24 total.
+    let volTag = '';
+    try {
+      const vcfg = (getRules().contractsPerDay) || {};
+      if (window.VolumeBudget && vcfg.enabled) {
+        const used = window.VolumeBudget.contractsUsed(s.trades);
+        const vs = window.VolumeBudget.volumeStatus(used, vcfg);
+        volTag = ' · vol ' + used + '/' + vs.cap;
+        if (vs.level !== 'ok' && vs.level !== grLastVolumeLevel) {
+          grLastVolumeLevel = vs.level;
+          banner(vs.text, vs.level === 'stop' ? 'red' : 'amber');
+        } else if (vs.level === 'ok') {
+          grLastVolumeLevel = 'ok';
+        }
+      }
+    } catch (e) {}
+
+    let ratchetTag = '';
+    try {
+      const ri = ratchetInfo();
+      const st = window.LossRatchet
+        ? window.LossRatchet.statusFor(dayPnl, ri, (getRules().lossRatchet) || {})
+        : null;
+      if (ri.tightened) ratchetTag = ' · RATCHET ' + money(-ri.cap) + ' (yday +' + money(yesterdayPnl()) + ')';
+      if (st && st.level !== 'ok' && st.level !== grLastRatchetLevel) {
+        grLastRatchetLevel = st.level;
+        banner(st.text, st.level === 'stop' ? 'red' : 'amber');
+      } else if (st && st.level === 'ok') {
+        grLastRatchetLevel = 'ok';
+      }
+    } catch (e) {}
+
+    // 2026-08-18/19: continuous reconciliation readout, not just a one-time
+    // banner — Anoop keeps 3 monitors open specifically to spot-check this,
+    // so the HUD should show it on every render, not just the moment it first
+    // diverges. Only shown while live-connected and only past the $1 rounding
+    // tolerance (see grIngestLive).
+    const domTag = (live && s.domBalance != null && Math.abs(s.domBalanceDiff || 0) > 1)
+      ? ' · ⚠ TV DOM ' + money(s.domBalance) + ' (Δ' + money(s.domBalanceDiff) + ')'
+      : '';
+    // 2026-08-19: same style as domTag above — trade-count reconciliation
+    // (SEMI_AUTONOMOUS_SYSTEM_PLAN.md item 3).
+    const tcTag = (live && s.tradeCountMismatch)
+      ? ' · ⚠ COUNT broker ' + s.brokerFilledCount + ' vs tracked ' + s.foldTradeCount
+      : '';
+    document.getElementById('gr-meta').textContent = 'Day ' + money(dayPnl) + srcTag + ' · stop ' + money(-dayStop()) + ratchetTag + ' · size ' + (maxSize || 0) + '/' + SIZE_CAP + volTag + (disc !== null ? ' · disc ' + disc + '%' : '') + scTxt + (nn ? ' · ' + nn : '') + domTag + tcTag;
     const logWrap = document.getElementById('gr-logwrap'); if (logWrap) logWrap.style.opacity = live ? '0.4' : '1';
-    if (stopped && !s.acked) grShowStop(s);
+    if (stopped && !s.acked) grShowStop(s); else stopAlarm.stop();
   };
 
   function grInit() {
     if (document.getElementById('gr-hud')) return;
     const bar = document.createElement('div'); bar.id = 'gr-hud'; bar.className = 'gr-hud gr-clear';
     bar.innerHTML = '<div id="gr-state" class="gr-state">✓ CLEAR</div><div id="gr-meta" class="gr-meta"></div>'
+      // 2026-08-17: persistent, always-visible indicator for a pending trade
+      // ticket (Phase 2b) — GO verdicts can be rare, so the ticket card sitting
+      // in the chat panel alone isn't enough; this stays lit until the ticket
+      // is confirmed or dismissed, from anywhere in the app.
+      + '<div id="gr-ticket-pill" class="gr-ticket-pill" style="display:none" onclick="tcScrollToPending()" title="Click to jump to the pending trade ticket">⚡ TRADE TICKET PENDING</div>'
       + '<div id="gr-logwrap" class="gr-log"><input id="gr-size" class="gr-in" type="number" min="1" placeholder="size"><input id="gr-pnl" class="gr-in" type="number" placeholder="P&L $"><button class="gr-btn" onclick="grLog()">Log trade</button><button class="gr-btn gr-reset" onclick="grResetDay()" title="reset day">↺</button></div>';
     document.body.appendChild(bar);
     const ov = document.createElement('div'); ov.id = 'gr-stop-overlay';
-    ov.innerHTML = '<div class="gr-stop-box"><div class="gr-stop-title">⛔ DAILY STOP HIT</div><div class="gr-stop-sub">You are done trading today. Flatten every position and close Tradovate. The account you keep is worth more than the trade you skip.</div><input id="gr-stop-ack" class="gr-stop-inp" placeholder="type: i am done"><button class="gr-btn gr-stop-btn" onclick="grAckStop()">Acknowledge</button></div>';
+    // 2026-08-16: gr-stop-countdown shows the mandatory-pause message; the
+    // input/button start disabled and grShowStop() unlocks them once
+    // StopAlarm.ackDelayRemainingMs() reaches 0. id added to the button
+    // (previously class-only) so grShowStop() can address it directly.
+    ov.innerHTML = '<div class="gr-stop-box"><div class="gr-stop-title">⛔ DAILY STOP HIT</div><div class="gr-stop-sub">You are done trading today. Flatten every position and close Tradovate. The account you keep is worth more than the trade you skip.</div><div id="gr-stop-countdown" class="gr-stop-countdown"></div><input id="gr-stop-ack" class="gr-stop-inp" placeholder="type: i am done" disabled><button id="gr-stop-btn" class="gr-btn gr-stop-btn" onclick="grAckStop()" disabled>Acknowledge</button></div>';
     document.body.appendChild(ov);
     if (window.api && window.api.onNewsStatus) window.api.onNewsStatus(grNews);
     if (window.api && window.api.onTradovateAccount) window.api.onTradovateAccount(grIngestLive);
+    // 2026-08-17: tv-broker-account carries the same aggregated
+    // connected/tradeCount/dayPnl/maxSize/lastLossTs/trades fields
+    // grIngestLive already expects (see tv-broker-feed.js), plus raw
+    // summary/positions/orders this guard doesn't need — passing the whole
+    // message through is safe, grIngestLive only reads the fields it knows.
+    if (window.api && window.api.onTvBrokerAccount) window.api.onTvBrokerAccount(grIngestLive);
     if (window.api && window.api.onRules) window.api.onRules(grApplyRules);
     grRender(); setInterval(grRender, 1000);
   }
@@ -5758,6 +7706,59 @@ async function loadArchives() {
   ARCHIVE_CACHE = a;
   return a;
 }
+// ── Account journeys view (2026-08-16) ──────────────────────────────────────
+// The single-dataset eval→funded lifecycle record (journey-tracker.js),
+// replacing the old per-click account_archives.json as the primary picture:
+// one card per attempt, eval and funded phases on the SAME card so they can
+// never be read as two unrelated accounts. Same lazy-cache-then-rerender
+// shape as loadArchives()/insArchiveBlock() just below it.
+let JOURNEY_CACHE = null;
+async function loadJourneys() {
+  if (JOURNEY_CACHE !== null) return JOURNEY_CACHE;
+  let j = [];
+  try { if (window.api && window.api.journeyList) j = await window.api.journeyList(); } catch (e) {}
+  if (!Array.isArray(j)) j = [];
+  JOURNEY_CACHE = j;
+  return j;
+}
+function journeyPhase(j) {
+  if (j.funded) return j.funded.status === 'breached' ? 'FUNDED_BREACHED' : 'FUNDED';
+  if (j.eval.status === 'breached') return 'EVAL_BREACHED';
+  return 'EVAL';
+}
+function journeyPhaseLabel(phase) {
+  return { EVAL: '🟦 EVAL — in progress', EVAL_BREACHED: '📉 EVAL BREACHED', FUNDED: '🎯 FUNDED — live', FUNDED_BREACHED: '📉 FUNDED BREACHED' }[phase] || phase;
+}
+function journeyMoney(n) { return n == null ? '—' : costMoney(n); }
+function insJourneyBlock() {
+  if (JOURNEY_CACHE === null) { loadJourneys().then(() => { if (typeof renderInsights === 'function') renderInsights(); }); return ''; }
+  if (!JOURNEY_CACHE.length) return '';
+  const rows = JOURNEY_CACHE.slice().reverse().map(j => {
+    const phase = journeyPhase(j);
+    const evCls = (phase === 'EVAL_BREACHED' || phase === 'FUNDED_BREACHED') ? 'ins-bad' : 'ins-good';
+    const sizeLabel = (ACCOUNT_PROFILES[j.size] && ACCOUNT_PROFILES[j.size].label) || j.size || '?';
+    const head = costEsc(sizeLabel) + ' · ' + costEsc(j.slotId || '') + ' · ' + journeyPhaseLabel(phase);
+
+    const evalLine = '<div class="ins-daymetrics"><span>Eval: ' + j.eval.status
+      + (j.eval.startBalance != null ? ', start ' + journeyMoney(j.eval.startBalance) : '')
+      + (j.eval.finalBalance != null ? ', ended ' + journeyMoney(j.eval.finalBalance) : '')
+      + (j.eval.startedAt ? ', ' + fmtDMY(j.eval.startedAt.slice(0, 10)) : '') + '</span></div>';
+
+    let fundedLine = '';
+    if (j.funded) {
+      const payouts = j.funded.payouts || [];
+      const total = payouts.reduce((s, p) => s + (p.amount || 0), 0);
+      fundedLine = '<div class="ins-daymetrics"><span>Funded: ' + j.funded.status
+        + (j.funded.startedAt ? ', ' + fmtDMY(j.funded.startedAt.slice(0, 10)) : '')
+        + '</span><span>' + payouts.length + ' payout' + (payouts.length === 1 ? '' : 's') + (total ? ', ' + journeyMoney(total) + ' total' : '') + '</span></div>';
+      if (payouts.length) {
+        fundedLine += '<div class="ins-note-good">' + payouts.map(p => '✓ ' + fmtDMY(p.date) + ' ' + journeyMoney(p.amount)).join('&nbsp;&nbsp;') + '</div>';
+      }
+    }
+    return '<div class="ins-day"><div class="ins-day-head ' + evCls + '">' + head + '</div>' + evalLine + fundedLine + '</div>';
+  }).join('');
+  return '<div class="analysis-block"><div class="block-title">Account Journeys — Eval → Funded</div>' + rows + '</div>';
+}
 function insArchiveBlock() {
   if (ARCHIVE_CACHE === null) { loadArchives().then(() => { if (typeof renderInsights === 'function') renderInsights(); }); return ''; }
   if (!ARCHIVE_CACHE.length) return '';
@@ -5782,8 +7783,9 @@ function renderInsights() {
   const el = document.getElementById('ins-body'); if (!el) return;
   const hist = (typeof grHistory === 'function' ? grHistory() : []).slice().sort((a, b) => a.date < b.date ? -1 : 1);
   const acc = state.account;
-  if (!hist.length) { el.innerHTML = '<div class="no-trades">No days logged yet. Upload your Performance CSVs (Analyze CSV) — each day is analyzed separately.</div>' + insArchiveBlock() + insClearBtn(); return; }
+  if (!hist.length) { el.innerHTML = '<div class="no-trades">No days logged yet. Upload your Performance reports (Update File) — each day is analyzed separately.</div>' + insJourneyBlock() + insArchiveBlock() + insClearBtn(); return; }
   let h = '';
+  h += insJourneyBlock();
   h += insLoopBlock();
   h += insScoreBlock(hist);
   h += insRedDayBlock(hist);
@@ -6732,10 +8734,29 @@ function csvApply(filename, parsed) {
       + `. Current balance $${Math.round(bal)}, cushion $${Math.round(cushion)}.) `
       + 'Pull app_get_data("insights") and coach me on this upload: verdict on the process, the ONE pattern that matters most right now, and one concrete fix for tomorrow. Reference my actual numbers, keep it tight, and do not repeat phrasings you have already used with me.';
     setTimeout(() => { try { sendMessage(dbMsg); } catch (e) {} }, 600);
-    // 2026-07-28: Post-Session Analyst auto-fires AFTER the debrief finishes.
-    // 5s delay gives the debrief time to start streaming (it waits for
-    // isStreaming to clear before starting its own stream).
-    setTimeout(() => { try { runPostSessionReview(); } catch (e) {} }, 5000);
+    // ── 2026-08-12: full Post-Session report is now OPT-IN ────────────────────
+    // It used to auto-fire 5s after EVERY CSV upload, on top of the debrief
+    // above — two AI calls per upload. Anoop: "it is such a long list of
+    // details... I cannot read the whole post-session review every time I
+    // upload a CSV. At the end of the session, I will upload only once. That
+    // is when I need all the details."
+    // The report is ~5-7K tokens in / ~1.5K out (about $0.014 a time on
+    // Haiku). The cost is the smaller argument — generating 1,500 tokens
+    // nobody reads is 100% waste at any price, and it buried the one line he
+    // actually wanted underneath it.
+    // The SHORT debrief above still fires on every upload. The full report now
+    // runs only on request: "End Day & Save", or typing "post session review".
+    // Restore the old behaviour with autoPostSessionReview: true in rules.json.
+    const autoPSR = (getRules().autoPostSessionReview === true);
+    if (autoPSR) {
+      setTimeout(() => { try { runPostSessionReview(); } catch (e) {} }, 5000);
+    } else {
+      setTimeout(() => {
+        try {
+          addSystemMessage('Full post-session report skipped (not auto-run). Type "post session review" or use End Day & Save when you want the detailed breakdown.');
+        } catch (e) {}
+      }, 1200);
+    }
   } catch (e) {}
 }
 
@@ -6849,7 +8870,14 @@ function csvIngest(filename, csvText) {
       ['day_trades', 'copilot_day_trades'],
       ['pb_tags', 'copilot_pb_tags'],
       ['maemfe', 'copilot_maemfe'],
-      ['loop_state', 'copilot_loop']
+      ['loop_state', 'copilot_loop'],
+      // 2026-08-13: ck_history was WRITE-ONLY. endDay() flushed it to
+      // accounts/<slot>/ck_history.json but nothing ever read it back, while
+      // two code paths removeItem('copilot_ck_history') on clear/wipe. So the
+      // "permanent record" Anoop asked for could be destroyed by a clear even
+      // though a good copy sat on disk. Now restored on boot like every other
+      // per-slot dataset — which also means his completion streak survives.
+      ['ck_history', 'copilot_ck_history']
     ];
     let ledger = null;
     for (const [key, lsKey] of pairs) {
@@ -6859,6 +8887,12 @@ function csvIngest(filename, csvText) {
         if (nonEmpty) {
           localStorage.setItem(lsKey, JSON.stringify(v));
           if (key === 'balance_ledger') ledger = v;
+          // 2026-08-13: this is the path that eventually has the RIGHT data
+          // even when the fast boot path above raced ahead with a stale
+          // snapshot — but nothing told the checklist UI to look again. Without
+          // this, a correct completion could land in localStorage and the gate
+          // would still show "not done" until he switched tabs by hand.
+          if (key === 'ck_history' && typeof ckRenderGate === 'function') ckRenderGate();
         }
       } catch (e) {}
     }
@@ -6894,6 +8928,10 @@ function csvIngest(filename, csvText) {
   }
   if (window.api && window.api.onWsOpen) window.api.onWsOpen(() => setTimeout(restoreFromDisk, 800));
   else setTimeout(restoreFromDisk, 2500);
+  // 2026-08-18: start the periodic/unload autosave once the boot restore has
+  // had its turn, so the first autosave can never write a pre-restore (empty)
+  // snapshot over a good disk file.
+  setTimeout(() => { try { startAccountAutosave(); } catch (e) {} }, 5000);
 })();
 
 
@@ -7038,6 +9076,89 @@ function jrDrawRadar(id, labels, values) { // values 0-100
   x.closePath(); x.fillStyle = acc + '33'; x.fill(); x.strokeStyle = acc; x.lineWidth = 2; x.stroke();
   x.fillStyle = jrCss('--text-mid'); x.font = '9.5px Outfit, sans-serif'; x.textAlign = 'center';
   labels.forEach((l, i) => { const [px, py] = pt(i, R + 13); x.fillText(l, px, py + 3); });
+}
+
+// ── Points / sizing charts (2026-08-13) ─────────────────────────────────────
+// Anoop: "make this chart live in journal tab inside everyday trade data. so
+// that i know and judge my mistakes of oversizing and find my sweet spot."
+// Both functions read window.PointsTracker — the SAME module server.js uses
+// and the Node tests replay against real trade history — so this chart can
+// never quietly disagree with the numbers Anoop is told in chat.
+
+// Per-day bars: bar height = points captured on that trade, bar OPACITY =
+// how large the size was relative to that day's biggest trade. A big, dark
+// bar sitting in red is the oversizing mistake made visible — no reading
+// required. Dashed line = that day's mean.
+function jrDrawPointsBars(id, trades, mult) {
+  const p = jrPrep(id); if (!p) return;
+  const PT = window.PointsTracker; if (!PT) return;
+  const { x, w, h } = p, padB = 6, padT = 6;
+  const valid = trades
+    .map(t => ({ t, pts: PT.tradePoints(t, mult) }))
+    .filter(o => o.pts !== null);
+  if (!valid.length) return;
+  const maxAbs = Math.max(...valid.map(o => Math.abs(o.pts)), 1);
+  const maxSize = Math.max(...valid.map(o => o.t.size || 1), 1);
+  const bw = (w - 10) / valid.length;
+  const zero = padT + (h - padB - padT) / 2;
+  valid.forEach((o, i) => {
+    const bh = Math.abs(o.pts) / maxAbs * (h - padB - padT) / 2;
+    const sizeFrac = Math.min(1, (o.t.size || 1) / maxSize);
+    x.fillStyle = o.pts >= 0 ? jrCss('--green') : jrCss('--red');
+    x.globalAlpha = 0.30 + 0.60 * sizeFrac; // bigger contract = more opaque bar
+    x.fillRect(5 + i * bw + bw * 0.15, o.pts >= 0 ? zero - bh : zero, bw * 0.7, Math.max(bh, 1));
+    x.globalAlpha = 1;
+  });
+  const meanPts = valid.reduce((a, o) => a + o.pts, 0) / valid.length;
+  const meanY = zero - Math.max(-1, Math.min(1, meanPts / maxAbs)) * (h - padB - padT) / 2;
+  x.strokeStyle = jrCss('--border2'); x.setLineDash([3, 4]);
+  x.beginPath(); x.moveTo(5, meanY); x.lineTo(w - 5, meanY); x.stroke(); x.setLineDash([]);
+  x.strokeStyle = jrCss('--border2');
+  x.beginPath(); x.moveTo(5, zero); x.lineTo(w - 5, zero); x.stroke();
+}
+
+// Aggregate across the whole account: bucket every trade by size, run each
+// bucket through PointsTracker.summarize(), and hand back expectancy per
+// bucket. This IS "find my sweet spot" — the size whose expectancy is
+// highest, computed, not guessed.
+function jrSizeSweetSpot(mult) {
+  const PT = window.PointsTracker; if (!PT) return [];
+  const trades = jrAllTrades();
+  const buckets = [
+    { label: '1 lot', test: s => s === 1 },
+    { label: '2 lots', test: s => s === 2 },
+    { label: '3-5 lots', test: s => s >= 3 && s <= 5 },
+    { label: '6+ lots', test: s => s >= 6 }
+  ];
+  return buckets
+    .map(b => {
+      const bt = trades.filter(t => b.test(t.size));
+      return { label: b.label, n: bt.length, summary: PT.summarize(bt, mult) };
+    })
+    .filter(r => r.n > 0 && r.summary);
+}
+
+function jrDrawSizeSweetSpot(id, rows) {
+  const p = jrPrep(id); if (!p || !rows.length) return;
+  const { x, w, h } = p, padB = 22, padT = 6;
+  const vals = rows.map(r => r.summary.expectancyPts);
+  const max = Math.max(...vals.map(Math.abs), 0.5);
+  const bw = (w - 10) / rows.length;
+  const zero = padT + (h - padB - padT) / 2;
+  const bestIdx = vals.indexOf(Math.max(...vals));
+  rows.forEach((r, i) => {
+    const v = r.summary.expectancyPts;
+    const bh = Math.abs(v) / max * (h - padB - padT) / 2;
+    const bx = 5 + i * bw + bw * 0.15, by = v >= 0 ? zero - bh : zero, bwid = bw * 0.7, bhh = Math.max(bh, 1);
+    x.fillStyle = v >= 0 ? jrCss('--green') : jrCss('--red');
+    x.globalAlpha = 0.85; x.fillRect(bx, by, bwid, bhh); x.globalAlpha = 1;
+    if (i === bestIdx && v > 0) { x.strokeStyle = jrCss('--accent'); x.lineWidth = 2; x.strokeRect(bx - 1, by - 1, bwid + 2, bhh + 2); }
+    x.fillStyle = jrCss('--text-dim'); x.font = '9px "JetBrains Mono", monospace'; x.textAlign = 'center';
+    x.fillText(r.label, 5 + i * bw + bw / 2, h - 12);
+    x.fillText('n=' + r.n, 5 + i * bw + bw / 2, h - 3);
+  });
+  x.strokeStyle = jrCss('--border2');
+  x.beginPath(); x.moveTo(5, zero); x.lineTo(w - 5, zero); x.stroke();
 }
 
 // ── Scalp Stats section ────────────────────────────────────────────────────────
@@ -7254,7 +9375,7 @@ async function renderJournal() {
       }
     }
   }
-  if (!days.length) { _jrArchiveOverlay = null; body.innerHTML = '<div class="no-trades">No trading days ingested yet — upload a Performance CSV/PDF in Analyze CSV and the journal builds itself.</div>'; return; }
+  if (!days.length) { _jrArchiveOverlay = null; body.innerHTML = '<div class="no-trades">No trading days ingested yet — upload a Performance report in Update File and the journal builds itself.</div>'; return; }
 
   // Show WHERE this account's data is being written, in the UI — so there's no
   // need to read a server console to know if the drive path worked.
@@ -7272,6 +9393,16 @@ async function renderJournal() {
 
   const s = jrStats();
   const tile = (k, v, cls) => '<div class="jr-tile ' + (cls || '') + '"><div class="jr-k">' + k + '</div><div class="jr-v">' + v + '</div></div>';
+
+  // 2026-08-13: points + sizing tile, driven by window.PointsTracker — the
+  // same math behind the -2.99 pts/trade figure Anoop was given in chat, now
+  // computed live instead of re-typed by hand every morning.
+  const PT = window.PointsTracker;
+  const allTr = jrAllTrades();
+  const ptSummary = PT ? PT.summarize(allTr) : null;
+  const rollRatio = PT ? PT.rollingRatio(allTr, 10) : null;
+  const guidance = PT ? PT.sizeGuidance(rollRatio) : null;
+
   let html = archiveBanner + dirLine + '<div class="jr-grid">'
     + tile('Net P&L', jrMoney(s.net), s.net >= 0 ? 'jr-g' : 'jr-r')
     + tile('Win rate', s.winRate.toFixed(1) + '%', s.winRate >= 50 ? 'jr-g' : 'jr-r')
@@ -7279,7 +9410,22 @@ async function renderJournal() {
     + tile('Avg win / loss', jrMoney(s.avgW) + ' / ' + jrMoney(-s.avgL), s.avgW > s.avgL ? 'jr-g' : 'jr-r')
     + tile('Expectancy/trade', jrMoney(s.expectancy), s.expectancy >= 0 ? 'jr-g' : 'jr-r')
     + tile('Days', s.greenDays + '/' + s.nDays + ' green', '')
+    + (ptSummary ? tile('Points/trade', (ptSummary.expectancyPts >= 0 ? '+' : '') + ptSummary.expectancyPts.toFixed(1) + ' pts', ptSummary.expectancyPts >= 0 ? 'jr-g' : 'jr-r') : '')
+    + (rollRatio != null ? tile('Rolling ratio (10)', rollRatio === Infinity ? '∞' : rollRatio.toFixed(2) + ':1', rollRatio >= 1 ? 'jr-g' : 'jr-r') : '')
     + '</div>';
+
+  if (guidance) {
+    html += '<div class="jr-sizing-note' + (guidance.tier === 'minimum' ? ' jr-r' : guidance.tier === 'step-up' ? ' jr-g' : '') + '" style="font-size:12px;padding:6px 10px;margin:0 0 10px;">'
+      + '<b>Sizing right now:</b> ' + guidance.label + '</div>';
+  }
+
+  const sweetRows = jrSizeSweetSpot();
+  if (sweetRows.length) {
+    html += '<div class="analysis-block"><div class="block-title">Size sweet spot — expectancy (pts) by size</div>'
+      + jrCanvas('jr-sweetspot', 120)
+      + '<div style="font-size:11px;color:var(--text-dim);margin-top:4px;">Outlined bar = best expectancy bucket. This is computed from every trade on this account, not a guess.</div>'
+      + '</div>';
+  }
 
   html += '<div class="analysis-block"><div class="block-title">Equity Curve — cumulative net</div>' + jrCanvas('jr-equity', 130) + '</div>';
   html += '<div class="analysis-block">' + jrCalendarHtml() + '</div>';
@@ -7306,6 +9452,7 @@ async function renderJournal() {
   // Draw after DOM exists
   let cum = 0; const eq = days.map(d => (cum += ledger[d].net || 0));
   jrDrawLine('jr-equity', eq);
+  if (sweetRows.length) jrDrawSizeSweetSpot('jr-sweetspot', sweetRows);
 
   const hist = jrLS('copilot_gr_history', []);
   const last = hist[hist.length - 1];
@@ -7319,12 +9466,14 @@ async function renderJournal() {
   hist.forEach(d => { if (d.dow >= 1 && d.dow <= 5) dowSum[d.dow - 1] += d.pnl; });
   jrDrawBars('jr-dow', ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'], dowSum);
 
-  // per-day mini equity curves (only the expanded ones exist in the DOM)
+  // per-day mini equity curves + points/sizing bars (only the expanded ones
+  // exist in the DOM)
   Object.keys(djOpen).forEach(d => {
     if (!djOpen[d]) return;
     const tr = (dtAll[d] || []);
     if (tr.length < 2) return;
     let c = 0; jrDrawLine('dj-eq-' + d, tr.map(t => (c += t.pnl)));
+    jrDrawPointsBars('dj-pts-' + d, tr);
   });
 
   const hourSum = {};
@@ -7351,6 +9500,27 @@ function edToday() {
   const p = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
   const g = t => (p.filter(x => x.type === t)[0] || {}).value;
   return `${g('year')}-${g('month')}-${g('day')}`;
+}
+
+// 2026-08-18: "if I forget to save it should autosave at 8pm IST daily." The
+// server broadcasts 'auto-end-day-trigger' once per IST calendar day at/after
+// 20:00 (see checkEndDayAutosave in server.js); this only actually calls
+// endDay() if the active slot's own persisted meta shows it wasn't already
+// saved TODAY — a manual "End Day & Save" click earlier the same day makes
+// this a no-op instead of a second (redundant) post-session-review run.
+// dataEndDay()'s write is a fixed per-date filename regardless (see
+// dataEndDay() in server.js), so even a genuine double-call overwrites the
+// same record rather than duplicating it — this guard exists to avoid
+// re-firing the expensive Jessi post-session analysis, not to prevent data
+// duplication (that's already impossible by construction).
+async function handleEndDayAutoTrigger(date) {
+  if (!date) return;
+  const slot = (typeof acctSlot === 'function') ? acctSlot() : null;
+  if (!slot) return;
+  let meta = null;
+  try { meta = await window.api.dataLoad('meta__' + slot.id); } catch (e) {}
+  if (meta && meta.lastEndDay === date) return; // already saved today, manually
+  await endDay();
 }
 
 async function endDay() {
@@ -7420,6 +9590,16 @@ async function endDay() {
     (savedPath ? `\nSaved to: ${savedPath}` : '\n⚠ Could not write the snapshot file — check the data folder path.')
   );
   if (typeof renderJournal === 'function' && document.getElementById('tab-journal') && document.getElementById('tab-journal').style.display !== 'none') renderJournal();
+
+  // 2026-08-12: this is the ONE moment the full report is genuinely wanted —
+  // Anoop: "At the end of the session, I will upload only once. That is when I
+  // need all the details." It no longer fires on every CSV upload, so End Day
+  // is where it belongs. Delayed so the summary above renders first, and only
+  // when a session actually happened — closing a no-trade day should not spend
+  // ~7K tokens analysing nothing.
+  if (today && today.n > 0) {
+    setTimeout(() => { try { runPostSessionReview(); } catch (e) {} }, 1500);
+  }
 }
 
 // Final record when an account closes — breached or cleared. Written into that
@@ -7572,6 +9752,14 @@ function djDayRow(date, dayStats, trades) {
       + '</div>';
 
     h += '<canvas id="dj-eq-' + date + '" height="70" style="width:100%;display:block;margin:8px 0 4px;"></canvas>';
+
+    // 2026-08-13: points captured per trade THIS day, bar opacity = contract
+    // size relative to the day's biggest trade. A big dark bar in red is the
+    // oversizing mistake, visible without reading the table below it.
+    if (trades.length >= 2) {
+      h += '<div style="font-size:10px;color:var(--text-dim);margin:6px 0 2px;">Points per trade — darker bar = bigger size</div>'
+        + '<canvas id="dj-pts-' + date + '" height="60" style="width:100%;display:block;margin:0 0 4px;"></canvas>';
+    }
 
     // Per-day Scalp Stats — hold-time distribution, avg/med hold, avg gap,
     // hold-exceeded, for THIS day only (Anoop asked for per-day, not just

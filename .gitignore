@@ -12,3 +12,9 @@ _backup_before_move/
 .gbrain-source
 app/.firecrawl/
 .gstack/
+.context/
+.firecrawl/
+.kilo/
+_backups/
+hive/
+roster-backups/

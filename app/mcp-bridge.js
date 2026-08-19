@@ -19,6 +19,12 @@ const RECOVERY_WAIT_MS = 25 * 1000;
 // tv_launch itself must be allowed to run far longer than a normal tool call.
 const LAUNCH_TIMEOUT_MS = 90 * 1000;
 const HEALTH_TIMEOUT_MS = 20 * 1000;
+// How many CONSECUTIVE failed health probes before TradingView is declared
+// disconnected. >1 so transient CDP contention (a monitor mid-symbol-switch,
+// a slow chart read) can't masquerade as a dropped connection — see the note
+// in _checkTVHealth. At HEARTBEAT_MS=30s this delays a genuine-crash
+// detection by ~30s, which is the deliberate trade for not crying wolf.
+const HEALTH_FAIL_STREAK_TO_DISCONNECT = 2;
 // Backoff cap for auto-restarting the bridge's own child process if IT dies
 // (separate from TradingView dying — see tv-recovery handling below).
 const MAX_BRIDGE_RESTART_BACKOFF_MS = 30 * 1000;
@@ -36,6 +42,7 @@ class MCPBridge extends EventEmitter {
     this._recovering = false;
     this._bridgeRestartAttempts = 0;
     this._intentionalStop = false;
+    this._healthFailStreak = 0; // consecutive failed tv_health_check probes
   }
 
   async start() {
@@ -64,6 +71,7 @@ class MCPBridge extends EventEmitter {
       });
 
       this.proc.on('exit', (code) => {
+        console.warn(`[mcp-bridge] child process exited (code ${code}) — ready=false, tvConnected=false`);
         this.ready = false;
         this.tvConnected = false;
         this._stopHeartbeat();
@@ -84,6 +92,7 @@ class MCPBridge extends EventEmitter {
       });
 
       this.proc.on('error', (err) => {
+        console.error('[mcp-bridge] child process error:', err.message);
         reject(err);
       });
 
@@ -91,22 +100,34 @@ class MCPBridge extends EventEmitter {
       setTimeout(async () => {
         try {
           await this._initialize();
+          console.log('[mcp-bridge] child process ready — JSON-RPC handshake complete (this is NOT proof TradingView/CDP is reachable, only that the bridge process is up)');
           this._bridgeRestartAttempts = 0;
           resolve();
         } catch (e) {
+          console.error('[mcp-bridge] initialize() failed:', e.message);
           reject(e);
         }
       }, 1500);
     });
   }
 
+  // Every status message goes through here so it's both broadcast to the
+  // client (existing behavior) AND written to the server log file — before
+  // this fix, mcpBridge had zero console output anywhere, so a live session's
+  // TradingView connect/disconnect/recovery history was unrecoverable from
+  // logs after the fact, only visible in the moment via the UI dot.
+  _statusLog(msg) {
+    console.log('[mcp-bridge] ' + msg);
+    this.emit('status', msg);
+  }
+
   _scheduleBridgeRestart() {
     this._bridgeRestartAttempts++;
     const delay = Math.min(3000 * this._bridgeRestartAttempts, MAX_BRIDGE_RESTART_BACKOFF_MS);
-    this.emit('status', `Bridge process exited unexpectedly — restarting in ${Math.round(delay / 1000)}s (attempt ${this._bridgeRestartAttempts})`);
+    this._statusLog(`Bridge process exited unexpectedly — restarting in ${Math.round(delay / 1000)}s (attempt ${this._bridgeRestartAttempts})`);
     setTimeout(() => {
       this.start().catch((e) => {
-        this.emit('status', 'Bridge restart failed: ' + e.message);
+        this._statusLog('Bridge restart failed: ' + e.message);
         // start() failing rejects the promise but the exit handler above
         // won't fire again on its own here, so keep the retry loop alive.
         this._scheduleBridgeRestart();
@@ -151,14 +172,40 @@ class MCPBridge extends EventEmitter {
     }
 
     const wasConnected = this.tvConnected;
-    this.tvConnected = connected;
 
     if (connected) {
-      if (!wasConnected) this.emit('tv-connected');
-    } else {
-      if (wasConnected) this.emit('tv-disconnected', detail);
-      if (!this._recovering) this._attemptTVRecovery(detail);
+      this._healthFailStreak = 0;
+      this.tvConnected = true;
+      if (!wasConnected) {
+        console.log('[mcp-bridge] tv_health_check: CDP connected — TradingView chart is live-readable');
+        this.emit('tv-connected');
+      }
+      return;
     }
+
+    // 2026-08-18 (Anoop: "I don't want the MCP to fall off automatically"):
+    // a SINGLE failed probe used to be enough to declare TradingView dead —
+    // which flipped the UI indicator, fired the disconnect alarm, forced the
+    // verdict to NO-GO, and kicked off a relaunch attempt. But this probe
+    // shares one CDP connection with the PO3 monitor, the secondary-symbol
+    // watch (which switches symbols), the Jessi chart monitor and the broker
+    // poll; under that contention a probe can easily exceed its 20s budget
+    // while TradingView is perfectly healthy. Treating that as a real
+    // disconnect is what made the connection look like it "falls off" on its
+    // own. Require consecutive failures before believing it — a genuine
+    // crash keeps failing and is still caught, just one heartbeat later.
+    this._healthFailStreak = (this._healthFailStreak || 0) + 1;
+    if (this._healthFailStreak < HEALTH_FAIL_STREAK_TO_DISCONNECT) {
+      console.warn(`[mcp-bridge] tv_health_check failed (${this._healthFailStreak}/${HEALTH_FAIL_STREAK_TO_DISCONNECT}) — ${detail || 'unknown'}. Holding the connection state; likely CDP contention, not a real drop.`);
+      return; // deliberately leaves tvConnected as-is and does NOT recover yet
+    }
+
+    this.tvConnected = false;
+    if (wasConnected) {
+      console.warn(`[mcp-bridge] tv_health_check: CDP connection LOST after ${this._healthFailStreak} consecutive failures (${detail || 'unknown reason'})`);
+      this.emit('tv-disconnected', detail);
+    }
+    if (!this._recovering) this._attemptTVRecovery(detail);
   }
 
   // TradingView desktop (a separate Windows Store app, not this bridge
@@ -193,7 +240,7 @@ class MCPBridge extends EventEmitter {
     // If TradingView is already running WITHOUT CDP during a session, we still
     // won't kill it — we say so explicitly instead of silently doing nothing.
     this._recovering = true;
-    this.emit('status', inSessionWindow
+    this._statusLog(inSessionWindow
       ? `TradingView unreachable (${detail || 'unknown'}) — inside your session window, trying a SAFE start (will not close existing charts)…`
       : `TradingView unreachable (${detail || 'unknown'}) — relaunching (allow up to 2 min)…`);
     try {
@@ -212,8 +259,9 @@ class MCPBridge extends EventEmitter {
       }
       this.tvConnected = ok;
       if (ok) {
+        console.log('[mcp-bridge] recovery succeeded — CDP reconnected');
         this.emit('tv-connected');
-        this.emit('status', inSessionWindow
+        this._statusLog(inSessionWindow
           ? 'TradingView connected (safe start — your charts were not touched).'
           : 'TradingView relaunched and reconnected.');
       } else if (inSessionWindow) {
@@ -221,12 +269,12 @@ class MCPBridge extends EventEmitter {
         // already running but was started WITHOUT the CDP debugging flag. We
         // deliberately will not kill it mid-session — tell him precisely what
         // to do instead of leaving a silent red dot.
-        this.emit('status', 'TradingView is open but without the debug connection, and I will NOT close it mid-session. Close TradingView yourself and reopen it via the "Launch TradingView for Claude" shortcut, or wait until after 21:15 IST for an automatic fix.');
+        this._statusLog('TradingView is open but without the debug connection, and I will NOT close it mid-session. Close TradingView yourself and reopen it via the "Launch TradingView for Claude" shortcut, or wait until after 21:15 IST for an automatic fix.');
       } else {
-        this.emit('status', 'TradingView relaunch attempted but still not connected — will retry on next heartbeat.');
+        this._statusLog('TradingView relaunch attempted but still not connected — will retry on next heartbeat.');
       }
     } catch (e) {
-      this.emit('status', 'TradingView auto-relaunch failed: ' + e.message + ' — will retry on next heartbeat.');
+      this._statusLog('TradingView auto-relaunch failed: ' + e.message + ' — will retry on next heartbeat.');
     } finally {
       this._recovering = false;
     }

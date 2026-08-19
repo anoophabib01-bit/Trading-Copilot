@@ -11,6 +11,7 @@
   let currentJessiReqId = null; // active Jessi (Groq) chat request
   let currentJessiVoiceReqId = null; // active Jessi voice-mode request
   let currentDebateReqId = null;     // active 3-agent debate request
+  let currentAutoDebateReqId = null; // active PO3-monitor-triggered debate (independent of the above — see 'auto-debate-triggered')
   let currentScalperReqId = null;    // active Scalper (scalping specialist) request
   let currentPostReviewReqId = null; // active post-session review request
   let currentPo3ReqId = null;        // active ICT Power of 3 request
@@ -111,6 +112,14 @@
         }
         break;
 
+      // 2026-08-16 (Pattern 02, assistive routing): advisory only — not
+      // gated on currentJessiReqId since it's informational, not part of the
+      // streamed answer, and should still show even if a newer message has
+      // already superseded reqId tracking by the time it arrives.
+      case 'mode-hint':
+        emit('jessiChat:modeHint', msg.message);
+        break;
+
       case 'jessi-chat-token':
         if (msg.reqId === currentJessiReqId) emit('jessiChat:token', msg.text);
         break;
@@ -175,29 +184,78 @@
         break;
 
       // ── 3-Agent Debate mode ──────────────────────────────────────────────
+      // 2026-08-17: every debate-* message now also checks currentAutoDebateReqId
+      // (set on 'auto-debate-triggered' below) — without this, a PO3-monitor-
+      // triggered debate's status/arguments/verdict would be silently dropped
+      // here (reqId never matches currentDebateReqId, which only a manual
+      // sendDebateChat() call ever sets), even though the server broadcasts
+      // them correctly. Routed to a parallel debate:auto* channel so it can't
+      // collide with a manual debate's own UI rendering.
       case 'debate-status':
         if (msg.reqId === currentDebateReqId) emit('debate:status', msg.phase);
+        else if (msg.reqId === currentAutoDebateReqId) emit('debate:autoStatus', msg.phase);
         break;
       case 'debate-arguments':
         if (msg.reqId === currentDebateReqId) {
           emit('debate:arguments', msg.jessi, msg.analysis, msg.po3,
             { jessi: msg.jessiAnsweredBy, analysis: msg.analysisAnsweredBy, po3: msg.po3AnsweredBy });
+        } else if (msg.reqId === currentAutoDebateReqId) {
+          emit('debate:autoArguments', msg.jessi, msg.analysis, msg.po3,
+            { jessi: msg.jessiAnsweredBy, analysis: msg.analysisAnsweredBy, po3: msg.po3AnsweredBy });
         }
         break;
       case 'debate-judge-token':
         if (msg.reqId === currentDebateReqId) emit('debate:judgeToken', msg.text);
+        else if (msg.reqId === currentAutoDebateReqId) emit('debate:autoJudgeToken', msg.text);
         break;
       case 'debate-judge-done':
         if (msg.reqId === currentDebateReqId) {
           currentDebateReqId = null;
           emit('debate:judgeDone', msg.fullText, msg.answeredBy);
+        } else if (msg.reqId === currentAutoDebateReqId) {
+          currentAutoDebateReqId = null;
+          emit('debate:autoJudgeDone', msg.fullText, msg.answeredBy);
         }
         break;
       case 'debate-judge-error':
         if (msg.reqId === currentDebateReqId) {
           currentDebateReqId = null;
           emit('debate:judgeError', msg.message);
+        } else if (msg.reqId === currentAutoDebateReqId) {
+          currentAutoDebateReqId = null;
+          emit('debate:autoJudgeError', msg.message);
         }
+        break;
+      // 2026-08-16 (Pattern 03 voting variant): arrives AFTER debate-judge-done
+      // already nulled currentDebateReqId, so — like mode-hint — this is
+      // deliberately ungated on reqId. Silent (no message) when the refuter
+      // found nothing, so this only ever fires with something worth reading.
+      case 'debate-refutation':
+        emit('debate:refutation', msg.text);
+        break;
+
+      // 2026-08-17: PO3 monitor auto-triggered a Debate call on its own
+      // (left ACCUMULATION) — not gated on currentDebateReqId since nothing
+      // client-side initiated this one. Adopting msg.reqId here is what lets
+      // the debate-* cases above route this specific run's events to the
+      // debate:auto* channel instead of dropping them.
+      case 'auto-debate-triggered':
+        currentAutoDebateReqId = msg.reqId;
+        emit('debate:autoTriggered', msg);
+        break;
+
+      // ── Phase 2b: trade confirm/execute (2026-08-17) ─────────────────────
+      // Arrives after debate-judge-done (same as debate-refutation above),
+      // ungated on reqId for the same reason — currentDebateReqId is already
+      // nulled by then.
+      case 'trade-ticket-suggested':
+        emit('trade:ticketSuggested', msg);
+        break;
+      case 'trade-confirm-result':
+        emit('trade:confirmResult', msg);
+        break;
+      case 'trade-confirm-rejected':
+        emit('trade:confirmRejected', msg);
         break;
 
       // ── Post-Session Analyst ─────────────────────────────────────────────
@@ -349,12 +407,34 @@
         emit('ny:levels', msg);
         break;
 
+      case 'auto-end-day-trigger':
+        emit('endDay:autoTrigger', msg);
+        break;
+
       case 'news-status':
         emit('news:status', msg);
         break;
 
       case 'tradovate-account':
         emit('tradovate:account', msg);
+        break;
+
+      // 2026-08-17: server has been broadcasting this since the TradingView
+      // broker-feed monitor was built, but nothing client-side ever listened
+      // for it — confirmed live, silently dropped every 10s. This is the fix.
+      case 'tv-broker-account':
+        emit('tv:brokerAccount', msg);
+        break;
+
+      // 2026-08-19: startup/reconnect self-test result (SEMI_AUTONOMOUS_SYSTEM_PLAN.md item 2).
+      case 'live-feed-self-test':
+        emit('tv:liveFeedSelfTest', msg);
+        break;
+
+      // 2026-08-19: live mistake-pattern match against Anoop's own documented
+      // failure history (mistake-patterns.js). F1 first, advisory only.
+      case 'mistake-pattern':
+        emit('tv:mistakePattern', msg);
         break;
 
       case 'tradovate-test-result':
@@ -367,6 +447,11 @@
 
       case 'mechanical-analysis':
         emit('mechanical:analysis', msg);
+        break;
+
+      // Bias-adherence coach note, pushed after ✓ PRE-TRADE DONE (2026-08-13).
+      case 'bias-note':
+        emit('bias:note', msg);
         break;
 
       case 'session-alert':
@@ -382,6 +467,7 @@
       case 'data-saved':
       case 'data-loaded':
       case 'pdf-extracted':
+      case 'xlsx-extracted':
       case 'data-wiped':
       case 'data-end-day-saved':
       case 'data-dir':
@@ -389,6 +475,9 @@
       case 'shot-saved':
       case 'shot-list':
       case 'shot-data':
+      case 'account-db-result':
+      case 'journey-list':
+      case 'journey-result':
         resolvePending(msg.reqId, msg);
         break;
 
@@ -526,6 +615,7 @@
       currentJessiReqId = null;
       emit('jessiChat:done', '');
     },
+    onJessiChatModeHint:  (cb) => on('jessiChat:modeHint', cb),
     onJessiChatToken:     (cb) => on('jessiChat:token',    cb),
     onJessiChatToolStart: (cb) => on('jessiChat:toolStart', cb),
     onJessiChatToolDone:  (cb) => on('jessiChat:toolDone',  cb),
@@ -619,6 +709,15 @@
     onDebateJudgeToken:    (cb) => on('debate:judgeToken', cb),
     onDebateJudgeDone:     (cb) => on('debate:judgeDone',  cb),
     onDebateJudgeError:    (cb) => on('debate:judgeError', cb),
+    onDebateRefutation:    (cb) => on('debate:refutation', cb),
+    // 2026-08-17: PO3-monitor-triggered debate — parallel channel, see the
+    // 'auto-debate-triggered'/currentAutoDebateReqId handling above.
+    onDebateAutoTriggered:  (cb) => on('debate:autoTriggered',  cb),
+    onDebateAutoStatus:     (cb) => on('debate:autoStatus',     cb),
+    onDebateAutoArguments:  (cb) => on('debate:autoArguments',  cb),
+    onDebateAutoJudgeToken: (cb) => on('debate:autoJudgeToken', cb),
+    onDebateAutoJudgeDone:  (cb) => on('debate:autoJudgeDone',  cb),
+    onDebateAutoJudgeError: (cb) => on('debate:autoJudgeError', cb),
 
     // Post-Session Analyst (auto-fires after CSV ingest)
     sendPostSessionReview: () => {
@@ -673,6 +772,11 @@
     dataWipeAccount: (slotId)            => sendRequest({ type: 'data-wipe-account', slotId }).then(r => r.ok),
     dataEndDay:      (slotId, date, payload) => sendRequest({ type: 'data-end-day', slotId, date, payload }),
     dataDirGet:      ()                  => sendRequest({ type: 'data-dir-get' }).then(r => r.dir),
+    accountDbRebuild: () => sendRequest({ type: 'account-db-rebuild' }, 20000).then(r => r),
+
+    // Account journeys — single eval→funded lifecycle dataset (2026-08-16, journey-tracker.js)
+    journeyList:   () => sendRequest({ type: 'journey-list' }).then(r => r.journeys || []),
+    journeyAction: (action, args) => sendRequest(Object.assign({ type: 'journey-action', action }, args || {})).then(r => r),
 
     // Daily Journal: per-account notes + chart screenshots (2026-07-25)
     noteSave: (slotId, date, note) => sendRequest({ type: 'note-save', slotId, date, note }).then(r => r.ok),
@@ -742,14 +846,36 @@
     onLondonLevels:    (cb) => on('london:levels',     cb),
     onNyLevels:        (cb) => on('ny:levels',         cb), // FIX 2026-07-27 — see ws-client.js case 'ny-levels' note
     onNewsStatus:      (cb) => on('news:status',       cb),
+    onEndDayAutoTrigger:(cb)=> on('endDay:autoTrigger', cb),
     onTradovateAccount:(cb) => on('tradovate:account',  cb),
+    onTvBrokerAccount: (cb) => on('tv:brokerAccount',   cb),
+    onLiveFeedSelfTest: (cb) => on('tv:liveFeedSelfTest', cb),
+    onMistakePattern:  (cb) => on('tv:mistakePattern',    cb),
     onTradovateTestResult:(cb)=> on('tradovate:testResult', cb),
     testTradovate:     ()   => rawSend({ type: 'tradovate-test' }),
     restartTradovate:  ()   => rawSend({ type: 'tradovate-restart' }),
     onNewsChartMarks:  (cb) => on('news:chartMarks',   cb),
     onMechanicalAnalysis: (cb) => on('mechanical:analysis', cb),
+    onBiasNote:        (cb) => on('bias:note',          cb),
+    checklistDone:     (record) => rawSend({ type: 'checklist-done', record: record }),
     onSessionAlert:    (cb) => on('session:alert',     cb),
     onWsOpen:          (cb) => on('ws:open',           cb),
+
+    // Phase 2b: trade confirm/execute (2026-08-17). requestId is generated
+    // HERE, client-side, unique per Confirm click — it is the dedup key the
+    // server uses to refuse a double-click/replay (see server.js's
+    // handleTradeConfirm). One requestId per call, never reused by the caller.
+    onTradeTicketSuggested: (cb) => on('trade:ticketSuggested', cb),
+    sendTradeConfirm: (payload) => {
+      const requestId = 'tc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+      // payload spread FIRST, type/requestId applied LAST — a caller-supplied
+      // `type` or `requestId` in payload can never override the ones this
+      // function controls.
+      rawSend(Object.assign({}, payload, { type: 'trade-confirm-request', requestId }));
+      return requestId;
+    },
+    onTradeConfirmResult:   (cb) => on('trade:confirmResult',   cb),
+    onTradeConfirmRejected: (cb) => on('trade:confirmRejected', cb),
 
     // Rules (rules.json on the server is the single source of truth)
     getRules:  () => sendRequest({ type: 'rules-get' }).then(r => r.data),
@@ -760,10 +886,16 @@
     dataSave: (key, payload) => sendRequest({ type: 'data-save', key, payload }).then(r => r.ok),
     dataLoad: (key)          => sendRequest({ type: 'data-load', key }).then(r => r.data),
 
-    // PDF text extraction (server-side pdf-parse, for PDF uploads in Analyze CSV)
+    // PDF text extraction (server-side pdf-parse, for PDF uploads in Update File)
     pdfExtract: (base64) => sendRequest({ type: 'pdf-extract', base64 }).then(r => {
       if (!r.ok) throw new Error(r.error || 'PDF extraction failed');
       return r.text;
+    }),
+    // 2026-08-17: Excel (.xlsx/.xls) — same request/response shape as
+    // pdfExtract above, server converts the first sheet straight to CSV.
+    xlsxExtract: (base64) => sendRequest({ type: 'xlsx-extract', base64 }).then(r => {
+      if (!r.ok) throw new Error(r.error || 'Spreadsheet extraction failed');
+      return r.csv;
     }),
 
     // Read-aloud: any chat text → Edge TTS clips (en-IN neural, same voice as

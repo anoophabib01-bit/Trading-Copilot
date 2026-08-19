@@ -60,7 +60,7 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 6. `replay_stop` → return to realtime
 
 ### "Screen multiple symbols"
-- `batch_run` with `symbols: ["ES1!", "NQ1!", "YM1!"]` and `action: "screenshot"` or `"get_ohlcv"`
+- ⚠️ **`batch_run` is BROKEN (confirmed 2026-08-17 by reading `core/batch.js` directly)** — it switches symbol/timeframe per iteration and **never restores the original chart state** afterward, unlike every other multi-TF function in this project. Using it will leave the user's live chart parked on whatever it checked last. Do not wire it into anything automated. For a restore-safe multi-symbol pattern instead, see `app/server.js`'s `checkPo3SecondarySymbol()` in the MNQ-CoPilot app repo — switches, reads, and ALWAYS restores in a `finally`, same discipline as `withChartLock`/`getFullBars`.
 
 ### "Draw on the chart"
 - `draw_shape` → horizontal_line, trend_line, rectangle, text (pass point + optional point2)
@@ -69,9 +69,9 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 - `draw_clear` → remove all
 
 ### "Manage alerts"
-- `alert_create` → set price alert (condition: "crossing", "greater_than", "less_than")
-- `alert_list` → view active alerts
-- `alert_delete` → remove alerts
+- `alert_list` → view active alerts (works — uses TradingView's internal REST API, not DOM)
+- `alert_delete` with `delete_all: true` → remove ALL alerts (works, but no single-alert delete yet — see `core/alerts.js`)
+- ⚠️ **`alert_create` is HALF-BROKEN (confirmed 2026-08-17, live).** Dialog-opening is fixed and reliable (was a case-sensitivity bug: real button is `aria-label="Create alert"`, lowercase, not `"Create Alert"`). **Price-setting is still broken** — the standard native-setter + input/change event trick that works for every other TradingView input (qty, TP/SL in `trading.js`) does NOT update this field's React state; 4 live tests each silently created an alert at the current market price instead of the requested one. The function now catches this itself (verifies the actual committed price via `alert_list` and returns `success:false` with a warning on mismatch, rather than falsely claiming success) — so a caller checking the return value won't be fooled, but **do not treat any alert this creates as being at the requested price** until someone does the real fix (per-keystroke `Input.dispatchKeyEvent` simulation, not yet attempted). See `core/alerts.js`'s header comment for the full trail.
 
 ### "Navigate the UI"
 - `ui_open_panel` → open/close pine-editor, strategy-tester, watchlist, alerts, trading
