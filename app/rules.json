@@ -1,27 +1,56 @@
 {
   "_comment": "Single source of truth for all discipline rules. Edit here — scorer, guardrails and reports all read this file. Times are IST wall-clock minutes (e.g. 810 = 13:30).",
   "sizeCap": 2,
-  "_sizeCap_comment": "FIXED 2026-07-28 (Anoop): was 6, silently 3x looser than the documented hard rule (CLAUDE.md rule #2: max 2 contracts/entry). The 150K eval breach on 2026-07-21 was exactly this — sized 5 lots, doubled to 10, against a stated 2-cap the app was never actually enforcing at this number.",
-  "tradeLimit": { "eval": 2, "funded": 20 },
+  "_sizeCap_comment": "FIXED 2026-07-28 (Anoop): was 6, silently 3x looser than the documented hard rule (CLAUDE.md rule #2: max 2 contracts/entry). The 150K eval breach on 2026-07-21 was exactly this — sized 5 lots, doubled to 10, against a stated 2-cap the app was never actually enforcing at this number. 2026-08-15: these BASE numbers are now the FUNDED ruleset — stageRules.eval permits upward from here, stageRules.funded clamps. See stage-rules.js for why the safe numbers are the base ones.",
+  "sizeFloor": 2,
+  "_sizeFloor_comment": "ADDED 2026-08-15. One-contract trades lose money in BOTH stages — eval 25% win rate/-$361 over 12 trades, funded 54% win rate but still -$345 over 13 trades, because the wins are too small to pay for the losses. Sizing down to 1 is not caution, it is what hesitation looks like in the ledger. 2 contracts is the only size profitable in both stages (eval +$535, funded +$264), and it survives dropping its single best trade in both.",
+  "tradeLimit": {
+    "eval": 2,
+    "funded": 20
+  },
   "_tradeLimit_comment": "SUPERSEDED 2026-07-28 by tradesPerSession/tradesPerDay below — kept only so any code path still reading the old shape doesn't crash. Do not raise this back up as the active limit.",
   "tradesPerSession": 5,
-  "tradesPerDay": 10,
+  "tradesPerDay": 5,
+  "_tradesPerDay_comment": "CHANGED 2026-08-15: was 10. The base rules are NORMAL (non-scalper) mode, and Anoop's own note sets normal mode at under 5 trades/day. Scalper raises it to 10 via scalperRules; funded clamps it to 6 via stageRules. Trade COUNT is owned by the tradingMode axis — stageRules.eval deliberately does not set it, so switching to eval can never raise the count above what the mode allows.",
+  "maxHoldSeconds": 1800,
+  "_maxHoldSeconds_comment": "ADDED 2026-08-15. Normal-mode ceiling of 30 min; scalperRules tightens to 900 (15 min). Anoop's note put a 15-min MINIMUM on normal mode; the data says the opposite — trades held over 15 min are 40% win rate and -$646 net across 15 trades, while the 5-15 min window is 22% of his trades and 145% of his profit (+$1,975, robust to dropping its best trade). Caveat kept on record: hold time is an outcome, not a decision, and those long holds are most likely failed scalps he refused to cut rather than planned swing trades — so this is a ceiling on hanging on, not evidence that swing trading fails for him.",
   "qualifyingTradeMinAbsPnl": 100,
   "_qualifying_comment": "2026-07-28 (Anoop): only trades that closed with |P&L| >= $100 count toward the 5/session, 10/day cap. Anything that closed between -$100 and +$100 is a scratch/near-breakeven trade and doesn't count as one of the 5.",
   "scorerTradesPerDayLimit": 10,
-  "dailyLossTiers": { "yellow": -250, "red": -350, "hard": -500 },
+  "dailyLossTiers": {
+    "yellow": -250,
+    "red": -350,
+    "hard": -500
+  },
   "_dailyLossTiers_comment": "CHANGED 2026-07-28 (Anoop): was -100/-150/-200.",
-  "dayStop": { "eval": 1500, "funded": 200 },
+  "dayStop": {
+    "eval": 1500,
+    "funded": 200
+  },
   "cooldownMinutes": 15,
   "sessionWindowsIST": [
-    { "name": "London", "startMin": 810, "endMin": 900 },
-    { "name": "NY", "startMin": 1140, "endMin": 1260 }
+    {
+      "name": "London",
+      "startMin": 810,
+      "endMin": 900
+    },
+    {
+      "name": "NY",
+      "startMin": 1140,
+      "endMin": 1260
+    }
   ],
   "oneInstrumentPerDay": true,
   "commissionPerContractPerSide": 0.59,
-  "giveback": { "armAtProfit": 400, "retracePct": 50 },
+  "giveback": {
+    "armAtProfit": 400,
+    "retracePct": 50
+  },
   "perTradeMaxLoss": 300,
-  "challenge": { "greenDays": 5, "scoreTarget": 70 },
+  "challenge": {
+    "greenDays": 5,
+    "scoreTarget": 70
+  },
   "eval": {
     "start": 150000,
     "startDate": "2026-07-08",
@@ -31,13 +60,59 @@
   },
   "tradingMode": "standard",
   "scalperRules": {
-    "_comment": "Override rules when tradingMode === 'scalper'. Anything NOT listed here falls through to the standard rules above.",
-    "sizeCap": 4,
-    "tradesPerSession": 8,
-    "tradesPerDay": 15,
-    "dailyLossTiers": { "yellow": -200, "red": -300, "hard": -400 },
+    "_comment": "Override rules when tradingMode === 'scalper'. Anything NOT listed here falls through to the standard rules above. 2026-08-15: sizeCap deliberately REMOVED from this block — contract size is now owned by stageRules (eval/funded), not by trading style. Leaving it here meant switching to scalper mode on a FUNDED account silently raised the size cap, which is the exact change his own data says destroys that account (funded: every size except 2 contracts loses money, -$1,717 across 31 trades).",
+    "tradesPerSession": 5,
+    "tradesPerDay": 10,
+    "_tradesPerDay_comment": "CHANGED 2026-08-15: was 15 (session 8). Anoop's note: scalper may exceed 5 trades, up to 10/day.",
+    "dailyLossTiers": {
+      "yellow": -200,
+      "red": -300,
+      "hard": -400
+    },
     "cooldownAfterLossOnly": true,
-    "maxHoldSeconds": 1800,
+    "maxHoldSeconds": 900,
+    "_maxHoldSeconds_comment": "CHANGED 2026-08-15: was 1800 (30 min). Anoop's note says scalper hold time is under 15 min, and the data agrees — over 15 min is 40% win rate, -$646 across 15 trades.",
     "scorerTradesPerDayLimit": 15
-  }
+  },
+  "stageRules": {
+    "_comment": "ADDED 2026-08-15. The eval/funded risk layer, applied AFTER scalperRules — see stage-rules.js for the full derivation and the fail-safe argument. Anoop's strategy, verbatim: 'I want to risk aggressively in evaluation and be very secure when I'm creating a funded account, safe in funded... Spend less time in evaluation, more time in funded.' eval PERMITS upward from the base; funded CLAMPS and can only ever tighten (same one-way-ratchet idea as lossRatchet.mode 'min'). Trade COUNT is intentionally absent from the eval block so that being in eval can never raise the count above what the trading mode allows.",
+    "eval": {
+      "sizeCap": 4,
+      "contractsPerDayMax": 36,
+      "_comment": "Size 2-4. His 3-4c bucket is +$2,007 over 14 trades and stays +$1,286 after dropping its best trade, median +$57 — a real edge. 5-6c is NOT kept: +$506 that collapses to +$24 once one +$482 trade is removed, i.e. one lucky trade rather than an edge. This is where I disagreed with his handwritten note, which said scalper size 4-6 max 6; he accepted the cap of 4 on 2026-08-15. contractsPerDayMax 36 is deliberately near-non-binding: all six of his eval days above 12 contracts were GREEN (+$2,865, 6/6), and an intraday daily-loss stop COSTS money in eval at every level tested. The eval constraint is meant to be the clock, not the size."
+    },
+    "funded": {
+      "sizeCap": 2,
+      "sizeFloor": 2,
+      "tradesPerDay": 6,
+      "contractsPerDayMax": 12,
+      "dailyLossCap": 200,
+      "clampMode": "min",
+      "_comment": "Fixed at 2 contracts — not a range. 2c is the largest funded sample (20 trades) and the only profitable one (+$264, still +$83 after dropping its best trade, median +$8). Every other size loses: 1c -$345, 3c -$437, 4c -$103, 5-6c -$384, 7c+ -$449, totalling -$1,717 over 31 trades. contractsPerDayMax 12 = 6 trades x 2c, confirmed by the day-level data: all three funded days above 12 contracts lost (-$1,763, 0/3 green) while the two profitable funded days ran 10 and 11 contracts. dailyLossCap 200 comes from an intraday simulation walking each day's trades in order and halting at the cap — every level helps in funded and tighter is monotonically better ($200 -> +$795, $300 -> +$583, $500 -> +$219). It matches the dayStop.funded of 200 already in this file, which was never actually enforced."
+    }
+  },
+  "lossRatchet": {
+    "enabled": true,
+    "mode": "min",
+    "floor": 100,
+    "warnAtPct": 50
+  },
+  "_lossRatchet_comment": "ADDED 2026-08-12 (Anoop's own rule): tomorrow's maximum loss may never exceed what he made today. Targets his stated failure mode - 'after a couple of profit days, one day eats all my profits'. mode 'min' = cap is min(normal dayStop, yesterday's profit) - it can only ever TIGHTEN. This matters: the rule as first described ('max loss = yesterday's profit') would set an $800 cap after an $800 green day, i.e. 4x the $200 rule, loosening risk exactly after the good days that historically precede a blow-up. mode 'raw' would allow that; do not use it. floor = the cap never drops below this, so a tiny green day ($20) doesn't make tomorrow untradeable. A red or flat yesterday leaves the normal dayStop in force. warnAtPct = show a caution banner at this percentage of the cap.",
+  "requireChecklist": true,
+  "_requireChecklist_comment": "ADDED 2026-08-12 (task #33). Until now the pre-trade checklist was advisory - nothing stopped a trade without it. On 2026-08-10 Anoop skipped it and lost $855.50, and named it himself afterwards as the thing he was supposed to do. It is now a HARD NO-GO reason, ranked with the daily stop, not a soft 'pending' one (soft renders as amber PENDING CHECK-IN, which is precisely the ignorable state that let this slide for months). Set false to disable - deliberately a config switch rather than something he has to delete code to bypass, because guards that cannot be turned off get ripped out instead.",
+  "contractsPerDay": {
+    "enabled": true,
+    "max": 12,
+    "warnAtPct": 75
+  },
+  "_contractsPerDay_comment": "ADDED 2026-08-12. Caps TOTAL contracts traded per day, which nothing did before: sizeCap limits each ENTRY to 2, and tradesPerDay limits COUNT to 10 - but ten legal 2-lot trades is twenty contracts, every one inside the rules, day already lost. max=12 comes from Anoop's own five logged days, which split on exactly this: 10c=+$440, 11c=+$157.50, 12c=-$142, 24c=-$879.50, 29c=-$572.50. Under ~12 he makes money or loses small; past 24 he loses a week. Same trader, same setups - only the size changed. 12 contracts = six 2-lot trades, which also lands near the 3-4 trades/day profile of evaluation PASSERS in his own research file (failures average 6.8; his logged average is 6.4).",
+  "biasAdherence": {
+    "enabled": true,
+    "targetPct": 75,
+    "warnPct": 60,
+    "minTradesToJudge": 2
+  },
+  "_biasAdherence_comment": "ADDED 2026-08-13 (Anoop, verbatim): 'I should follow the trade direction according to it. 70% to 80% should be in the same direction.' targetPct 75 is the midpoint of the range he named; warnPct 60 is where Jessi starts naming it rather than just reporting it. DIRECTION OF RECORD = the Daily Bias field from the pre-trade checklist (his call 2026-08-13); 4H and 1H are logged as CONTEXT and downgrade confidence when they disagree, they do not override or veto. This became computable only on 2026-08-13: before that the checklist record stored {date, score, tier} and threw the bias/h4/h1 away, so there was nothing to compare trades against. minTradesToJudge stops a 1-trade day reading as '0% adherence' - one counter-trend scratch is not a pattern. Set enabled:false to silence the whole feature.",
+  "autoPostSessionReview": false,
+  "_autoPostSessionReview_comment": "ADDED 2026-08-12 (Anoop): the full Post-Session Analyst report used to auto-fire 5s after EVERY CSV upload, on top of the auto-debrief - two AI calls per upload. The report is ~5-7K tokens in and ~1.5K out (roughly $0.014 on Haiku), and Anoop's words: 'it is such a long list of details... I cannot read the whole post-session review every time I upload a CSV'. Generating something unread is 100% waste at any price. Now OFF by default: the short debrief still fires on upload, and the full report runs only when explicitly asked - 'End Day & Save', or typing 'post session review' in chat. Set true to restore the old auto-fire behaviour."
 }

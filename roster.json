@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "savedAt": "2026-08-18T12:46:19.889Z",
+  "agents": [
+    {
+      "id": "god",
+      "name": "Michael",
+      "character": "michael",
+      "accent": "lemon",
+      "description": "on standby",
+      "project": "hive",
+      "tmuxTarget": "",
+      "cwd": "G:\\MNQ-CoPilot",
+      "status": "idle",
+      "action": "awaiting",
+      "progress": 0,
+      "currentStation": "desk",
+      "ptyId": "pty-god",
+      "command": "claude --model claude-sonnet-4-6[1m] --permission-mode bypassPermissions",
+      "provider": "claude",
+      "model": "claude-sonnet-4-6[1m]",
+      "isGod": true,
+      "lastPrompt": "/us"
+    }
+  ],
+  "archived": [],
+  "restorable": [],
+  "queues": {
+    "god": [
+      {
+        "id": "q-1787056306676-6",
+        "text": "what is the issue?",
+        "ts": 1787056306676
+      },
+      {
+        "id": "q-1787056647545-7",
+        "text": "You have new hive inbox message(s) — read your inbox, act on them now, and move handled ones to inbox/.done/. Act autonomously; only message god if you genuinely need a decision.",
+        "ts": 1787056647545
+      }
+    ]
+  },
+  "selectedId": "god"
+}

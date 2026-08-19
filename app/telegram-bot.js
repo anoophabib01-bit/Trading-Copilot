@@ -100,6 +100,22 @@ class TelegramBridge {
     });
   }
 
+  // 2026-08-17: push a chart screenshot alongside a GO verdict — much faster
+  // to eyeball on a phone than reading a paragraph. Fails soft to a
+  // text-only notify() if the photo send fails for any reason (bad path,
+  // Telegram API error) — a GO alert must never go completely missing just
+  // because the screenshot step had a problem.
+  notifyPhoto(photoPath, caption) {
+    if (!this.bot || !this.deps) return;
+    const cfg = this.deps.loadConfig();
+    if (!cfg.telegramChatId) return;
+    this.bot.sendPhoto(cfg.telegramChatId, photoPath, { caption: (caption || '').slice(0, 1024) })
+      .catch((err) => {
+        console.error('Telegram notifyPhoto error, falling back to text:', err.message);
+        this.notify(caption || '(GO verdict — screenshot failed to send)');
+      });
+  }
+
   // ── Internal ────────────────────────────────────────────────────────────
   async _sendChunked(chatId, text) {
     if (!this.bot) return;

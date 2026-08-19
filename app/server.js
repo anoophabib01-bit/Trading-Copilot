@@ -1,5 +1,25 @@
 'use strict';
+const path0 = require('path');
+// ── Persistent crash log (2026-08-13, /investigate) ───────────────────────────
+// Root cause of "we can never diagnose the evening crashes": START CO-PILOT.bat
+// runs this as `cmd /k "node server.js"` with NO output redirection — every
+// console.error the crash guards below ever printed vanished the moment that
+// window closed. Installed FIRST, before any other require, so nothing can log
+// before mirroring is active. Every console.log/warn/error still prints to the
+// visible window exactly as before — this only ADDS a durable copy on disk at
+// app/logs/server-YYYY-MM-DD.log. See crash-logger.js for why appendFileSync
+// (not a buffered stream) is used — this only works if the crash line is
+// actually flushed before the process can die.
+require('./crash-logger').installConsoleMirror(path0.join(__dirname, 'logs'));
+
 const http = require('http');
+const atomicWrite = require('./atomic-write');  // crash-safe writes — must load BEFORE any save path
+const providerChain = require('./provider-chain'); // provider selection + fail-open chain (unit-tested)
+const stageRules = require('./stage-rules');       // eval/funded risk layer (unit-tested)
+const verdictGrounding = require('./verdict-grounding'); // Debate-verdict numeric grounding check (unit-tested)
+const postSessionOrch = require('./post-session-orchestrator'); // dynamic worker selection for post-session review (unit-tested)
+const chatIntent = require('./chat-intent'); // assistive mode-routing hint, advisory only (unit-tested)
+const goVerdictDetect = require('./go-verdict-detect'); // GO-verdict classifier for the refutation pass (unit-tested)
 const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
@@ -14,6 +34,11 @@ const sessionMgr = require('./session-manager');
 const telegramBot = require('./telegram-bot');
 const booksIndex = require('./books-index');
 const tradovate = require('./tradovate');
+const tvBrokerFeed = require('./tv-broker-feed'); // balance-delta-at-flat P&L fold for the TradingView broker feed (unit-tested)
+const mistakePatterns = require('./mistake-patterns'); // live pattern-matching against Anoop's own documented failure history (2026-08-19, F1 first slice — advisory only, unit-tested)
+const tradeConfirmRules = require('./trade-confirm-rules'); // Phase 2a/2b rule-check for the confirm/execute flow — unit-tested
+const tradeTicketParse = require('./trade-ticket-parse'); // Phase 2b: pure parser for JUDGE_PERSONA's TRADE_TICKET line — unit-tested
+const tradeConfirmDedup = require('./trade-confirm-dedup'); // Phase 2b: double-submit/idempotency guard — unit-tested
 
 const PORT = 7433;
 const CONFIG_PATH = path.join(require('os').homedir(), '.mnq-copilot-config.json');
@@ -25,11 +50,24 @@ const CONFIG_PATH = path.join(require('os').homedir(), '.mnq-copilot-config.json
 // connection, a flaky TTS socket) could kill the whole process mid-session —
 // the worst possible time. Log loudly, keep running. Deliberately NOT
 // swallowing errors silently: everything prints with a stack for the log.
-process.on('uncaughtException', (err) => {
-  console.error('[CRASH-GUARD] uncaughtException (process kept alive):', err && err.stack || err);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[CRASH-GUARD] unhandledRejection (process kept alive):', reason && reason.stack || reason);
+// 2026-08-13: uptime + a clear ===CRASH=== marker added so the log file is
+// grep-able for real incidents ("grep -A20 CRASH server-2026-08-*.log")
+// instead of scrolling past every routine console.error line looking for the
+// one that mattered.
+function logCrash(kind, errOrReason) {
+  console.error('===CRASH=== ' + kind + ' — uptime ' + Math.round(process.uptime()) + 's (process kept alive):',
+    (errOrReason && errOrReason.stack) || errOrReason);
+}
+process.on('uncaughtException', (err) => { logCrash('uncaughtException', err); });
+process.on('unhandledRejection', (reason) => { logCrash('unhandledRejection', reason); });
+// The two guards above only catch errors that let the process KEEP running.
+// If it dies outright (OOM-killed, window closed and the child process torn
+// down with it, an unexpected process.exit()), neither guard fires — this is
+// the other half of "why we could never tell what happened." exit handlers
+// can't do async I/O, but the synchronous crash-logger append still works
+// here since it's a plain fs.appendFileSync call.
+process.on('exit', (code) => {
+  console.error('===EXIT=== code ' + code + ' — uptime ' + Math.round(process.uptime()) + 's');
 });
 
 // ── Config ─────────────────────────────────────────────────────────────────────
@@ -37,7 +75,7 @@ function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch { return {}; }
 }
 function saveConfig(cfg) {
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+  atomicWrite.writeAtomic(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
 }
 
 // ── OmniRoute primary-provider selection (2026-08-07) ───────────────────────────
@@ -51,11 +89,12 @@ function saveConfig(cfg) {
 // existed. This is the fail-open behavior Anoop asked for after seeing
 // OmniRoute's free/high-reasoning models ride pooled CLI-subscription
 // accounts (real ban risk, no SLA) rather than paid API keys.
-const STANDARD_FALLBACK_CHAIN = [
-  { provider: 'gemini', model: 'gemini-3.1-flash-lite' },
-  { provider: 'gemini', model: 'gemini-2.5-flash' },
-  { provider: 'groq',   model: 'openai/gpt-oss-20b' }
-];
+// 2026-08-12 (task #34): the chain itself now lives in provider-chain.js and is
+// unit-tested there. This local copy is DELETED rather than kept in sync — two
+// definitions of the fail-open order is precisely the drift that has bitten this
+// repo before (a hardcoded sizeCap silently 3x looser than rules.json, and the
+// stale '16 accounts' figure repeated by every persona). One definition only.
+//   → see provider-chain.js: STANDARD_FALLBACK_CHAIN
 // 2026-08-10 (revised — reverted the 08-10 Scalper-only-model experiment
 // above this comment): Anoop wants ONE shared code path across Jessi/
 // Scalper/Debate/PO3, not a Scalper-specific carve-out — and OmniRoute
@@ -189,12 +228,19 @@ const STANDARD_FALLBACK_CHAIN = [
 // errors, fallbackChainFor() drops straight through to Gemini and then Groq —
 // the same chain that has been carrying this app for weeks. A dead prepaid
 // balance must never mean a dead co-pilot in the middle of a session.
+// 2026-08-12 (task #34): the selection + fail-open logic moved to
+// provider-chain.js so it can actually be unit-tested — server.js is an entry
+// point and exports nothing, so this code had ZERO coverage despite deciding
+// which brain answers every request and what happens when it dies mid-session.
+// These wrappers keep the existing call signature, so all nine call sites are
+// untouched. Config is read here and passed IN, which is what makes the module
+// pure and testable without touching the real config file.
+// NOTE: provider-chain also restores an OmniRoute branch (used only when there
+// is no Anthropic key AND its health probe passes). With a key present
+// Anthropic wins regardless, so this is not a behaviour change today — it just
+// means re-enabling OmniRoute later needs no code edit.
 function primaryProviderModel() {
-  const cfg = loadConfig();
-  if (cfg.apiKey && !cfg.disableAnthropic) {
-    return { provider: 'anthropic', model: cfg.agentModel || 'claude-haiku-4-5' };
-  }
-  return { provider: 'gemini', model: 'gemini-3.5-flash' };
+  return providerChain.primaryProviderModel(loadConfig(), groqAgent.isOmniRouteReady());
 }
 // When OmniRoute is primary, Gemini's own default model rejoins the chain as
 // the first fallback step (it was the primary before OmniRoute existed);
@@ -209,9 +255,7 @@ function primaryProviderModel() {
 // already failed. gemini-3.5-flash is the model that has actually been serving
 // this app, so it belongs at the front of any fail-open path.
 function fallbackChainFor(primary) {
-  return (primary.provider === 'omniroute' || primary.provider === 'anthropic')
-    ? [{ provider: 'gemini', model: 'gemini-3.5-flash' }, ...STANDARD_FALLBACK_CHAIN]
-    : STANDARD_FALLBACK_CHAIN;
+  return providerChain.fallbackChainFor(primary);
 }
 
 // ── Request cancellation (2026-08-06) ───────────────────────────────────────────
@@ -224,6 +268,13 @@ function fallbackChainFor(primary) {
 // fires it — reqIds are process-wide unique (a single incrementing counter
 // in ws-client.js), so no per-connection scoping is needed.
 const activeRequests = new Map(); // reqId -> AbortController
+// 2026-08-16 (Pattern 02 assistive routing, chat-intent.js): per-connection
+// cooldown so a scalping-mode hint doesn't repeat every message in a session
+// that's already been told once. WeakMap keyed by the ws connection object
+// itself — entries fall out of memory naturally when a connection closes,
+// no manual cleanup needed.
+const modeHintLastAt = new WeakMap();
+const MODE_HINT_COOLDOWN_MS = 20 * 60 * 1000;
 function registerRequest(reqId) {
   const ctrl = new AbortController();
   activeRequests.set(reqId, ctrl);
@@ -242,11 +293,21 @@ let currentMode = loadConfig().mode || 'funded'; // 'eval' | 'funded'
 
 // ── Rules (single source of truth: rules.json in project root) ─────────────────
 const RULES_PATH = path.join(__dirname, 'rules.json');
+// These are the in-code FALLBACK values, used only when rules.json cannot be
+// read or parsed. 2026-08-15: sizeCap was 6 here — three times looser than the
+// 2 that rules.json has enforced since 2026-07-28. A corrupt or briefly
+// unreadable rules.json would therefore have silently handed back the exact
+// size cap that breached the 150K eval on 2026-07-21. Fallbacks must be the
+// SAFE numbers (i.e. the funded ruleset), never the permissive ones — same
+// argument as stage-rules.js: what you get when something fails must be the
+// state that cannot hurt him.
 const DEFAULT_RULES = {
-  sizeCap: 6,
+  sizeCap: 2,
+  sizeFloor: 2,
   tradeLimit: { eval: 2, funded: 20 },
   tradesPerSession: 5,
-  tradesPerDay: 10,
+  tradesPerDay: 5,
+  maxHoldSeconds: 1800,
   qualifyingTradeMinAbsPnl: 100,
   scorerTradesPerDayLimit: 10,
   dailyLossTiers: { yellow: -250, red: -350, hard: -500 },
@@ -261,36 +322,57 @@ const DEFAULT_RULES = {
   giveback: { armAtProfit: 400, retracePct: 50 },
   perTradeMaxLoss: 200
 };
+// 2026-08-15: sizeCap REMOVED from this block. Contract size is owned by the
+// stage layer (stageRules in rules.json), not by trading style — leaving it
+// here meant flipping to scalper mode on a FUNDED account silently raised the
+// cap from 2 to 4, the one change his data says wrecks that account.
 const SCALPER_DEFAULTS = {
-  sizeCap: 4,
-  tradesPerSession: 8,
-  tradesPerDay: 15,
+  tradesPerSession: 5,
+  tradesPerDay: 10,
   dailyLossTiers: { yellow: -200, red: -300, hard: -400 },
   cooldownAfterLossOnly: true,
-  maxHoldSeconds: 1800,
+  maxHoldSeconds: 900,
   scorerTradesPerDayLimit: 15
 };
 function loadRules() {
   try { return Object.assign({}, DEFAULT_RULES, JSON.parse(fs.readFileSync(RULES_PATH, 'utf8'))); }
   catch { return Object.assign({}, DEFAULT_RULES); }
 }
-/** Return the effective ruleset for the active trading mode.
- *  In 'scalper' mode, scalperRules overlay the standard rules.
- *  In 'standard' mode (default), returns raw rules unchanged. */
-function getActiveRules() {
+/** Return the effective ruleset for the active trading mode AND account stage.
+ *
+ *  TWO INDEPENDENT AXES, applied in this order (2026-08-15):
+ *    1. base rules (rules.json) — these ARE the funded/safe numbers
+ *    2. scalperRules            — if tradingMode === 'scalper'. Owns HOW he
+ *                                 trades: hold time, entry candle, trade count.
+ *    3. stageRules              — always. Owns HOW MUCH he may lose: contract
+ *                                 size, contracts/day, daily loss cap.
+ *
+ *  Stage is applied LAST so nothing upstream can loosen it, and 'funded' only
+ *  ever clamps. See stage-rules.js for the derivation from his own trade data
+ *  and for why the safe numbers are the base rather than an overlay.
+ *
+ *  @param {string} [stage] 'eval' | 'funded'. Defaults to the live currentMode,
+ *         so all existing no-arg callers become stage-aware automatically; the
+ *         parameter exists so the merge stays testable without global state.
+ */
+function getActiveRules(stage) {
   const raw = loadRules();
   const mode = raw.tradingMode || 'standard';
-  if (mode !== 'scalper') return raw;
-  // Merge scalper overrides onto base rules (scalperRules block wins)
-  const scalper = Object.assign({}, SCALPER_DEFAULTS, raw.scalperRules || {});
-  const merged = Object.assign({}, raw, scalper);
-  // Keep the full scalperRules block and mode marker in the output
-  merged.tradingMode = 'scalper';
-  merged.scalperRules = raw.scalperRules || SCALPER_DEFAULTS;
-  return merged;
+  const st = (stage === 'eval' || stage === 'funded') ? stage : currentMode;
+
+  let merged = raw;
+  if (mode === 'scalper') {
+    // Merge scalper overrides onto base rules (scalperRules block wins)
+    const scalper = Object.assign({}, SCALPER_DEFAULTS, raw.scalperRules || {});
+    merged = Object.assign({}, raw, scalper);
+    // Keep the full scalperRules block and mode marker in the output
+    merged.tradingMode = 'scalper';
+    merged.scalperRules = raw.scalperRules || SCALPER_DEFAULTS;
+  }
+  return stageRules.applyStageRules(merged, st);
 }
 function saveRules(rules) {
-  fs.writeFileSync(RULES_PATH, JSON.stringify(rules, null, 2), 'utf8');
+  atomicWrite.writeAtomic(RULES_PATH, JSON.stringify(rules, null, 2), 'utf8');
 }
 
 // ── Local data persistence ────────────────────────────────────────────────────
@@ -381,7 +463,7 @@ function dataSave(key, payload) {
   try {
     const fp = dataPathFor(key);
     fs.mkdirSync(path.dirname(fp), { recursive: true });
-    fs.writeFileSync(fp, JSON.stringify(payload, null, 2), 'utf8');
+    atomicWrite.writeAtomic(fp, JSON.stringify(payload, null, 2), 'utf8');
     return true;
   } catch (e) { console.error('dataSave failed for', key, e.message); return false; }
 }
@@ -439,7 +521,7 @@ function saveReviewRecord(kind, fullText, extra) {
       text: String(fullText)
     });
 
-    fs.writeFileSync(fp, JSON.stringify(arr, null, 2), 'utf8');
+    atomicWrite.writeAtomic(fp, JSON.stringify(arr, null, 2), 'utf8');
     console.log(`[reviews] saved ${kind} → data/reviews/${day}.json (${arr.length} entries that day)`);
     return true;
   } catch (e) {
@@ -530,7 +612,7 @@ function dataEndDay(slotId, dateStr, payload) {
   try {
     const fp = path.join(DATA_DIR, 'accounts', slotId, 'daily', dateStr + '.json');
     fs.mkdirSync(path.dirname(fp), { recursive: true });
-    fs.writeFileSync(fp, JSON.stringify(payload, null, 2), 'utf8');
+    atomicWrite.writeAtomic(fp, JSON.stringify(payload, null, 2), 'utf8');
     return fp;
   } catch (e) { console.error('dataEndDay failed:', e.message); return false; }
 }
@@ -567,6 +649,30 @@ async function extractPdfText(base64) {
   return result.text || '';
 }
 
+// 2026-08-17 (Anoop: "Update file" should read all kinds of trade reports,
+// not just CSV/PDF). Excel exports (.xlsx/.xls) are a common broker-report
+// format — parsed server-side the same way PDFs already are, converting the
+// FIRST sheet straight to CSV text via SheetJS's own sheet_to_csv() so it
+// flows through the exact same, already-tested csvIngest()/csvParseTrades()
+// pipeline on the client — no new row-parsing logic to get wrong, same
+// pattern handlePdfFile() already uses (extract → convert to CSV → reuse
+// the CSV path). Dependency note: the plain `xlsx` package on npm is
+// unpatched (known Prototype Pollution + ReDoS CVEs, no fix available per
+// `npm audit` — SheetJS's real fix only ships via their own CDN). Installed
+// instead as `xlsx: "npm:@e965/xlsx@^0.20.3"` — a provenance-signed npm
+// republish of the patched build, the community-recommended fix referenced
+// across SheetJS's own GitHub issues (#2822, #2825).
+async function extractXlsxCsv(base64) {
+  if (!base64) throw new Error('No spreadsheet data received');
+  const XLSX = require('xlsx');
+  const buf = Buffer.from(base64, 'base64');
+  const wb = XLSX.read(buf, { type: 'buffer' });
+  const firstSheetName = wb.SheetNames[0];
+  if (!firstSheetName) throw new Error('Spreadsheet has no sheets');
+  const sheet = wb.Sheets[firstSheetName];
+  return XLSX.utils.sheet_to_csv(sheet);
+}
+
 // ── MIME types ─────────────────────────────────────────────────────────────────
 const MIME = {
   '.html': 'text/html',
@@ -580,6 +686,54 @@ const MIME = {
 const httpServer = http.createServer((req, res) => {
   let url = req.url === '/' ? '/index.html' : req.url;
   url = url.split('?')[0];
+
+  // ── GET /health (2026-08-12, task #5) ────────────────────────────────────
+  // One place that answers "what is actually alive right now" without reading
+  // the terminal. Two concrete uses:
+  //   1. START CO-PILOT.bat currently just polls until the PORT accepts a
+  //      connection — which is true the instant the socket binds, before the
+  //      MCP bridge or TradingView are up. This reports real readiness.
+  //   2. When something misbehaves mid-session, this distinguishes "the AI
+  //      provider died" from "TradingView dropped" from "a monitor stopped" in
+  //      one request, instead of guessing from symptoms.
+  // Deliberately does NOT expose API keys — only whether each is configured.
+  if (url === '/health') {
+    let body;
+    try {
+      const cfg = loadConfig();
+      const primary = primaryProviderModel();
+      body = {
+        ok: true,
+        uptimeSec: Math.round(process.uptime()),
+        mode: currentMode,
+        ai: {
+          primary: primary.provider + '/' + primary.model,
+          fallbackChain: fallbackChainFor(primary).map(c => c.provider + '/' + c.model),
+          keys: {                       // configured? — never the values
+            anthropic: !!cfg.apiKey,
+            gemini: !!cfg.geminiApiKey,
+            groq: !!cfg.groqApiKey,
+            omniroute: !!cfg.omniRouteApiKey
+          },
+          omniRouteHealthy: groqAgent.isOmniRouteReady()
+        },
+        tradingview: {
+          bridgeReady: !!mcpBridge.ready,          // our child process is up
+          tvConnected: !!mcpBridge.tvConnected     // CDP actually reachable — these diverge, and that divergence caused a false "connected" indicator before
+        },
+        monitors: {
+          mechanical: !!mechanicalInterval,
+          engulf: Object.keys(engulfMonitors || {}).length,
+          sfp: Object.keys(sfpMonitors || {}).length
+        }
+      };
+    } catch (e) {
+      body = { ok: false, error: e.message };
+    }
+    res.writeHead(body.ok ? 200 : 503, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(body, null, 2));
+  }
+
   const filePath = path.join(__dirname, 'renderer', url);
 
   if (!fs.existsSync(filePath)) {
@@ -632,6 +786,12 @@ wss.on('connection', (ws) => {
       case 'tts-speak':        handleTtsSpeak(ws, msg);   break;
       case 'ict-po3':          handleIctPo3(ws, msg);     break;
       case 'po3-monitor-toggle':
+        // 2026-08-17: track an explicit manual OFF so the new auto-start-on-
+        // reconnect (see mcpBridge.on('tv-connected', ...)) can't silently
+        // override a choice Anoop actually made — a CDP blip + heartbeat
+        // recovery firing 'tv-connected' again should not un-disable a
+        // monitor he deliberately turned off.
+        po3MonitorUserDisabled = !msg.enabled;
         msg.enabled ? startPo3Monitor() : stopPo3Monitor();
         break;
       case 'po3-check-now': checkPo3Phase(); break;
@@ -707,9 +867,15 @@ wss.on('connection', (ws) => {
         break;
       case 'screenshot-get':   handleScreenshot(ws, msg);  break;
       case 'mcp-reconnect':    startMCP();                 break;
+      case 'checklist-done':   handleChecklistDone(ws, msg); break;
+      case 'account-db-rebuild': handleAccountDbRebuild(ws, msg); break;
+      case 'journey-action':   handleJourneyAction(ws, msg); break;
+      case 'journey-list':     handleJourneyList(ws, msg);   break;
       case 'mode-switch':      handleModeSwitch(ws, msg);  break;
       case 'engulf-monitor-toggle': handleEngulfToggle(msg); break;
       case 'engulf-check-now': checkEngulfingSignal(msg.tf || '1h'); break;
+      case 'tv-broker-check-now': pollTVBrokerAccount(); break;
+      case 'trade-confirm-request': handleTradeConfirm(ws, msg); break;
       case 'fvg-monitor-toggle': handleFVGToggle(msg); break;
       case 'fvg-check-now': checkFVGSignal(msg.tf || '30m'); break;
       case 'sfp-monitor-toggle': handleSFPToggle(msg); break;
@@ -758,6 +924,11 @@ wss.on('connection', (ws) => {
           .then(text => send(ws, { type: 'pdf-extracted', reqId: msg.reqId, ok: true, text }))
           .catch(err => send(ws, { type: 'pdf-extracted', reqId: msg.reqId, ok: false, error: err.message }));
         break;
+      case 'xlsx-extract':
+        extractXlsxCsv(msg.base64)
+          .then(csv => send(ws, { type: 'xlsx-extracted', reqId: msg.reqId, ok: true, csv }))
+          .catch(err => send(ws, { type: 'xlsx-extracted', reqId: msg.reqId, ok: false, error: err.message }));
+        break;
       default: break;
     }
   });
@@ -771,6 +942,14 @@ function send(ws, obj) {
 
 function broadcast(obj) {
   wss.clients.forEach(ws => send(ws, obj));
+}
+
+// 2026-08-17: lets handleDebateChat/dispatchGoRefutation be invoked with
+// ws=null for a system-initiated debate (see autoTriggerDebate below) — every
+// connected client sees it instead of one specific request's socket, which
+// doesn't exist for a background trigger.
+function emitTo(ws, obj) {
+  if (ws) send(ws, obj); else broadcast(obj);
 }
 
 // ── Handler: Config ────────────────────────────────────────────────────────────
@@ -789,6 +968,99 @@ function handleConfigSet(ws, msg) {
 }
 
 // ── Handler: Mode switch ───────────────────────────────────────────────────────
+// Fires the moment he presses ✓ PRE-TRADE DONE (2026-08-13). His ask: "This is
+// a reminder that you should give me on the chat after I complete the checklist."
+//
+// Deliberately NOT an LLM call: it is a deterministic restatement of what he
+// just declared plus arithmetic over his own record. An LLM here would cost
+// tokens and latency to paraphrase numbers it would occasionally get wrong,
+// and the whole point is that he asked for PROOF.
+// 2026-08-13 (Anoop): "gather all the information of all the accounts and
+// make one database to analyse." Rebuilds DATA/account_database.json from
+// every slot folder under DATA/accounts/ — read-only aggregation, never
+// mutates any per-account source file. Reuses this server's already-resolved
+// DATA_DIR rather than account-db.js guessing its own path, so this always
+// reads the SAME location the rest of the app is actually writing to.
+const accountDb = require('./account-db');
+const journeyTracker = require('./journey-tracker');
+function handleAccountDbRebuild(ws, msg) {
+  try {
+    const db = accountDb.rebuildAccountDatabase(DATA_DIR);
+    // 2026-08-13 (Anoop: "make excel... CSV file... not excel"): every trade,
+    // every account, one file, so he can see it all at once without hunting
+    // through 5 separate account tabs. Written to disk (account_trades.csv,
+    // same folder as the JSON database) AND handed back in the response so
+    // the renderer can trigger an immediate browser download — no need to
+    // go find the file on disk first.
+    const csvOut = accountDb.writeTradesCsv(DATA_DIR, db);
+    // 2026-08-13 (Anoop: "why is the data unreadable to a normal person...
+    // I don't want it to be saved as code"): one self-contained HTML file,
+    // opens in any browser, styled tables, no software to configure.
+    const htmlOut = accountDb.writeHtmlReport(DATA_DIR, db);
+    send(ws, { type: 'account-db-result', reqId: msg && msg.reqId, ok: true, summary: accountDb.formatSummary(db), db: db, csv: csvOut.csv, html: htmlOut.html });
+  } catch (e) {
+    console.error('[account-db] rebuild failed:', e.message);
+    send(ws, { type: 'account-db-result', reqId: msg && msg.reqId, ok: false, error: e.message });
+  }
+}
+
+// ── Account journeys: single-dataset eval→funded lifecycle (2026-08-16) ────
+// See journey-tracker.js for the full model and why it replaced the old
+// per-click account_archives.json mechanism. One WS action per real-world
+// event; each is a guarded state transition, so a stray/duplicate click is
+// rejected rather than silently recorded a second time or under the wrong
+// slot. slotId is what the renderer already knows from the existing
+// breach/clear buttons — activeJourneyForSlot() finds the right journey so
+// the client never has to track journey ids itself.
+function handleJourneyAction(ws, msg) {
+  try {
+    const action = msg.action;
+    let result;
+    if (action === 'start') {
+      const journey = journeyTracker.startEvalJourney(DATA_DIR, { slotId: msg.slotId, size: msg.size, startBalance: msg.startBalance });
+      result = { ok: true, journey: journey };
+    } else {
+      const journey = journeyTracker.activeJourneyForSlot(DATA_DIR, msg.slotId);
+      if (!journey) { result = { ok: false, reason: 'no-active-journey' }; }
+      else if (action === 'eval-breach') result = journeyTracker.recordEvalBreach(DATA_DIR, journey.id, { finalBalance: msg.finalBalance });
+      else if (action === 'eval-cleared') result = journeyTracker.recordEvalCleared(DATA_DIR, journey.id, { finalBalance: msg.finalBalance, fundedStartBalance: msg.fundedStartBalance });
+      else if (action === 'funded-breach') result = journeyTracker.recordFundedBreach(DATA_DIR, journey.id, { finalBalance: msg.finalBalance });
+      else if (action === 'funded-payout') result = journeyTracker.recordFundedPayout(DATA_DIR, journey.id, { amount: msg.amount, date: msg.date });
+      else result = { ok: false, reason: 'unknown-action' };
+    }
+    send(ws, { type: 'journey-result', reqId: msg.reqId, action: action, ok: result.ok, reason: result.reason, journey: result.journey });
+  } catch (e) {
+    console.error('[journey] action failed:', e.message);
+    send(ws, { type: 'journey-result', reqId: msg && msg.reqId, ok: false, reason: 'exception' });
+  }
+}
+
+function handleJourneyList(ws, msg) {
+  try {
+    const journeys = journeyTracker.readJourneys(DATA_DIR);
+    send(ws, { type: 'journey-list', reqId: msg && msg.reqId, journeys: journeys });
+  } catch (e) {
+    send(ws, { type: 'journey-list', reqId: msg && msg.reqId, journeys: [] });
+  }
+}
+
+function handleChecklistDone(ws, msg) {
+  try {
+    const rules = getActiveRules();
+    if (rules.biasAdherence && rules.biasAdherence.enabled === false) return;
+    const loaded = biasLoadMatrix();
+    const ck = (msg && msg.record) || null;
+    if (!ck) return;
+    const text = biasTracker.formatPostChecklist(ck, loaded && loaded.matrix, rules);
+    if (!text) return;
+    send(ws, { type: 'bias-note', text: text });
+    console.log('[bias] post-checklist reminder sent for ' + (ck.date || '?'));
+  } catch (e) {
+    // Never let this break the checklist completion he just earned.
+    console.warn('[bias] post-checklist reminder failed:', e.message);
+  }
+}
+
 function handleModeSwitch(ws, msg) {
   setCurrentMode(msg.mode);
 }
@@ -870,7 +1142,9 @@ async function handleChat(ws, msg) {
 // message when it looks needed — not a standing background poll).
 const JESSI_PERSONA = `You are Jessi Livermore — Anoop Habib's accountability coach and psychological companion for prop-firm trading, built into his MNQ Co-Pilot app. Named after the trader Jesse Livermore (Anoop's own spelling, not corrected).
 
-Who you're talking to: Anoop Habib, Hubballi, Karnataka, India (IST). Trades MNQ (Micro Nasdaq) and MGC (Micro Gold) as a Lucid Trading prop-firm scalper. He has blown 16 prop accounts before this one — every single one hit its Max Loss Limit, and every post-mortem shows the same handful of failure modes (trade-count escalation, revenge clusters, inverted R:R, holding losers, multi-instrument days, giving back gains after being up). You know this history. Reference it plainly when it's relevant — don't soften it.
+Who you're talking to: Anoop Habib, Hubballi, Karnataka, India (IST). Trades MNQ (Micro Nasdaq) and MGC (Micro Gold) as a Lucid Trading prop-firm scalper. THE GOAL IS ONE CLEAN PAYOUT, not a spotless record — he can take more evaluation attempts than he has capital to worry about, and the only account he cannot afford is the funded one he is careless with. Past losses hit Max Loss Limit every time, via the same handful of failure modes (trade-count escalation, revenge clusters, inverted R:R, holding losers, giving back gains after being up) — those are the specific behaviors to watch for, cited BY BEHAVIOR when they show up in his data, never as a running tally of accounts lost. A tally reads as "this is already decided" and kills the motivation to try the next one clean; a named behavior in today's data is something he can still act on right now.
+STAGE ASYMMETRY (his own framing, 2026-08-13): evaluation is where he can afford to spend TIME — clearing it fast is the goal, not zero risk. Funded is where the discipline must be tightest, because that is the account that actually pays out. Grade eval on pace-to-clear; grade funded on process purity. Do not apply funded-strictness language to an eval account or eval-patience language to a funded one.
+He is running SINGLE funded accounts for now, building capital one payout at a time — not simultaneous multi-account copy-trading. Do not suggest running several accounts at once unless he raises it himself; that is a later-stage plan, not today's.
 ## COACHING PROTOCOL (added 2026-08-11 at Anoop's request — follow this every reply)
 Anoop's words: "It is just pointing out to me that I am making the mistake. There is no
 motivation... it should motivate me to keep calm, relax, and trade when needed."
@@ -1004,7 +1278,7 @@ const JESSI_VOICE_TOOLS = [
 
 // Condensed persona for the voice path — same character, ~1/3 the tokens, and
 // it enforces short spoken replies (which also cuts output tokens + dead air).
-const JESSI_PERSONA_VOICE = `You are Jessi Livermore, Anoop's trading accountability coach (voice mode) in his MNQ Co-Pilot app. Anoop trades MNQ/MGC on a Lucid prop account from Hubballi, India. He has blown 16 prop accounts, all by hitting the max-loss limit, always via the same failure modes: trade-count escalation, revenge re-entries, oversized "high-conviction" trades, holding losers, trading multiple instruments, and giving back gains after being green. You know this and name it plainly — coach, not cheerleader. Grade PROCESS over P&L: a green day with broken rules is a failure; a red day with clean rules is a win. Never validate a revenge trade, an oversize, or an "I'll get it back."
+const JESSI_PERSONA_VOICE = `You are Jessi Livermore, Anoop's trading accountability coach (voice mode) in his MNQ Co-Pilot app. Anoop trades MNQ/MGC on a Lucid prop account from Hubballi, India. Goal is ONE clean payout — he can afford more eval attempts, not more carelessness on a funded account. Watch for the specific failure modes: trade-count escalation, revenge re-entries, oversized "high-conviction" trades, holding losers, trading both MNQ and MGC same day (one instrument per day, per rules.json), and giving back gains after being green. Name the behavior in today's data, never a tally of past accounts — coach, not cheerleader, and not a scoreboard of losses either. Eval = clear it fast. Funded = zero slack on process. Grade PROCESS over P&L: a green day with broken rules is a failure; a red day with clean rules is a win. Never validate a revenge trade, an oversize, or an "I'll get it back."
 Use app_get_data(section) for anything about the open account (status/cost/insights/trades/scalp/checklist/roadmap) instead of guessing — "scalp" gives the per-day hold-time/gap breakdown, use it whenever Anoop asks how his scalping looked on a given day. Use app_do to act in the app. You can NEVER place trades. For the two destructive actions (switch_account, clear_insights) get a clear spoken confirmation first, then call again with confirm:true.
 HARD RULES (JadeCap-derived, non-negotiable): (1) he pre-commits an A+ setup + trade cap before session — if he hits it or mentions "one more," tell him he's done, don't help rationalize it. (2) Grade the day on plan-adherence, not P&L — plan-clean red day = win, off-plan green day = loss, say so even when it's uncomfortable. (3) Wanting to keep trading right after a finished plan trade is discomfort, not opportunity — name it and point him to the 15-min break away from the desk. (4) New indicator/confirmation added right after a loss is a red flag, not an upgrade — ask what it concretely improves. (5) Push him for ONE short reason per trade, not a stacked justification — a real edge sounds boring.
 CRITICAL: this is VOICE — keep every reply to 1-3 short spoken sentences. No lists, no markdown, no long explanations. If he needs detail, offer to put it in the chat.`;
@@ -1361,6 +1635,90 @@ function istDateAnchor() {
   return `Today is ${d} (${wd}), ${t} IST. All app data and every uploaded trade report (Tradovate CSV) is Indian Standard Time (UTC+5:30) — the trader is in India trading the US market. Resolve "today"/"yesterday"/day-of-week strictly in IST from this line; never guess.`;
 }
 
+// ── Bias adherence (2026-08-13) ───────────────────────────────────────────────
+// Anoop: "compare it with my p&L and crosscheck if my pre-trade was correct or
+// wrong and even remind me if in the past i was wrong or right."
+//
+//   accounts/<slot>/ck_history.json   (declared bias / 4H / 1H per day)
+//        +                          ──> biasTracker.buildMatrix ──> Jessi context
+//   accounts/<slot>/day_trades.json   (side + pnl per trade)          + Judge
+//
+// Reads straight off disk rather than the config bucket: the checklist record
+// is written there immediately on DONE (renderer ckWriteRecord), so this sees a
+// completion within the same session without waiting for End Day.
+const biasTracker = require('./bias-tracker');
+
+function biasActiveSlotId() {
+  const cfg = loadConfig();
+  return cfg.activeSlotId || null;
+}
+
+function biasLoadMatrix() {
+  try {
+    const slot = biasActiveSlotId();
+    if (!slot) return null;
+    const ckh = dataLoad('ck_history__' + slot) || [];
+    const dt = dataLoad('day_trades__' + slot) || {};
+    if (!Array.isArray(ckh) || !ckh.length) return { matrix: null, ckh: [], dt: dt };
+    return { matrix: biasTracker.buildMatrix(ckh, dt, getActiveRules()), ckh: ckh, dt: dt };
+  } catch (e) {
+    console.warn('[bias] matrix build failed:', e.message);
+    return null;
+  }
+}
+
+// Today's checklist record + today's trades, for the live cross-check.
+function biasTodayContext() {
+  try {
+    const rules = getActiveRules();
+    if (rules.biasAdherence && rules.biasAdherence.enabled === false) return '';
+    const loaded = biasLoadMatrix();
+    if (!loaded) return '';
+    // Calendar IST, NOT tradingDayStampIST(). The checklist record is keyed by
+    // calendar day (renderer/checklist-logic.js tradingDayIST) because a
+    // pre-trade checklist is a ritual before a session, not a fill; trade
+    // records use the 03:45 Globex rollover. The two strings are identical
+    // except between 00:00 and 03:45 IST — and matching a checklist against the
+    // rollover key in that window would silently find nothing and report "no
+    // checklist recorded today" to a man who had just done one.
+    const today = new Date(Date.now() + 330 * 60 * 1000).toISOString().slice(0, 10);
+    const ck = (loaded.ckh || []).filter(e => e && e.date === today)[0] || null;
+    return biasTracker.formatContext(ck, (loaded.dt || {})[today], loaded.matrix, rules);
+  } catch (e) {
+    console.warn('[bias] context failed:', e.message);
+    return '';
+  }
+}
+
+// 2026-08-19 (Anoop's request: "live feed should be accessible to whole of
+// the app and work with all agents"): a single shared accessor for today's
+// LIVE broker state, so every agent context-builder reads the same source
+// instead of each rebuilding its own (or, as of today, not reading it at
+// all — buildJessiContext below sourced balance/P&L purely from the CSV-
+// derived config bucket, never tvBrokerFeedState). First slice: wired into
+// Jessi (both voice and text share this function). Debate/PO3 context
+// builders (gatherAnalysisContext/gatherPO3Context) are the next step, not
+// done in this same pass — see SEMI_AUTONOMOUS_SYSTEM_PLAN.md's
+// "live feed accessible to all agents" section for the staged rollout
+// reasoning (verify one integration live before extending to the rest).
+function formatLiveFeedContext() {
+  if (!mcpBridge.ready || !mcpBridge.tvConnected) return null;
+  if (tvBrokerFeedReadOk !== true) return null;
+  const st = tvBrokerFeedState;
+  const confirmed = (st.trades || []).filter(t => !t.pnlUnknown);
+  const unconfirmed = (st.trades || []).filter(t => t.pnlUnknown);
+  const lines = [
+    `Live broker feed (today, real trades — not the CSV): ${st.tradeCount} trade(s), confirmed day P&L $${st.dayPnl.toFixed(2)} (from ${confirmed.length} trade(s) this instance watched close)` +
+      (unconfirmed.length ? `, plus ${unconfirmed.length} trade(s) recovered from order history with $ unconfirmed (check the broker for exact P&L on those)` : '') + '.'
+  ];
+  if (st.wasFlat === false) lines.push(`A position is currently OPEN (size ${st.sizeSeenThisTrade}) — not yet counted, will fold in on close.`);
+  try {
+    const f1 = mistakePatterns.checkTradeCountEscalation(st.trades);
+    if (f1.matched) lines.push(`⚠ ${f1.message}`);
+  } catch (e) {}
+  return lines.join(' ');
+}
+
 function buildJessiContext(minimal) {
   const cfg = loadConfig();
   const key = jessiBucketKey(cfg); // see jessiBucketKey() note above — slot-keyed, not legacy accountSize_mode
@@ -1381,6 +1739,20 @@ function buildJessiContext(minimal) {
   // exactly the continuity ("where his head's at") voice coaching needs too.
   const minimalAlign = formatAlignmentNotes(1);
   if (minimalAlign) parts.push(`\n### Where his head's at (most recent):\n${minimalAlign}`);
+
+  // 2026-08-13: in BOTH minimal (voice) and full context. Anoop asked for the
+  // cross-check "the whole day whenever i chat" — a voice turn is a chat turn,
+  // and this is ~8 short lines, cheap enough for the voice budget.
+  const biasCtx = biasTodayContext();
+  if (biasCtx) {
+    parts.push(`\n### Direction of record vs what he actually did\n${biasCtx}
+When his adherence is below target, say the number and name the pattern — do not lecture. If today is GOT AWAY WITH IT, never congratulate the P&L: he broke his own declared direction and got paid, which is the lesson that ends accounts. Cite the precedent date when one is given.`);
+  }
+
+  // 2026-08-19: live broker feed, same short line in both minimal (voice)
+  // and full context — see formatLiveFeedContext() above.
+  const liveCtx = formatLiveFeedContext();
+  if (liveCtx) parts.push(`\n### Live feed (today, real broker data)\n${liveCtx}`);
 
   if (minimal) return parts.join('\n');
 
@@ -1465,6 +1837,19 @@ async function handleJessiChat(ws, msg) {
   const tvSnapshot = await maybeFetchTVSnapshot(lastUserText);
   const systemPrompt = JESSI_PERSONA + '\n\n' + buildJessiContext() + (tvSnapshot ? '\n\n' + tvSnapshot : '');
 
+  // 2026-08-16 (Pattern 02, assistive routing — chat-intent.js): advisory
+  // only, never rewrites systemPrompt or reroutes the message. A separate WS
+  // message the renderer shows as a system note; Jessi's own answer is
+  // untouched either way.
+  try {
+    const intent = chatIntent.classifyChatIntent(lastUserText);
+    const hint = chatIntent.modeMismatchHint(intent, (getActiveRules().tradingMode || 'standard'));
+    if (hint && !chatIntent.shouldSuppressForCooldown(modeHintLastAt.get(ws), Date.now(), MODE_HINT_COOLDOWN_MS)) {
+      modeHintLastAt.set(ws, Date.now());
+      send(ws, { type: 'mode-hint', reqId, message: hint });
+    }
+  } catch (e) {}
+
   // FIX (2026-07-23, "still not working" — text chat hit a 429 on
   // llama-3.3-70b-versatile, TPD 95443/100000 used): this call never passed a
   // `model`, so groq-agent.js's stream() silently defaulted to the 70B model
@@ -1540,7 +1925,7 @@ Your data domain (and ONLY yours — stay in your lane):
 - Key levels: support/resistance, Pine-drawn lines/labels/boxes, PDH/PDL, session levels
 - Technical indicators: RSI, MACD, EMA, Bollinger Bands, VWAP — whatever's on the chart
 - Market structure: higher highs/lows, lower highs/lows, FVGs, SFPs, engulfing patterns
-- Multi-timeframe alignment: Daily → 4H → 1H → 15M → 5M confluence
+- Multi-timeframe alignment: 1H → 15M → 5M confluence. Your context includes a MECHANICAL 1H BIAS block (2026-08-17, PO3's own bias-gate source) — use it, don't say you lack 1H/HTF data. Daily is DELIBERATELY never given to you (Anoop reads the daily candle himself, same rule Power of 3 follows) — if a top-down needs Daily specifically, say that's his call to make, not a data gap you're missing.
 - Playbook validity: whether current price action satisfies Playbook A (engulfing + TF alignment), Playbook B (SFP + FVG), or Playbook C (engulfing validity rules)
 
 What you are NOT:
@@ -1570,11 +1955,74 @@ Decision hierarchy (non-negotiable):
 - ALL THREE must be green for a GO. Any one red = NO-GO, with the specific reason.
 - Power of 3 alone is never sufficient for a GO — a clean AMD read with a discipline violation is still NO.
 
-Tone: Direct, data-backed, no hedging. You're the final word — own it. Keep it concise: verdict first, then 2-4 sentences of reasoning citing specific points from each agent. Not an essay.
+YOU ARE THE ONLY AGENT WHO WRITES AT LENGTH. The other three are now capped at a
+headline plus two lines each, deliberately, because Anoop reads this mid-session
+with money on and cannot absorb four long analyses. That means:
+- The VERDICT is yours alone. They are forbidden from giving one. If you do not
+  state it, nobody does.
+- The fix for tomorrow is yours alone. Always end with a section headed exactly
+  "## ONE CONCRETE FIX FOR TOMORROW" containing ONE action, in one or two lines,
+  specific enough to do without deciding anything further. Not three options, not
+  a principle — one action. "Cap tomorrow at 6 contracts total" is a fix.
+  "Be more disciplined" is not.
+- Do NOT repeat their headlines back. They have already been read directly above
+  you. Reference a point only when your verdict turns on it.
 
-Context: Anoop has blown 16 prop accounts. Every single one hit its Max Loss Limit through the same failure modes. The margin for error is zero. When in doubt, the answer is NO.
+Tone: Direct, data-backed, no hedging. You're the final word — own it. Keep it
+tight: verdict on the first line, then 2-4 sentences of reasoning, then the fix.
+The whole screen — your verdict plus their three cards — must be readable in
+under five minutes. Not an essay.
 
-COST OF FAILURE — cite this, it is the point. The ACCOUNT & TRADE DATA block includes a COST line with his real lifetime prop spend, payouts received, and net position, fed live from his Cost tab. Quote those exact figures rather than any number you remember. When a session goes badly, state plainly what the running total now is and that payouts remain at zero — the gap between what he has spent and what he has been paid is the single most honest argument against taking one more trade. Never estimate or round it; if the COST line is absent, say the figure is unavailable rather than inventing one.`;
+Depth stays available; it just is not the default. Every figure you were handed
+remains in the app's records. If Anoop wants the long version he asks a direct
+question, or runs the post-session report — and then length is fine.
+
+Context: Zero margin for error on ANY currently open account — funded especially, since that is the one that pays out. When in doubt, the answer is NO. Past losses hit Max Loss Limit through a recurring, specific handful of failure modes (trade-count escalation, revenge re-entries, size-up while down, holding losers, giving back gains) — cite the specific behavior in today's data if you see it, not a running account count.
+
+COST OF FAILURE — cite this, it is the point. The ACCOUNT & TRADE DATA block includes a COST line with his real lifetime prop spend, payouts received, and net position, fed live from his Cost tab. Quote those exact figures rather than any number you remember. When a session goes badly, state plainly what the running total now is and that payouts remain at zero — the gap between what he has spent and what he has been paid is the single most honest argument against taking one more trade. Never estimate or round it; if the COST line is absent, say the figure is unavailable rather than inventing one.
+
+MACHINE-READABLE TICKET LINE (2026-08-17, Phase 2b). If and ONLY IF your verdict is a genuine GO with a specific entry, end your response with one line in exactly this format (own line, nothing after it):
+TRADE_TICKET: side=buy|sell size=N [stop=PRICE] [target=PRICE]
+- side and size are REQUIRED whenever you say GO. size must be a whole number you believe is appropriate — the app enforces its own hard cap independently of what you write here, so do not inflate it to seem confident; state the size you actually believe is right for this setup.
+- stop/target are OPTIONAL — include a PRICE only if you can point to a specific level from the arguments above (a real structural level, not a guess). Omit the key entirely rather than inventing a number.
+- Do NOT include a symbol on this line — the app resolves the live symbol itself.
+- On a NO-GO, do not emit this line at all.
+This line is parsed by the app to offer Anoop a one-click trade ticket — it is a mechanical instruction, not part of your prose, so keep your actual verdict text exactly as tight as instructed above; add this as a final standalone line after everything else, including "## ONE CONCRETE FIX FOR TOMORROW".`;
+
+// 2026-08-16 (Pattern 03, parallelization — the VOTING variant). Debate mode
+// already uses SECTIONING well (Jessi/Analysis/PO3, each one lane, Judge
+// synthesizes). Voting — the same judgment checked a second independent way
+// for extra confidence — was entirely absent. Scoped to GO verdicts only,
+// on purpose: that is the one outcome that actually authorizes risk, so it
+// is the only one worth the extra call. Fires AFTER the verdict has already
+// been shown (see handleDebateChat's onDone) rather than before it, so the
+// live trading moment pays zero extra latency — the safety value lands as a
+// follow-up note a few seconds later instead of a delay on the verdict
+// itself. Silent when it finds nothing: a refuter that always says something
+// trains Anoop to ignore it, exactly the failure mode a real second opinion
+// is supposed to prevent.
+const REFUTER_PERSONA = `You are a skeptical second-opinion reviewer for Anoop Habib's MNQ Co-Pilot trading app. You are handed a GO verdict that has ALREADY been shown to Anoop, along with the three arguments (Jessi/discipline, Analysis/technical, Power of 3/AMD phase) it was built from.
+
+Your ONLY job: try, genuinely, to find a real reason this GO is wrong — a discipline flag Jessi raised that the verdict underweighted, a technical invalidity Analysis raised that got glossed over, or an AMD-phase problem Power of 3 raised that was dismissed too quickly.
+
+If you find a genuine objection: state it in 2-3 sentences, specific and actionable, citing the exact point from whichever argument you're drawing on.
+
+If you cannot find a real objection after actually trying: reply with EXACTLY this and nothing else — "NO OBJECTION — the GO holds up."
+
+Do not manufacture a concern to look thorough. A false alarm on a genuinely good trade has a real cost too — it teaches Anoop to distrust a working system.`;
+
+function dispatchGoRefutation(ws, reqId, judgeContext, verdictText) {
+  // Deliberately not awaited by the caller — see the comment above. Own
+  // try/catch so a failure here can never surface as a debate error; the
+  // verdict Anoop already has stands regardless of what happens next.
+  runDebateAgent(REFUTER_PERSONA, 'Review the GO verdict above. Does it hold up?', judgeContext + '\n\n## THE VERDICT ALREADY SHOWN\n' + verdictText, null)
+    .then(result => {
+      const text = (result && result.text || '').trim();
+      if (!text || /^no objection/i.test(text)) return; // silent — nothing to add
+      emitTo(ws, { type: 'debate-refutation', reqId, text });
+    })
+    .catch(e => console.error('[go-refutation] failed:', e.message));
+}
 
 // Pre-fetch all data for the Analysis agent (no tool calling during debate)
 async function gatherAnalysisContext() {
@@ -1641,6 +2089,29 @@ async function gatherAnalysisContext() {
       parts.push(doji ? doji.text : 'No 1H doji at PDH/PDL on the last closed 1H bar.');
     } catch (e) {
       parts.push('\n## COMPUTED READS: unavailable (' + e.message + ')');
+    }
+
+    // 2026-08-17, tightened same day: originally added a 4H read here to
+    // close the gap gatherPO3Context() was fixed for on 2026-07-29 (a NO-GO
+    // verdict cited "Analysis has no Daily/4H/1H chart data"). Anoop then
+    // moved PO3's own bias gate from 4H to 1H (checkPo3Phase/gatherPO3Context)
+    // — this block follows, reusing po3TrendRead('60'), the EXACT function +
+    // bar count PO3's gate now uses, so the two agents can never disagree.
+    // NOTE this is deliberately a DIFFERENT read from the "1H vs 15m aligned"
+    // line in COMPUTED READS above — that one uses getTrendForTF('60') (60
+    // bars, a different classifier instance for a different job: entry
+    // alignment). This block is PO3's own bias number specifically, so the
+    // two agents' AMD framing can't drift apart. Two different lenses on 1H,
+    // not a contradiction if they read slightly differently.
+    try {
+      const gateRead = await po3TrendRead('60').catch(() => null);
+      parts.push('\n## MECHANICAL 1H BIAS — PO3\'s bias-gate source (computed by the app, no AI — same function+bar-count Power of 3\'s gate uses)');
+      parts.push(gateRead
+        ? '1H (PO3 gate): ' + (gateRead.label || gateRead.direction) + ' | direction=' + gateRead.direction + ' | score=' + (gateRead.score != null ? gateRead.score : 'n/a') + ' | bars=' + (gateRead.bars || 'n/a')
+        : '1H (PO3 gate): unavailable');
+      parts.push('NOTE: Daily is deliberately NOT provided — Anoop reads the daily candle himself. Do not claim a daily read; if his question needs one, say Daily is his call, not yours.');
+    } catch (e) {
+      parts.push('\n## MECHANICAL 1H BIAS: unavailable (' + e.message + ')');
     }
   } else {
     parts.push('## CHART DATA: UNAVAILABLE (TradingView not connected)');
@@ -1724,7 +2195,20 @@ function runDebateAgent(systemPrompt, userQuestion, dataContext, signal) {
   });
 }
 
-async function handleDebateChat(ws, msg) {
+// 2026-08-19 BUG FIX (found live, root-caused after a recurring
+// withChartLock timeout cascade every ~3 minutes): checkPo3SecondarySymbol
+// used to hold the exclusive chart lock through this ENTIRE function,
+// including the full multi-agent LLM debate below (Jessi + Analysis + PO3 in
+// parallel, then the Judge) — 10-90+ seconds observed live. Every other
+// chart-lock consumer (PO3 primary monitor, Engulf, SFP, key-level checks)
+// queued behind it and routinely timed out. `preGathered`, when provided,
+// lets a caller supply context it already fetched WHILE the chart was still
+// parked on the symbol it needed — the caller (checkPo3SecondarySymbol) can
+// then restore the primary symbol and release the lock BEFORE the slow LLM
+// calls below ever start. Every other caller (the manual Debate button, the
+// primary-symbol auto-trigger) omits it and this function gathers its own
+// context exactly as before — zero behavior change for them.
+async function handleDebateChat(ws, msg, preGathered) {
   const { messages, reqId } = msg;
   const lastUserText = (messages && messages.length) ? messages[messages.length - 1].content : '';
   const abortCtrl = registerRequest(reqId);
@@ -1740,23 +2224,35 @@ async function handleDebateChat(ws, msg) {
   // failure now reaches the client immediately instead of silently hanging.
   try {
     // Phase 1: Pre-fetch data for both agents
-    send(ws, { type: 'debate-status', reqId, phase: 'gathering', message: 'Gathering data for both agents...' });
+    emitTo(ws, { type: 'debate-status', reqId, phase: 'gathering', message: 'Gathering data for both agents...' });
 
-    const jessiContext = buildJessiContext();
-    const tvSnapshot = await maybeFetchTVSnapshot(lastUserText);
-    const analysisContext = await gatherAnalysisContext();
+    const jessiContext = preGathered ? preGathered.jessiContext : buildJessiContext();
+    const tvSnapshot = preGathered ? preGathered.tvSnapshot : await maybeFetchTVSnapshot(lastUserText);
+    const analysisContext = preGathered ? preGathered.analysisContext : await gatherAnalysisContext();
 
-    const jessiSystemPrompt = JESSI_PERSONA + '\n\nYou are in DEBATE MODE. Present your argument on this question from your perspective (discipline, psychology, trade history, patterns, accountability). Be specific — cite dates, trade counts, failure modes. Do NOT give a final verdict — the Expert Judge will do that. Keep your argument to 3-6 sentences, data-dense.\n\n' + jessiContext + (tvSnapshot ? '\n\n' + tvSnapshot : '');
-    const analysisSystemPrompt = istDateAnchor() + '\n\n' + ANALYSIS_DEBATE_PERSONA + '\n\nPresent your argument on this question from your perspective (chart structure, levels, indicators, multi-TF alignment, playbook validity). Be specific — cite prices, levels, indicator values. Do NOT give a final verdict — the Expert Judge will do that. Keep your argument to 3-6 sentences, data-dense.';
+    const jessiSystemPrompt = JESSI_PERSONA + '\n\nYou are in DEBATE MODE. Your lane is DISCIPLINE ONLY: trade count, size, cooldown, revenge, plan adherence. Not the chart, not the phase, not the verdict.'
+      // 2026-08-17: found live — Jessi was ignoring DEBATE_BRIEF_FORMAT entirely
+      // (writing full paragraphs, no headline) and telling Anoop to "switch to
+      // the main chat" for chart analysis, a phrase that exists nowhere in this
+      // prompt. Root cause: the base JESSI_PERSONA above (used in her OTHER
+      // modes too) has a HARD LINE section saying symbol/timeframe switching
+      // "is the main co-pilot chat's job, not yours" — true in her normal
+      // single-agent chat mode, where that really is a different code path, but
+      // there is no second "chat" inside a debate reply, and nothing above told
+      // her that distinction doesn't apply here. Being explicit about it,
+      // rather than trusting her to infer it from an unrelated HARD LINE bullet.
+      + '\n\nIMPORTANT — THIS IS THE ONLY CHAT. There is no separate "main chat" to switch to from inside a debate reply — you and the Judge below are answering in the SAME view, right now. Never tell Anoop to switch chats or ask elsewhere. If his question is really about chart/phase/verdict, do not refuse or explain your lane restriction — just give your DISCIPLINE read on whatever decision is on the table (is now a safe moment to enter, size-wise and state-of-mind-wise) and let the Judge below cover the rest. The output shape below is MANDATORY even when you are tempted to explain yourself — a refusal or an apology is not an exemption from it.'
+      + DEBATE_BRIEF_FORMAT + '\n\n' + jessiContext + (tvSnapshot ? '\n\n' + tvSnapshot : '');
+    const analysisSystemPrompt = istDateAnchor() + '\n\n' + ANALYSIS_DEBATE_PERSONA + '\n\nYour lane is STRUCTURE ONLY: alignment, level, 9-EMA, trigger. Lead with the COMPUTED READS you were given — they are arithmetic, not opinion. Not discipline, not phase, not the verdict.' + DEBATE_BRIEF_FORMAT;
 
     // Phase 2: Run all THREE agents in parallel.
     // 2026-07-28: ICT Power of 3 joined the debate as a full participant
     // (Anoop: "i want its active participation" — a side button wasn't the
     // flow he asked for). Its AMD phase read is fetched with its own
     // multi-timeframe context, independent of the Analysis agent's.
-    send(ws, { type: 'debate-status', reqId, phase: 'debating', message: 'Jessi, Analysis and Power of 3 are building their arguments...' });
+    emitTo(ws, { type: 'debate-status', reqId, phase: 'debating', message: 'Jessi, Analysis and Power of 3 are building their arguments...' });
 
-    const po3Context = await gatherPO3Context();
+    const po3Context = preGathered ? preGathered.po3Context : await gatherPO3Context();
     const po3SystemPrompt = istDateAnchor() + '\n\n' + ICT_PO3_PERSONA + ICT_PO3_DEBATE_SUFFIX;
 
     // ── 2026-08-11: ROOT-CAUSE FIX for Jessi fabricating trades in debate ────
@@ -1805,7 +2301,7 @@ async function handleDebateChat(ws, msg) {
 
     // Send all three arguments to the UI — each carries {text, answeredBy} so
     // the UI can show which model actually produced that argument.
-    send(ws, {
+    emitTo(ws, {
       type: 'debate-arguments', reqId,
       jessi: jessiArgument.text, jessiAnsweredBy: jessiArgument.answeredBy,
       analysis: analysisArgument.text, analysisAnsweredBy: analysisArgument.answeredBy,
@@ -1813,9 +2309,24 @@ async function handleDebateChat(ws, msg) {
     });
 
     // Phase 3: Judge synthesizes — streamed to user
-    send(ws, { type: 'debate-status', reqId, phase: 'judging', message: 'Expert Judge is reviewing both arguments...' });
+    emitTo(ws, { type: 'debate-status', reqId, phase: 'judging', message: 'Expert Judge is reviewing both arguments...' });
 
-    const judgeContext = `## JESSI'S ARGUMENT (Discipline & Psychology)\n${jessiArgument.text}\n\n## ANALYSIS AGENT'S ARGUMENT (Technical & Market)\n${analysisArgument.text}\n\n## ICT POWER OF 3 ARGUMENT (AMD phase — Accumulation / Manipulation / Distribution)\n${po3Argument.text}\n\n## ORIGINAL QUESTION\n${lastUserText}`;
+    // 2026-08-13 (Anoop): "create a subagent in the bridge who tracks activity
+    // of checklist and insights and reports to judge who guides me to improve."
+    // Deterministic rather than an LLM sub-agent: the tracker's whole value is
+    // that its numbers are computed from his own record, so a fourth model
+    // paraphrasing them would only add cost, latency and a chance of drift.
+    // The Judge gets the arithmetic and does the guiding.
+    let biasBlock = '';
+    try {
+      const bc = biasTodayContext();
+      if (bc) {
+        biasBlock = `\n\n## PRE-TRADE ADHERENCE (computed from his own checklist + trade records — these numbers are ground truth, do not re-estimate them)\n${bc}\n`
+          + `Weigh this in your verdict. A technically valid setup that runs AGAINST his declared direction of record is a NO-GO on discipline grounds even if the Analysis agent likes it — that is the "got away with it" pattern, and a profitable version of it is more dangerous than a losing one.`;
+      }
+    } catch (e) {}
+
+    const judgeContext = `## JESSI'S ARGUMENT (Discipline & Psychology)\n${jessiArgument.text}\n\n## ANALYSIS AGENT'S ARGUMENT (Technical & Market)\n${analysisArgument.text}\n\n## ICT POWER OF 3 ARGUMENT (AMD phase — Accumulation / Manipulation / Distribution)\n${po3Argument.text}${biasBlock}\n\n## ORIGINAL QUESTION\n${lastUserText}`;
 
     const judgePrimary = primaryProviderModel();
     await groqAgent.stream(
@@ -1828,26 +2339,96 @@ async function handleDebateChat(ws, msg) {
         temperature: 0.5,
         signal: abortCtrl.signal,
         fallbackChain: fallbackChainFor(judgePrimary),
-        onToken:  (text) => send(ws, { type: 'debate-judge-token', reqId, text }),
+        onToken:  (text) => emitTo(ws, { type: 'debate-judge-token', reqId, text }),
         onDone:   (fullText, answeredBy) => {
-          send(ws, { type: 'debate-judge-done', reqId, fullText, answeredBy });
+          // 2026-08-16 (Pattern 05, evaluator-optimizer — verdict-grounding.js):
+          // runtime backstop for the 2026-08-10 fabrication incident and for
+          // JUDGE_PERSONA's own DATA-INTEGRITY HALT instruction (#6), which is
+          // an instruction, not a guarantee. Every dollar figure in the
+          // verdict must trace to judgeContext (what the Judge was actually
+          // given) or to a real rules.json threshold. Fails VISIBLE, never
+          // silent and never a block — an ungrounded figure gets a clearly
+          // hedged warning appended, the verdict itself is never withheld.
+          let outText = fullText;
+          try {
+            const grounding = verdictGrounding.checkGrounding(fullText, judgeContext, getActiveRules());
+            if (!grounding.ok) {
+              outText = fullText + verdictGrounding.groundingWarningBlock(grounding.ungrounded);
+              console.warn('[verdict-grounding] ungrounded figures in Judge verdict:', grounding.ungrounded.join(', '));
+            }
+          } catch (e) { console.error('[verdict-grounding] check failed:', e.message); }
+
+          emitTo(ws, { type: 'debate-judge-done', reqId, fullText: outText, answeredBy });
           // Archive the verdict AND the three arguments it was built from —
           // the verdict alone is not reviewable without knowing what each
           // agent actually said. Wrapped so a disk problem can never affect
           // the response already sent above.
-          saveReviewRecord('judge', fullText, {
+          saveReviewRecord('judge', outText, {
             question: lastUserText,
             jessi: jessiArgument,
             analysis: analysisArgument,
             po3: po3Argument
           });
+          // 2026-08-16 (Pattern 03 voting variant) — fired AFTER the verdict
+          // above, never before: see dispatchGoRefutation()'s comment for why.
+          if (goVerdictDetect.isGoVerdict(outText)) {
+            dispatchGoRefutation(ws, reqId, judgeContext, outText);
+
+            // 2026-08-17: a GO is exactly the moment "I wasn't looking at
+            // the screen" matters most — push it to Telegram regardless of
+            // whether this debate was auto-triggered by the PO3 monitor or
+            // typed by hand, same fire-and-forget pattern every other
+            // monitor alert in this file already uses. A chart screenshot is
+            // faster to eyeball on a phone than a paragraph — attached when
+            // available, text-only fallback (notifyPhoto's own behavior) if
+            // the capture fails for any reason.
+            (async () => {
+              const src = String(reqId).startsWith('auto-debate-') ? 'Auto-watch' : 'Debate';
+              const caption = `🟢 GO [${src}] — ${outText.slice(0, 900)}${outText.length > 900 ? '…' : ''}`;
+              try {
+                const shot = await mcpBridge.callTool('capture_screenshot', { region: 'chart' });
+                const parsed = parseToolResult(shot);
+                if (parsed && parsed.success && parsed.file_path) {
+                  telegramBot.notifyPhoto(parsed.file_path, caption);
+                  return;
+                }
+              } catch (e) { console.error('[go-screenshot] capture failed:', e.message); }
+              telegramBot.notify(caption);
+            })().catch((e) => console.error('[go-notify] failed:', e.message));
+
+            // Phase 2b (2026-08-17): surface a trade ticket if the Judge
+            // emitted a valid TRADE_TICKET line. Fire-and-forget — a failure
+            // here must never affect the verdict already sent above.
+            try {
+              const ticket = tradeTicketParse.parseTradeTicket(outText);
+              if (ticket) {
+                (async () => {
+                  let symbol = null;
+                  try {
+                    const stateRes = await withChartLock(() => mcpBridge.callTool('chart_get_state', {}));
+                    const state = parseToolResult(stateRes);
+                    symbol = (state && state.symbol) || null;
+                  } catch (e) { /* symbol stays null — client/server resolve it again at confirm time */ }
+                  emitTo(ws, {
+                    type: 'trade-ticket-suggested',
+                    sourceVerdictId: reqId,
+                    side: ticket.side,
+                    size: ticket.size,
+                    stopPrice: ticket.stopPrice,
+                    targetPrice: ticket.targetPrice,
+                    symbol
+                  });
+                })().catch((e) => console.error('[trade-ticket-suggested] failed:', e.message));
+              }
+            } catch (e) { console.error('[trade-ticket-parse] failed:', e.message); }
+          }
         },
-        onError:  (errMsg) => send(ws, { type: 'debate-judge-error', reqId, message: errMsg })
+        onError:  (errMsg) => emitTo(ws, { type: 'debate-judge-error', reqId, message: errMsg })
       }
     );
   } catch (e) {
     console.error('[handleDebateChat] uncaught error:', e);
-    send(ws, { type: 'debate-judge-error', reqId, message: e.message || 'Debate failed unexpectedly.' });
+    emitTo(ws, { type: 'debate-judge-error', reqId, message: e.message || 'Debate failed unexpectedly.' });
   } finally {
     unregisterRequest(reqId);
   }
@@ -1894,22 +2475,24 @@ engineered in three stages around the session's OPENING PRICE.
    FVG) back through the accumulation range.
 
 ## HARD REQUIREMENT — HTF BIAS GATES THE PHASE CALL (non-negotiable)
-The framework is USELESS without a correct daily bias, because manipulation is
+The framework is USELESS without a correct bias, because manipulation is
 defined relative to it — "manipulation" only means something as a move AGAINST
 a direction that's already established on the higher timeframe.
 Your bias comes from the "MECHANICAL BIAS" block in the data — the app grades
-30 bars of 4H (e.g. "STRONG BEAR"). READ THAT BLOCK FIRST. It states the 4H
-direction (your gate), the 1H direction, and an explicit GATE line telling you
-whether bias is established. Trust that GATE line.
+30 bars of 1H (e.g. "STRONG BEAR"). READ THAT BLOCK FIRST. It states the 1H
+direction (your gate) and an explicit GATE line telling you whether bias is
+established. Trust that GATE line.
 DAILY IS DELIBERATELY NOT IN YOUR DATA (2026-07-29, Anoop's decision — he reads
-the daily candle himself). Never claim or imply a daily read. 4H is your bias
-gate; 1H is your structure anchor.
+the daily candle himself). Never claim or imply a daily read.
+(2026-08-17: the bias gate was tightened from 4H to 1H — reacts to a changing
+bias faster than a 4H read could. If you see stale references to "4H bias"
+anywhere else, this 1H gate is the current, correct source — trust the data
+block over any older wording.)
 
 This is a HARD GATE, not a soft caveat:
-- If the 4H direction is bullish or bearish → bias IS established. Proceed to
-  read the phase on 15m/5m as normal, even if the 1H read is neutral. The 4H
-  sets bias here; the lower reads do not veto it.
-- If the 4H direction itself is 'unclear' → PHASE MUST BE "UNCLEAR".
+- If the 1H direction is bullish or bearish → bias IS established. Proceed to
+  read the phase on 15m/5m as normal.
+- If the 1H direction itself is 'unclear' → PHASE MUST BE "UNCLEAR".
   Full stop. Do NOT name ACCUMULATION, MANIPULATION, or DISTRIBUTION in this
   case, no matter how clean the 15m/5m structure looks in isolation. A textbook
   sweep-and-reversal on 5m still means nothing if you don't know which
@@ -1922,13 +2505,13 @@ This is a HARD GATE, not a soft caveat:
 
 ## TIMEFRAME WEIGHTING (Anoop's instruction) — two DIFFERENT jobs, don't blur them
 - **Direction (bias): the MECHANICAL BIAS block governs this, always.**
-  4H (30 bars) is the gate, 1H is corroboration. Never let 15m/5m override or
-  substitute for it. State the label you were actually given (e.g. "4H STRONG
-  BEAR, 30 bars") rather than a vague "trend".
+  1H (30 bars) is the gate. Never let 15m/5m override or substitute for it.
+  State the label you were actually given (e.g. "1H STRONG BEAR, 30 bars")
+  rather than a vague "trend".
 - **Phase (which of A/M/D, ONCE bias is established): 15m/5m govern this.**
-  Accumulation and manipulation are session-relative micro-structure — by the
-  time a 4H candle closes the whole AMD cycle may already be over, so the
-  phase itself has to be read on the lower timeframes.
+  Accumulation and manipulation are session-relative micro-structure — the
+  phase itself has to be read on the lower timeframes even once the 1H gate
+  has passed.
   - **15m: PRIMARY phase-structure read** — accumulation range and the
     manipulation sweep are clearest here. Weight this most, but only after
     the HTF gate above has passed.
@@ -1943,7 +2526,7 @@ This is a HARD GATE, not a soft caveat:
 but this must work on whatever he has open — read it, never assume it)
 **PHASE:** ACCUMULATION | MANIPULATION | DISTRIBUTION | UNCLEAR
 **CONFIDENCE:** HIGH | MEDIUM | LOW
-**4H BIAS:** bullish | bearish | unclear (quote the graded label + bar count)
+**1H BIAS:** bullish | bearish | unclear (quote the graded label + bar count)
 **EVIDENCE (15m):** the specific structure — cite actual prices/levels.
 **EVIDENCE (5m):** displacement / FVG / sweep detail — cite actual prices.
 **LIQUIDITY:** which pool was taken or is being targeted, with the price.
@@ -1960,13 +2543,55 @@ but this must work on whatever he has open — read it, never assume it)
 - If a timeframe's data is missing, say so — do not fill the gap with a guess.
 - You describe market STATE. You do NOT tell Anoop to enter, size, or exit — his
   playbook rules and risk limits govern that, and other agents handle it.
-- Anoop has blown 16 accounts; the most valuable thing you can say is often
+- Zero margin for error on the open account; the most valuable thing you can say is often
   "this is still ACCUMULATION — nothing to do yet."
 - Under 250 words.`;
 
 // Debate-mode variant of the PO3 persona. Same doctrine, but it argues its
 // corner for the Judge instead of issuing a standalone report — mirrors how
 // JESSI_PERSONA / ANALYSIS_DEBATE_PERSONA are adapted for debate.
+// ── DEBATE BREVITY CONTRACT (2026-08-12) ─────────────────────────────────────
+// Anoop: "I cannot read all of it... I want something very simple, but all the
+// headlines should be available with one or two lines stating what is happening
+// and where... it creates messy mind if too much text that can't be read within
+// 5-10 mins."
+//
+// The old instruction said "3-6 sentences, data-dense" and every agent ignored
+// it — producing 300+ word essays. A word count is a suggestion; a FIXED SHAPE
+// is not. Models comply with a template far more reliably than with a limit,
+// so this specifies the exact output form and forbids everything else.
+//
+// Deliberately NOT a content cut. The rule is "compress, don't drop": the
+// number that proves the point must survive. What gets removed is narration,
+// re-explanation, and the three agents each restating the verdict — which is
+// the Judge's job and was being duplicated four times over.
+const DEBATE_BRIEF_FORMAT = `
+
+## OUTPUT SHAPE — MANDATORY, NO EXCEPTIONS
+Reply in EXACTLY this shape. Nothing before it, nothing after it:
+
+**HEADLINE IN CAPS, 3-6 WORDS**
+<ONE sentence: the single most important thing, WITH the number or price that proves it.>
+<ONE sentence: what that means for the next entry.>
+
+HARD RULES:
+- 45 words TOTAL, maximum. Count them.
+- Exactly two sentences under the headline. Not three.
+- NEVER give a verdict, a GO/NO-GO, or a recommendation — the Expert Judge owns
+  that and will state it once. If you state it too, he reads it four times.
+- NEVER give the "one fix for tomorrow" — the Judge owns that too.
+- NEVER restate what another agent covers. Stay strictly in your own lane.
+- Keep the NUMBER, drop the narration. "9-EMA rejects at 29781.31" survives;
+  "this suggests we should be cautious about the current structure" does not.
+- If you have nothing that matters, say so in one line. Padding to look useful
+  is the failure mode here, not being brief.
+
+NOTHING IS LOST BY BEING BRIEF. Every figure you are holding stays in your
+context and in the app's data. If Anoop wants the depth he asks a direct
+question in chat, or runs the full post-session report — and you answer at
+whatever length that needs. This shape governs the DEBATE CARD only, which he
+reads mid-session with money on. Brief here, complete on request.`;
+
 const ICT_PO3_DEBATE_SUFFIX = `
 
 ## YOU ARE IN DEBATE MODE
@@ -1979,8 +2604,7 @@ The HTF bias gate above still applies in debate mode exactly as written: if
 phase call blocked," NOT a phase name with a confidence caveat attached. The
 Judge cannot correct a wrong phase call after the fact, so blocking it here is
 your job, not a soft flag for the Judge to notice. Do not manufacture a
-phase call to sound useful.
-Keep it to 3-6 sentences, data-dense.`;
+phase call to sound useful.` + DEBATE_BRIEF_FORMAT;
 
 // ── Power of 3's own graded trend read ───────────────────────────────────────
 // 2026-07-29 (Anoop): "for directional bias change from 60 bars to 30 bars and
@@ -2018,109 +2642,11 @@ async function po3TrendRead(tfCode) {
   }
 }
 
-// ── MECHANICAL AMD PHASE DETECTOR (no AI) ────────────────────────────────────
-// 2026-07-29 (Anoop): "i want it to trigger me and give my an output in lower
-// time frames as confirmation for my trade entry", polling every 60s, alert on
-// ANY phase change.
-//
-// Deliberately NOT an LLM call per poll: at 60s that's ~60 Gemini requests an
-// hour, which is exactly the quota exhaustion that took Jessi down twice. This
-// is pure arithmetic on bars — free, instant, deterministic, and it produces
-// the same A/M/D verdict the agent would. The LLM is only used afterwards to
-// narrate a trigger that has already fired.
-//
-// Phase logic, from Anoop's ICT Power of 3 PDF:
-//   ACCUMULATION  — price still inside the opening range built after session open
-//   MANIPULATION  — that range broken AGAINST the 4H bias (liquidity swept)
-//   DISTRIBUTION  — after such a sweep, price displaces back through the range
-//                   in the direction OF the 4H bias
-// Anything without an established 4H bias is UNCLEAR (the hard gate).
-//
-// `openingBars` = how many bars after session open define the accumulation
-// range. 4 x 15m = the first hour of the session.
-function computeAmdPhase(bars, biasDirection, sessionStartUnix, openingBars) {
-  const out = { phase: 'UNCLEAR', reason: null, rangeHigh: null, rangeLow: null, sweptTo: null, detail: null };
-  if (biasDirection !== 'bullish' && biasDirection !== 'bearish') {
-    out.reason = '4H bias not established — gate blocks the phase call';
-    return out;
-  }
-  if (!Array.isArray(bars) || !bars.length) {
-    out.reason = 'no bars available';
-    return out;
-  }
-
-  // Bars from the current session only.
-  const sess = bars.filter(b => b && typeof b.time === 'number' && b.time >= sessionStartUnix);
-  if (sess.length < 2) {
-    out.reason = 'session just opened (fewer than 2 bars) — too early to judge';
-    return out;
-  }
-
-  const nOpen = Math.max(1, openingBars || 4);
-  const opening = sess.slice(0, nOpen);
-  const rangeHigh = Math.max(...opening.map(b => b.high));
-  const rangeLow = Math.min(...opening.map(b => b.low));
-  out.rangeHigh = rangeHigh;
-  out.rangeLow = rangeLow;
-
-  // Still inside the opening window itself → by definition accumulating.
-  if (sess.length <= nOpen) {
-    out.phase = 'ACCUMULATION';
-    out.reason = 'still inside the opening ' + nOpen + '-bar range (' + rangeLow + '–' + rangeHigh + ')';
-    return out;
-  }
-
-  const after = sess.slice(nOpen);
-  // On a bullish bias, manipulation runs DOWN (sweeps sell-side liquidity).
-  // On a bearish bias, manipulation runs UP (sweeps buy-side liquidity).
-  const sweepIsDown = biasDirection === 'bullish';
-
-  let sweepIdx = -1, sweepExtreme = null;
-  for (let i = 0; i < after.length; i++) {
-    const b = after[i];
-    if (sweepIsDown && b.low < rangeLow) { sweepIdx = i; sweepExtreme = b.low; break; }
-    if (!sweepIsDown && b.high > rangeHigh) { sweepIdx = i; sweepExtreme = b.high; break; }
-  }
-
-  if (sweepIdx === -1) {
-    // No sweep against bias yet. If price has instead already run WITH bias
-    // beyond the range, the session is distributing without a clean trap.
-    const ranWithBias = sweepIsDown
-      ? after.some(b => b.high > rangeHigh)
-      : after.some(b => b.low < rangeLow);
-    if (ranWithBias) {
-      out.phase = 'DISTRIBUTION';
-      out.reason = 'broke the opening range in the direction of 4H bias without a counter-sweep first — distributing, but no manipulation trap was set';
-      return out;
-    }
-    out.phase = 'ACCUMULATION';
-    out.reason = 'price still contained within the opening range (' + rangeLow + '–' + rangeHigh + '); no liquidity swept yet';
-    return out;
-  }
-
-  out.sweptTo = sweepExtreme;
-
-  // Sweep happened. Has price displaced back through the range with bias?
-  const post = after.slice(sweepIdx + 1);
-  const reclaimed = sweepIsDown
-    ? post.some(b => b.close > rangeLow)   // bullish: closed back above the swept low
-    : post.some(b => b.close < rangeHigh); // bearish: closed back below the swept high
-
-  if (reclaimed) {
-    out.phase = 'DISTRIBUTION';
-    out.reason = 'liquidity swept to ' + sweepExtreme + ' (' + (sweepIsDown ? 'below' : 'above') +
-      ' the opening range), then price closed back ' + (sweepIsDown ? 'above ' + rangeLow : 'below ' + rangeHigh) +
-      ' — manipulation complete, distributing with 4H bias (' + biasDirection + ')';
-    out.detail = 'ENTRY-RELEVANT: this is the reversal out of manipulation.';
-    return out;
-  }
-
-  out.phase = 'MANIPULATION';
-  out.reason = 'liquidity being swept to ' + sweepExtreme + ' (' + (sweepIsDown ? 'below' : 'above') +
-    ' the opening range) against 4H bias (' + biasDirection + ') — trap in progress, no reclaim yet';
-  out.detail = 'NOT yet an entry — wait for the close back inside the range.';
-  return out;
-}
+// ── MECHANICAL AMD PHASE DETECTOR (no AI) — extracted 2026-08-17 into ───────
+// amd-phase.js (unit-tested, and reused by tradingview-mcp's replay-mode
+// backtest script so a historical validation run can never drift from what
+// actually runs live). See that file's header for the full doctrine comment.
+const { computeAmdPhase } = require('./amd-phase');
 
 // Unix timestamp for the start of the session window that is currently active
 // (or most recently active) in IST. Returns null outside both windows.
@@ -2159,6 +2685,11 @@ function currentSessionStartUnix(nowMs) {
 // with computeAmdPhase — no LLM per poll.
 const PO3_MONITOR_INTERVAL_MS = 60 * 1000;
 const PO3_OPENING_BARS = 4; // 4 x 15m = first hour after session open
+// 2026-08-17: true once Anoop explicitly toggles the P3 Monitor off via the
+// UI — checked before any auto-start-on-reconnect call so a CDP blip can't
+// silently turn a deliberate OFF back on. Cleared the moment he toggles it
+// back on (or the app restarts — this is intentionally NOT persisted).
+let po3MonitorUserDisabled = false;
 const po3Monitor = {
   running: false,
   interval: null,
@@ -2167,6 +2698,54 @@ const po3Monitor = {
   lastSymbol: null,   // see symbol-change reset in checkPo3Phase
   lastCheck: null
 };
+
+// ── Auto-triggered Debate on a real PO3 phase transition (2026-08-17) ──────
+// Anoop: "the debate mode eats lots of tokens and i cannot keep checking
+// every now and then... i wanted it to keep a watch for me full time." The
+// PO3 monitor below is already free (mechanical, no AI) and already polls
+// full-time whenever TradingView is connected — this hooks the expensive
+// 3-agent Debate + Judge call to fire ONLY when it detects a real,
+// structural reason to check (leaving ACCUMULATION), instead of running on
+// a blind timer, which would spend tokens whether or not anything changed.
+let lastAutoDebateAt = 0;
+const AUTO_DEBATE_COOLDOWN_MS = 10 * 60 * 1000; // floor against a choppy day flipping phases repeatedly
+let autoDebateReqCounter = 0;
+
+// Returns a Promise (settles once the debate finishes) so callers that want
+// to know when it's done can await it. `preGathered`, when passed, is
+// forwarded straight to handleDebateChat — see that function's 2026-08-19
+// header comment. checkPo3SecondarySymbol uses this to gather context WHILE
+// still on the secondary symbol, then restores/releases its lock BEFORE
+// calling this — no longer holds anything through the debate's LLM calls.
+// The primary (same-symbol) call site never awaits this and never passes
+// preGathered; fire-and-forget still works identically since nothing there
+// depended on the return value.
+// Shared with checkPo3SecondarySymbol, which needs the exact same text
+// BEFORE calling autoTriggerDebate — it must pass it to maybeFetchTVSnapshot
+// itself while still on the secondary symbol (see that function's 2026-08-19
+// pre-gathering change). Kept in one place so the two can never drift apart.
+function buildAutoDebateQuestion(phaseInfo) {
+  return `Automated check (not typed by Anoop): ${phaseInfo.symLabel || 'the instrument'} just moved from ${phaseInfo.from || 'ACCUMULATION'} to ${phaseInfo.phase} on the 15m at ${phaseInfo.time} IST (1H bias: ${phaseInfo.biasLabel || 'unknown'}). Is this a valid entry right now?`;
+}
+
+function autoTriggerDebate(phaseInfo, preGathered) {
+  const now = Date.now();
+  if (now - lastAutoDebateAt < AUTO_DEBATE_COOLDOWN_MS) {
+    console.log('[auto-debate] skipped — within ' + Math.round(AUTO_DEBATE_COOLDOWN_MS / 60000) + 'min cooldown of the last auto-triggered debate');
+    return Promise.resolve();
+  }
+  lastAutoDebateAt = now;
+  const reqId = 'auto-debate-' + (++autoDebateReqCounter) + '-' + now;
+  const question = buildAutoDebateQuestion(phaseInfo);
+  console.log('[auto-debate] triggered by phase transition ' + (phaseInfo.from || '?') + ' -> ' + phaseInfo.phase + ', reqId=' + reqId);
+  broadcast({ type: 'auto-debate-triggered', reqId, reason: phaseInfo.message || question });
+  // ws=null → handleDebateChat broadcasts every message to all connected
+  // clients instead of one request's socket (see emitTo above) — there is no
+  // originating client for a background trigger.
+  return handleDebateChat(null, { messages: [{ role: 'user', content: question }], reqId }, preGathered).catch((e) => {
+    console.error('[auto-debate] handleDebateChat failed:', e.message);
+  });
+}
 
 // Whatever symbol is currently on Anoop's chart. The whole read path is
 // symbol-agnostic (2026-07-29 audit: no hardcoded instrument anywhere in the
@@ -2218,16 +2797,18 @@ async function checkPo3Phase() {
     }
     if (symbol) po3Monitor.lastSymbol = symbol;
 
-    // 4H bias must be per-symbol too — po3TrendRead caches by timeframe only,
-    // so clear its cache on a symbol change to avoid grading MGC with MNQ's
-    // cached 4H trend.
+    // Bias must be per-symbol too — po3TrendRead caches by timeframe only, so
+    // clear its cache on a symbol change to avoid grading MGC with MNQ's
+    // cached trend.
     if (po3Monitor.lastPhase === null && symbol) {
-      // cheap targeted invalidation: only the TFs this monitor reads
-      delete po3TrendCache['240'];
-      delete po3TrendCache['60'];
+      delete po3TrendCache['60']; // the one TF the bias gate reads (2026-08-17: was 4H/'240', now 1H)
     }
 
-    const bias = await po3TrendRead('240');          // cached 3 min
+    // 2026-08-17 (Anoop): bias gate tightened from 4H to 1H — reacts faster
+    // to a changing bias than a 4H read could. The phase/trigger read below
+    // (15m primary, 5m in gatherPO3Context) is UNCHANGED — only the higher-
+    // timeframe gate this phase call is conditioned on moved.
+    const bias = await po3TrendRead('60');           // cached 3 min
     const bars = await getFullBars('15', 40);        // switches TF, auto-restores
     const res = computeAmdPhase(bars, bias && bias.direction, sessionStart, PO3_OPENING_BARS);
     po3Monitor.lastCheck = new Date().toISOString();
@@ -2249,7 +2830,7 @@ async function checkPo3Phase() {
         const biasLabel = (bias && (bias.label || bias.direction)) || 'unknown';
         const symLabel = symbol ? String(symbol).replace(/^[A-Z_]+:/, '') : 'chart';
         const msg = 'POWER OF 3 [' + symLabel + ']' + (prev ? ' — ' + prev + ' → ' + res.phase : ' — ' + res.phase) +
-          ' at ' + istTime + ' IST | 4H bias: ' + biasLabel +
+          ' at ' + istTime + ' IST | 1H bias: ' + biasLabel +
           (res.rangeHigh != null ? ' | opening range ' + res.rangeLow + '–' + res.rangeHigh : '') +
           '\n' + res.reason + (res.detail ? '\n' + res.detail : '');
         broadcast({
@@ -2270,6 +2851,16 @@ async function checkPo3Phase() {
           message: msg
         });
         console.log('[PO3 MONITOR][' + symLabel + '] ' + (prev || 'none') + ' -> ' + res.phase + ' | ' + res.reason);
+
+        // 2026-08-17: auto-trigger the expensive Debate only on the one
+        // transition that actually matters — LEAVING accumulation. Staying in
+        // accumulation, or any other transition (e.g. back INTO accumulation),
+        // is deliberately not a trigger; per JUDGE_PERSONA, accumulation alone
+        // is always a WAIT, so there is nothing new to check by re-running the
+        // debate while still in it.
+        if (prev === 'ACCUMULATION' && (res.phase === 'MANIPULATION' || res.phase === 'DISTRIBUTION')) {
+          autoTriggerDebate({ from: prev, phase: res.phase, symLabel, biasLabel, time: istTime, message: msg });
+        }
       }
     }
   } catch (e) {
@@ -2278,6 +2869,148 @@ async function checkPo3Phase() {
   }
 }
 
+// ── Secondary-symbol watch (2026-08-17) ─────────────────────────────────────
+// Anoop: "Build All including batch_run... i want to use its to full
+// potential" — for watching MGC alongside whatever's on the primary chart
+// (MNQ). batch_run itself is UNUSABLE for this: read live (its actual
+// core/batch.js, not just the tool schema) — it switches symbol/timeframe
+// per iteration and NEVER restores the original chart state afterward,
+// unlike every other multi-timeframe function in this file (getFullBars,
+// withChartLock). Wiring it into an automated watcher would silently leave
+// Anoop's live chart parked on whatever it checked last. Built instead as a
+// restore-safe check using the SAME withChartLock discipline as the rest of
+// this codebase: switch to the other symbol, read, switch back — ALWAYS
+// restored in a finally block, even on error.
+//
+// Runs on a SLOWER interval than the primary monitor (3 min, not 60s) and
+// deliberately less often — every switch is a real, visible flicker on
+// Anoop's actual screen, so this trades completeness for not being
+// obnoxious. If the secondary symbol shows a real transition worth checking
+// (leaving ACCUMULATION), the chart is held on it for the FULL debate
+// duration rather than switched back immediately — same "only disrupt for
+// something real" principle as the token-cost gate on the primary monitor.
+const PO3_SECONDARY_INTERVAL_MS = 3 * 60 * 1000;
+let po3SecondaryMonitor = { lastPhase: null, lastSessionStart: null, interval: null };
+
+// 2026-08-19 BUG FIX (found live: "This symbol doesn't exist" on both chart
+// panes, right after this session's own debate-lock refactor to
+// checkPo3SecondarySymbol touched this code path). This used to swap the
+// ticker root via naive substring replace while KEEPING whatever exchange
+// prefix the primary symbol happened to have — a stale/mismatched pane's
+// prefix could end up attached to the wrong ticker, producing an
+// exchange:ticker pair that doesn't exist.
+//
+// Correct values confirmed by DIRECT OBSERVATION of the live chart, not
+// guessed: chart_get_state on the user's own already-working chart returned
+// "CME_MINI:MNQ1!" and, separately, "COMEX_MINI:MGC1!" — both loading real
+// bar data. (A first attempt used TradingView's public symbolSearch() REST
+// API instead, which reports plain "CME"/"COMEX" — that field is the
+// LISTING exchange, not the exchange:ticker prefix TradingView's own chart
+// routing actually needs; trusting it produced the exact same "symbol
+// doesn't exist" error being fixed here. Direct observation of a working
+// chart is the only reliable source for this — API metadata mismatched it
+// on the first attempt.)
+function otherSymbolFor(sym) {
+  if (!sym) return null;
+  if (/MNQ/i.test(sym)) return 'COMEX_MINI:MGC1!';
+  if (/MGC/i.test(sym)) return 'CME_MINI:MNQ1!';
+  return null; // not one of the two instruments Anoop trades — nothing to pair it with
+}
+
+async function checkPo3SecondarySymbol() {
+  if (!mcpBridge.ready || !mcpBridge.tvConnected) return;
+  const sessionStart = currentSessionStartUnix();
+  if (sessionStart == null) { po3SecondaryMonitor.lastPhase = null; return; }
+  if (po3SecondaryMonitor.lastSessionStart !== sessionStart) {
+    po3SecondaryMonitor.lastSessionStart = sessionStart;
+    po3SecondaryMonitor.lastPhase = null;
+  }
+
+  const primarySymbol = await getCurrentChartSymbol();
+  const secondary = otherSymbolFor(primarySymbol);
+  if (!secondary) return;
+
+  // 2026-08-19 BUG FIX (root-caused live after a recurring withChartLock
+  // timeout cascade every ~3 minutes, this monitor's own interval): this
+  // used to hold the lock through autoTriggerDebate — the FULL multi-agent
+  // LLM debate (Jessi + Analysis + PO3 in parallel, then the Judge),
+  // 10-90+ seconds observed live — blocking every other chart-lock consumer
+  // (PO3 primary monitor, Engulf, SFP, key-level checks) for that whole
+  // time. The lock now covers ONLY the switch + phase read + (if a real
+  // transition fires) gathering the debate's context WHILE STILL on the
+  // secondary symbol — then the primary symbol is restored and the lock
+  // released BEFORE any LLM call happens. `preGathered` (built here, while
+  // still parked on the secondary symbol) is threaded through
+  // autoTriggerDebate -> handleDebateChat, which skips its own internal
+  // gathering when given this and reads the SAME data instead of
+  // re-fetching from a chart that's already back on the primary symbol.
+  let debateArgs = null; // set inside the lock if a transition needs a debate; fired AFTER the lock releases
+  await withChartLock(async () => {
+    try {
+      const setResult = await mcpBridge.callTool('chart_set_symbol', { symbol: secondary });
+      const setParsed = parseToolResult(setResult);
+      if (!setParsed || setParsed.success === false) {
+        console.warn('[PO3 SECONDARY] could not switch to ' + secondary + ' — skipping this cycle');
+        return;
+      }
+      delete po3TrendCache['60']; // per-symbol cache — avoid grading MGC with MNQ's cached trend or vice versa
+      const bias = await po3TrendRead('60');
+      const bars = await getFullBars('15', 40);
+      const res = computeAmdPhase(bars, bias && bias.direction, sessionStart, PO3_OPENING_BARS);
+      const prev = po3SecondaryMonitor.lastPhase;
+      po3SecondaryMonitor.lastPhase = res.phase;
+      if (prev !== res.phase && !(prev === null && res.phase === 'UNCLEAR')) {
+        const istTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
+        const biasLabel = (bias && (bias.label || bias.direction)) || 'unknown';
+        const symLabel = String(secondary).replace(/^[A-Z_]+:/, '');
+        const msg = 'POWER OF 3 [' + symLabel + ' — secondary watch]' + (prev ? ' — ' + prev + ' → ' + res.phase : ' — ' + res.phase) +
+          ' at ' + istTime + ' IST | 1H bias: ' + biasLabel + '\n' + res.reason;
+        broadcast({ type: 'po3-phase-change', from: prev, to: res.phase, phase: res.phase, symbol: secondary, symLabel, secondary: true, bias: bias ? bias.direction : null, biasLabel, time: istTime, message: msg });
+        console.log('[PO3 SECONDARY][' + symLabel + '] ' + (prev || 'none') + ' -> ' + res.phase + ' | ' + res.reason);
+        if (prev === 'ACCUMULATION' && (res.phase === 'MANIPULATION' || res.phase === 'DISTRIBUTION')) {
+          const phaseInfo = { from: prev, phase: res.phase, symLabel, biasLabel, time: istTime, message: msg };
+          // Same cooldown check autoTriggerDebate itself does — skip the
+          // (otherwise wasted) gathering below if it would just be dropped.
+          if (Date.now() - lastAutoDebateAt >= AUTO_DEBATE_COOLDOWN_MS) {
+            const question = buildAutoDebateQuestion(phaseInfo);
+            const preGathered = {
+              jessiContext: buildJessiContext(),
+              tvSnapshot: await maybeFetchTVSnapshot(question),
+              analysisContext: await gatherAnalysisContext(),
+              po3Context: await gatherPO3Context(),
+            };
+            debateArgs = [phaseInfo, preGathered];
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[PO3 SECONDARY] error:', e.message);
+    } finally {
+      // ALWAYS restore — even on error. Must never leave Anoop's live chart
+      // parked on the wrong symbol. This now runs right after gathering
+      // (if any), NOT after a debate — the lock releases within seconds
+      // instead of however long the LLM calls take.
+      try { await mcpBridge.callTool('chart_set_symbol', { symbol: primarySymbol }); } catch (e) { console.error('[PO3 SECONDARY] failed to restore symbol:', e.message); }
+      delete po3TrendCache['60'];
+    }
+  });
+  // Fired AFTER the lock has released and the primary symbol is restored —
+  // the debate's LLM calls no longer block anything else on the chart lock.
+  if (debateArgs) await autoTriggerDebate(...debateArgs);
+}
+
+// 2026-08-19 (Anoop's explicit decision, after the MGC symbol bug): the
+// secondary-symbol watch (checkPo3SecondarySymbol, below) switches his live
+// chart AWAY from whatever instrument he's actively looking at, every 3
+// minutes, to check the OTHER instrument — disruptive while he's mid-
+// analysis or marking levels by hand, independent of the symbol-string bug
+// that was also found and fixed in otherSymbolFor(). Explicit call:
+// "stop switching instruments entirely... only read/change timeframes on
+// whatever instrument you already have open." Disabled by simply never
+// starting its interval — checkPo3SecondarySymbol/otherSymbolFor are left
+// in place (not deleted) in case this is revisited later, but nothing calls
+// them anymore. The PRIMARY PO3 monitor (below) is unaffected — it only
+// ever reads whatever symbol is currently on screen, never switches it.
 function startPo3Monitor() {
   if (po3Monitor.running) return;
   po3Monitor.running = true;
@@ -2290,6 +3023,7 @@ function startPo3Monitor() {
 
 function stopPo3Monitor() {
   if (po3Monitor.interval) { clearInterval(po3Monitor.interval); po3Monitor.interval = null; }
+  if (po3SecondaryMonitor.interval) { clearInterval(po3SecondaryMonitor.interval); po3SecondaryMonitor.interval = null; }
   po3Monitor.running = false;
   broadcast({ type: 'po3-monitor-status', running: false });
   console.log('Power of 3 monitor stopped');
@@ -2362,43 +3096,30 @@ async function gatherPO3Context() {
     }
   }
 
-  // BIAS SOURCE — FIXED 2026-07-29. This previously called ONLY get4HTrend(),
-  // which classifies just 5 bars of 4H with a 60%-of-bars threshold. That
-  // returns 'unclear' in almost any non-trending market, so the HTF gate was
-  // firing permanently and Power of 3 answered "PHASE: UNCLEAR" every single
-  // time — exactly what Anoop reported ("power of 3 always unclear").
-  // The app already computes a far better bias via getTrendForTF(), which
-  // grades ~60 bars and produces the "STRONG BEAR · 60b" read shown in the
-  // Analysis tab. That richer signal was being computed and displayed but
-  // never handed to this agent. Feeding Daily + 1H now, with labels/scores,
-  // so the gate has a real bias to work with instead of a near-permanent
-  // 'unclear'. Daily is primary (matches Core Rule #1: Daily sets bias).
+  // BIAS SOURCE — FIXED 2026-07-29, TIGHTENED 2026-08-17. Originally called
+  // ONLY get4HTrend(), which classified just 5 bars of 4H with a 60%-of-bars
+  // threshold — returned 'unclear' in almost any non-trending market, so the
+  // HTF gate fired permanently and Power of 3 answered "PHASE: UNCLEAR" every
+  // single time. Fixed 07-29 by switching to po3TrendRead() (30 bars,
+  // classifyTrendStrength). 2026-08-17 (Anoop): gate tightened from 4H to 1H
+  // — reacts to a changing bias faster than a 4H read could. Daily is
+  // deliberately never fetched (Core Rule: Anoop reads the daily candle
+  // himself), and 4H is no longer fetched either now that the gate is 1H.
   try {
-    const [h4Read, hourRead] = await Promise.all([
-      po3TrendRead('240').catch(() => null),
-      po3TrendRead('60').catch(() => null)
-    ]);
+    const hourRead = await po3TrendRead('60').catch(() => null);
     parts.push('\n## MECHANICAL BIAS (computed by the app, no AI — this is your bias source)');
-    if (h4Read) {
-      parts.push('4H (BIAS GATE): ' + (h4Read.label || h4Read.direction) +
-        ' | direction=' + h4Read.direction +
-        ' | score=' + (h4Read.score != null ? h4Read.score : 'n/a') +
-        ' | bars=' + (h4Read.bars || 'n/a') +
-        (h4Read.detail ? ' | ' + h4Read.detail : ''));
-    } else {
-      parts.push('4H (BIAS GATE): unavailable');
-    }
     if (hourRead) {
-      parts.push('1H: ' + (hourRead.label || hourRead.direction) +
+      parts.push('1H (BIAS GATE): ' + (hourRead.label || hourRead.direction) +
         ' | direction=' + hourRead.direction +
         ' | score=' + (hourRead.score != null ? hourRead.score : 'n/a') +
-        ' | bars=' + (hourRead.bars || 'n/a'));
+        ' | bars=' + (hourRead.bars || 'n/a') +
+        (hourRead.detail ? ' | ' + hourRead.detail : ''));
     } else {
-      parts.push('1H: unavailable');
+      parts.push('1H (BIAS GATE): unavailable');
     }
-    const bDir = h4Read && h4Read.direction;
+    const bDir = hourRead && hourRead.direction;
     const biasOk = bDir === 'bullish' || bDir === 'bearish';
-    parts.push('GATE: 4H bias is ' + (biasOk ? 'ESTABLISHED (' + bDir + ') — proceed to read the phase on 15m/5m'
+    parts.push('GATE: 1H bias is ' + (biasOk ? 'ESTABLISHED (' + bDir + ') — proceed to read the phase on 15m/5m'
                                              : 'NOT established — phase call must be UNCLEAR'));
     parts.push('NOTE: Daily is deliberately NOT provided — Anoop reads the daily candle himself. Do not claim a daily read.');
   } catch (e) {
@@ -2583,8 +3304,13 @@ const POST_SESSION_ANALYST_PERSONA = `You are the POST-SESSION ANALYST for Anoop
 ## YOUR ROLE
 You fire AFTER a trading session is over and Anoop has uploaded his Performance CSV. Your job is a forensic, numbers-first breakdown of the session. You are NOT a coach or cheerleader — you are an auditor who also gives forward-looking guidance.
 
+## YOU ARE THE SYNTHESIS STEP, NOT THE ONLY ANALYST
+Two things below have already been computed for you by dedicated passes, before you ever see this prompt:
+- A **DETERMINISTIC SESSION SUMMARY** block — the date/trade-count/P&L/win-rate arithmetic, computed by code directly from the day's ledger. Use it verbatim for section 1. Do not recompute or re-derive any figure in it — if your own reading of the raw data would produce a different number, the deterministic block is correct and yours is not.
+- A **PATTERN CHECK FINDINGS** block — the output of focused single-purpose workers, each dispatched ONLY when today's numbers actually crossed a real threshold for that specific failure mode (2026-08-16: orchestrator-workers pattern — see post-session-orchestrator.js). Incorporate their findings into section 6 rather than re-deriving your own read of the same patterns from scratch. If it says no workers triggered, say plainly that none of the documented failure-mode thresholds were tripped today — do not invent a concern to fill the section.
+
 ## OUTPUT FORMAT (strict, always follow this order)
-1. **SESSION SUMMARY** — date, instrument, session window (London/NY), trade count, gross P&L, net P&L (after commission), max intraday drawdown, win rate.
+1. **SESSION SUMMARY** — taken from the DETERMINISTIC SESSION SUMMARY block above, plus instrument and session window (London/NY) if available from the data.
 2. **PLAN ADHERENCE** — Did Anoop write a pre-committed A+ cap before the session? Did he stay inside it? Grade: PASS or FAIL. (Rule #13 & #14: the plan-adherence grade overrides P&L — a green day that broke the cap is a FAIL.)
 3. **RULE-BY-RULE COMPLIANCE** — Go through every applicable rule and score it:
    - Max 2 contracts per entry (rule #2)
@@ -2598,19 +3324,76 @@ You fire AFTER a trading session is over and Anoop has uploaded his Performance 
    Mark each: ✅ COMPLIANT, ⚠️ PARTIAL, or 🚨 VIOLATED — with the specific data point (timestamp, trade #, size) that proves it.
 4. **POSITIVES** — What went right, with evidence. Even on bad days, find the process wins.
 5. **NEGATIVES** — What went wrong, with evidence. No softening. Cite the exact trade(s).
-6. **PATTERN CHECK** — Compare today against Anoop's 6 documented failure modes (trade count escalation, revenge clusters, inverted R:R, holding losers, multi-instrument, accounts up-then-crashed). Flag ANY match.
+6. **PATTERN CHECK** — Built from the PATTERN CHECK FINDINGS block above. Present each triggered worker's finding; if none triggered, say so in one line.
 7. **NEXT SESSION GUIDANCE** — 2-3 concrete, actionable items for tomorrow. Not platitudes — specific behavioral instructions tied to what you found above. If today was a FAIL, the first item should address the primary failure mode.
 
 ## RULES
 - Reference actual numbers from the data — timestamps, P&L, sizes, hold times. No generalizing.
 - If data is missing for a check, say "DATA MISSING — cannot verify" rather than guessing.
 - Commission estimate: $0.59/contract/side (from rules.json).
-- The trader has blown 16 accounts with $0 payouts lifetime. Zero margin for error in your assessment.
+- Goal is the next clean payout, not a spotless record. Zero margin for error in your assessment, especially if this session was on a FUNDED account — an eval breach costs time, a funded breach costs the payout itself.
 - Do NOT give investment advice or trade recommendations. You analyze the session that already happened.
 - Keep the entire review under 600 words. Dense, not padded.`;
 
+// 2026-08-16 (Pattern 04, orchestrator-workers — post-session-orchestrator.js):
+// deterministically decides which focused pattern-check workers today's data
+// actually warrants, then runs them in parallel via the same runDebateAgent()
+// helper the Debate flow already uses. Returns { summaryBlock, findingsBlock }
+// — two markdown strings ready to splice into the synthesis prompt. Never
+// throws: any failure gathering signals degrades to "0 workers, no
+// deterministic summary" rather than blocking the review outright — a
+// post-session review must never fail to render because one signal source
+// was unavailable.
+async function runPostSessionWorkers(abortSignal) {
+  let gr = null, quadrant = null, ckToday = null, biasBlock = '';
+  try {
+    const { parseLS } = jessiActiveBucket();
+    const grHist = parseLS('copilot_gr_history', []) || [];
+    gr = Array.isArray(grHist) && grHist.length ? grHist[grHist.length - 1] : null;
+  } catch (e) {}
+  try {
+    const loaded = biasLoadMatrix();
+    if (loaded) {
+      const today = new Date(Date.now() + 330 * 60 * 1000).toISOString().slice(0, 10);
+      ckToday = (loaded.ckh || []).filter(e => e && e.date === today)[0] || null;
+      const day = biasTracker.dayAdherence(ckToday, (loaded.dt || {})[today], getActiveRules());
+      quadrant = biasTracker.quadrantFor(day, getActiveRules());
+    }
+    biasBlock = biasTodayContext();
+  } catch (e) {}
+
+  const flags = postSessionOrch.detectFlags({ gr, quadrant, ckToday, rules: getActiveRules() });
+  const workers = postSessionOrch.selectWorkers(flags);
+  const summary = postSessionOrch.deterministicSummary(gr);
+  const summaryBlock = summary
+    ? '## DETERMINISTIC SESSION SUMMARY (computed by code, not the model — use verbatim)\n' + summary
+    : '## DETERMINISTIC SESSION SUMMARY\nDATA MISSING — no gr_history entry found for this session.';
+
+  if (!workers.length) {
+    return {
+      summaryBlock,
+      findingsBlock: '## PATTERN CHECK FINDINGS\nNo pattern-check workers triggered — none of the documented failure-mode thresholds were crossed today.'
+    };
+  }
+
+  const grJson = gr ? JSON.stringify(gr) : '{}';
+  const results = await Promise.all(workers.map(w => {
+    const dataContext = w.topic === 'biasAdherence' ? (biasBlock || 'No bias data available.')
+      : w.topic === 'checklistSkip' ? ('Checklist record: ' + JSON.stringify(ckToday || {}))
+      : ('Today\'s session numbers (JSON): ' + grJson);
+    return runDebateAgent(w.persona, 'Assess this specific pattern for today\'s session using only the data given.', dataContext, abortSignal)
+      .then(r => Object.assign({}, w, r));
+  }));
+
+  const findingsBlock = '## PATTERN CHECK FINDINGS (from dedicated focused workers — incorporate, do not re-derive)\n'
+    + results.map(r => `**${r.title}:** ${r.text}`).join('\n\n');
+
+  return { summaryBlock, findingsBlock };
+}
+
 async function handlePostSessionReview(ws, msg) {
   const { reqId } = msg;
+  const abortCtrl = registerRequest(reqId);
 
   // BUGFIX (2026-07-28): same top-level try/catch fix as handleDebateChat —
   // no throw in here used to reach the client, leaving the UI stuck on the
@@ -2621,9 +3404,15 @@ async function handlePostSessionReview(ws, msg) {
     // Gather ALL data
     const parts = [];
 
+    // 2026-08-16: dynamic-worker pattern check runs alongside the rest of the
+    // gathering below — see runPostSessionWorkers() just above.
+    const { summaryBlock, findingsBlock } = await runPostSessionWorkers(abortCtrl.signal);
+    parts.push(summaryBlock);
+    parts.push('\n' + findingsBlock);
+
     // Rules
     const rules = getActiveRules();
-    parts.push('## ACTIVE RULES (rules.json)\n' + JSON.stringify(rules, null, 2));
+    parts.push('\n## ACTIVE RULES (rules.json)\n' + JSON.stringify(rules, null, 2));
 
     // Full account + trade + insights data
     const appData = jessiAppGetData('all');
@@ -2677,11 +3466,27 @@ async function handlePostSessionReview(ws, msg) {
         provider: postSessionPrimary.provider,
         model: postSessionPrimary.model,
         temperature: 0.8,
+        signal: abortCtrl.signal,
         fallbackChain: fallbackChainFor(postSessionPrimary),
         onToken:  (text) => send(ws, { type: 'post-review-token', reqId, text }),
         onDone:   (fullText, answeredBy) => {
-          send(ws, { type: 'post-review-done', reqId, fullText, answeredBy });
-          saveReviewRecord('post-session', fullText, {});
+          // 2026-08-16 (Pattern 01, prompt chaining — the "gate" step):
+          // facts (deterministic summary + worker findings, gathered above)
+          // → draft (this call) → gate. Same verdict-grounding.js used for
+          // the Debate verdict, applied here to the full report against
+          // everything it was actually handed (dataContext, which itself
+          // starts with the deterministic summary/findings blocks).
+          let outText = fullText;
+          try {
+            const grounding = verdictGrounding.checkGrounding(fullText, dataContext, rules);
+            if (!grounding.ok) {
+              outText = fullText + verdictGrounding.groundingWarningBlock(grounding.ungrounded);
+              console.warn('[verdict-grounding] ungrounded figures in post-session report:', grounding.ungrounded.join(', '));
+            }
+          } catch (e) { console.error('[verdict-grounding] check failed:', e.message); }
+
+          send(ws, { type: 'post-review-done', reqId, fullText: outText, answeredBy });
+          saveReviewRecord('post-session', outText, {});
         },
         onError:  (errMsg) => send(ws, { type: 'post-review-error', reqId, message: errMsg })
       }
@@ -2689,6 +3494,8 @@ async function handlePostSessionReview(ws, msg) {
   } catch (e) {
     console.error('[handlePostSessionReview] uncaught error:', e);
     send(ws, { type: 'post-review-error', reqId, message: e.message || 'Post-session review failed unexpectedly.' });
+  } finally {
+    unregisterRequest(reqId);
   }
 }
 
@@ -2722,10 +3529,11 @@ async function handlePostSessionReview(ws, msg) {
 const SCALPER_PERSONA = `You are THE SCALPER — Anoop Habib's specialist scalping coach inside his MNQ Co-Pilot app. You are not Jessi (the general accountability coach) and not the Post-Session Analyst (the forensic auditor). You are the one who understands the CRAFT of scalping AND the greed that destroys it, and your entire value is in spotting the gap between the two in Anoop specifically.
 
 ## WHO ANOOP IS (do not forget any of this)
-- Trades MNQ/MGC micros on a Lucid prop account from Hubballi, India (IST). Currently a $50K EVALUATION, slot s1.
-- Has blown 16 prop accounts (17 bought, 1 active). $0 payouts ever.
-- NEVER state his lifetime spend or net position from memory. Read it from the COST line in the ACCOUNT & TRADE DATA block, which is fed live from his Cost tab, and quote that verbatim. A hardcoded total here had drifted from the real figure and agents were repeating it as fact; it was removed 2026-08-11.
-- EVERY blow-up died the same way: trade-count escalation, revenge re-entries within minutes, sizing UP while already down, holding losers, trading both instruments in one day, and giving back gains after being green.
+- Trades MNQ/MGC micros on a Lucid prop account from Hubballi, India (IST). Read the CURRENT account size and stage (eval/funded) live from the ACCOUNT & TRADE DATA block — do not hardcode a slot or stage here, it drifts.
+- Goal: one clean payout at a time, growing capital from ~$1,000 by rotating that capital through eval attempts into single funded accounts. NOT simultaneous multi-account copy-trading yet — that is a later-stage plan, only raise it if he does.
+- STAGE ASYMMETRY: eval exists to be cleared FAST — time in eval is the cost, not risk. Funded exists to be protected — zero slack on process once funded, because that account is what actually pays out. Coach the pace in eval; coach the discipline in funded. Do not blur the two.
+- NEVER state his lifetime spend, payout total, or net position from memory. Read it from the COST line in the ACCOUNT & TRADE DATA block, which is fed live from his Cost tab, and quote that verbatim. A hardcoded total here had drifted from the real figure and agents were repeating it as fact; it was removed 2026-08-11.
+- EVERY blow-up died the same way: trade-count escalation, revenge re-entries within minutes, sizing UP while already down, holding losers, trading both instruments in one day, and giving back gains after being green. Name the SPECIFIC behavior when it's in today's data — never a running tally of past accounts. He can afford another eval attempt; he cannot afford treating "one more account gone" as proof it's already over.
 - ~83% of his trades are scalps (under 10 minutes). The app runs a Scalper Mode with its own ruleset for exactly this reason.
 - He is a COMPETENT ANALYST and a POOR RISK MANAGER. This is the central fact about him. His marked levels, zones and bias work are usually reasonable. His size, his re-entry timing, and his hold discipline are what kill him. Do not spend your time re-teaching him chart reading — spend it on the execution gap.
 
@@ -2747,7 +3555,7 @@ On the analyst side he asks "where is price likely to go?" On the trader side he
 - **Green P&L is not a defence.** Per his own rule #14 a green day with a broken plan is a FAILED session, full stop. When the market rewarded a violation, say plainly that the reward is the danger — it is the reinforcement that trains the next blow-up. This is the most important thing you do.
 - **Separate "was the level right" from "was the trade right".** Grade them independently, every time. He is allowed to be right about direction and still have taken a bad trade. Tell him which of the two failed.
 - **Be specific about the fix.** Not "size down" but "trades 6 and 7 were 4 contracts against your 2-cap, taken 40s and 11s after a loss — the fix is the 15-minute timer, not smaller size, because size was a symptom of the re-entry urge."
-- **Never help him rationalise.** "High conviction", "it was a clean setup", "I was already in profit", "I only need one more" — every one of these is the sound of the thing that blew 17 accounts. Name it as such, calmly, without moralising.
+- **Never help him rationalise.** "High conviction", "it was a clean setup", "I was already in profit", "I only need one more" — every one of these is the exact sound of a revenge re-entry or a size-up-while-down dressed as reasoning. Name the specific behavior, calmly, without moralising — not a reference to past accounts.
 - **Do not be cruel and do not be soft.** You are an expert peer who takes him seriously enough to be blunt. No lectures, no shaming, no cheerleading.
 
 ## YOUR HARD ENFORCEMENT DUTIES
@@ -3172,8 +3980,16 @@ for (const key of Object.keys(ENGULF_TFS)) {
   engulfMonitors[key] = { running: false, interval: null, lastSignalKey: null, lastCheck: null };
 }
 
+// 2026-08-19 (Anoop: "the live feed should ... be active always ... and
+// notify me when any of the 3 playbook setup appear"): mirrors
+// po3MonitorUserDisabled — a manual OFF must survive a TradingView reconnect,
+// but absent that, this monitor auto-starts the moment TradingView connects,
+// same as PO3 already does, instead of requiring the toggle to be flipped by
+// hand every session.
+let engulfMonitorUserDisabled = false;
 function handleEngulfToggle(msg) {
   const key = ENGULF_TFS[msg.tf] ? msg.tf : '1h';
+  engulfMonitorUserDisabled = !msg.enabled;
   if (msg.enabled) {
     startEngulfMonitor(key);
   } else {
@@ -3383,8 +4199,12 @@ for (const k of Object.keys(FVG_TFS)) {
   fvgMonitors[k] = { running: false, interval: null, lastSignalKey: null, lastCheck: null };
 }
 
+// 2026-08-19: same auto-start-unless-user-disabled pattern as
+// engulfMonitorUserDisabled/po3MonitorUserDisabled above.
+let fvgMonitorUserDisabled = false;
 function handleFVGToggle(msg) {
   const key = FVG_TFS[msg.tf] ? msg.tf : '30m';
+  fvgMonitorUserDisabled = !msg.enabled;
   if (msg.enabled) startFVGMonitor(key); else stopFVGMonitor(key);
 }
 
@@ -3514,14 +4334,107 @@ function timeframeMatches(reported, requested) {
 // order. This was a live risk the moment runMechanicalAnalysis started
 // Promise.all-ing a Daily and a 1H read. Serialize every caller through one
 // promise chain so only one chart switch is ever in flight.
-let _chartOpChain = Promise.resolve();
-function withChartLock(fn) {
-  const run = _chartOpChain.then(fn, fn);
-  // Keep the chain alive even if this op rejects, and don't leak the error
-  // into the next caller.
-  _chartOpChain = run.then(() => {}, () => {});
-  return run;
+//
+// 2026-08-19 BUG FIX (found live, Anoop's own multi-hour soak test — exactly
+// what it was for): this had NO timeout. Every caller — pollTVBrokerAccount,
+// the startup self-test, PO3/Engulf/SFP monitors, everything chart-related —
+// routes through this same chain. If a single locked operation ever hung
+// (a CDP hiccup, a stuck response that never resolves NOR rejects), every
+// future call queued up behind it FOREVER, silently — confirmed live: zero
+// real log activity for ~3 hours while TradingView/CDP itself was verified
+// completely healthy via an independent connection the whole time, and the
+// process itself stayed alive (an unrelated setInterval kept ticking),
+// so even the HTTP-liveness watchdog would never have caught this — the
+// server answered :7433 fine, it was just internally deadlocked. This is a
+// second, distinct class of silent failure from Bug 5 (the server process
+// itself dying) — the process survives, but the one shared resource every
+// live-feed caller depends on does not.
+const LOCK_TIMEOUT_MS = 30000; // generous — real chart/broker ops finish in a few seconds; this exists purely so ONE stuck call can never again freeze every future poll/monitor for hours
+
+// 2026-08-19 BUG FIX #2 (found live, same soak test, same session): giving
+// EVERY caller — chart-timeframe-switching monitors (PO3/Engulf/SFP/
+// getFullBars) AND the broker-feed poll/self-test/order-confirm — one
+// single shared lock meant they contended for it even though most of them
+// have no actual reason to serialize against each other. Confirmed live:
+// a real stop-loss fill closed Anoop's position at 15:34:59 IST; the broker
+// poll's OWN call queued up behind several chart-timeframe-switch operations
+// (PO3/Engulf/SFP/key-level checks, all mid-flight around a volatile moment)
+// and didn't get to run — and therefore didn't record the close — until
+// ~4 minutes later, well outside his explicit "within a minute" requirement.
+// The timeout fix above (Bug 9) stopped this from hanging forever, but a
+// 30s-capped wait behind up to ~5 queued chart operations can still add up
+// to minutes — capping the wait isn't the same as removing the contention.
+//
+// The ORIGINAL 2026-07-28 chart-lock comment's actual concern was narrower
+// than "share one lock for everything": overlapping TIMEFRAME SWITCHES
+// corrupting each other (getFullBars A/B racing), and — per the 2026-08-17
+// addition — a broker poll interleaving mid-ORDER-PLACEMENT specifically.
+// Neither of those requires the broker feed to also wait behind PO3's
+// timeframe switches. Split into two independent locks: `withChartLock`
+// stays for anything that switches/reads chart timeframe or symbol
+// (getFullBars, getBarsAndLabels, the PO3 secondary-symbol switch);
+// `withBrokerLock` is new, used ONLY by the broker-feed poll, the self-test's
+// broker/quote reads, and order confirm/placement — exactly the set of
+// callers that genuinely must not interleave with EACH OTHER, and nothing
+// else. The broker feed can now update within one 10s poll cycle even while
+// a chart monitor is mid-timeframe-switch.
+function makeLock(name) {
+  let chain = Promise.resolve();
+  let timeoutStreak = 0;
+  return function withLock(fn) {
+    // 2026-08-19: captured synchronously, at the moment of the CALL, not the
+    // moment of the (much later) timeout — this is the one piece of
+    // information that's been missing while chasing the unhandled-rejection
+    // crash: every timeout error looks identical ("operation exceeded
+    // 30000ms"), so the crash log alone can't say WHICH of the ~8 call sites
+    // sharing this lock was actually the unhandled one. Appended to the
+    // timeout error's own stack below so the next occurrence is diagnosable
+    // from the log directly instead of guessed at.
+    const callerStack = new Error().stack;
+    const run = chain.then(fn, fn);
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        timeoutStreak++;
+        console.error(`[${name}] operation exceeded ${LOCK_TIMEOUT_MS}ms (streak: ${timeoutStreak}) — releasing the lock for the next caller instead of freezing the whole live feed. The original call may still complete in the background; its result is discarded.`);
+        const err = new Error(`${name}: operation exceeded ${LOCK_TIMEOUT_MS}ms`);
+        err.stack += '\n--- withLock() was CALLED from ---\n' + callerStack;
+        reject(err);
+      }, LOCK_TIMEOUT_MS);
+    });
+    const winner = Promise.race([run, timeout]);
+    // Chain advances on whichever settles first. If `run` itself eventually
+    // settles after we've already moved on (post-timeout), its result/error
+    // is deliberately ignored here — swallowed so it can never become an
+    // unhandled rejection — a future caller must never wait on a call this
+    // function already gave up on.
+    run.then(() => clearTimeout(timer), () => clearTimeout(timer));
+    run.catch(() => {});
+    chain = winner.then(
+      () => { timeoutStreak = 0; },
+      () => {} // rejection (including our own timeout) still advances the chain — never gets permanently stuck on one bad link
+    );
+    // 2026-08-19 BUG FIX (found live, same session, same day): a timeout
+    // still crashed the process with an unhandled-rejection log line despite
+    // the guards above — because THOSE guards attach handlers to `run` and to
+    // a *derived* promise (`chain = winner.then(...)`), not to `winner`
+    // itself, the exact value returned to the caller. If a caller ever
+    // invokes withChartLock/withBrokerLock without awaiting or catching the
+    // result (a fire-and-forget call, which existed among today's monitor
+    // callers), `winner`'s own rejection has zero handlers attached to IT
+    // specifically and Node reports it as unhandled — confirmed live,
+    // moments after the split above shipped. Attaching a no-op `.catch()`
+    // directly to `winner` guarantees it always has at least one handler,
+    // regardless of what any caller does, while the SAME `winner` object is
+    // still returned below — a well-behaved caller's own `await`/`.catch()`
+    // on it keeps working exactly as before; this only closes the gap for
+    // callers that don't.
+    winner.catch(() => {});
+    return winner;
+  };
 }
+const withChartLock = makeLock('withChartLock');
+const withBrokerLock = makeLock('withBrokerLock');
 
 async function getFullBars(tfCode, count) {
   return withChartLock(() => _getFullBarsUnlocked(tfCode, count));
@@ -3742,8 +4655,15 @@ for (const k of Object.keys(SFP_TFS)) {
   sfpMonitors[k] = { running: false, interval: null, lastCheck: null, lastSweepKey: null, lastConfirmKey: null, pending: null };
 }
 
+// 2026-08-19: same auto-start-unless-user-disabled pattern as
+// engulfMonitorUserDisabled/po3MonitorUserDisabled above. This is Playbook B
+// (SFP + FVG / liquidity raid) — one of the 3 playbook setups the checklist
+// tracks, so "notify me when any of the 3 playbook setups appear" needs this
+// one running by default too, not just PO3.
+let sfpMonitorUserDisabled = false;
 function handleSFPToggle(msg) {
   const key = SFP_TFS[msg.tf] ? msg.tf : '30m';
+  sfpMonitorUserDisabled = !msg.enabled;
   if (msg.enabled) startSFPMonitor(key); else stopSFPMonitor(key);
 }
 
@@ -4510,6 +5430,36 @@ function stopNewsTracking() {
   if (newsInterval) { clearInterval(newsInterval); newsInterval = null; }
 }
 
+// ── End-Day autosave fallback (2026-08-18) ──────────────────────────────────
+// Anoop: "if I forget to save it should autosave at 8pm IST daily." endDay()
+// itself is a client-side function (it reads live UI state/localStorage), so
+// this server-side timer can only ask the client to run it — it broadcasts a
+// trigger once IST clock time crosses 20:00 for a NEW IST calendar day, and
+// the client (app.js) checks that account's own `lastEndDay` meta field
+// before actually calling endDay(), so a manual End Day click earlier that
+// day makes this a no-op, not a duplicate save. dataEndDay() itself writes to
+// a fixed per-date filename (see dataEndDay() above) so even a genuine
+// double-call overwrites the same record rather than appending a duplicate.
+let endDayAutosaveInterval = null;
+let endDayAutosaveFiredForDate = null;
+function endDayAutosaveIstNow() {
+  const p = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false
+  }).formatToParts(new Date());
+  const g = t => (p.find(x => x.type === t) || {}).value;
+  return { date: `${g('year')}-${g('month')}-${g('day')}`, hour: Number(g('hour')) };
+}
+function checkEndDayAutosave() {
+  const { date, hour } = endDayAutosaveIstNow();
+  if (hour < 20 || endDayAutosaveFiredForDate === date) return;
+  endDayAutosaveFiredForDate = date;
+  broadcast({ type: 'auto-end-day-trigger', date });
+}
+function startEndDayAutosaveWatch() {
+  checkEndDayAutosave(); // covers a restart that happens after 8pm the same day
+  endDayAutosaveInterval = setInterval(checkEndDayAutosave, 5 * 60 * 1000);
+}
+
 // ── Session pre-open prep (mechanical, no LLM) ──────────────────────────────
 // 10 minutes before London (1:30 PM IST) and NY (7:00 PM IST) session opens,
 // auto-run the same PDH/PDL + Asia H/L zone marking as the manual "Mark
@@ -4578,10 +5528,47 @@ async function startMCP() {
     // button. Now it tracks both — either going false flips the indicator off.
     mcpBridge.on('connected',     ()    => broadcast({ type: 'mcp-status', connected: mcpBridge.ready && mcpBridge.tvConnected }));
     mcpBridge.on('disconnected',  ()    => broadcast({ type: 'mcp-status', connected: false, message: 'TradingView bridge disconnected' }));
-    mcpBridge.on('tv-connected',  ()    => broadcast({ type: 'mcp-status', connected: true }));
-    mcpBridge.on('tv-disconnected', (detail) => broadcast({ type: 'mcp-status', connected: false, message: 'TradingView disconnected' + (detail ? ': ' + detail : '') }));
-    if (mcpBridge.ready) return;
+    mcpBridge.on('tv-connected',  ()    => {
+      broadcast({ type: 'mcp-status', connected: true });
+      // 2026-08-17 (Anoop: "keep a watch for me full time as long as
+      // tradingview is connected"): auto-start the free, mechanical PO3
+      // monitor the moment TradingView is reachable, instead of requiring
+      // the P3 Monitor toggle to be flipped by hand every session. Idempotent
+      // — startPo3Monitor() no-ops if already running. Skipped if Anoop
+      // explicitly turned it off (po3MonitorUserDisabled) — a reconnect must
+      // never override that choice.
+      if (!po3MonitorUserDisabled) startPo3Monitor();
+      // 2026-08-19 (Anoop: "the live feed should ... be active always"):
+      // same auto-start-on-connect treatment for the other 2 of the 3
+      // playbook-setup monitors (SFP+FVG/liquidity-raid is Playbook B,
+      // started via startSFPMonitor; Engulfing+TF via startEngulfMonitor).
+      // Each is independently idempotent and independently respects its own
+      // *MonitorUserDisabled flag, exactly like PO3 above.
+      if (!engulfMonitorUserDisabled) startEngulfMonitor('1h');
+      if (!sfpMonitorUserDisabled) startSFPMonitor('30m');
+      // 2026-08-19: re-run the self-test on every reconnect, not just once at
+      // boot — a reconnect can land with the Trading Panel no longer open or
+      // linked, and that's exactly the state this test exists to catch.
+      // Same 15s delay as the initial run: give TradingView a moment to
+      // finish rendering after the CDP handshake before probing it.
+      scheduleLiveFeedSelfTest(15000);
+    });
+    mcpBridge.on('tv-disconnected', (detail) => {
+      tvBrokerFeedReadOk = null; // force a fresh readable/not-readable log line once CDP comes back, don't trust the pre-drop state
+      broadcast({ type: 'mcp-status', connected: false, message: 'TradingView disconnected' + (detail ? ': ' + detail : '') });
+    });
+    if (mcpBridge.ready) {
+      if (mcpBridge.tvConnected && !po3MonitorUserDisabled) startPo3Monitor(); // already connected before this call — 'tv-connected' won't fire again
+      if (mcpBridge.tvConnected && !engulfMonitorUserDisabled) startEngulfMonitor('1h');
+      if (mcpBridge.tvConnected && !sfpMonitorUserDisabled) startSFPMonitor('30m');
+      if (mcpBridge.tvConnected) scheduleLiveFeedSelfTest(15000);
+      return;
+    }
     await mcpBridge.start();
+    if (mcpBridge.tvConnected && !po3MonitorUserDisabled) startPo3Monitor(); // covers a start() that resolves already-connected, race-safe alongside the event listener
+    if (mcpBridge.tvConnected && !engulfMonitorUserDisabled) startEngulfMonitor('1h');
+    if (mcpBridge.tvConnected && !sfpMonitorUserDisabled) startSFPMonitor('30m');
+    if (mcpBridge.tvConnected) scheduleLiveFeedSelfTest(15000);
   } catch (err) {
     broadcast({ type: 'mcp-status', connected: false, message: 'TradingView MCP: ' + err.message });
   }
@@ -4596,6 +5583,504 @@ function startTradovate() {
   const cfg = loadConfig();
   tradovate.stop();
   if (cfg.tvEnabled && cfg.tvName) tradovate.start(cfg, snap => broadcast({ type: 'tradovate-account', ...snap }));
+}
+
+// ── TradingView-sourced live broker feed (2026-08-17) ───────────────────────
+// Anoop: "can we use tradingview as live feed?" — checked live against his
+// real Tradeify account (Tradovate white-label). TradingView Desktop's
+// Trading Panel renders a linked broker's positions/orders/account summary
+// as plain semantic <table> elements (data-name="TRADOVATE.positions-table"
+// etc.), not canvas — fully readable via the existing CDP bridge, no
+// Tradovate REST API credentials needed at all. See
+// tradingview-mcp/src/core/trading.js for the confirmed DOM structure.
+//
+// 2026-08-17: live-wired into the guardrail via tv-broker-feed.js's fold() —
+// balance-delta-at-flat (account balance right after a position returns to
+// flat, minus balance the last time it was flat) is the only realized-P&L
+// source trading.js's getAccountSummary() actually confirmed against the DOM
+// (a Filled order's own row carries no realized-P&L column). See
+// tv-broker-feed.js's header comment: this fold is unit-tested but the
+// balance-delta math itself is STILL UNVERIFIED against a real non-zero-P&L
+// closed trade — re-confirm against the next real fill before trusting the
+// numbers beyond the guardrail's own use.
+// 2026-08-19 BUG FIX (found live, on Anoop's own first real test trade of the
+// day): tvBrokerFeedState lived ONLY in memory. A restart at any point after
+// a round-trip closed but before the position it was tracking closes again
+// wiped the fold's dayPnl/tradeCount/trades back to freshState() — the
+// restart's first poll would find the account already flat and establish
+// THAT as the baseline, having never observed the earlier not-flat→flat
+// transition, so that trade became permanently invisible to the live feed.
+// Confirmed exactly this: Anoop closed a round trip at 12:58:29 IST, this
+// server restarted twice after that (13:06:47, 13:14:53 IST) — both times
+// the HUD still read "0 trades" despite the broker's orders table showing 3
+// real fills. Every other per-slot dataset (ledger, gr_history, etc.) is
+// already mirrored to disk (see saveActiveBucket()'s 2026-08-18 fix in
+// app.js for the same class of bug on the client side) — this was the one
+// piece of live-trading state that wasn't. Persisted via dataSave/dataLoad
+// (existing atomic-write pattern) to a single global file, not per-slot,
+// since there is exactly one real broker account regardless of which
+// virtual eval/funded slot is currently selected in the UI.
+const TV_BROKER_STATE_KEY = 'tv_broker_feed_state';
+function loadTVBrokerFeedState() {
+  try {
+    const saved = dataLoad(TV_BROKER_STATE_KEY);
+    // freshState()'s own dayKeyMs check in fold() already discards a stale
+    // (yesterday's) state on the first fold() call of a new day — restoring
+    // it here unconditionally and letting fold() do that comparison is
+    // simpler and less error-prone than duplicating the day-rollover logic.
+    if (saved && typeof saved === 'object' && Array.isArray(saved.trades)) return saved;
+  } catch (e) {}
+  return tvBrokerFeed.freshState();
+}
+function persistTVBrokerFeedState() {
+  try { dataSave(TV_BROKER_STATE_KEY, tvBrokerFeedState); } catch (e) {}
+}
+
+let tvBrokerMonitorTimer = null;
+let tvBrokerSeenOrderIds = new Set(); // high-water mark so a fill is only ever "new" once
+// NOT loadTVBrokerFeedState() here — DATA_DIR isn't finalized until
+// initDataDir() runs inside the httpServer.listen() startup callback below
+// (it can redirect to a different real directory). Loading here, at module
+// top-level, would read from the pre-initDataDir() fallback path while
+// persistTVBrokerFeedState() later saves to the real one — save and load
+// would silently point at two different directories, and the restore would
+// never find what was actually saved. Real state is loaded explicitly right
+// after initDataDir() runs (search loadTVBrokerFeedState() below).
+let tvBrokerFeedState = tvBrokerFeed.freshState();
+let tvBrokerFeedReadOk = null; // null = never polled yet; tracks state so log lines only fire on transitions, not every 10s
+let tvBrokerOrdersSuspectLogged = false; // tracks the orders-table-empty-but-position-open transition, same log-once-per-state pattern
+const TV_BROKER_POLL_MS = 10000;
+
+async function pollTVBrokerAccount() {
+  if (!mcpBridge.ready || !mcpBridge.tvConnected) return;
+  try {
+    // 2026-08-17 (Eng review finding, Phase 2b): this read shares the same
+    // CDP/page context as placeMarketOrder()'s multi-second click sequence
+    // (handleTradeConfirm, below) — without serialization, a poll landing
+    // mid-order could interleave with order-placement clicks. Routed through
+    // the same withChartLock every other chart-mutating caller already uses.
+    const raw = await withBrokerLock(() => mcpBridge.callTool('trading_get_account', {}));
+    const text = (raw && raw.content) ? raw.content.map(c => c.text || '').join('') : null;
+    const result = text ? JSON.parse(text) : null;
+    if (!result || !result.success) {
+      // CDP to the chart can be up (mcpBridge.tvConnected=true) while the
+      // Trading Panel/broker isn't actually open or linked — trading.js's
+      // getAccountSummary() returns success:false in that case. Surface it
+      // instead of silently no-opping, so the UI can distinguish "no new
+      // trades" from "the broker feed isn't actually being read."
+      const reason = (result && result.error) || 'broker panel not found (Trading Panel not open or broker not linked)';
+      if (tvBrokerFeedReadOk !== false) console.warn('[tv-broker] broker feed NOT readable: ' + reason);
+      tvBrokerFeedReadOk = false;
+      broadcast({
+        type: 'tv-broker-account',
+        success: false,
+        connected: false,
+        reason
+      });
+      return;
+    }
+    // 2026-08-18 BUG FIX (found live: 3 real trades recorded as ZERO).
+    // trading_get_account's own `success` is hardcoded true and says nothing
+    // about whether the positions/orders tables were actually FOUND in the
+    // DOM. The check above therefore always passed. Critically, `positions`
+    // below is an empty array BOTH when the account is genuinely flat AND
+    // when the positions table could not be read at all — and isFlat is
+    // derived from it. An unreadable table thus looked like "flat" forever,
+    // the fold's not-flat→flat transition never fired, and no trade was ever
+    // recorded no matter how many were actually taken.
+    //
+    // Flatness is only knowable if the positions table was genuinely read.
+    // If it wasn't, refuse to fold — a wrong "flat" corrupts the guardrail's
+    // trade count, day P&L and size-after-loss state, which are the things
+    // standing between Anoop and a blown account. Report it loudly instead.
+    const positionsReadable = !!(result.positions && result.positions.success);
+    if (!positionsReadable) {
+      const reason = 'positions table not readable — cannot determine flat/open state, so trades CANNOT be counted. Open the Trading Panel\'s Positions tab in TradingView.';
+      if (tvBrokerFeedReadOk !== false) console.warn('[tv-broker] ' + reason);
+      tvBrokerFeedReadOk = false;
+      broadcast({ type: 'tv-broker-account', success: false, connected: false, reason });
+      return;
+    }
+    if (tvBrokerFeedReadOk !== true) console.log('[tv-broker] broker feed readable — positions/orders tables found, trade tracking is live');
+    tvBrokerFeedReadOk = true;
+
+    const orders = (result.orders && result.orders.orders) || [];
+    // 2026-08-19 BUG FIX (found live, on Anoop's own first real test trade
+    // today): the orders table can read as genuinely EMPTY
+    // ("There is no trading data here yet") while the positions table
+    // simultaneously shows a real open position from a filled entry order —
+    // an impossible combination (a position cannot exist without at least
+    // one filled order that created it). Observed live: 1 open MNQU6 long,
+    // 0 rows in the orders table. tradingview-mcp's own header comment
+    // assumed all 4 panel tables are always populated regardless of which
+    // tab is showing — this proves that assumption doesn't always hold (the
+    // Orders tab likely needs to have been visited/rendered at least once).
+    // Trusting an empty `orders` here as ground truth would make the
+    // brokerFilledCount reconciliation (below) permanently under-count and
+    // fire a false MISMATCH banner the moment this position closes — exactly
+    // the kind of false alarm that erodes trust in the whole feed. Treat
+    // this specific combination as "orders table stale/unreadable", not as
+    // "zero orders happened".
+    const ordersTableSuspect = orders.length === 0 && (result.positions.positions || []).length > 0;
+    if (ordersTableSuspect && tvBrokerOrdersSuspectLogged !== true) {
+      console.warn('[tv-broker] orders table read as empty while a position is open — treating orders-derived counts as unreliable this poll (likely the Orders tab has not been rendered yet in TradingView). Open the Orders tab once to populate it.');
+      tvBrokerOrdersSuspectLogged = true;
+    } else if (!ordersTableSuspect) {
+      tvBrokerOrdersSuspectLogged = false;
+    }
+    // 2026-08-19 (Anoop pushed back, correctly, on "permanently invisible" —
+    // the data to fix this was right there in the orders table). One-time-
+    // per-day backfill of the trade COUNT/side/size/prices for round trips
+    // that fully closed before THIS server instance ever polled — the exact
+    // gap the balance-delta fold can't close by design. $ P&L is deliberately
+    // NOT computed for these (see tv-broker-feed.js's
+    // reconstructClosedTradesFromOrders header comment — no verified
+    // per-contract multiplier exists in this codebase; inventing one would
+    // trade a visible gap for an invisible wrong number). Gated by
+    // backfillDone, persisted, so a later restart never re-runs this and
+    // double-counts against trades the live fold has since observed for
+    // real. Skipped while ordersTableSuspect — backfilling from a table
+    // that's stale/not-yet-rendered would just reconstruct nothing or, worse,
+    // a wrong partial history.
+    if (!ordersTableSuspect && !tvBrokerFeedState.backfillDone) {
+      const backfillDayKeyMs = tvBrokerFeed.istDayStartMs(Date.now());
+      const backfilled = tvBrokerFeed.reconstructClosedTradesFromOrders(orders, backfillDayKeyMs);
+      if (backfilled.length) {
+        console.log(`[tv-broker] backfilled ${backfilled.length} closed trade(s) from order history (side/size/prices only — $ P&L NOT computed, check the broker's own numbers): ` +
+          backfilled.map(t => `${t.side} ${t.size}x ${t.entryPrice}->${t.exitPrice}`).join(', '));
+      }
+      tvBrokerFeedState = {
+        ...tvBrokerFeedState,
+        dayKeyMs: backfillDayKeyMs,
+        trades: [...backfilled, ...tvBrokerFeedState.trades],
+        tradeCount: tvBrokerFeedState.tradeCount + backfilled.length,
+        backfillDone: true,
+      };
+      persistTVBrokerFeedState();
+    }
+
+    const filled = orders.filter(tvBrokerFeed.isFilledOrderRow);
+    const newFills = filled.filter(o => o['Order ID'] && !tvBrokerSeenOrderIds.has(o['Order ID']));
+    if (newFills.length) {
+      newFills.forEach(o => tvBrokerSeenOrderIds.add(o['Order ID']));
+      console.log(`[tv-broker] ${newFills.length} new filled order(s) detected: ` +
+        newFills.map(o => `${o.Symbol} ${o.Side} x${o['Filled Qty'] || o.Qty}`).join(', '));
+    }
+
+    const positions = (result.positions && result.positions.positions) || [];
+    const isFlat = !positions.length;
+    const openSize = positions.reduce((m, p) => Math.max(m, Math.abs(Number(p.Qty) || 0)), 0);
+    const balanceRaw = result.summary && result.summary.header ? result.summary.header.balance : null;
+    const balance = tvBrokerFeed.parseBalance(balanceRaw);
+    const prevTradeCount = tvBrokerFeedState.tradeCount;
+    // 2026-08-19: hasNewFill ties the poll-aliasing backstop to real evidence
+    // (this same poll's orders-table read found a genuinely new Filled
+    // order) instead of firing on any balance movement — see fold()'s
+    // 2026-08-19 comment for the live incident (Balance drifting on its own
+    // while genuinely flat, fabricating 20 fake trades) this closes.
+    tvBrokerFeedState = tvBrokerFeed.fold(tvBrokerFeedState, { balance, isFlat, openSize, nowMs: Date.now(), hasNewFill: newFills.length > 0 });
+    // Every poll, not just on a trade close — sizeSeenThisTrade/wasFlat/
+    // balanceAtLastFlat all need to survive a restart mid-trade too, not
+    // only the completed-trades list, or a restart during an OPEN position
+    // would lose the "last known flat balance" reference point the eventual
+    // close needs to compute P&L against.
+    persistTVBrokerFeedState();
+    if (tvBrokerFeedState.tradeCount > prevTradeCount) {
+      const newTrades = tvBrokerFeedState.trades.slice(prevTradeCount);
+      console.log(`[tv-broker] ${newTrades.length} trade(s) closed (balance-delta-at-flat, unverified live): ` +
+        newTrades.map(t => `size ${t.size} pnl ${t.pnl.toFixed(2)}`).join(', '));
+
+      // 2026-08-19 (Anoop's request, scoped decision same day): live
+      // pattern-matching against his own documented failure history, F1
+      // first (trade-count escalation via win count — see
+      // mistake-patterns.js's header for why this isn't the same signal as
+      // rules.json's tradesPerDay cap). Checked only when the trade count
+      // just changed (not every 10s poll), advisory only — fires once per
+      // day, persisted so a restart never re-fires it mid-session.
+      if (!tvBrokerFeedState.f1AdvisoryFired) {
+        const f1 = mistakePatterns.checkTradeCountEscalation(tvBrokerFeedState.trades);
+        if (f1.matched) {
+          console.log('[mistake-pattern] F1 fired: ' + f1.message);
+          tvBrokerFeedState = { ...tvBrokerFeedState, f1AdvisoryFired: true };
+          persistTVBrokerFeedState();
+          broadcast({ type: 'mistake-pattern', pattern: 'F1', message: f1.message, winCount: f1.winCount });
+        }
+      }
+    }
+
+    // Phase 2a shadow-mode (2026-08-17, see PHASE2_SEMI_AUTONOMOUS_SPEC.md):
+    // logs what the trade-confirm rule-check WOULD decide for a hypothetical
+    // next trade at rules.json's sizeCap, against real live-feed state, every
+    // poll. Nothing reads this decision, nothing calls placeMarketOrder with
+    // it — purely observational, so its behavior can be validated against a
+    // real trading day before Phase 2b ever wires it to anything that acts.
+    try {
+      const activeRules = getActiveRules();
+      const shadowCheck = tradeConfirmRules.checkTradeAllowed(activeRules, currentMode, tvBrokerFeedState.trades, activeRules.sizeCap);
+      if (!shadowCheck.allowed) {
+        console.log(`[trade-confirm-shadow] would BLOCK a ${activeRules.sizeCap}-size trade right now: ${shadowCheck.reason}`);
+      }
+    } catch (e) {
+      console.warn('[trade-confirm-shadow] evaluation failed:', e.message);
+    }
+
+    // 2026-08-19 (SEMI_AUTONOMOUS_SYSTEM_PLAN.md item 3, trade-count leg):
+    // fold()'s tradeCount comes from INFERRED flat-transitions/balance deltas
+    // — the same inference logic that missed 3 real trades before the
+    // 2026-08-18 fixes. The orders table's own Filled-status rows are a
+    // separate, independent, literal count straight from the broker, so
+    // comparing them catches a future regression in the fold logic the same
+    // way the balance-delta reconciliation already catches drift there.
+    // VISIBILITY ONLY per this task's instruction — s.live.tradeCount / the
+    // fold's enforcement path are deliberately NOT changed here.
+    // Honest caveat: a single closed round trip can show as 2 filled rows
+    // (one to open, one to close/flatten), so this is not guaranteed to be a
+    // clean 1:1 match even when nothing is wrong — it is still useful as a
+    // "did the count move together" signal, which is what 0-tolerance means
+    // here: flag any difference and let Anoop's eyes judge it, don't try to
+    // silently normalize entry/exit pairing on his behalf.
+    const brokerFilledCount = filled.length;
+    const foldTradeCount = tvBrokerFeedState.tradeCount;
+    // ordersTableSuspect (above): don't compare a known-stale orders read
+    // against the fold's count — that would be comparing real data to a
+    // table that hasn't rendered yet, guaranteed to look like a mismatch.
+    const tradeCountMismatch = !ordersTableSuspect && brokerFilledCount !== foldTradeCount;
+
+    broadcast({
+      type: 'tv-broker-account',
+      success: true,
+      summary: result.summary,
+      positions: result.positions,
+      orders: result.orders,
+      newFillCount: newFills.length,
+      connected: true,
+      tradeCountMismatch,
+      ordersTableSuspect,
+      brokerFilledCount,
+      foldTradeCount,
+      tradeCount: tvBrokerFeedState.tradeCount,
+      dayPnl: tvBrokerFeedState.dayPnl,
+      maxSize: tvBrokerFeedState.maxSize,
+      lastLossTs: tvBrokerFeedState.lastLossTs,
+      trades: tvBrokerFeedState.trades
+    });
+  } catch (e) {
+    console.warn('[tv-broker] poll failed:', e.message);
+  }
+}
+function startTVBrokerMonitor() {
+  if (tvBrokerMonitorTimer) clearInterval(tvBrokerMonitorTimer);
+  tvBrokerMonitorTimer = setInterval(pollTVBrokerAccount, TV_BROKER_POLL_MS);
+  pollTVBrokerAccount(); // don't make the client wait a full cycle for the first read
+}
+function stopTVBrokerMonitor() {
+  if (tvBrokerMonitorTimer) { clearInterval(tvBrokerMonitorTimer); tvBrokerMonitorTimer = null; }
+}
+
+// ── Startup/reconnect self-test (2026-08-19, SEMI_AUTONOMOUS_SYSTEM_PLAN.md item 2) ──
+// "The app opened" and "the live feed actually works" are different facts —
+// this makes the second one a stated result instead of something Anoop has to
+// squint at 3 screens to guess. Named 4-link in the plan doc but is really 3
+// checks: CDP was already covered live by the existing mcp-status indicator,
+// so this only re-derives it (cheap, no extra call) rather than re-testing it.
+let liveFeedSelfTestTimer = null;
+async function runLiveFeedSelfTest() {
+  const failures = [];
+  let passed = 0;
+  const total = 3;
+
+  // Check 1: CDP reachable — already tracked continuously by mcpBridge, this
+  // just folds it into the same PASS/FAIL report rather than re-probing.
+  if (mcpBridge.ready && mcpBridge.tvConnected) {
+    passed++;
+  } else {
+    failures.push('CDP: TradingView chart connection not established');
+  }
+
+  // Check 2: broker panel readable — reuses getAccount()'s degraded/unreadable
+  // fields (trading.js) via the same trading_get_account call pollTVBrokerAccount
+  // already makes, routed through the same withBrokerLock (2026-08-19: split
+  // from withChartLock — see that split's header comment) so this can't race
+  // a concurrent poll or order placement, without also queuing behind
+  // unrelated chart-timeframe-switch monitor activity.
+  try {
+    const raw = await withBrokerLock(() => mcpBridge.callTool('trading_get_account', {}));
+    const text = (raw && raw.content) ? raw.content.map(c => c.text || '').join('') : null;
+    const result = text ? JSON.parse(text) : null;
+    const positionsOk = !!(result && result.positions && result.positions.success);
+    const ordersOk = !!(result && result.orders && result.orders.success);
+    const summaryOk = !!(result && result.summary && result.summary.success);
+    if (result && result.success && positionsOk && ordersOk && summaryOk) {
+      passed++;
+    } else {
+      const unreadable = (result && result.unreadable) ||
+        ['positions', 'orders', 'summary'].filter((k, i) => ![positionsOk, ordersOk, summaryOk][i]);
+      failures.push('Broker panel: unreadable — ' + (unreadable.join(', ') || 'unknown reason') + ' (open the Trading Panel in TradingView)');
+    }
+  } catch (e) {
+    failures.push('Broker panel: check threw — ' + e.message);
+  }
+
+  // Check 3: synthetic fresh-quote check — a quote_get that returns real,
+  // non-error, non-stale data proves the chart itself (not just the broker
+  // panel) is actually alive and rendering current bars, not frozen/blank.
+  try {
+    const raw = await withBrokerLock(() => mcpBridge.callTool('quote_get', {}));
+    const text = (raw && raw.content) ? raw.content.map(c => c.text || '').join('') : null;
+    const result = text ? JSON.parse(text) : null;
+    const hasPrice = !!(result && result.success && (typeof result.last === 'number' || typeof result.close === 'number'));
+    if (hasPrice) {
+      passed++;
+    } else {
+      failures.push('Quote: ' + ((result && result.error) || 'no readable price returned (chart may be loading/blank)'));
+    }
+  } catch (e) {
+    failures.push('Quote: check threw — ' + e.message);
+  }
+
+  const resultMsg = { type: 'live-feed-self-test', passed, total, failures, at: Date.now() };
+  console.log(`[self-test] live feed: ${passed}/${total} checks passed` + (failures.length ? ' — ' + failures.join(' | ') : ''));
+  broadcast(resultMsg);
+  return resultMsg;
+}
+function scheduleLiveFeedSelfTest(delayMs) {
+  if (liveFeedSelfTestTimer) clearTimeout(liveFeedSelfTestTimer);
+  liveFeedSelfTestTimer = setTimeout(() => {
+    liveFeedSelfTestTimer = null;
+    runLiveFeedSelfTest().catch(e => console.warn('[self-test] failed to run:', e.message));
+  }, delayMs == null ? 15000 : delayMs);
+}
+
+// ── Phase 2b: trade confirm/execute (2026-08-17) ────────────────────────────
+// See PHASE2_SEMI_AUTONOMOUS_SPEC.md. Enforcement lives HERE, server-side —
+// a disabled Confirm button in the browser is a courtesy, not a guarantee;
+// this is the only place that can actually call trading_place_market_order,
+// and it re-checks independently every time regardless of what the client
+// already believes.
+//
+// Double-submit guard (Eng review's top-flagged bug, 2026-08-17): the
+// requestId-seen check and the mark-as-seen write happen SYNCHRONOUSLY,
+// before any `await` — Node's single-threaded event loop means there is no
+// interleaving window in which two near-simultaneous trade-confirm-request
+// messages could both pass the check. Logic extracted to trade-confirm-dedup.js
+// so it's unit-tested including a simulated race, not just inline logic
+// nobody can exercise without a live WS connection.
+const tradeConfirmDedupState = tradeConfirmDedup.createDedupState();
+const TRADE_CONFIRM_DEDUP_WINDOW_MS = 30 * 60 * 1000; // 30 min — well past any plausible legitimate retry
+
+async function handleTradeConfirm(ws, msg) {
+  const requestId = msg && msg.requestId;
+  const { sourceVerdictId, side, symbol, qty, stopPrice, targetPrice } = msg || {};
+
+  const dedup = tradeConfirmDedup.checkAndMark(tradeConfirmDedupState, requestId, sourceVerdictId, Date.now(), TRADE_CONFIRM_DEDUP_WINDOW_MS);
+  if (!dedup.ok) {
+    send(ws, { type: 'trade-confirm-rejected', requestId: requestId || null, reason: dedup.reason });
+    return;
+  }
+
+  try {
+    if (process.env.TV_ALLOW_LIVE_ORDERS !== '1') {
+      send(ws, { type: 'trade-confirm-rejected', requestId, reason: 'live orders are not enabled this session (TV_ALLOW_LIVE_ORDERS was not set at launch)' });
+      return;
+    }
+    if (!mcpBridge.ready || !mcpBridge.tvConnected) {
+      send(ws, { type: 'trade-confirm-rejected', requestId, reason: 'TradingView is not connected' });
+      return;
+    }
+
+    const sideNorm = String(side || '').toLowerCase();
+    const qtyNum = Number(qty);
+    if (sideNorm !== 'buy' && sideNorm !== 'sell') {
+      send(ws, { type: 'trade-confirm-rejected', requestId, reason: `invalid side: ${side}` });
+      return;
+    }
+    if (!Number.isFinite(qtyNum) || qtyNum <= 0 || Math.floor(qtyNum) !== qtyNum) {
+      send(ws, { type: 'trade-confirm-rejected', requestId, reason: `invalid size: ${qty}` });
+      return;
+    }
+
+    // NO OVERRIDE — the one rules check that gates real execution. Reuses the
+    // same pure logic the manual/live-feed guardrail already enforces
+    // (tv-broker-feed.js's `trades` shape), extended in trade-confirm-rules.js.
+    const rules = getActiveRules();
+    const check = tradeConfirmRules.checkTradeAllowed(rules, currentMode, tvBrokerFeedState.trades, qtyNum);
+    if (!check.allowed) {
+      console.log(`[trade-confirm] BLOCKED requestId=${requestId}: ${check.reason}`);
+      send(ws, { type: 'trade-confirm-rejected', requestId, reason: check.reason });
+      return;
+    }
+
+    // Consumed BEFORE the order call, not after — deliberate. If the order
+    // attempt below fails (network blip, DOM timing), this verdict/ticket
+    // can no longer be retried; Anoop needs a fresh debate call for a new
+    // one. That's a usability cost, but the alternative (leaving the verdict
+    // reusable until a confirmed success) reopens exactly the stale-ticket
+    // replay window the Eng review flagged — failing toward "can't retry
+    // easily" is the safe direction here, matching the no-override philosophy.
+    tradeConfirmDedup.consumeVerdict(tradeConfirmDedupState, sourceVerdictId);
+
+    // Resolve the live symbol server-side — the client/Judge never gets to
+    // decide what symbol actually gets submitted (see trade-ticket-parse.js's
+    // header comment on why symbol is deliberately never parsed from the
+    // verdict text).
+
+    // Symbol resolution AND order placement run inside ONE withChartLock call
+    // (not two separate ones) — otherwise something else queued on the same
+    // lock (a chart/symbol switch) could interleave in the gap between "read
+    // the symbol" and "place the order", letting the symbol go stale in that
+    // split second. One lock call = one atomic unit.
+    //
+    // 2026-08-19: deliberately stays on withChartLock, NOT the new
+    // withBrokerLock the broker-feed poll moved to — this is the one
+    // broker-adjacent operation that genuinely needs serialization against
+    // chart/SYMBOL switches specifically (PO3's secondary-symbol watch calls
+    // chart_set_symbol; an interleaving switch here could place an order on
+    // the wrong instrument, a correctness risk that outweighs the latency
+    // cost). The broker poll itself is a simple read in a different DOM
+    // region (positions/orders tables, not the order ticket) — safe to let
+    // it interleave with this, and doing so is what actually fixes the
+    // "poll queued for minutes behind chart monitors" latency bug found live
+    // today.
+    const raw = await withChartLock(async () => {
+      let resolvedSymbol = symbol || null;
+      try {
+        const stateRes = await mcpBridge.callTool('chart_get_state', {});
+        const state = parseToolResult(stateRes);
+        if (state && state.symbol) resolvedSymbol = state.symbol;
+      } catch (e) { /* fall back to client-supplied symbol, if any */ }
+
+      const orderArgs = { side: sideNorm, qty: qtyNum, symbol: resolvedSymbol };
+      if (stopPrice != null) orderArgs.stopPrice = Number(stopPrice);
+      if (targetPrice != null) orderArgs.targetPrice = Number(targetPrice);
+      const orderRaw = await mcpBridge.callTool('trading_place_market_order', orderArgs);
+      return { orderRaw, resolvedSymbol };
+    });
+    const result = parseToolResult(raw.orderRaw);
+    const resolvedSymbol = raw.resolvedSymbol;
+
+    // Durable log BEFORE attempting to notify the client (Eng review: a
+    // dropped WS connection right after a real fill would otherwise leave no
+    // record at all that an order was placed). console.log is mirrored to
+    // disk by crash-logger.js's installConsoleMirror, loaded first in this
+    // file specifically so nothing can log before that mirror is active.
+    console.log(`[trade-confirm] ORDER ${result && result.success ? 'SUBMITTED' : 'FAILED'} requestId=${requestId} side=${sideNorm} qty=${qtyNum} symbol=${resolvedSymbol} stop=${stopPrice != null ? stopPrice : 'none'} target=${targetPrice != null ? targetPrice : 'none'} result=${JSON.stringify(result)}`);
+
+    if (!result || result.success === false) {
+      send(ws, { type: 'trade-confirm-result', requestId, success: false, error: (result && result.error) || 'order placement failed' });
+      return;
+    }
+    // 2026-08-19: placeMarketOrder() started returning verified/verifyDetail
+    // (its own post-submit getPositions()/getOrders() readback, see
+    // trading.js) but this response never forwarded them — a caller reading
+    // trade-confirm-result had success:true with no way to tell an actually-
+    // confirmed fill apart from an unconfirmed submit. Surfacing both now so
+    // the UI/user isn't presented a plain "success" when the order's real
+    // state is still unconfirmed.
+    send(ws, { type: 'trade-confirm-result', requestId, success: true, submittedLabel: result.submittedLabel, stopPrice: result.stopPrice, targetPrice: result.targetPrice, verified: result.verified, verifyDetail: result.verifyDetail });
+  } catch (e) {
+    console.error(`[trade-confirm] requestId=${requestId} uncaught error:`, e.message);
+    send(ws, { type: 'trade-confirm-result', requestId, success: false, error: e.message || 'unexpected error' });
+  }
 }
 
 // SINGLE-INSTANCE GUARD (2026-07-29, Anoop: "if i open two windows are opening
@@ -4617,6 +6102,12 @@ httpServer.on('error', (err) => {
 
 httpServer.listen(PORT, '127.0.0.1', async () => {
   initDataDir();   // 2026-07-25: resolve D:\co-pilot DATA (or fall back) before anything writes
+  // 2026-08-19: restore today's live trade-tracking state now that DATA_DIR
+  // is final — see the note at tvBrokerFeedState's declaration for why this
+  // can't happen at module top-level. Must run before startTVBrokerMonitor()
+  // (below) starts polling, or the very first poll would fold against a
+  // still-fresh state and immediately overwrite whatever was just restored.
+  tvBrokerFeedState = loadTVBrokerFeedState();
   startTradovate();
   console.log(`\n╔══════════════════════════════════════╗`);
   console.log(`║  Co-Pilot — http://localhost:${PORT}  ║`);
@@ -4628,8 +6119,19 @@ httpServer.listen(PORT, '127.0.0.1', async () => {
   if (cfg.geminiApiKey) { groqAgent.initGemini(cfg.geminiApiKey); console.log('✓ Gemini API key loaded (Jessi primary brain)'); }
   else console.log('⚠  No Gemini key — Jessi falls back to Groq (smaller 6-8K tokens/min ceiling). Free key: aistudio.google.com/apikey');
   if (cfg.groqApiKey) { groqAgent.init(cfg.groqApiKey); console.log('✓ Groq API key loaded (Jessi fallback + voice STT/TTS)'); }
-  if (cfg.apiKey) { groqAgent.initAnthropic(cfg.apiKey); console.log('✓ Anthropic key wired into ALL agents (primary brain)'); }
   else console.log('⚠  No Groq key — Jessi chat falls back to offline mode until one is added in Settings');
+  if (cfg.apiKey) { groqAgent.initAnthropic(cfg.apiKey); console.log('✓ Anthropic key wired into ALL agents (primary brain)'); }
+
+  // 2026-08-12 (task #32): sweep temp files left by a write that was
+  // interrupted by a crash. These are always disposable — a .tmp still on disk
+  // is by definition one whose rename never completed, so its contents were
+  // never the live file. Reported rather than silent: a non-zero count here is
+  // evidence the process died mid-write last session, which is worth knowing.
+  try {
+    const swept = atomicWrite.cleanupTemps(DATA_DIR)
+                + atomicWrite.cleanupTemps(path.join(DATA_DIR, 'accounts'));
+    if (swept) console.log(`✓ Cleared ${swept} interrupted-write temp file(s) — the app died mid-save last session`);
+  } catch (e) {}
   if (cfg.omniRouteApiKey) {
     groqAgent.initOmniRoute(cfg.omniRouteApiKey, cfg.omniRouteBaseUrl);
     console.log('✓ OmniRoute API key loaded (primary brain when enabled)');
@@ -4642,6 +6144,8 @@ httpServer.listen(PORT, '127.0.0.1', async () => {
   } else console.log('ℹ  No OmniRoute key — using Gemini/Groq chain only');
   startJessiTVMonitor();
   console.log('✓ Jessi background chart monitor started (3-min cadence)');
+  startTVBrokerMonitor();
+  console.log('✓ TradingView broker-account monitor started (10s cadence, polls only while TV is connected)');
   console.log(`✓ Mode: ${(cfg.mode || 'funded').toUpperCase()}`);
 
   // 2026-08-11 (Anoop): "I don't want telegram to work... remove them."
@@ -4678,6 +6182,7 @@ httpServer.listen(PORT, '127.0.0.1', async () => {
   startNewsTracking();
   startMechanicalAnalysis();
   startSessionPrepScheduler();
+  startEndDayAutosaveWatch();
 
   const { exec } = require('child_process');
   exec(`start http://localhost:${PORT}`);

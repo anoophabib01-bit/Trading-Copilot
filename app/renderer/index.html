@@ -65,10 +65,18 @@
     <button class="tmode-btn" id="tmode-scalper-btn" onclick="switchTradingMode('scalper')">SCALPER</button>
   </div>
 
+  <!-- Full-width kill bar, shown only when the chart feed is dead. The
+       titlebar chip alone was missable with the window partly covered. -->
+  <div id="tv-dead-bar">⚠ TRADINGVIEW DISCONNECTED — CHART DATA IS STALE — DO NOT OPEN NEW TRADES</div>
+
   <div id="tv-status">
     <div id="tv-dot"></div>
     <span id="tv-status-text">Connecting…</span>
   </div>
+  <!-- 2026-08-19: persistent (not a toast) self-test line — SEMI_AUTONOMOUS_SYSTEM_PLAN.md
+       item 2. Always visible once a result arrives, updates in place on every
+       reconnect re-test. See app.js's onLiveFeedSelfTest handler. -->
+  <div id="live-feed-selftest" style="display:none;"></div>
   <div class="session-time" id="session-clock"></div>
   <!-- Reopen the account picker any time (2026-07-25, Anoop: "there should be
        an option to get to this page if i want to shift my account later on") -->
@@ -165,6 +173,24 @@
         <div class="progress-bar" title="MLL buffer used">
           <div class="progress-fill" id="buffer-bar" style="width:0%"></div>
         </div>
+
+        <!-- 2026-08-13 (Anoop): "any account that I select has to be opened
+             totally... after I breach or clear it should show above today and
+             below 50K details." Was previously ONLY inside the ⇄ Account
+             picker modal — real functions (accountBreached/
+             accountClearedToFunded already exist and operate on whichever
+             slot is currently open), just not visible without an extra click.
+             Same eval-only/funded-only classes _renderMode() already toggles
+             everywhere else in this panel — no new JS needed, these show/hide
+             automatically with the account's stage. -->
+        <div class="eval-only acct-action-row" style="display:none;">
+          <button class="gate-status-btn gate-status-breach" onclick="accountBreached(event)" title="Mark THIS open account breached — archives its data and resets it fresh">Eval breached</button>
+          <button class="gate-status-btn gate-status-clear" onclick="accountClearedToFunded(event)" title="Mark THIS open account's eval cleared — moves it to FUNDED with a clean slate">Cleared → Funded</button>
+        </div>
+        <div class="funded-only acct-action-row">
+          <button class="gate-status-btn gate-status-breach" onclick="accountBreached(event)" title="Mark THIS open account breached — archives its data and resets it fresh">Funded breached</button>
+          <button class="gate-status-btn gate-status-clear" onclick="accountPaidOut(event)" title="Record first payout on THIS open funded account — archives the period's data, stays FUNDED with a fresh ledger">First payout</button>
+        </div>
       </div>
 
       <!-- Today's session -->
@@ -220,8 +246,15 @@
       <button class="qa-btn"          onclick="quickAction('analyze')"><span class="btn-icon">◎</span> Full Analysis</button>
       <button class="qa-btn"          onclick="document.getElementById('goodtrade-input').click()"><span class="btn-icon">★</span> Analyze Good Trade</button>
       <input type="file" id="goodtrade-input" accept="image/*" style="display:none">
-      <button class="qa-btn"          onclick="document.getElementById('csv-file-input').click()"><span class="btn-icon">▤</span> Analyze CSV/PDF</button>
-      <input type="file" id="csv-file-input" accept=".csv,.pdf" multiple style="display:none">
+      <!-- 2026-08-17: renamed from "Analyze CSV/PDF" — extended to any
+           trade-related report, not just CSV/PDF. .xlsx/.xls parsed
+           server-side (SheetJS) and converted to CSV; .csv/.txt/.tsv (or any
+           unrecognized extension) go through the existing text path, which
+           now auto-detects comma/tab/semicolon delimiters instead of
+           assuming comma. Same handler (handleCsvFileSelected), same
+           ledger/guardrail pipeline underneath either way. -->
+      <button class="qa-btn"          onclick="document.getElementById('csv-file-input').click()" title="Upload any trade-related report — CSV, Excel, PDF, or plain text export"><span class="btn-icon">▤</span> Update File</button>
+      <input type="file" id="csv-file-input" accept=".csv,.pdf,.xlsx,.xls,.txt,.tsv" multiple style="display:none">
       <button class="qa-btn"          onclick="runIctPo3()" title="ICT Power of 3 — judges Accumulation / Manipulation / Distribution across 1H/15m/5m, Daily bias gate (weights 15m + 5m most)"><span class="btn-icon">◱</span> Power of 3 (AMD)</button>
       <button class="qa-btn" id="po3-monitor-btn" onclick="togglePo3Monitor()" title="Mechanical AMD phase monitor — polls 15m every 60s and alerts in chat on ANY phase change (Accumulation / Manipulation / Distribution). No AI call per poll, so no quota use."><span class="btn-icon">◱</span> P3 Monitor</button>
       <button class="qa-btn"          onclick="quickAction('watchlist')" title='Reads whichever watchlist tab is active in TradingView — switch to "focus" first'><span class="btn-icon">☰</span> Scan Watchlist</button>
@@ -316,6 +349,11 @@
       <div class="rtab" data-tab="insights" onclick="switchTab('insights')">Insights</div>
       <div class="rtab" data-tab="cost" onclick="switchTab('cost')">Cost</div>
     </div>
+
+    <!-- Global checklist banner (2026-08-13). Lives OUTSIDE #right-content so
+         it is visible on every tab — a banner you escape by switching tabs is
+         not a banner. -->
+    <div id="ck-global-banner" class="ck-banner" style="display:none"></div>
 
     <div id="right-content">
 
@@ -639,6 +677,36 @@
       <!-- Checklist tab — ported from Edgedesk (C:\Users\Admin\Claude\Projects\Edgedesk\EdgeDesk.html) -->
       <div id="tab-checklist" style="display:none;padding:12px;">
 
+        <!-- Sticky decision bar (2026-08-13). The verdict used to live ~2500px
+             down the scroll, so the one thing he needs before a session — am I
+             cleared — was never on screen. Progress + tier + the DONE/Skip
+             controls now stay pinned. The Skip button is STATIC HTML on purpose:
+             the gate's escape hatch must not be rendered by the same JS that
+             computes the gate, or an exception takes both. -->
+        <div class="ck-sticky">
+          <div class="ck-sticky-row">
+            <span class="ck-sticky-count"><span id="ck-sticky-progress">0/0</span> confirmed</span>
+            <span class="ck-sticky-tier is-nogo" id="ck-sticky-tier">NO-GO</span>
+            <span class="ck-streak" id="ck-streak" style="display:none"></span>
+            <span style="margin-left:auto;display:flex;gap:6px">
+              <button class="btn-save ck-sticky-done" onclick="ckMarkDone()">✓ PRE-TRADE DONE</button>
+              <button class="ck-skip-btn" onclick="ckSkipToday()" title="Recorded as SKIPPED — breaks your streak">Skip today</button>
+            </span>
+          </div>
+          <div id="ck-save-error" class="ck-save-error" style="display:none">⚠ NOT SAVING — this checklist is not being recorded. Check browser storage.</div>
+          <div id="ck-gate-hint" class="ck-gate-hint" style="display:none"></div>
+        </div>
+
+        <div class="analysis-block" id="ck-block-weekly">
+          <div class="block-title">Weekend Screen Time</div>
+          <div style="font-size:10px;color:var(--text-dim);margin-bottom:6px">Weekly, not part of the pre-trade gate. Log the hours to bring them down.</div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input class="form-input" id="ck-weekly-hours" type="number" min="0" step="0.5" placeholder="hours" style="width:110px" onchange="ckSaveWeekly()">
+            <span style="font-size:10px;color:var(--text-dim)">hours this week</span>
+          </div>
+          <pre id="ck-weekly-trend" class="ck-weekly-trend">No weeks logged yet.</pre>
+        </div>
+
         <div class="analysis-block">
           <div class="block-title">Body Check</div>
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px">
@@ -665,6 +733,15 @@
                 <button id="ck-napNo" class="ck-body-btn" onclick="ckSetBody('nap','no')">✗ No</button>
               </div>
             </div>
+          </div>
+          <!-- Stress routine (2026-08-13, Anoop): "routine to keep stress low
+               during trading hours". Ticks rather than a timed prompt — a
+               mid-session interrupt would fire while he is in a position. -->
+          <div class="ck-subtitle" style="margin-top:9px">Stress Routine</div>
+          <div style="display:flex;gap:5px;flex-wrap:wrap">
+            <button id="ck-stress-rec" class="ck-body-btn" onclick="ckSetStress('rec')">🔴 Recording on</button>
+            <button id="ck-stress-breath" class="ck-body-btn" onclick="ckSetStress('breath')">🌬️ 2 min breathing</button>
+            <button id="ck-stress-phone" class="ck-body-btn" onclick="ckSetStress('phone')">📵 Phone away</button>
           </div>
         </div>
 
@@ -893,7 +970,7 @@
         <!-- Account breach/clear actions — added 2026-07-22. Static (outside
              #ins-body) so they survive every renderInsights() re-render. -->
         <div style="display:flex;gap:8px;margin-bottom:10px;">
-          <button class="engulf-check-btn" style="flex:1;color:var(--red);" onclick="accountBreached()" title="Archives all current trade/insight data to a file, then wipes this account/stage clean for your next attempt">⚠ Account Breached</button>
+          <button class="engulf-check-btn" style="flex:1;color:var(--red);" onclick="accountBreached(event)" title="Archives all current trade/insight data to a file, then wipes this account/stage clean for your next attempt">⚠ Account Breached</button>
           <!-- "Cleared → Funded" removed 2026-07-25 (Anoop: "Do not have the
                account reach the account cleared to funded option in this
                insight"). Promotion is an account-level event — do it from the
@@ -912,6 +989,18 @@
       <!-- Cost tab: lifetime prop-account spend vs payouts -> breakeven -->
       <div id="tab-cost" style="display:none;padding:12px;">
         <div id="cost-body"><div class="no-trades">Loading cost ledger…</div></div>
+
+        <!-- Unified account database (2026-08-13, Anoop: "gather all the
+             information of all the accounts and make one database to
+             analyse"). Reads every slot folder under DATA/accounts/, combines
+             them read-only, writes DATA/account_database.json. Static so it
+             survives every renderCost() re-render. -->
+        <div class="analysis-block" style="margin-top:14px;">
+          <div class="block-title">All-Accounts Database</div>
+          <div style="font-size:10px;color:var(--text-dim);margin-bottom:8px;">Combines every account slot (s1–s5) into one readable report — opens right in a new tab, no software needed. Also saves a CSV (for Excel) and the raw JSON. Read-only: never changes any account's own data.</div>
+          <button class="engulf-check-btn" id="account-db-rebuild-btn" onclick="accountDbRebuildAndShow()">Open all-accounts report</button>
+          <pre id="account-db-summary" class="ck-weekly-trend" style="display:none;margin-top:9px;"></pre>
+        </div>
       </div>
 
     </div>
@@ -1068,6 +1157,25 @@
      hand-rolled regex alone can cover (e.g. "last five trades" spelled out,
      "trades from two days ago"). Exposes a global `nlp` function. -->
 <script src="compromise.js"></script>
+<!-- loss-ratchet.js must load BEFORE app.js: the guardrail HUD reads
+     window.LossRatchet when it computes today's cap. Same file Node requires
+     for the unit tests, so the rule can't drift between test and runtime. -->
+<script src="loss-ratchet.js"></script>
+<script src="checklist-logic.js"></script>
+<script src="volume-budget.js"></script>
+<!-- size-freeze-guard.js: must load before app.js — grLog() in app.js reads
+     window.SizeFreezeGuard when grading a newly-logged trade. Same file Node
+     requires for the unit tests (test/size-freeze-guard.test.js). -->
+<script src="size-freeze-guard.js"></script>
+<!-- stop-alarm.js: must load before app.js — the guardrail's stop-overlay
+     reads window.StopAlarm for its escalation cadence and mandatory ack
+     delay. Same file Node requires for test/stop-alarm.test.js. -->
+<script src="stop-alarm.js"></script>
+<!-- points-tracker.js: same points/expectancy/sizing math the Node tests
+     replay against real trade history — see app/test/points-tracker.test.js.
+     Journal's points chart and the Scalper's sizing guidance both read
+     window.PointsTracker so neither can quietly disagree with the other. -->
+<script src="points-tracker.js"></script>
 <script src="ws-client.js"></script>
 <script src="app.js"></script>
 <!-- Resilience layer — MUST load after app.js. Error traps, stall watchdog,

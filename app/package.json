@@ -8,11 +8,12 @@
     "test": "node --test"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
+    "@anthropic-ai/sdk": "^0.116.0",
     "dommatrix": "^0.1.1",
     "express": "^5.2.1",
     "node-telegram-bot-api": "^0.66.0",
     "pdf-parse": "^2.4.5",
-    "ws": "^8.21.0"
+    "ws": "^8.21.0",
+    "xlsx": "npm:@e965/xlsx@^0.20.3"
   }
 }

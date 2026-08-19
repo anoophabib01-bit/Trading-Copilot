@@ -14,11 +14,27 @@ function _resolve(deps) {
   };
 }
 
-export async function getState({ _deps } = {}) {
+// 2026-08-18: fixed a live bug — with a multi-pane layout open (2+ charts
+// side by side, e.g. MNQ + MGC), CHART_API always reads whichever pane
+// TradingView itself currently considers "active" (last clicked/focused),
+// NOT necessarily the pane the caller actually wants. A stale/broken pane
+// (e.g. showing "This symbol doesn't exist") could silently be read instead
+// of the live one sitting right next to it. getState now: (1) accepts an
+// optional pane_index to target a specific pane explicitly, bypassing the
+// "active" pointer entirely; (2) when no pane_index is given and more than
+// one pane exists, cross-checks the active pane against all panes and flags
+// it (multi_pane_layout + all_panes) rather than trusting it blindly, so a
+// caller in app/server.js can detect and correct instead of acting on a
+// dead chart.
+export async function getState({ pane_index, _deps } = {}) {
   const { evaluate } = _resolve(_deps);
+  const targetExpr = (pane_index !== undefined && pane_index !== null)
+    ? `window.TradingViewApi._chartWidgetCollection.getAll()[${Number(pane_index)}]`
+    : CHART_API;
   const state = await evaluate(`
     (function() {
-      var chart = ${CHART_API};
+      var chart = ${targetExpr};
+      if (!chart) return { error: 'pane_index out of range' };
       var studies = [];
       try {
         var allStudies = chart.getAllStudies();
@@ -26,15 +42,62 @@ export async function getState({ _deps } = {}) {
           return { id: s.id, name: s.name || s.title || 'unknown' };
         });
       } catch(e) {}
+      var barCount = -1;
+      try {
+        var model = chart.model ? chart.model() : null;
+        var mainSeries = model ? model.mainSeries() : null;
+        barCount = mainSeries ? mainSeries.bars().size() : -1;
+      } catch(e) {}
+
+      // Multi-pane awareness: report every pane's symbol/bar-count so a
+      // caller can tell "active" apart from "the pane I actually meant".
+      var cwc = window.TradingViewApi._chartWidgetCollection;
+      var all = cwc.getAll();
+      var panes = [];
+      if (all.length > 1) {
+        for (var i = 0; i < all.length; i++) {
+          try {
+            var c = all[i];
+            var m = c.model ? c.model() : null;
+            var ms = m ? m.mainSeries() : null;
+            panes.push({ index: i, symbol: ms ? ms.symbol() : null, bar_count: ms ? ms.bars().size() : -1 });
+          } catch(e) { panes.push({ index: i, error: e.message }); }
+        }
+      }
+
       return {
         symbol: chart.symbol(),
         resolution: chart.resolution(),
         chartType: chart.chartType(),
         studies: studies,
+        bar_count: barCount,
+        multi_pane_layout: all.length > 1,
+        all_panes: panes,
       };
     })()
   `);
-  return { success: true, ...state };
+  if (state && state.error) throw new Error(state.error);
+
+  // bar_count === 0 on the pane actually being read is exactly the "This
+  // symbol doesn't exist" / broken-pane symptom reported live 2026-08-18.
+  // Auto-correct (per user decision 2026-08-18): if the caller didn't pin a
+  // specific pane_index and the "active" pane is dead, but another pane in
+  // the same layout has real data, transparently re-read from that pane
+  // instead of returning a symbol string that looks fine but has no data
+  // behind it. Always reported via auto_corrected_from_active so a caller
+  // can tell this happened rather than assuming "active" was honored.
+  if ((pane_index === undefined || pane_index === null) && state && state.bar_count === 0 && state.multi_pane_layout) {
+    const alt = (state.all_panes || []).find(p => typeof p.bar_count === 'number' && p.bar_count > 0);
+    if (alt) {
+      const corrected = await getState({ pane_index: alt.index, _deps });
+      return { ...corrected, auto_corrected_from_active: true, dead_pane_index: state.all_panes.findIndex(p => p.bar_count === 0) };
+    }
+  }
+
+  const warning = (state && state.bar_count === 0)
+    ? 'This pane has 0 bars — likely a broken/invalid symbol pane, not live data. If a multi-pane layout is open, check all_panes for one with a real bar_count and pass its index as pane_index.'
+    : undefined;
+  return { success: true, ...state, ...(warning ? { warning } : {}) };
 }
 
 export async function setSymbol({ symbol, _deps }) {

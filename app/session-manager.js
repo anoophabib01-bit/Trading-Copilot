@@ -1,6 +1,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
+const atomicWrite = require('./atomic-write');
 
 const SESSIONS_DIR = 'G:\\MNQ-CoPilot\\sessions';
 
@@ -55,7 +56,7 @@ function startSession(date, { balance, floor, buffer, bias, keyLevel, goNoGo, re
 - Rule focus:
 `;
 
-  fs.writeFileSync(p, content, 'utf8');
+  atomicWrite.writeAtomic(p, content, 'utf8');
   return { path: p, existed: false };
 }
 
@@ -81,7 +82,7 @@ function logTrade(date, trade) {
     `$1${row}\n`
   );
 
-  fs.writeFileSync(p, content, 'utf8');
+  atomicWrite.writeAtomic(p, content, 'utf8');
   return { num, path: p };
 }
 
@@ -101,7 +102,7 @@ function updateVerdict(date, { compliance, patterns, best, worst, fix, nextBias,
   if (nextLevel) content = content.replace(/- Level to watch:\s*$/, `- Level to watch: ${nextLevel}`);
   if (nextFocus) content = content.replace(/- Rule focus:\s*$/, `- Rule focus: ${nextFocus}`);
 
-  fs.writeFileSync(p, content, 'utf8');
+  atomicWrite.writeAtomic(p, content, 'utf8');
   return true;
 }
 
