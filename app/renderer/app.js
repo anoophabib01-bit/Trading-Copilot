@@ -4785,7 +4785,8 @@ function renderTradeTicketCard(msg) {
 }
 
 // 1.3: Chart Watchers panel — renders the server's watchers-status snapshot.
-// (1.4 extends this with health states amber/red and lastError tooltips.)
+// 1.4: health states — healthy 🟢 / amber 🟡 (stale, restart attempted) /
+// red 🔴 (still stale after restart) / tv-offline ⚪ / stopped ⚪.
 function renderChartWatchers(data) {
   const panel = document.getElementById('chart-watchers-panel');
   const note = document.getElementById('chart-watchers-note');
@@ -4798,10 +4799,20 @@ function renderChartWatchers(data) {
   }
   if (note) note.textContent = 'Always on — no switches to forget.';
   const rows = Array.isArray(d.rows) ? d.rows : [];
+  const dotFor = { healthy: '🟢', amber: '🟡', red: '🔴', 'tv-offline': '⚪', stopped: '⚪' };
   panel.innerHTML = rows.map(r => {
-    const dot = r.running ? '🟢' : '⚪';
+    const health = r.health || (r.running ? 'healthy' : 'stopped');
+    const dot = dotFor[health] || '⚪';
     const last = r.lastCheck ? new Date(r.lastCheck).toLocaleTimeString('en-IN', { hour12: false }) : '—';
-    return '<div class="watcher-row"><span>' + dot + '</span><span>' + escHtml(r.label || r.id) + '</span><span class="stat-label">' + (r.running ? 'watching · last check ' + last + ' IST' : 'stopped') + '</span></div>';
+    const errAttr = r.lastError ? ' title="last error: ' + escHtml(r.lastError) + '"' : '';
+    const stateText = {
+      healthy: 'watching · last check ' + last + ' IST',
+      amber: 'STALE — restart attempted',
+      red: 'DEAD — restart failed',
+      'tv-offline': 'waiting for TradingView',
+      stopped: 'stopped'
+    }[health] || 'unknown';
+    return '<div class="watcher-row"' + errAttr + '><span>' + dot + '</span><span>' + escHtml(r.label || r.id) + '</span><span class="stat-label">' + stateText + '</span></div>';
   }).join('');
 }
 

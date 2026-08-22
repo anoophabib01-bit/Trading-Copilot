@@ -2744,7 +2744,9 @@ const po3Monitor = {
   lastPhase: null,
   lastSessionStart: null,
   lastSymbol: null,   // see symbol-change reset in checkPo3Phase
-  lastCheck: null
+  lastCheck: null,
+  lastError: null,          // 1.4 liveness
+  restartAttempted: false   // 1.4 liveness
 };
 
 // ── Auto-triggered Debate on a real PO3 phase transition (2026-08-17) ──────
@@ -2811,14 +2813,21 @@ async function getCurrentChartSymbol() {
 
 async function checkPo3Phase() {
   if (!mcpBridge.ready || !mcpBridge.tvConnected) {
-    broadcast({ type: 'po3-monitor-check', time: new Date().toISOString(), status: 'TV offline' });
+    // 1.4: the poll loop itself is alive — stamp lastCheck so the liveness
+    // watchdog never flags a watcher that merely reported TV-down.
+    po3Monitor.lastCheck = new Date().toISOString();
+    broadcast({ type: 'po3-monitor-check', time: po3Monitor.lastCheck, status: 'TV offline' });
     return;
   }
+  po3Monitor.lastError = null;
 
   const sessionStart = currentSessionStartUnix();
   if (sessionStart == null) {
     // Outside both session windows — nothing to monitor (Core Rule #6).
-    broadcast({ type: 'po3-monitor-check', time: new Date().toISOString(), status: 'outside session window' });
+    // 1.4: the poll loop is alive; stamp lastCheck so the watchdog doesn't
+    // flag PO3 as stale during the hours it is intentionally idle.
+    po3Monitor.lastCheck = new Date().toISOString();
+    broadcast({ type: 'po3-monitor-check', time: po3Monitor.lastCheck, status: 'outside session window' });
     po3Monitor.lastPhase = null;
     return;
   }
@@ -2912,6 +2921,7 @@ async function checkPo3Phase() {
       }
     }
   } catch (e) {
+    po3Monitor.lastError = e.message;
     console.error('[PO3 MONITOR] error:', e.message);
     broadcast({ type: 'po3-monitor-check', time: new Date().toISOString(), status: 'error: ' + e.message });
   }
@@ -4040,7 +4050,7 @@ const ENGULF_TFS = {
 
 const engulfMonitors = {};
 for (const key of Object.keys(ENGULF_TFS)) {
-  engulfMonitors[key] = { running: false, interval: null, lastSignalKey: null, lastCheck: null, lastRejectKey: null };
+  engulfMonitors[key] = { running: false, interval: null, lastSignalKey: null, lastCheck: null, lastRejectKey: null, lastError: null, restartAttempted: false }; // 1.4 liveness
 }
 
 // 1.2 (plan decision 2): engulf watchers are always on — there is no
@@ -4086,6 +4096,7 @@ async function checkEngulfingSignal(key) {
   }
 
   mon.lastCheck = new Date().toISOString();
+  mon.lastError = null;
   let found = false;
   let direction = null;
   let source = null;
@@ -4204,6 +4215,7 @@ async function checkEngulfingSignal(key) {
     broadcast({ type: 'engulf-check', tf: key, time: mon.lastCheck, found, direction });
 
   } catch (e) {
+    mon.lastError = e.message;
     console.error(`Engulf monitor [${cfg.label}] error:`, e.message);
     broadcast({ type: 'engulf-check', tf: key, time: mon.lastCheck, found: false, status: 'error: ' + e.message });
   }
@@ -4297,7 +4309,7 @@ const FVG_TFS = {
 };
 const fvgMonitors = {};
 for (const k of Object.keys(FVG_TFS)) {
-  fvgMonitors[k] = { running: false, interval: null, lastSignalKey: null, lastCheck: null };
+  fvgMonitors[k] = { running: false, interval: null, lastSignalKey: null, lastCheck: null, lastError: null, restartAttempted: false }; // 1.4 liveness
 }
 
 // 1.2 (plan decision 2): FVG watcher is always on — no supported OFF.
@@ -4339,6 +4351,7 @@ async function checkFVGSignal(key) {
   }
 
   mon.lastCheck = new Date().toISOString();
+  mon.lastError = null;
   let found = false, direction = null, gapLow = null, gapHigh = null;
 
   try {
@@ -4367,6 +4380,7 @@ async function checkFVGSignal(key) {
     }
     broadcast({ type: 'fvg-check', tf: key, time: mon.lastCheck, found, direction });
   } catch (e) {
+    mon.lastError = e.message;
     console.error(`FVG monitor [${cfg.label}] error:`, e.message);
     broadcast({ type: 'fvg-check', tf: key, time: mon.lastCheck, found: false, status: 'error: ' + e.message });
   }
@@ -4812,7 +4826,7 @@ const sfpMonitors = {};
 for (const k of Object.keys(SFP_TFS)) {
   // pending: { direction, level, sweptAt, expiresAt } once a raid has fired,
   // cleared either by a confirming displacement FVG or by expiry.
-  sfpMonitors[k] = { running: false, interval: null, lastCheck: null, lastSweepKey: null, lastConfirmKey: null, pending: null };
+  sfpMonitors[k] = { running: false, interval: null, lastCheck: null, lastSweepKey: null, lastConfirmKey: null, pending: null, lastError: null, restartAttempted: false }; // 1.4 liveness
 }
 
 // 1.2 (plan decision 2): SFP/Playbook B watcher is always on — no
@@ -4854,6 +4868,7 @@ async function checkSFPSignal(key) {
   }
 
   mon.lastCheck = new Date().toISOString();
+  mon.lastError = null;
 
   try {
     const bars = await getFullBars(cfg.tfCode, cfg.lookback);
@@ -4940,6 +4955,7 @@ async function checkSFPSignal(key) {
 
     broadcast({ type: 'sfp-check', tf: key, time: mon.lastCheck, found: !!sfp, pending: !!mon.pending, direction: sfp ? sfp.direction : null });
   } catch (e) {
+    mon.lastError = e.message;
     console.error(`SFP monitor [${cfg.label}] error:`, e.message);
     broadcast({ type: 'sfp-check', tf: key, time: mon.lastCheck, found: false, pending: !!mon.pending, status: 'error: ' + e.message });
   }
@@ -5683,12 +5699,12 @@ function stopSessionPrepScheduler() {
 // PO3 alone keeps its user-disable flag (the plan's toggle removal list is
 // the five watchers only; PO3's UI toggle stays).
 const ALL_MONITORS = [
-  { id: 'po3',        label: 'Power of 3 (AMD)', mon: () => po3Monitor,         cond: () => !po3MonitorUserDisabled,  run: () => startPo3Monitor() },
-  { id: 'engulf-1h',  label: 'Engulf 1H',        mon: () => engulfMonitors['1h'],  run: () => startEngulfMonitor('1h') },
-  { id: 'engulf-30m', label: 'Engulf 30M',       mon: () => engulfMonitors['30m'], run: () => startEngulfMonitor('30m') },
-  { id: 'engulf-15m', label: 'Engulf 15M',       mon: () => engulfMonitors['15m'], run: () => startEngulfMonitor('15m') },
-  { id: 'fvg-30m',    label: 'FVG 30M',          mon: () => fvgMonitors['30m'],    run: () => startFVGMonitor('30m') },
-  { id: 'sfp-30m',    label: 'SFP / Playbook B 30M', mon: () => sfpMonitors['30m'], run: () => startSFPMonitor('30m') },
+  { id: 'po3',        label: 'Power of 3 (AMD)', mon: () => po3Monitor,         intervalMs: PO3_MONITOR_INTERVAL_MS, cond: () => !po3MonitorUserDisabled,  run: () => startPo3Monitor() },
+  { id: 'engulf-1h',  label: 'Engulf 1H',        mon: () => engulfMonitors['1h'],  intervalMs: 60 * 1000, run: () => startEngulfMonitor('1h') },
+  { id: 'engulf-30m', label: 'Engulf 30M',       mon: () => engulfMonitors['30m'], intervalMs: 45 * 1000, run: () => startEngulfMonitor('30m') },
+  { id: 'engulf-15m', label: 'Engulf 15M',       mon: () => engulfMonitors['15m'], intervalMs: 30 * 1000, run: () => startEngulfMonitor('15m') },
+  { id: 'fvg-30m',    label: 'FVG 30M',          mon: () => fvgMonitors['30m'],    intervalMs: 30 * 1000, run: () => startFVGMonitor('30m') },
+  { id: 'sfp-30m',    label: 'SFP / Playbook B 30M', mon: () => sfpMonitors['30m'], intervalMs: 60 * 1000, run: () => startSFPMonitor('30m') },
 ];
 
 function armMonitorsStaggered() {
@@ -5704,12 +5720,59 @@ function buildWatchersStatus() {
   const tvDown = !(mcpBridge.ready && mcpBridge.tvConnected);
   const rows = ALL_MONITORS.map(e => {
     const mon = e.mon();
-    return { id: e.id, label: e.label, running: !!mon.running, lastCheck: mon.lastCheck || null };
+    // 1.4: amber = no completed check within 3× the watcher's own interval;
+    // red = still stale after the watchdog's one automatic restart.
+    let health = 'stopped';
+    if (tvDown) health = 'tv-offline';
+    else if (mon.running && mon.lastCheck && Date.now() - new Date(mon.lastCheck).getTime() > 3 * e.intervalMs) health = mon.restartAttempted ? 'red' : 'amber';
+    else if (mon.running) health = 'healthy';
+    return { id: e.id, label: e.label, running: !!mon.running, health, lastCheck: mon.lastCheck || null, lastError: mon.lastError || null };
   });
   return { tvConnected: !tvDown, rows };
 }
 function broadcastWatchersStatus() {
   broadcast({ type: 'watchers-status', data: buildWatchersStatus() });
+}
+
+// 1.4: liveness watchdog — a running watcher that hasn't completed a check
+// within 3× its own interval gets ONE automatic restart, then red. Skipped
+// while TradingView is down (nothing can be stale then; reconnect re-arms
+// everything via armMonitorsStaggered).
+let watcherLivenessInterval = null;
+function startWatcherLivenessWatch() {
+  if (watcherLivenessInterval) return;
+  const tick = () => {
+    if (!mcpBridge.ready || !mcpBridge.tvConnected) return;
+    let changed = false;
+    for (const e of ALL_MONITORS) {
+      const mon = e.mon();
+      if (!mon.running) continue;
+      const last = mon.lastCheck ? new Date(mon.lastCheck).getTime() : 0;
+      const stale = Date.now() - last > 3 * e.intervalMs;
+      if (!stale) {
+        if (mon.restartAttempted || mon.livenessRed) {
+          mon.restartAttempted = false;
+          mon.livenessRed = false;
+          changed = true;
+          console.log(`[watcher-liveness] ${e.id} recovered — fresh check observed`);
+        }
+        continue;
+      }
+      if (!mon.restartAttempted) {
+        mon.restartAttempted = true;
+        console.log(`[watcher-liveness] ${e.id} stale (no check in ~${Math.round((Date.now() - last) / 1000)}s, limit ${Math.round(3 * e.intervalMs / 1000)}s) — attempting one restart`);
+        changed = true;
+        try { e.run(); } catch (err) { console.error(`[watcher-liveness] ${e.id} restart failed:`, err.message); }
+      } else if (!mon.livenessRed) {
+        mon.livenessRed = true;
+        console.log(`[watcher-liveness] ${e.id} still stale after one restart — RED`);
+        changed = true;
+      }
+    }
+    if (changed) broadcastWatchersStatus();
+  };
+  watcherLivenessInterval = setInterval(tick, 30 * 1000);
+  setTimeout(tick, 10000); // first pass soon after boot, once monitors have had a chance to run
 }
 
 // ── MCP startup ────────────────────────────────────────────────────────────────
@@ -6825,6 +6888,7 @@ httpServer.listen(PORT, '127.0.0.1', async () => {
   startMechanicalAnalysis();
   startSessionPrepScheduler();
   startEndDayAutosaveWatch();
+  startWatcherLivenessWatch();
 
   const { exec } = require('child_process');
   exec(`start http://localhost:${PORT}`);
