@@ -1177,7 +1177,40 @@
      window.PointsTracker so neither can quietly disagree with the other. -->
 <script src="points-tracker.js"></script>
 <script src="ws-client.js"></script>
+<!-- ── Day Recap overlay (2026-08-22) ──────────────────────────────────────
+     Shows once per trading day, on first launch, BEFORE the session. The point
+     is not a report — it is putting yesterday's specific mistake in front of
+     Anoop while he can still act on it. Dismissing records the date. -->
+<div id="recap-overlay">
+  <div id="recap-box">
+    <div id="recap-head">
+      <div>
+        <div id="recap-eyebrow">YESTERDAY — <span id="recap-date"></span></div>
+        <h2 id="recap-title">Day Recap</h2>
+      </div>
+      <div id="recap-verdict"></div>
+    </div>
+    <div id="recap-focus"></div>
+    <div id="recap-stats"></div>
+    <div id="recap-size"></div>
+    <div id="recap-last-trades"></div>
+    <div id="recap-jessi">
+      <div id="recap-jessi-label">TODAY’S READ</div>
+      <div id="recap-jessi-text"></div>
+    </div>
+    <div id="recap-mistakes"></div>
+    <div id="recap-good"></div>
+    <div id="recap-quote"></div>
+    <div id="recap-actions">
+      <button class="btn-cancel" onclick="recapDismiss(true)">Skip for today</button>
+      <button class="btn-save" onclick="recapDismiss(false)">Start the day →</button>
+    </div>
+  </div>
+</div>
+
 <script src="app.js"></script>
+<!-- Loaded after app.js: reuses insCoachNotes/insMoney/edToday from it. -->
+<script src="day-recap.js"></script>
 <!-- Resilience layer — MUST load after app.js. Error traps, stall watchdog,
      and chat transcript persistence. See renderer/resilience.js. -->
 <script src="resilience.js"></script>

@@ -39,6 +39,7 @@ const mistakePatterns = require('./mistake-patterns'); // live pattern-matching 
 const positionEvents = require('./position-events'); // fast open/close/scale/flip detector for the 5s positions watch (2026-08-20, pure + unit-tested)
 const tradeConfirmRules = require('./trade-confirm-rules'); // Phase 2a/2b rule-check for the confirm/execute flow — unit-tested
 const tradeTicketParse = require('./trade-ticket-parse'); // Phase 2b: pure parser for JUDGE_PERSONA's TRADE_TICKET line — unit-tested
+const playbookC = require('./playbook-c'); // Playbook C engulfing validity + shared closed-bar helper — unit-tested
 const tradeConfirmDedup = require('./trade-confirm-dedup'); // Phase 2b: double-submit/idempotency guard — unit-tested
 
 const PORT = 7433;
@@ -4038,7 +4039,7 @@ const ENGULF_TFS = {
 
 const engulfMonitors = {};
 for (const key of Object.keys(ENGULF_TFS)) {
-  engulfMonitors[key] = { running: false, interval: null, lastSignalKey: null, lastCheck: null };
+  engulfMonitors[key] = { running: false, interval: null, lastSignalKey: null, lastCheck: null, lastRejectKey: null };
 }
 
 // 2026-08-19 (Anoop: "the live feed should ... be active always ... and
@@ -4100,7 +4101,12 @@ async function checkEngulfingSignal(key) {
     // cfg.tfCode, collects bars + Pine labels/study values, then restores
     // whatever TF was showing before — same contract the old comment claimed
     // market_multi_tf had, now actually true.
-    const { bars, labelText } = await getBarsAndLabels(cfg.tfCode, 5);
+    const { bars: rawBars, labelText } = await getBarsAndLabels(cfg.tfCode, 5);
+    // Closed candles only. The last bar getBarsAndLabels returns is still
+    // forming, so the old code re-read a moving high/low/close on every poll
+    // and could report an engulfing that vanished by the close. Same fix
+    // checkSFPSignal got on 2026-07-15; engulf and FVG never received it.
+    const bars = playbookC.dropFormingBar(rawBars, cfg.tfCode);
 
     // ── Method 1/2: indicator label or study-value text mentions engulfing ──
     if (/bull[^|]{0,30}engulf|engulf[^|]{0,30}bull/i.test(labelText)) {
@@ -4109,11 +4115,47 @@ async function checkEngulfingSignal(key) {
       found = true; direction = 'BEARISH'; source = `${cfg.label} indicator`;
     }
 
-    // ── Method 3: real full-range engulfing on parsed OHLCV bars (Playbook C) ──
+    // ── Method 3: real full-range engulfing on parsed OHLCV bars ─────────────
     if (!found) {
       const engulf = detectEngulfFromBars(bars);
       if (engulf) {
         found = true; direction = engulf.direction; source = `${cfg.label} OHLCV (full-range)`;
+      }
+    }
+
+    // ── Playbook C validity gate (2026-08-22) ────────────────────────────────
+    // Until now the comment above claimed "(Playbook C)" but detectEngulfFromBars
+    // only checks the full-range condition — 1 of the rulebook's 4. The two it
+    // skipped (swing location, liquidity already swept) are the two that separate
+    // a reversal from a continuation candle mid-trend, so this monitor alerted on
+    // candles Anoop's own rules disqualify, with nothing saying the check was
+    // skipped. The gate applies to ALL candidates including Pine-label hits,
+    // since a chart indicator has no idea about his structure rules either.
+    //
+    // Rejections are BROADCAST, not swallowed: seeing which candles are filtered,
+    // and why, is how the thresholds get tuned from evidence. A rejection is not
+    // a missed trade.
+    let pbc = null;
+    if (found && direction) {
+      // 5 bars cannot support a structure read — pull real history the same way
+      // checkSFPSignal does, then drop the still-forming bar.
+      const fullBars = playbookC.dropFormingBar(
+        await getFullBars(cfg.tfCode, playbookC.PBC_HISTORY_BARS), cfg.tfCode);
+      const pdhpdl = await getPDHPDL();
+      pbc = playbookC.validateEngulfPlaybookC(fullBars, direction, pdhpdl);
+      if (!pbc.valid) {
+        const rejectKey = direction + '_' + key + '_rej_' +
+          (fullBars.length ? fullBars[fullBars.length - 1].time : 0);
+        if (rejectKey !== mon.lastRejectKey) {
+          mon.lastRejectKey = rejectKey;
+          console.log(`ENGULF REJECTED [${cfg.label}]: ${direction} — ${pbc.reason}`);
+        }
+        broadcast({
+          type: 'engulf-check', tf: key, time: mon.lastCheck,
+          found: false, rejected: true, direction,
+          reason: pbc.reason, structure: pbc.structure
+        });
+        return;
       }
     }
 
@@ -4144,6 +4186,9 @@ async function checkEngulfingSignal(key) {
         const signalMessage = `${direction} Engulfing on ${cfg.label} at ${istTime} IST${alignNote} — check a lower TF for entry`;
         broadcast({
           type: 'engulf-signal',
+          playbook: key === '1h' ? 'A' : 'C',
+          structure: pbc ? pbc.structure : null,
+          validity: pbc ? pbc.reason : null,
           tf: key,
           tfLabel: cfg.label,
           direction,
@@ -4304,7 +4349,13 @@ async function checkFVGSignal(key) {
     // FIX (2026-08-06): market_multi_tf never existed as a real tool — see
     // gatherPO3Context's fix above. detectFVGFromBars only looks at the last
     // 3 bars, so 5 is ample.
-    const bars = await getFullBars(cfg.tfCode, 5);
+    // Closed candles only (see checkEngulfingSignal). A 15M gap that opens at
+    // minute 3 and closes by minute 15 is not a gap. detectFVGFromBars needs 3.
+    const bars = playbookC.dropFormingBar(await getFullBars(cfg.tfCode, 6), cfg.tfCode);
+    if (bars.length < 3) {
+      broadcast({ type: 'fvg-check', tf: key, time: mon.lastCheck, found: false, status: 'waiting for a closed ' + cfg.label + ' bar' });
+      return;
+    }
     const fvg = detectFVGFromBars(bars);
     if (fvg) {
       found = true; direction = fvg.direction; gapLow = fvg.gapLow; gapHigh = fvg.gapHigh;
