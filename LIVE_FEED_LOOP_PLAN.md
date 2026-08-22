@@ -618,7 +618,7 @@ the prerequisite for Phase 5's scorecard.*
   worse decisions than no scorecard.
   *Done:*
 
-- [ ] **5.3 — Mechanical detection for the remaining failure modes — fixes H4**
+- [~] **5.3 — Mechanical detection for the remaining failure modes — fixes H4**
 
   F1 (trade-count escalation) and F2 (revenge cluster) are live. F3-F6 and M1-M6 were blocked on
   missing entry times, prices and symbol — **Phase 4.1 unblocks most of them in one pass**, which
@@ -630,7 +630,7 @@ the prerequisite for Phase 5's scorecard.*
   his own words in `renderer/index.html`, never paraphrased into something softer.
 
   Store a per-day pattern vector so the trend over weeks is visible, not just today's verdict.
-  *Done:*
+  *Skipped: 2026-08-22 (DSH build) — PARTIAL per the plan's own constraint. F3 (inverted R:R) BUILT: `checkInvertedRR` in mistake-patterns.js (realized avgLoss ≥ f3Ratio × avgWin with ≥ f3MinWins wins and ≥1 loss; pnlUnknown excluded; defaults ratio 2 / minWins 2; thresholds read from NEW rules.json keys f3Ratio/f3MinWins — never hardcoded; source text cited verbatim) + 6 tests (39/39 file). Wired into BOTH channels: formatLiveFeedContext (current state every agent turn) and the once-per-IST-day poll fire (f3AdvisoryFired persisted in the feed state). F4-F6 and M1-M6 deliberately NOT built: Anoop's standing decision requires each pattern verified live before the next is started, and live verification is exactly what this build environment cannot provide — building them unverified would violate the decision this task cites. Their inputs now exist (4.1), so each is one pattern-per-commit away. The per-day pattern-vector store is deferred with them (it feeds on the patterns it stores). NEEDS LIVE: F3's first real firing.*
 
 ---
 

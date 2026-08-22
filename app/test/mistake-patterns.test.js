@@ -1,7 +1,7 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { checkTradeCountEscalation, F1_WIN_THRESHOLD } = require('../mistake-patterns.js');
+const { checkTradeCountEscalation, F1_WIN_THRESHOLD, checkInvertedRR } = require('../mistake-patterns.js');
 
 test('F1_WIN_THRESHOLD is 2, matching the documented "stop at 2 good trades" text', () => {
   assert.equal(F1_WIN_THRESHOLD, 2);
@@ -251,4 +251,43 @@ test('F2: a backfilled record built by the REAL reconstructor is treated as unkn
   const r = checkRevengeCluster([{ pnl: -100, at: dayKey }, built[0], { pnl: -20, at: dayKey + 60 * MIN }], OPTS);
   assert.equal(r.matched, false);
   assert.equal(r.indeterminate, true);
+});
+
+// ── F3 — inverted R:R (LIVE_FEED_LOOP_PLAN 5.3) ─────────────────────────────
+test('F3: fewer than f3MinWins wins never fires', () => {
+  const r = checkInvertedRR([{ pnl: 5 }, { pnl: -200 }, { pnl: -10 }], { f3Ratio: 2, f3MinWins: 2 });
+  assert.equal(r.matched, false);
+});
+
+test('F3: no loss never fires', () => {
+  const r = checkInvertedRR([{ pnl: 15 }, { pnl: 25 }], { f3Ratio: 2, f3MinWins: 2 });
+  assert.equal(r.matched, false);
+});
+
+test('F3: fires when avgLoss >= ratio × avgWin with enough wins', () => {
+  const r = checkInvertedRR([{ pnl: 10 }, { pnl: 12 }, { pnl: -45 }], { f3Ratio: 2, f3MinWins: 2 });
+  assert.equal(r.matched, true);
+  assert.equal(r.winCount, 2);
+  assert.equal(r.lossCount, 1);
+  assert.equal(r.avgWin, 11);
+  assert.equal(r.avgLoss, 45);
+  assert.match(r.message, /PATTERN F3/);
+});
+
+test('F3: does NOT fire when losses are small relative to wins', () => {
+  const r = checkInvertedRR([{ pnl: 50 }, { pnl: 60 }, { pnl: -45 }], { f3Ratio: 2, f3MinWins: 2 });
+  assert.equal(r.matched, false);
+  assert.equal(r.message, null);
+});
+
+test('F3: pnlUnknown trades are excluded from the win/loss math', () => {
+  const r = checkInvertedRR([{ pnl: 10 }, { pnl: 12 }, { pnl: 0, pnlUnknown: true }, { pnl: -45 }], { f3Ratio: 2, f3MinWins: 2 });
+  assert.equal(r.matched, true); // the unknown trade neither helps nor blocks the ratio
+  assert.equal(r.winCount, 2);
+  assert.equal(r.lossCount, 1);
+});
+
+test('F3: defaults apply when opts are missing (ratio 2, minWins 2)', () => {
+  const r = checkInvertedRR([{ pnl: 10 }, { pnl: 10 }, { pnl: -40 }], null);
+  assert.equal(r.matched, true);
 });
