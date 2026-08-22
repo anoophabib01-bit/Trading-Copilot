@@ -158,7 +158,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**6 / 24 tasks complete.** (0.1, 0.3, 1.1–1.4 — build by DSH, senior partner Claude Code)
+**10 / 24 resolved.** 9 done (0.1, 0.3, 1.1–1.4, 2.1–2.3) + 1 skipped with reason (0.2) — build by DSH, senior partner Claude Code
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -217,7 +217,7 @@ degrade the whole chart layer.*
   rather than assumed.
   *Done: 2026-08-22 (DSH build). New `app/chart-bar-cache.js` (pure: normalizeTf, ttlMsForTf = 1/3 bar duration, ChartBarCache, staggerOffsetMs) + `app/test/chart-bar-cache.test.js` (10 tests). Wired into `getFullBars` and `getBarsAndLabels` with per-symbol keys via new `getChartSymbolCached` (10s symbol cache); Pine label text cached in a second instance with the same per-TF TTL. `makeLock` now logs queue depth whenever the lock is contended and exposes `queueDepth()`/`maxQueueDepth()` getters. Watcher starts staggered 4s apart via `armMonitorsStaggered()` at all three connect sites. DEVIATION for review: per the plan's TTL, a just-closed new bar becomes visible up to ~TTL/2 after close — a detection-lag tradeoff, documented in the module header. Full suite 566/566 green (556 baseline + 10 new).*
 
-- [ ] **0.2 — Baseline capture, for real this time**
+- [~] **0.2 — Baseline capture, for real this time**
 
   `SIGNAL_LOOP_PLAN.md` task 0.1 was skipped and its author recorded the shortfall honestly:
   there is no before-picture, so nobody can say whether the closed-bar fix reduced false
@@ -227,7 +227,7 @@ degrade the whole chart layer.*
 
   This is cheap — it is one session with logging on, no code change beyond a broadcast tap —
   and it is the only chance to measure what arming the other four watchers actually adds.
-  *Done:*
+  *Skipped: 2026-08-22 (DSH build) — the one-live-session capture cannot be run from the build environment; it needs Anoop's machine mid-session. The broadcast tap itself is SUPERSEDED by task 2.1's signal-ledger (server-side JSONL at fire time, wired into all six fire paths), which captures strictly more than the baseline file would have. Remaining on-machine item for Anoop/Claude after merge: run one full session and compare the ledger against expectations — the "before" picture for the other four watchers stays unmeasured and must not be claimed.*
 
 - [x] **0.3 — Branch and test baseline**
 
@@ -306,7 +306,7 @@ degrade the whole chart layer.*
 *Nothing about the detection layer can be tuned from evidence until this exists. It is also
 the prerequisite for Phase 5's scorecard.*
 
-- [ ] **2.1 — Signal ledger, server-side, at broadcast time**
+- [x] **2.1 — Signal ledger, server-side, at broadcast time**
 
   New `signal-ledger.js`. Every fire **and every Playbook C rejection** appends one line to
   `DATA_DIR/signals/<YYYY-MM-DD>.jsonl`:
@@ -328,9 +328,9 @@ the prerequisite for Phase 5's scorecard.*
   *Rejections are data, not noise.* The Playbook C filter rate per timeframe is the direct
   measure of whether the gate is protecting Anoop or starving him, and it is currently
   unmeasurable.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). New `app/signal-ledger.js` (pure: sessionTierForMinutes, buildSignalRow with the plan's exact field set + `event`/`decision`/`decidedAt`/`signalTs` extras for 2.2/2.3 consumers, serializeSignal) + `app/test/signal-ledger.test.js` (6 tests). `ledgerSignal()` in server.js appends to `DATA_DIR/signals/<trading-day-IST>.jsonl` at fire time with context captured NOW: sessionTier (from rules.sessionWindowsIST), hourTrend (from po3TrendCache), newsBlackout (computeNewsStatus), symbol (chart symbol cache), accountSlot, mode. dailyTrend deliberately null — Daily is Anoop's own read (see gatherAnalysisContext). Wired into all six fire paths: engulf accept/reject, FVG, SFP raid, Playbook B confirm, PO3 phase change (UNCLEAR written valid:false). DEVIATION: shipped together with 2.2/2.3 in one commit (see 2.2's Done line) because the fire-path edits interleave ledger and arm calls. Task 0.2 marked [~] in this commit — its tap is superseded by this ledger.*
 
-- [ ] **2.2 — Signal expiry and a single live-setup slot**
+- [x] **2.2 — Signal expiry and a single live-setup slot**
 
   A server-side `armedSetup` holding the most recent live setup with a computed expiry —
   8 candles of the signal's own timeframe, mirroring the SFP patience window, which is the
@@ -343,9 +343,9 @@ the prerequisite for Phase 5's scorecard.*
 
   On expiry with no decision recorded, write `decision: 'ignored'` to the ledger. An untouched
   signal is itself a data point.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). Server-side `armedSetup` slot: `armSetup()` (newer replaces older), `readArmedSetup()` (lazy expiry = 8 candles × tfSecondsFor(tfCode); on expiry writes decision:'ignored' to the ledger), `clearArmedSetup()`, `broadcastArmedSetup()` (pushes `armed-setup` WS). Armed by: engulf accept (A/C), FVG fire, Playbook B confirm. Deliberately NOT armed by SFP raid alone ("not a trade yet") or PO3 phase changes (informational events) — recorded as a scoping decision for review. DEVIATION: shipped with 2.1 and 2.3 as one commit (fire-path edits interleave ledger+arm calls; splitting after the fact would have been error-prone); the commit message carries all three task ids.*
 
-- [ ] **2.3 — Decision capture: two buttons, one click**
+- [x] **2.3 — Decision capture: two buttons, one click**
 
   When a setup is live, the UI offers exactly **Took it** / **Passed**. No form, no note field
   required — anything heavier will not get used mid-session. Writes
@@ -354,7 +354,7 @@ the prerequisite for Phase 5's scorecard.*
   This is deliberately built *before* the automated fill-join in Phase 5. It is the cheapest
   thing that makes the loop learn, it works even if every automated join fails, and it is the
   fallback if the live-feed join proves unreliable.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). Server: `handleSignalDecision` (WS `signal-decision`; validates decision ∈ {took,passed} and signalTs matches the live slot; writes the decision row to the day's ledger, clears the slot, broadcasts armed-setup:null) + `armed-setup-get` pull. Client: armed-setup card in chat with exactly two buttons (Took it / Passed), re-rendered on push, removed on decision/expiry; decision result echoed as a system message. Full suite 572/572 (566 + 6 new signal-ledger tests).*
 
 ---
 

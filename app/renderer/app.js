@@ -1865,6 +1865,19 @@ function setupWsEvents() {
     }, 15000);
   }
 
+  // 2.3: armed-setup card — Took it / Passed. Exactly two buttons, no form.
+  if (window.api.onArmedSetup) {
+    window.api.onArmedSetup(setup => renderArmedSetupCard(setup));
+    window.api.getArmedSetup().then(renderArmedSetupCard).catch(() => {});
+  }
+  if (window.api.onSignalDecisionResult) {
+    window.api.onSignalDecisionResult(res => {
+      if (res && res.ok && typeof addSystemMessage === 'function') {
+        addSystemMessage('Signal decision recorded: ' + String(res.decision || '').toUpperCase() + '.');
+      }
+    });
+  }
+
   window.api.onSFPCheck(chk => {
     const tf = (chk && chk.tf) || '15m';
     if (!state.sfp[tf]) return;
@@ -4814,6 +4827,48 @@ function renderChartWatchers(data) {
     }[health] || 'unknown';
     return '<div class="watcher-row"' + errAttr + '><span>' + dot + '</span><span>' + escHtml(r.label || r.id) + '</span><span class="stat-label">' + stateText + '</span></div>';
   }).join('');
+}
+
+// 2.3: armed-setup card — the server's single live-setup slot. Two buttons:
+// Took it / Passed. No form, no note field. Removed on decision/expiry (the
+// server broadcasts armed-setup:null in both cases).
+let _armedSetupCardTs = null;
+function renderArmedSetupCard(setup) {
+  const existing = document.getElementById('armed-setup-card');
+  if (!setup) {
+    if (existing) existing.remove();
+    _armedSetupCardTs = null;
+    return;
+  }
+  if (existing && _armedSetupCardTs === setup.signalTs) return; // same setup already rendered
+  if (existing) existing.remove();
+  _armedSetupCardTs = setup.signalTs;
+  const msgs = document.getElementById('messages');
+  if (!msgs) return;
+  const d = document.createElement('div');
+  d.className = 'msg system-msg trade-ticket-card';
+  d.id = 'armed-setup-card';
+  const mins = Math.max(0, Math.round(((setup.expiresAt || 0) - Date.now()) / 60000));
+  const detail = [
+    setup.direction || '',
+    setup.tfLabel || setup.tfCode || '',
+    setup.level != null ? 'level ' + setup.level : '',
+    setup.gapLow != null ? 'gap ' + setup.gapLow + '-' + setup.gapHigh : ''
+  ].filter(Boolean).join(' · ');
+  d.innerHTML = '<div class="msg-bubble trade-ticket-bubble">'
+    + '<div class="tt-header">📡 Setup live — Playbook ' + escHtml(String(setup.playbook || '?')) + ' ' + escHtml(detail) + '</div>'
+    + '<div class="tt-row"><span class="stat-label">expires in ~' + mins + ' min — mark what you did:</span></div>'
+    + '<div class="tt-actions">'
+    + '<button class="gr-btn" onclick="tcSignalDecision(' + Number(setup.signalTs) + ', \'took\')">Took it</button>'
+    + '<button class="gr-btn gr-reset" onclick="tcSignalDecision(' + Number(setup.signalTs) + ', \'passed\')">Passed</button>'
+    + '</div></div>';
+  msgs.appendChild(d);
+  scrollToBottom();
+}
+window.tcSignalDecision = function (signalTs, decision) {
+  const el = document.getElementById('armed-setup-card');
+  if (el) { el.querySelectorAll('button').forEach(b => { b.disabled = true; }); }
+  if (window.api.signalDecision) window.api.signalDecision(signalTs, decision);
 }
 
 window.tcDismiss = function (id) {
