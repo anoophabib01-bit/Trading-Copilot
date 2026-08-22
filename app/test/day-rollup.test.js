@@ -9,6 +9,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { gradeTrades, rollupDay, tradingDayKey } = require('../renderer/day-rollup.js');
+const dayRollup = require('../renderer/day-rollup.js');
 
 const WINS = [{ name: 'London', startMin: 810, endMin: 900 }, { name: 'NY', startMin: 1140, endMin: 1260 }];
 // 2026-08-10 is a Monday. Times are IST wall-clock.
@@ -79,4 +80,30 @@ test('tradingDayKey anchors to the 03:45 IST rollover', () => {
   assert.equal(tradingDayKey(Date.parse('2026-08-18T09:00:00+05:30')), '2026-08-18');
   assert.equal(tradingDayKey(Date.parse('2026-08-18T00:30:00+05:30')), '2026-08-17'); // 00:30 IST is pre-rollover
   assert.equal(tradingDayKey(Date.parse('2026-08-18T03:46:00+05:30')), '2026-08-18');
+});
+
+// ── normalizeSide (4.3 audit fix) ───────────────────────────────────────────
+// The stored row vocabulary is LONG/SHORT; the live broker feed speaks
+// buy/sell. Writing the raw broker word into the row made MAE/MFE read every
+// live BUY as a short and made the 4.5 tolerance identity reject a live row
+// against its own CSV (side mismatch) — re-opening the doubling landmine.
+test('normalizeSide maps the broker vocabulary onto the stored row vocabulary', () => {
+  assert.equal(dayRollup.normalizeSide('buy'), 'LONG');
+  assert.equal(dayRollup.normalizeSide('sell'), 'SHORT');
+  assert.equal(dayRollup.normalizeSide('BUY'), 'LONG');
+  assert.equal(dayRollup.normalizeSide('Sell'), 'SHORT');
+});
+
+test('normalizeSide passes the stored vocabulary through untouched', () => {
+  assert.equal(dayRollup.normalizeSide('LONG'), 'LONG');
+  assert.equal(dayRollup.normalizeSide('short'), 'SHORT');
+});
+
+test('normalizeSide returns null rather than guessing on absent/garbage input', () => {
+  assert.equal(dayRollup.normalizeSide(null), null);
+  assert.equal(dayRollup.normalizeSide(undefined), null);
+  assert.equal(dayRollup.normalizeSide(''), null);
+  assert.equal(dayRollup.normalizeSide('  '), null);
+  assert.equal(dayRollup.normalizeSide('flat'), null);
+  assert.equal(dayRollup.normalizeSide(0), null);
 });
