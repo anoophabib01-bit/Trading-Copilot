@@ -4411,6 +4411,14 @@ function parseToolResult(res) {
 // See that file's header for WHY these are computed rather than asked of a model.
 const chartReads = require('./chart-reads');
 
+// LIVE_FEED_LOOP_PLAN 0.1 — chart bar-read cache (see chart-bar-cache.js).
+// Collapses N monitors reading the same (symbol, tf, count) into one chart
+// operation; a separate instance holds the Pine label-text reads that ride
+// along with getBarsAndLabels, so each gets the timeframe's own TTL.
+const chartBarCache = require('./chart-bar-cache');
+const barCache = new chartBarCache.ChartBarCache();
+const barLabelCache = new chartBarCache.ChartBarCache();
+
 // Defensively pull a bar array out of whatever shape data_get_ohlcv returns —
 // the exact field name isn't nailed down from a live call, so this tries the
 // common candidates rather than assuming one and silently returning nothing.
@@ -4493,7 +4501,15 @@ const LOCK_TIMEOUT_MS = 30000; // generous — real chart/broker ops finish in a
 function makeLock(name) {
   let chain = Promise.resolve();
   let timeoutStreak = 0;
+  // 0.1 observability: queue depth is logged whenever the lock is contended,
+  // so chart-lock saturation (the plan's #1 risk) is visible in the log
+  // instead of assumed. Getters exposed for the Chart Watchers panel (1.4).
+  let queueDepth = 0;
+  let maxQueueDepth = 0;
   return function withLock(fn) {
+    queueDepth++;
+    if (queueDepth > maxQueueDepth) maxQueueDepth = queueDepth;
+    if (queueDepth > 1) console.log(`[${name}] queue depth ${queueDepth}`);
     // 2026-08-19: captured synchronously, at the moment of the CALL, not the
     // moment of the (much later) timeout — this is the one piece of
     // information that's been missing while chasing the unhandled-rejection
@@ -4520,7 +4536,8 @@ function makeLock(name) {
     // is deliberately ignored here — swallowed so it can never become an
     // unhandled rejection — a future caller must never wait on a call this
     // function already gave up on.
-    run.then(() => clearTimeout(timer), () => clearTimeout(timer));
+    const release = () => { queueDepth = Math.max(0, queueDepth - 1); };
+    run.then(() => { clearTimeout(timer); release(); }, () => { clearTimeout(timer); release(); });
     run.catch(() => {});
     chain = winner.then(
       () => { timeoutStreak = 0; },
@@ -4542,14 +4559,40 @@ function makeLock(name) {
     // on it keeps working exactly as before; this only closes the gap for
     // callers that don't.
     winner.catch(() => {});
+    withLock.queueDepth = () => queueDepth;
+    withLock.maxQueueDepth = () => maxQueueDepth;
     return winner;
   };
 }
 const withChartLock = makeLock('withChartLock');
 const withBrokerLock = makeLock('withBrokerLock');
 
+// 0.1: cached symbol read so cache keys can be per-symbol without adding a
+// chart_get_state round-trip to every bar read. 10s staleness is safe — the
+// PO3 monitor re-reads every 60s and resets its state on symbol change, and
+// the secondary-symbol watch clears the bar cache on every switch.
+let chartSymbolCache = { symbol: null, at: 0 };
+const CHART_SYMBOL_CACHE_TTL_MS = 10 * 1000;
+async function getChartSymbolCached() {
+  if (chartSymbolCache.symbol && Date.now() - chartSymbolCache.at < CHART_SYMBOL_CACHE_TTL_MS) return chartSymbolCache.symbol;
+  try {
+    const stateRes = await mcpBridge.callTool('chart_get_state', {});
+    const state = parseToolResult(stateRes);
+    const sym = (state && (state.symbol || state.chart_symbol || state.ticker)) || null;
+    if (sym) chartSymbolCache = { symbol: sym, at: Date.now() };
+    return sym || chartSymbolCache.symbol;
+  } catch (e) {
+    return chartSymbolCache.symbol; // stale-but-real beats nothing
+  }
+}
+
 async function getFullBars(tfCode, count) {
-  return withChartLock(() => _getFullBarsUnlocked(tfCode, count));
+  const symbol = await getChartSymbolCached();
+  const cached = barCache.get(symbol, tfCode, count);
+  if (cached) return cached;
+  const bars = await withChartLock(() => _getFullBarsUnlocked(tfCode, count));
+  if (Array.isArray(bars) && bars.length) barCache.set(symbol, tfCode, count, bars);
+  return bars;
 }
 
 async function _getFullBarsUnlocked(tfCode, count) {
@@ -4595,7 +4638,16 @@ async function _getFullBarsUnlocked(tfCode, count) {
 // cfg.tfCode. Same switch/poll/restore pattern as _getFullBarsUnlocked,
 // just also collecting labels + study values in the same switched window.
 async function getBarsAndLabels(tfCode, count) {
-  return withChartLock(() => _getBarsAndLabelsUnlocked(tfCode, count));
+  const symbol = await getChartSymbolCached();
+  const cachedBars = barCache.get(symbol, tfCode, count);
+  const cachedLabel = barLabelCache.get(symbol, tfCode, count, { noslice: true });
+  if (cachedBars && cachedLabel !== null) return { bars: cachedBars, labelText: cachedLabel };
+  const result = await withChartLock(() => _getBarsAndLabelsUnlocked(tfCode, count));
+  if (result && Array.isArray(result.bars) && result.bars.length) {
+    barCache.set(symbol, tfCode, count, result.bars);
+    barLabelCache.set(symbol, tfCode, count, result.labelText || '');
+  }
+  return result;
 }
 
 async function _getBarsAndLabelsUnlocked(tfCode, count) {
@@ -5625,6 +5677,21 @@ function stopSessionPrepScheduler() {
   if (sessionPrepInterval) { clearInterval(sessionPrepInterval); sessionPrepInterval = null; }
 }
 
+// 0.1: arm the always-on watchers with staggered start offsets so their
+// timers don't align on the same tick (chart-bar-cache.js staggerOffsetMs).
+// One helper for the three connect sites below so the stagger — and 1.1's
+// ALL_MONITORS expansion — can never drift between them.
+function armMonitorsStaggered() {
+  const entries = [
+    { cond: () => !po3MonitorUserDisabled, run: () => startPo3Monitor() },
+    { cond: () => !engulfMonitorUserDisabled, run: () => startEngulfMonitor('1h') },
+    { cond: () => !sfpMonitorUserDisabled, run: () => startSFPMonitor('30m') },
+  ];
+  entries.forEach((e, i) => {
+    if (e.cond()) setTimeout(e.run, chartBarCache.staggerOffsetMs(i));
+  });
+}
+
 // ── MCP startup ────────────────────────────────────────────────────────────────
 async function startMCP() {
   try {
@@ -5649,15 +5716,12 @@ async function startMCP() {
       // — startPo3Monitor() no-ops if already running. Skipped if Anoop
       // explicitly turned it off (po3MonitorUserDisabled) — a reconnect must
       // never override that choice.
-      if (!po3MonitorUserDisabled) startPo3Monitor();
       // 2026-08-19 (Anoop: "the live feed should ... be active always"):
-      // same auto-start-on-connect treatment for the other 2 of the 3
-      // playbook-setup monitors (SFP+FVG/liquidity-raid is Playbook B,
-      // started via startSFPMonitor; Engulfing+TF via startEngulfMonitor).
-      // Each is independently idempotent and independently respects its own
-      // *MonitorUserDisabled flag, exactly like PO3 above.
-      if (!engulfMonitorUserDisabled) startEngulfMonitor('1h');
-      if (!sfpMonitorUserDisabled) startSFPMonitor('30m');
+      // auto-start-on-connect for the always-on watchers (PO3, engulf-1H,
+      // SFP-30M — each independently idempotent and respecting its own
+      // *MonitorUserDisabled flag). 0.1: armed via armMonitorsStaggered so
+      // the start times don't align on one tick.
+      armMonitorsStaggered();
       // 2026-08-19: re-run the self-test on every reconnect, not just once at
       // boot — a reconnect can land with the Trading Panel no longer open or
       // linked, and that's exactly the state this test exists to catch.
@@ -5670,16 +5734,12 @@ async function startMCP() {
       broadcast({ type: 'mcp-status', connected: false, message: 'TradingView disconnected' + (detail ? ': ' + detail : '') });
     });
     if (mcpBridge.ready) {
-      if (mcpBridge.tvConnected && !po3MonitorUserDisabled) startPo3Monitor(); // already connected before this call — 'tv-connected' won't fire again
-      if (mcpBridge.tvConnected && !engulfMonitorUserDisabled) startEngulfMonitor('1h');
-      if (mcpBridge.tvConnected && !sfpMonitorUserDisabled) startSFPMonitor('30m');
+      if (mcpBridge.tvConnected) armMonitorsStaggered(); // already connected before this call — 'tv-connected' won't fire again
       if (mcpBridge.tvConnected) scheduleLiveFeedSelfTest(15000);
       return;
     }
     await mcpBridge.start();
-    if (mcpBridge.tvConnected && !po3MonitorUserDisabled) startPo3Monitor(); // covers a start() that resolves already-connected, race-safe alongside the event listener
-    if (mcpBridge.tvConnected && !engulfMonitorUserDisabled) startEngulfMonitor('1h');
-    if (mcpBridge.tvConnected && !sfpMonitorUserDisabled) startSFPMonitor('30m');
+    if (mcpBridge.tvConnected) armMonitorsStaggered(); // covers a start() that resolves already-connected, race-safe alongside the event listener
     if (mcpBridge.tvConnected) scheduleLiveFeedSelfTest(15000);
   } catch (err) {
     broadcast({ type: 'mcp-status', connected: false, message: 'TradingView MCP: ' + err.message });

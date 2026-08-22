@@ -101,7 +101,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**1 / 24 tasks complete.** (0.3 done — build started 2026-08-22 by DSH, senior partner Claude Code)
+**2 / 24 tasks complete.** (0.1, 0.3 — build by DSH, senior partner Claude Code)
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -125,7 +125,7 @@ holes, and the CSV dependency dies.
 *Do first. Task 0.1 is not optional housekeeping — arming five watchers without it will
 degrade the whole chart layer.*
 
-- [ ] **0.1 — Chart-read budget: cache bars per timeframe, stagger the polls**
+- [x] **0.1 — Chart-read budget: cache bars per timeframe, stagger the polls**
 
   **The problem this prevents.** `checkEngulfingSignal` calls `getBarsAndLabels(tfCode, 5)`,
   which **switches the chart timeframe and restores it**, on *every* poll. On a candidate it
@@ -158,7 +158,7 @@ degrade the whole chart layer.*
   *Acceptance:* with all five watchers armed, measured chart-lock wait time for a synthetic
   `chart_get_state` call stays under 2s at p95. Log the queue depth so this is observable
   rather than assumed.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). New `app/chart-bar-cache.js` (pure: normalizeTf, ttlMsForTf = 1/3 bar duration, ChartBarCache, staggerOffsetMs) + `app/test/chart-bar-cache.test.js` (10 tests). Wired into `getFullBars` and `getBarsAndLabels` with per-symbol keys via new `getChartSymbolCached` (10s symbol cache); Pine label text cached in a second instance with the same per-TF TTL. `makeLock` now logs queue depth whenever the lock is contended and exposes `queueDepth()`/`maxQueueDepth()` getters. Watcher starts staggered 4s apart via `armMonitorsStaggered()` at all three connect sites. DEVIATION for review: per the plan's TTL, a just-closed new bar becomes visible up to ~TTL/2 after close — a detection-lag tradeoff, documented in the module header. Full suite 566/566 green (556 baseline + 10 new).*
 
 - [ ] **0.2 — Baseline capture, for real this time**
 
