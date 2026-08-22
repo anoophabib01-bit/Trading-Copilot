@@ -46,8 +46,26 @@ function checkTradeAllowed(rules, stage, todayTrades, requestedQty) {
     return { allowed: false, reason: `size ${qty} is under sizeFloor ${sizeFloor}` };
   }
 
+  // 2026-08-21 (Anoop's D1/D2): the trade COUNT only hard-blocks when every
+  // trade behind it was scored on verified evidence. A trade tagged
+  // evidence:'degraded' was scored by the fill-edge fallback — the same rule
+  // that produced the "9/3 TRADES — DONE" lockout against ~4 real round trips.
+  // A count built partly on that must not silently end a live session, so it
+  // degrades to advisory: allowed, but carrying a warning the UI surfaces.
+  //
+  // Note what is NOT downgraded. dayStop and the size rules below still hard-
+  // block, because they read BALANCE and SIZE — both directly observed, and
+  // neither depends on how many trades we think happened. Only the count is
+  // uncertain, so only the count loses its teeth.
+  const degradedCount = trades.filter(t => t && t.evidence === 'degraded').length;
   const tradesPerDay = typeof r.tradesPerDay === 'number' ? r.tradesPerDay : Infinity;
   if (trades.length >= tradesPerDay) {
+    if (degradedCount > 0) {
+      return {
+        allowed: true, reason: null, advisory: true,
+        warning: `trade count says ${trades.length}/${tradesPerDay}, but ${degradedCount} of those was scored on a degraded feed and may not be real. Not blocking on a number I cannot stand behind — check the broker's own order history before taking this.`,
+      };
+    }
     return { allowed: false, reason: `already ${trades.length} trades today, cap is ${tradesPerDay}` };
   }
 

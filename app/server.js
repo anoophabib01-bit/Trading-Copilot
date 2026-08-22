@@ -36,6 +36,7 @@ const booksIndex = require('./books-index');
 const tradovate = require('./tradovate');
 const tvBrokerFeed = require('./tv-broker-feed'); // balance-delta-at-flat P&L fold for the TradingView broker feed (unit-tested)
 const mistakePatterns = require('./mistake-patterns'); // live pattern-matching against Anoop's own documented failure history (2026-08-19, F1 first slice — advisory only, unit-tested)
+const positionEvents = require('./position-events'); // fast open/close/scale/flip detector for the 5s positions watch (2026-08-20, pure + unit-tested)
 const tradeConfirmRules = require('./trade-confirm-rules'); // Phase 2a/2b rule-check for the confirm/execute flow — unit-tested
 const tradeTicketParse = require('./trade-ticket-parse'); // Phase 2b: pure parser for JUDGE_PERSONA's TRADE_TICKET line — unit-tested
 const tradeConfirmDedup = require('./trade-confirm-dedup'); // Phase 2b: double-submit/idempotency guard — unit-tested
@@ -1701,6 +1702,25 @@ function biasTodayContext() {
 // done in this same pass — see SEMI_AUTONOMOUS_SYSTEM_PLAN.md's
 // "live feed accessible to all agents" section for the staged rollout
 // reasoning (verify one integration live before extending to the rest).
+// 2026-08-21 (D3): the OPEN position is now part of every agent's live-feed
+// context. It used to reach Jessi only as a chat line, so cutting the noisy
+// opened/scaled transcript lines would otherwise have made her blind to the
+// fact that a trade is on right now — the opposite of what was asked for.
+// "Tell Jessi" is a MODEL-CONTEXT requirement; "print it in the transcript"
+// is a UI one, and conflating them was the sharpest finding of the review.
+function formatOpenPositionContext() {
+  const rows = Array.isArray(tvLastPositions) ? tvLastPositions : [];
+  const open = rows.filter(p => {
+    const q = Number(String((p && p.Qty) == null ? '' : p.Qty).replace(/[^0-9.-]/g, ''));
+    return Number.isFinite(q) && q !== 0;
+  });
+  if (!open.length) return 'OPEN POSITION: none (flat).';
+  return 'OPEN POSITION RIGHT NOW: ' + open.map(p =>
+    `${p.Side || '?'} ${p.Qty} ${p.Symbol}` + (p['Avg Fill Price'] ? ` from ${p['Avg Fill Price']}` : '') +
+    (p.Profit ? ` (open P&L ${p.Profit})` : '')).join('; ') +
+    '. This is a LIVE position, not a closed trade — its P&L is floating and is not in the day total below.';
+}
+
 function formatLiveFeedContext() {
   if (!mcpBridge.ready || !mcpBridge.tvConnected) return null;
   if (tvBrokerFeedReadOk !== true) return null;
@@ -1715,6 +1735,14 @@ function formatLiveFeedContext() {
   try {
     const f1 = mistakePatterns.checkTradeCountEscalation(st.trades);
     if (f1.matched) lines.push(`⚠ ${f1.message}`);
+  } catch (e) {}
+  // 2026-08-20: F2 alongside F1. Unlike the poll-side broadcast (which fires
+  // once per day so a banner never becomes noise), the agent context reports
+  // the CURRENT state every turn — an agent asked "should I take this trade"
+  // mid-streak must see the streak, not a flag that already fired an hour ago.
+  try {
+    const f2 = mistakePatterns.checkRevengeCluster(st.trades, { cooldownMinutes: getActiveRules().cooldownMinutes });
+    if (f2.matched) lines.push(`⚠ ${f2.message}`);
   } catch (e) {}
   return lines.join(' ');
 }
@@ -1751,7 +1779,7 @@ When his adherence is below target, say the number and name the pattern — do n
 
   // 2026-08-19: live broker feed, same short line in both minimal (voice)
   // and full context — see formatLiveFeedContext() above.
-  const liveCtx = formatLiveFeedContext();
+  const liveCtx = [formatLiveFeedContext(), formatOpenPositionContext()].join(String.fromCharCode(10));
   if (liveCtx) parts.push(`\n### Live feed (today, real broker data)\n${liveCtx}`);
 
   if (minimal) return parts.join('\n');
@@ -2326,7 +2354,25 @@ async function handleDebateChat(ws, msg, preGathered) {
       }
     } catch (e) {}
 
-    const judgeContext = `## JESSI'S ARGUMENT (Discipline & Psychology)\n${jessiArgument.text}\n\n## ANALYSIS AGENT'S ARGUMENT (Technical & Market)\n${analysisArgument.text}\n\n## ICT POWER OF 3 ARGUMENT (AMD phase — Accumulation / Manipulation / Distribution)\n${po3Argument.text}${biasBlock}\n\n## ORIGINAL QUESTION\n${lastUserText}`;
+    // 2026-08-20: item 3 of the live mistake-tracking feedback loop
+    // (SEMI_AUTONOMOUS_SYSTEM_PLAN.md). The F1 advisory + today's real trade
+    // count/P&L reach the Judge through its DISCIPLINE lane, which its own
+    // hierarchy already weighs highest — a live pattern match is exactly the
+    // input that lane was built for. Same shared formatLiveFeedContext() the
+    // Jessi builder uses, so the two can never disagree about the numbers.
+    // Deliberately NOT given to the Analysis/PO3 agents: they are explicitly
+    // denied account/P&L (see gatherAnalysisContext's "ACCOUNT / P&L:
+    // deliberately not provided") and that lane separation is load-bearing.
+    let liveBlock = '';
+    try {
+      const lc = formatLiveFeedContext();
+      if (lc) {
+        liveBlock = `\n\n## LIVE BROKER FEED (today, real executed trades — ground truth, do not re-estimate or invent figures beyond these)\n${lc}\n`
+          + `Treat any ⚠ pattern line above as a DISCIPLINE input of the same weight as Jessi's argument. It is computed from his own executed trades, not an opinion. If a documented failure pattern is already showing today, a technically valid setup is still a NO-GO on discipline grounds — say which pattern, and that it is the reason.`;
+      }
+    } catch (e) {}
+
+    const judgeContext = `## JESSI'S ARGUMENT (Discipline & Psychology)\n${jessiArgument.text}\n\n## ANALYSIS AGENT'S ARGUMENT (Technical & Market)\n${analysisArgument.text}\n\n## ICT POWER OF 3 ARGUMENT (AMD phase — Accumulation / Manipulation / Distribution)\n${po3Argument.text}${biasBlock}${liveBlock}\n\n## ORIGINAL QUESTION\n${lastUserText}`;
 
     const judgePrimary = primaryProviderModel();
     await groqAgent.stream(
@@ -3452,6 +3498,14 @@ async function handlePostSessionReview(ws, msg) {
       }
     } catch (e) {}
 
+    // 2026-08-20: same shared live-feed accessor. The post-session review is
+    // written about the session that just ended, so the broker's own record of
+    // it belongs here alongside the client-reported session data.
+    try {
+      const lc = formatLiveFeedContext();
+      if (lc) parts.push('\n## LIVE BROKER FEED (today, real executed trades — ground truth if it disagrees with the session data above)\n' + lc);
+    } catch (e) {}
+
     const dataContext = parts.join('\n');
 
     send(ws, { type: 'post-review-status', reqId, phase: 'analyzing' });
@@ -3700,6 +3754,13 @@ async function handleScalperChat(ws, msg) {
     try {
       const align = formatAlignmentNotes(3);
       if (align) seed.push('\n## WHERE HIS HEAD\'S AT (his own dated reflections — read before coaching)\n' + align);
+    } catch (e) {}
+    // 2026-08-20: shared live-feed accessor (same one Jessi and the Judge read).
+    // The Scalper's whole job is today's execution, so a stale CSV-derived
+    // trade count was the worst place for this gap to sit.
+    try {
+      const lc = formatLiveFeedContext();
+      if (lc) seed.push('\n## LIVE BROKER FEED (today, real executed trades — ground truth over the CSV/scalp stats above if they disagree)\n' + lc);
     } catch (e) {}
 
     const seeded = [{ role: 'user', content: 'CONTEXT (auto-attached, not typed by Anoop):\n' + seed.join('\n') }]
@@ -5628,7 +5689,18 @@ function loadTVBrokerFeedState() {
     // (yesterday's) state on the first fold() call of a new day — restoring
     // it here unconditionally and letting fold() do that comparison is
     // simpler and less error-prone than duplicating the day-rollover logic.
-    if (saved && typeof saved === 'object' && Array.isArray(saved.trades)) return saved;
+    // 2026-08-20: refuse a state written by a fold we've since found buggy.
+    // Without this, the fix to the entry-fill over-counting ships but the
+    // inflated tradeCount it produced survives on disk and keeps enforcing —
+    // observed live as a session stuck at "9/3 TRADES — DONE" for ~4 real
+    // round trips, which would have persisted until IST rollover.
+    if (tvBrokerFeed.isStateSchemaStale(saved)) {
+      if (saved && typeof saved === 'object') {
+        console.warn(`[tv-broker] discarding persisted feed state written by an older schema (v${saved.schemaVersion || 1} < v${tvBrokerFeed.STATE_SCHEMA_VERSION}) — its tradeCount (${saved.tradeCount}) came from a fold since found to over-count. Starting today's count fresh from the broker's own order history.`);
+      }
+      return tvBrokerFeed.freshState();
+    }
+    if (Array.isArray(saved.trades)) return saved;
   } catch (e) {}
   return tvBrokerFeed.freshState();
 }
@@ -5649,9 +5721,119 @@ let tvBrokerSeenOrderIds = new Set(); // high-water mark so a fill is only ever 
 let tvBrokerFeedState = tvBrokerFeed.freshState();
 let tvBrokerFeedReadOk = null; // null = never polled yet; tracks state so log lines only fire on transitions, not every 10s
 let tvBrokerOrdersSuspectLogged = false; // tracks the orders-table-empty-but-position-open transition, same log-once-per-state pattern
+let tvBrokerWalkDesyncLogged = false; // same log-once-per-state pattern for the order-walk-vs-positions disagreement (2026-08-20, H5)
+// 2026-08-20 (found in review): the timestamp of THIS process's first broker
+// poll. The order-history backfill exists solely to recover round trips that
+// closed before this instance was watching — anything closing after this
+// moment is the live fold's job. Without this boundary the backfill can
+// reconstruct a trade the fold ALREADY recorded (realistic whenever
+// ordersTableSuspect delays the backfill past a real close), adding a second
+// pnlUnknown copy and inflating tradeCount straight into checkTradeAllowed's
+// tradesPerDay ceiling. Decision (Anoop, 2026-08-20): gate on this boundary
+// rather than fuzzy-matching exit timestamps — the two record types stamp
+// their times from different clocks (fold uses Date.now() at poll time, the
+// backfill parses TradingView's rendered string, whose timezone this codebase
+// asserts but has never verified), so a proximity match could silently drop a
+// REAL trade. A trade the fold misses after startup now stays visible as a
+// tradeCountMismatch banner instead of being silently double-counted.
+let tvBrokerFirstPollAt = null;
 const TV_BROKER_POLL_MS = 10000;
 
-async function pollTVBrokerAccount() {
+// ── Live position watch (2026-08-20, Anoop's request) ──────────────────────
+// "As soon as I close or open any trade it should be updated, and be part of
+// the workflow." Two gaps this closes, both real before today:
+//   1. LATENCY. The only live trade signal was the 10s full-account poll, so
+//      an open or a close could sit unreported for up to 10 seconds.
+//   2. OPENS WERE INVISIBLE. tv-broker-feed.js's fold only ever emits when a
+//      trade CLOSES (tradeCount increments). Nothing in the app knew a trade
+//      had started until it was over — so no rule could be checked, and no
+//      coaching could land, while the position was still on.
+//
+// This is a LIGHT read: trading_get_positions only (one table), not
+// trading_get_account (summary + positions + orders). It exists to spot the
+// transition fast and then hand off — on any change it triggers an immediate
+// full pollTVBrokerAccount() so the authoritative fold (P&L, trade count,
+// size) catches up in the same beat rather than on the next 10s tick.
+//
+// Cadence chosen by Anoop at 5s: TradingView is scraped over CDP, so every
+// tick is a real DOM read contending with the chart monitors and, critically,
+// with placeMarketOrder's multi-second click sequence — hence the same
+// withBrokerLock serialization the full poll already uses.
+const TV_POSITION_WATCH_MS = 5000;
+let tvPositionWatchTimer = null;
+// null = no baseline yet. diffPositions treats null as "first read, emit
+// nothing", which is what makes a mid-position server restart silent instead
+// of replaying the open position as a fresh entry.
+let tvLastPositions = null;
+let tvPositionWatchInFlight = false;
+// 2026-08-21 (D4): true only while handleTradeConfirm is inside its
+// withChartLock order-placement sequence.
+//
+// NOTE ON WHY THIS IS NARROW. The /autoplan eng review claimed the 5s watch
+// contends with order placement for a lock; that is wrong. Placement runs on
+// withChartLock (it must serialise against chart_set_symbol, or an
+// interleaving symbol switch could place an order on the WRONG INSTRUMENT),
+// while the broker reads run on withBrokerLock. They never queue behind each
+// other, and that split is a deliberate 2026-08-19 fix for a real "poll queued
+// for minutes behind chart monitors" bug. Suspending the watch would undo it.
+//
+// The genuine residual is smaller: mid-placement the orders table is being
+// rewritten, so the watch's follow-up FULL account read can catch it half
+// rendered, fail the walk/positions cross-check, and drop the feed into
+// degraded mode at the least convenient moment. So only the hand-off is
+// skipped. The lightweight positions read keeps running, which is exactly
+// when you most want to see the position appear.
+let tvOrderPlacementInFlight = false;
+// The side that was actually on when a position last closed, per symbol (plus
+// `__any` as a fallback for the single-instrument days that are the norm —
+// rules.json's oneInstrumentPerDay). The fold records size and P&L but never
+// side, so without this the auto-logged session row could only say '?'. Read
+// once, by the auto-log below, and only as a label — nothing enforces off it.
+const tvLastClosedSide = {};
+
+// 2026-08-20 (found reviewing the position-watch change that made it
+// reachable): coalesce concurrent polls into one. Until today this function
+// had a single caller — the 10s interval — so overlapping invocations needed
+// a >10s read to happen at all. It now has four: that interval, the
+// 'tv-broker-check-now' WS message, startup, and the 5s position watch, which
+// fires one on every open/close. Three can land on the same close.
+//
+// withBrokerLock does NOT protect this: it serializes the MCP read, but the
+// fold and everything after it run AFTER that await, unlocked. Double-SCORING
+// is already prevented twice over (fold compares against balanceAtLastFlat,
+// which the first poll has updated by then, and closedRoundTripsScored has to
+// advance) — but `prevTradeCount` is captured BEFORE the await, so a second
+// concurrent poll still sees tradeCount > prevTradeCount and re-runs the
+// whole new-trade block: a DUPLICATE row in his session log, a duplicate
+// trade-closed-live broadcast, and duplicate mistake-pattern evaluation.
+// Returning the in-flight promise makes every extra caller await the same
+// single read instead of racing it, and halves the CDP load as a side effect.
+// 2026-08-20 (review refinement): plain coalescing isn't enough on its own.
+// If the position watch spots a close while a poll is ALREADY in flight, that
+// in-flight poll may have read the account BEFORE the close landed — so
+// returning it would report pre-close numbers and silently drop the hand-off,
+// leaving the real close to wait out the 10s timer. `tvBrokerPollAgain` marks
+// "something changed after this read started" and runs exactly one more poll
+// when the current one finishes. One trailing re-run, not a queue: repeated
+// callers during a single poll collapse into the same single follow-up.
+let tvBrokerPollInFlight = null;
+let tvBrokerPollAgain = false;
+function pollTVBrokerAccount() {
+  if (tvBrokerPollInFlight) {
+    tvBrokerPollAgain = true;
+    return tvBrokerPollInFlight;
+  }
+  tvBrokerPollInFlight = pollTVBrokerAccountInner().finally(() => {
+    tvBrokerPollInFlight = null;
+    if (tvBrokerPollAgain) {
+      tvBrokerPollAgain = false;
+      pollTVBrokerAccount();
+    }
+  });
+  return tvBrokerPollInFlight;
+}
+
+async function pollTVBrokerAccountInner() {
   if (!mcpBridge.ready || !mcpBridge.tvConnected) return;
   try {
     // 2026-08-17 (Eng review finding, Phase 2b): this read shares the same
@@ -5742,9 +5924,44 @@ async function pollTVBrokerAccount() {
     // real. Skipped while ordersTableSuspect — backfilling from a table
     // that's stale/not-yet-rendered would just reconstruct nothing or, worse,
     // a wrong partial history.
+    // 2026-08-20 CRITICAL FIX (found in review, never observed live but fully
+    // reachable): this block used to stamp `dayKeyMs: <today>` onto the state
+    // while leaving `trades`/`dayPnl`/`tradeCount`/`lastLossTs` untouched, and
+    // it runs BEFORE fold(). fold()'s only day-rollover mechanism is comparing
+    // prevState.dayKeyMs against today's key (tv-broker-feed.js) — so if the
+    // backfill had never run (which is exactly what happens when
+    // ordersTableSuspect stayed true all session, a condition observed live on
+    // 2026-08-19) and the process crossed IST midnight, the stamp made fold()
+    // treat YESTERDAY's trades as today's. That is not just an advisory-banner
+    // problem: yesterday's losses would then feed trade-confirm-rules'
+    // checkTradeAllowed and size-freeze-guard's lastLossTs — real enforcement
+    // on a live-money account, silently wrong in the permissive direction for
+    // the day-stop and the trade count.
+    //
+    // Fixed by making the rollover EXPLICIT and unconditional here, before
+    // anything else touches the state: if the persisted state belongs to a
+    // previous IST day, reset it outright. fold() still does its own identical
+    // check afterwards — this is deliberately belt-and-braces, not a
+    // replacement, because the failure mode above was caused precisely by one
+    // code path assuming another one had already handled the boundary.
+    const todayKeyMs = tvBrokerFeed.istDayStartMs(Date.now());
+    if (tvBrokerFeedState.dayKeyMs != null && tvBrokerFeedState.dayKeyMs !== todayKeyMs) {
+      console.log(`[tv-broker] IST day rollover — clearing yesterday's feed state (${tvBrokerFeedState.tradeCount} trade(s), dayPnl ${Number(tvBrokerFeedState.dayPnl || 0).toFixed(2)}) before today's first fold.`);
+      tvBrokerFeedState = tvBrokerFeed.freshState();
+      persistTVBrokerFeedState();
+    }
+
+    if (tvBrokerFirstPollAt === null) tvBrokerFirstPollAt = Date.now();
+
     if (!ordersTableSuspect && !tvBrokerFeedState.backfillDone) {
-      const backfillDayKeyMs = tvBrokerFeed.istDayStartMs(Date.now());
-      const backfilled = tvBrokerFeed.reconstructClosedTradesFromOrders(orders, backfillDayKeyMs);
+      const backfillDayKeyMs = todayKeyMs;
+      const reconstructed = tvBrokerFeed.reconstructClosedTradesFromOrders(orders, backfillDayKeyMs);
+      // See tvBrokerFirstPollAt's declaration for why this boundary exists.
+      const backfilled = reconstructed.filter(t => typeof t.exitAt === 'number' && t.exitAt < tvBrokerFirstPollAt);
+      const skipped = reconstructed.length - backfilled.length;
+      if (skipped > 0) {
+        console.log(`[tv-broker] backfill skipped ${skipped} round trip(s) that closed AFTER this instance started polling — the live fold owns those; reconstructing them too would double-count into tradeCount and the tradesPerDay ceiling. If the fold missed one, it will show as a tradeCountMismatch rather than a silent duplicate.`);
+      }
       if (backfilled.length) {
         console.log(`[tv-broker] backfilled ${backfilled.length} closed trade(s) from order history (side/size/prices only — $ P&L NOT computed, check the broker's own numbers): ` +
           backfilled.map(t => `${t.side} ${t.size}x ${t.entryPrice}->${t.exitPrice}`).join(', '));
@@ -5773,12 +5990,57 @@ async function pollTVBrokerAccount() {
     const balanceRaw = result.summary && result.summary.header ? result.summary.header.balance : null;
     const balance = tvBrokerFeed.parseBalance(balanceRaw);
     const prevTradeCount = tvBrokerFeedState.tradeCount;
+    // 2026-08-20 (review): slice the new trades by ARRAY LENGTH, not by the
+    // trade COUNT. The two are equal only while nothing ever adds to one
+    // without the other — and the backfill above PREPENDS to `trades` while
+    // separately incrementing `tradeCount`. Any future divergence (a dedupe
+    // that removes a record, a repaired count) would make slice(count) return
+    // already-logged trades and re-write their rows to the session log —
+    // duplicates on disk that, unlike the feed state, no restart or day
+    // rollover ever cleans up.
+    const prevTradesLen = tvBrokerFeedState.trades.length;
+    // 2026-08-20: the broker's own count of CLOSED ROUND TRIPS today, from a
+    // per-symbol signed-quantity net-position walk over the filled orders.
+    // This is the unit the fold's tradeCount is supposed to be in — unlike
+    // `filled.length`, which counts ORDER ROWS and therefore inflates with
+    // every scale-in and every split exit. Two consumers below:
+    //   1. fold()'s poll-aliasing backstop, which needs proof a position
+    //      actually closed (an entry fill used to be enough — see fold()'s
+    //      2026-08-20 comment for the lockout that caused).
+    //   2. the tradeCountMismatch reconciliation, which was comparing order
+    //      rows against round trips and so could never agree on a normal day.
+    // null while ordersTableSuspect: a table that hasn't rendered would walk
+    // to a wrong (usually zero) count, which is worse than not comparing.
+    // 2026-08-20 (review, H5): the walk is only trustworthy if it agrees with
+    // the broker's own positions panel. One unreadable order row, or a trade
+    // opened before IST midnight and closed after it, leaves its running sum
+    // permanently non-zero — and every later round trip in that symbol then
+    // goes unseen. Because the fold now GATES on this count, a frozen count
+    // doesn't just mis-report: it disables the poll-aliasing backstop for the
+    // rest of the day and pins the mismatch banner on. So a desynced walk is
+    // treated exactly like an unreadable table — null, degraded path — rather
+    // than being fed in as though it were fact.
+    const walk = ordersTableSuspect ? null : tvBrokerFeed.analyzeOrderWalk(orders, todayKeyMs);
+    const walkDesynced = walk ? tvBrokerFeed.isWalkDesynced(walk.netBySymbol, positions) : false;
+    if (walk && (walkDesynced || walk.droppedRows > 0) && tvBrokerWalkDesyncLogged !== true) {
+      console.warn(`[tv-broker] order-history walk is out of step with the positions panel (desynced=${walkDesynced}, unreadable rows=${walk.droppedRows}). Treating its round-trip count as unavailable — the fold falls back to fill-edge detection, which can over-count. Check the Orders tab for a row with a missing fill price or timestamp.`);
+      tvBrokerWalkDesyncLogged = true;
+    } else if (walk && !walkDesynced && walk.droppedRows === 0) {
+      tvBrokerWalkDesyncLogged = false;
+    }
+    const closedRoundTripsToday = (!walk || walkDesynced || walk.droppedRows > 0)
+      ? null
+      : walk.closed.length;
     // 2026-08-19: hasNewFill ties the poll-aliasing backstop to real evidence
     // (this same poll's orders-table read found a genuinely new Filled
     // order) instead of firing on any balance movement — see fold()'s
     // 2026-08-19 comment for the live incident (Balance drifting on its own
     // while genuinely flat, fabricating 20 fake trades) this closes.
-    tvBrokerFeedState = tvBrokerFeed.fold(tvBrokerFeedState, { balance, isFlat, openSize, nowMs: Date.now(), hasNewFill: newFills.length > 0 });
+    tvBrokerFeedState = tvBrokerFeed.fold(tvBrokerFeedState, {
+      balance, isFlat, openSize, nowMs: Date.now(),
+      hasNewFill: newFills.length > 0,
+      closedRoundTrips: closedRoundTripsToday,
+    });
     // Every poll, not just on a trade close — sizeSeenThisTrade/wasFlat/
     // balanceAtLastFlat all need to survive a restart mid-trade too, not
     // only the completed-trades list, or a restart during an OPEN position
@@ -5786,9 +6048,108 @@ async function pollTVBrokerAccount() {
     // close needs to compute P&L against.
     persistTVBrokerFeedState();
     if (tvBrokerFeedState.tradeCount > prevTradeCount) {
-      const newTrades = tvBrokerFeedState.trades.slice(prevTradeCount);
+      const newTrades = tvBrokerFeedState.trades.slice(prevTradesLen);
       console.log(`[tv-broker] ${newTrades.length} trade(s) closed (balance-delta-at-flat, unverified live): ` +
         newTrades.map(t => `size ${t.size} pnl ${t.pnl.toFixed(2)}`).join(', '));
+
+      // 2026-08-20 (Anoop's request — "be part of the workflow"): a closed
+      // trade now writes its own row into today's session log instead of
+      // waiting to be typed in by hand, and announces itself in chat so
+      // Jessi's context has it while the next decision is still being made.
+      //
+      // WHAT IS AND ISN'T FILLED IN — deliberately narrow, per
+      // TRUST-PROTOCOL.md. The fold knows exactly two things about a closed
+      // trade: its size (when observed, 0 when inferred) and its realized P&L
+      // (the flat-to-flat balance delta). It does NOT know entry, stop or
+      // target — those are never recorded anywhere the fold can see. So they
+      // are written as '?' for Anoop to fill in, NOT guessed from the orders
+      // table's fill prices, which would silently pass an average fill off as
+      // a planned entry and a fill price off as a stop that was never set.
+      // `direction` comes from the position watch's own `closed` event (the
+      // side that was actually on), and stays '?' if that event wasn't seen.
+      for (const t of newTrades) {
+        try {
+          // 2026-08-20 (review): live-fold trade records are {size, pnl, at} —
+          // they carry NO `symbol` (only backfilled records do, and those never
+          // reach this loop). So the per-symbol lookup always missed and every
+          // row silently took the `__any` fallback. Harmless on a
+          // one-instrument day, but on an MNQ+MGC day it writes a CONFIDENT
+          // wrong direction to a file the Post-Session Analyst later reads back
+          // as fact — a TRUST-PROTOCOL violation. Fall back to '?' rather than
+          // to the other instrument's side whenever today wasn't single-symbol.
+          const symbolsToday = Object.keys(tvLastClosedSide).filter(k => k !== '__any');
+          const dir = tvLastClosedSide[t.symbol]
+            || (symbolsToday.length <= 1 ? tvLastClosedSide.__any : null)
+            || '?';
+          const pnlKnown = t.pnlUnknown !== true;
+          const noteBits = ['auto-logged from live feed'];
+          if (t.inferred) noteBits.push('size not observed (opened+closed between polls)');
+          if (!pnlKnown) noteBits.push('P&L NOT computed — read it off the broker');
+          const logged = sessionMgr.logTrade(sessionMgr.todayStr(), {
+            direction: dir === '?' ? '?' : dir.toUpperCase(),
+            entry: '?', stop: '?', target: '?', exit: '?',
+            pnl: pnlKnown ? Number(t.pnl.toFixed(2)) : undefined,
+            notes: noteBits.join('; ') + (t.size ? `; size ${t.size}` : ''),
+          });
+          // 2026-08-20 (review, H6): logTrade used to return success even when
+          // its insert silently no-opped. It now reports honestly, so a
+          // dropped trade is visible instead of vanishing — the whole point of
+          // auto-logging is that the record is complete without him thinking
+          // about it, which fails silently in exactly the wrong direction.
+          if (logged && logged.ok === false) {
+            console.warn('[tv-broker] auto-log did NOT write the trade row: ' + logged.reason);
+            broadcast({ type: 'session-log-failed', reason: logged.reason, path: logged.path });
+          }
+        } catch (e) {
+          // A session-log write must never take down the poll that also runs
+          // the guardrail's enforcement path.
+          console.warn('[tv-broker] auto-log to session log failed:', e.message);
+        }
+      }
+      // 2026-08-20: SELF-VERIFICATION. The fold's P&L comes from balance
+      // deltas; the order walk independently knows this round trip's entry
+      // price, exit price, side and size, and the point value is now
+      // established from data (117/117 real trades - scripts/verify-fold.js).
+      // So every closed trade is checked against a second, independent
+      // derivation the moment it happens, instead of waiting on another
+      // manual audit. This does NOT change any number the guardrail
+      // enforces: the balance delta stays the truth, because it is the
+      // account and it captures fees. Disagreement is SURFACED, exactly like
+      // the round-trip count reconciliation, so a wrong figure becomes a
+      // signal rather than a silent input to size-freeze-guard/cooldown.
+      if (walk && !walkDesynced && walk.closed.length >= newTrades.length) {
+        const commRate = getActiveRules().commissionPerContractPerSide;
+        const recentRts = walk.closed.slice(-newTrades.length);
+        newTrades.forEach((t, idx) => {
+          const rt = recentRts[idx];
+          const exp = tvBrokerFeed.expectedPnlFromFills(rt, commRate);
+          if (!exp || t.pnlUnknown) return; // no verified multiplier, or nothing to compare
+          const delta = t.pnl - exp.net;
+          // $1 of slack absorbs exchange rounding and fee timing without
+          // swallowing a real error - the 2026-08-20 miscounts were $50+ apart.
+          const ok = Math.abs(delta) <= 1.0;
+          const line = rt.symbol + ': balance-delta ' + t.pnl.toFixed(2) + ' vs fills ' + exp.net.toFixed(2) +
+            ' (' + rt.side + ' ' + rt.size + ' @ ' + rt.entryPrice + ' -> ' + rt.exitPrice +
+            ', gross ' + exp.gross.toFixed(2) + ' - comm ' + exp.commission.toFixed(2) + '), diff ' + delta.toFixed(2);
+          if (ok) console.log('[tv-broker] P&L cross-check OK on ' + line);
+          else console.warn('[tv-broker] P&L CROSS-CHECK MISMATCH on ' + line + '. Enforcement still uses the balance delta.');
+          broadcast({
+            type: 'pnl-cross-check', ok, symbol: rt.symbol,
+            balanceDelta: t.pnl, fromFills: exp.net, difference: delta,
+            side: rt.side, size: rt.size, entryPrice: rt.entryPrice, exitPrice: rt.exitPrice,
+          });
+        });
+      }
+
+      broadcast({
+        type: 'trade-closed-live',
+        trades: newTrades.map(t => ({
+          size: t.size, pnl: t.pnl, inferred: !!t.inferred, pnlUnknown: !!t.pnlUnknown,
+        })),
+        tradeCount: tvBrokerFeedState.tradeCount,
+        dayPnl: tvBrokerFeedState.dayPnl,
+        at: Date.now(),
+      });
 
       // 2026-08-19 (Anoop's request, scoped decision same day): live
       // pattern-matching against his own documented failure history, F1
@@ -5804,6 +6165,37 @@ async function pollTVBrokerAccount() {
           tvBrokerFeedState = { ...tvBrokerFeedState, f1AdvisoryFired: true };
           persistTVBrokerFeedState();
           broadcast({ type: 'mistake-pattern', pattern: 'F1', message: f1.message, winCount: f1.winCount });
+        }
+      }
+
+      // 2026-08-20: F2 (revenge clusters) — second pattern, same advisory-only
+      // contract as F1: fires once per IST day, persisted, no enforcement.
+      // Deliberately does NOT re-detect the size-up-after-a-loss half of F2's
+      // text — that is already a no-override hard stop in size-freeze-guard.js
+      // and alerting on it again would just double up. See
+      // MISTAKE_PATTERNS_PLAN.md and mistake-patterns.js's F2 header.
+      // cooldownMinutes comes from getActiveRules() (mode/stage-aware — 15
+      // standard, 5 scalper), never hardcoded here.
+      // 2026-08-20 FIX (found in review): the fired-flag is per SUB-SIGNAL,
+      // not per pattern. checkRevengeCluster returns either a rapid-reentry or
+      // a consecutive-losses match, and a single f2AdvisoryFired meant the
+      // lesser one permanently consumed the slot: a fast re-entry at 10:03
+      // would silence the "two losses back to back — close the platform"
+      // message for the rest of the day, which is the single most serious
+      // thing this file can say (4 of his 6 blown accounts). Keyed by kind so
+      // each sub-signal still fires at most once per IST day on its own.
+      const f2FiredKinds = tvBrokerFeedState.f2FiredKinds || {};
+      {
+        try {
+          const f2 = mistakePatterns.checkRevengeCluster(tvBrokerFeedState.trades, { cooldownMinutes: getActiveRules().cooldownMinutes });
+          if (f2.matched && !f2FiredKinds[f2.kind]) {
+            console.log(`[mistake-pattern] F2 fired (${f2.kind}): ` + f2.message);
+            tvBrokerFeedState = { ...tvBrokerFeedState, f2FiredKinds: { ...f2FiredKinds, [f2.kind]: true } };
+            persistTVBrokerFeedState();
+            broadcast({ type: 'mistake-pattern', pattern: 'F2', kind: f2.kind, message: f2.message, lossStreak: f2.lossStreak });
+          }
+        } catch (e) {
+          console.log('[mistake-pattern] F2 check failed: ' + e.message);
         }
       }
     }
@@ -5833,18 +6225,25 @@ async function pollTVBrokerAccount() {
     // way the balance-delta reconciliation already catches drift there.
     // VISIBILITY ONLY per this task's instruction — s.live.tradeCount / the
     // fold's enforcement path are deliberately NOT changed here.
-    // Honest caveat: a single closed round trip can show as 2 filled rows
-    // (one to open, one to close/flatten), so this is not guaranteed to be a
-    // clean 1:1 match even when nothing is wrong — it is still useful as a
-    // "did the count move together" signal, which is what 0-tolerance means
-    // here: flag any difference and let Anoop's eyes judge it, don't try to
-    // silently normalize entry/exit pairing on his behalf.
-    const brokerFilledCount = filled.length;
+    // 2026-08-20 FIX — this comparison was between two different UNITS.
+    // It used `filled.length` (ORDER ROWS) against the fold's tradeCount
+    // (ROUND TRIPS). A round trip is at minimum two orders, and the broker
+    // splits both scale-ins and exits across many rows — 2026-08-20's own
+    // data has one round trip made of seven order rows (six Sell 2 entries
+    // at 14:42:47, one Buy 12 exit at 14:43:14). So the banner fired on
+    // every normal trading day and read "broker 16 vs tracked 9" when the
+    // truth was neither number. The old comment below called this out as an
+    // "honest caveat" and shipped anyway; a reconciliation that cries wolf
+    // daily trains you to ignore the one time it is real, so it is now a
+    // like-for-like comparison: round trips vs round trips, both derived
+    // independently (order-history walk vs balance-delta fold).
+    const brokerRoundTripCount = closedRoundTripsToday;
+    const brokerFilledCount = filled.length; // diagnostics only — NOT the comparison
     const foldTradeCount = tvBrokerFeedState.tradeCount;
     // ordersTableSuspect (above): don't compare a known-stale orders read
     // against the fold's count — that would be comparing real data to a
     // table that hasn't rendered yet, guaranteed to look like a mismatch.
-    const tradeCountMismatch = !ordersTableSuspect && brokerFilledCount !== foldTradeCount;
+    const tradeCountMismatch = brokerRoundTripCount !== null && brokerRoundTripCount !== foldTradeCount;
 
     broadcast({
       type: 'tv-broker-account',
@@ -5856,8 +6255,17 @@ async function pollTVBrokerAccount() {
       connected: true,
       tradeCountMismatch,
       ordersTableSuspect,
+      brokerRoundTripCount,
       brokerFilledCount,
       foldTradeCount,
+      // 2026-08-21 (D2): provenance of the count the guardrail enforces on.
+      // 'verified'  = every trade scored with order-history corroboration.
+      // 'degraded'  = at least one was scored on the fill edge alone, the
+      //               rule that produced 9/3 — count is provisional and the
+      //               tradesPerDay cap is advisory, not a hard lock.
+      countEvidence: (tvBrokerFeedState.trades || []).some(t => t && t.evidence === 'degraded') ? 'degraded' : 'verified',
+      degradedTradeCount: (tvBrokerFeedState.trades || []).filter(t => t && t.evidence === 'degraded').length,
+      feedDegraded: closedRoundTripsToday === null,
       tradeCount: tvBrokerFeedState.tradeCount,
       dayPnl: tvBrokerFeedState.dayPnl,
       maxSize: tvBrokerFeedState.maxSize,
@@ -5875,6 +6283,106 @@ function startTVBrokerMonitor() {
 }
 function stopTVBrokerMonitor() {
   if (tvBrokerMonitorTimer) { clearInterval(tvBrokerMonitorTimer); tvBrokerMonitorTimer = null; }
+}
+
+// ── The fast open/close tick (2026-08-20) ──────────────────────────────────
+// See TV_POSITION_WATCH_MS for why this exists alongside the 10s full poll.
+// Contract: detect the transition, announce it, and hand off to the fold.
+// It deliberately does NOT compute P&L or touch tradeCount — tv-broker-feed's
+// balance-delta fold stays the single source of truth for both. A second
+// thing that also counts trades is precisely how the 2026-08-20 over-counting
+// bug happened, and this one runs twice as often.
+async function pollTVPositions() {
+  if (!mcpBridge.ready || !mcpBridge.tvConnected) return;
+  // A slow CDP read must not stack ticks on top of each other — at 5s with a
+  // shared broker lock, overlapping reads would queue behind one another and
+  // report a stale transition late rather than the current one on time.
+  if (tvPositionWatchInFlight) return;
+  tvPositionWatchInFlight = true;
+  try {
+    const raw = await withBrokerLock(() => mcpBridge.callTool('trading_get_positions', {}));
+    const text = (raw && raw.content) ? raw.content.map(c => c.text || '').join('') : null;
+    const result = text ? JSON.parse(text) : null;
+    // An unreadable panel is NOT "flat" — treating a failed read as zero
+    // positions would fire a phantom `closed` for every open trade the moment
+    // TradingView hiccups, and (once wired to the session log) write a
+    // phantom row for it. Leave the baseline untouched and wait.
+    if (!result || !result.success || !Array.isArray(result.positions)) return;
+
+    const rows = result.positions;
+    const events = positionEvents.diffPositions(tvLastPositions, rows);
+    tvLastPositions = rows;
+    if (!events.length) return;
+
+    for (const e of events) {
+      console.log('[tv-position] ' + positionEvents.describeEvent(e));
+      // Remember the side that is/was on, for the session-log row the fold
+      // writes (the fold itself never records side).
+      //
+      // 2026-08-21 BUG FIX (found in today's real trade — the first close on
+      // the fixed code): this used to record the side ONLY on a `closed`
+      // event, which loses a race it cannot win. The 10s account poll and
+      // this 5s watch both see the close, and whichever lands first wins:
+      // today the fold scored the trade at 07:27:19.821 and this watch
+      // reported CLOSED at 07:27:21.900 — two seconds LATER. So the
+      // auto-logged session row was written before any side was known and
+      // recorded direction as '?', for a trade whose side had been sitting
+      // in an `opened` event since 07:19:56.
+      //
+      // Recording on open/scale/flip too means the side is already known
+      // long before the close, regardless of which poller gets there first.
+      // A `closed` event still overwrites with the same value, so nothing is
+      // lost — this only removes the dependency on winning a race.
+      if (e.side && (e.kind === 'opened' || e.kind === 'scaled' || e.kind === 'flipped' || e.kind === 'closed')) {
+        tvLastClosedSide[e.symbol] = e.side;
+        tvLastClosedSide.__any = e.side;
+      }
+    }
+    // Push the transition immediately, before the (slower) full account read
+    // — this is the whole point of the fast tick. The client updates the HUD
+    // from this, then reconciles against the authoritative numbers when the
+    // tv-broker-account broadcast lands a moment later.
+    broadcast({
+      type: 'position-event',
+      events: events.map(e => ({ ...e, text: positionEvents.describeEvent(e) })),
+      at: Date.now(),
+    });
+
+    // D4 (2026-08-21): skip ONLY this hand-off while an order is mid-placement.
+    // The orders table is being rewritten at that moment, so a full account
+    // read can catch it half-rendered, fail the walk-vs-positions cross-check
+    // and drop the feed into degraded mode during the single most safety-
+    // critical operation the app performs. The 10s timer picks it up moments
+    // later, once the table has settled. The lightweight positions read above
+    // is unaffected and still reports the fill immediately.
+    if (tvOrderPlacementInFlight) {
+      console.log('[tv-position] order placement in flight — deferring the full account read to the next scheduled poll (orders table is mid-rewrite).');
+      return;
+    }
+    // Hand off to the authoritative path in the same beat rather than waiting
+    // out the rest of the 10s cycle. On a CLOSE this is what actually folds
+    // the realized P&L, increments the trade count, runs the mistake-pattern
+    // checks and (below) writes the session-log row.
+    await pollTVBrokerAccount();
+  } catch (e) {
+    console.warn('[tv-position] watch failed:', e.message);
+  } finally {
+    tvPositionWatchInFlight = false;
+  }
+}
+
+function startTVPositionWatch() {
+  if (tvPositionWatchTimer) clearInterval(tvPositionWatchTimer);
+  tvPositionWatchTimer = setInterval(pollTVPositions, TV_POSITION_WATCH_MS);
+  pollTVPositions(); // establishes the baseline; emits nothing by design
+}
+function stopTVPositionWatch() {
+  if (tvPositionWatchTimer) { clearInterval(tvPositionWatchTimer); tvPositionWatchTimer = null; }
+  // Drop the baseline too: on the next start, the first read must be treated
+  // as a fresh baseline rather than diffed against a snapshot from before the
+  // gap, which would report every change made in between as if it just
+  // happened, all at once.
+  tvLastPositions = null;
 }
 
 // ── Startup/reconnect self-test (2026-08-19, SEMI_AUTONOMOUS_SYSTEM_PLAN.md item 2) ──
@@ -6041,6 +6549,7 @@ async function handleTradeConfirm(ws, msg) {
     // it interleave with this, and doing so is what actually fixes the
     // "poll queued for minutes behind chart monitors" latency bug found live
     // today.
+    tvOrderPlacementInFlight = true;
     const raw = await withChartLock(async () => {
       let resolvedSymbol = symbol || null;
       try {
@@ -6054,7 +6563,7 @@ async function handleTradeConfirm(ws, msg) {
       if (targetPrice != null) orderArgs.targetPrice = Number(targetPrice);
       const orderRaw = await mcpBridge.callTool('trading_place_market_order', orderArgs);
       return { orderRaw, resolvedSymbol };
-    });
+    }).finally(() => { tvOrderPlacementInFlight = false; });
     const result = parseToolResult(raw.orderRaw);
     const resolvedSymbol = raw.resolvedSymbol;
 
@@ -6146,6 +6655,8 @@ httpServer.listen(PORT, '127.0.0.1', async () => {
   console.log('✓ Jessi background chart monitor started (3-min cadence)');
   startTVBrokerMonitor();
   console.log('✓ TradingView broker-account monitor started (10s cadence, polls only while TV is connected)');
+  startTVPositionWatch();
+  console.log(`✓ Live position watch started (${TV_POSITION_WATCH_MS / 1000}s cadence — open/close/scale detected here, then folded immediately by the account poll)`);
   console.log(`✓ Mode: ${(cfg.mode || 'funded').toUpperCase()}`);
 
   // 2026-08-11 (Anoop): "I don't want telegram to work... remove them."
