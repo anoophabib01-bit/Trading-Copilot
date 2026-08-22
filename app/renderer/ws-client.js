@@ -408,6 +408,15 @@
         emit('dayRecord:updated', msg);
         break;
 
+      // 5.2/H6: scorecard data + the per-trade attribution gate status
+      case 'h6-status':
+        emit('h6:status', msg);
+        break;
+
+      case 'scorecard-data':
+        emit('scorecard:data', msg);
+        break;
+
       case 'playbook-b-signal':
         emit('sfp:playbookB', msg);
         break;
@@ -891,6 +900,11 @@
     getArmedSetup:     ()  => sendRequest({ type: 'armed-setup-get' }).then(r => r.setup),
     // 4.3: live-feed day-record sync
     onDayRecordUpdated: (cb) => on('dayRecord:updated', cb),
+    // 5.2/H6: scorecard
+    getH6Status:   () => sendRequest({ type: 'h6-get' }).then(r => r),
+    onH6Status:    (cb) => on('h6:status', cb),
+    getScorecard:  () => sendRequest({ type: 'scorecard-get' }).then(r => r),
+    onScorecardData: (cb) => on('scorecard:data', cb),
     onPlaybookBSignal: (cb) => on('sfp:playbookB',     cb),
     onLondonLevels:    (cb) => on('london:levels',     cb),
     onNyLevels:        (cb) => on('ny:levels',         cb), // FIX 2026-07-27 — see ws-client.js case 'ny-levels' note

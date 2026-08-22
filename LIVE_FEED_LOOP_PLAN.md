@@ -158,7 +158,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**21 / 26 resolved.** 20 done (0.1, 0.1a, 0.3, 1.1–1.4, 2.1–2.3, 3.1–3.3, 3.3a, 3.4, 4.1–4.5) + 1 skipped with reason (0.2). Note: the audit added 0.1a + 3.3a on 2026-08-22, raising the total from 24 to 26 — build by DSH, senior partner Claude Code
+**23 / 26 resolved.** 22 done (0.1, 0.1a, 0.3, 1.1–1.4, 2.1–2.3, 3.1–3.3, 3.3a, 3.4, 4.1–4.5, 5.1, 5.2) + 2 skipped with reason (0.2; 5.3 partial — F3 built, F4-F6/M1-M6 await live verification). Note: the audit added 0.1a + 3.3a on 2026-08-22, raising the total from 24 to 26 — build by DSH, senior partner Claude Code
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -601,7 +601,7 @@ the prerequisite for Phase 5's scorecard.*
   confirmation) precisely measurable for the first time.
   *Done: 2026-08-22 (DSH build). New pure `app/signal-join.js` (joinTradeToSignal, directionOfTrade, ARMING_EVENTS) + `app/test/signal-join.test.js` (7 tests). Only ARMED-setup events can back a trade (engulf-fire/fvg-fire/playbook-b-confirm); direction must match (buy→BULLISH, sell→BEARISH); preceding only, inside rules.json's new `signalJoinWindowMinutes` (15); nearest wins; trade time = entryAt else fold at. Wired into `writeLiveTradeToDayRecord`: reads the day's signal ledger (DATA_DIR/signals/<dayKey>.jsonl), stamps the row with `signalBacked`/`playbook`/`minutesFromSignal` (which survive the re-grade into the stored row), and appends a `signal-join` line to the day's ledger AS IT HAPPENS. Failure mode 7 is now measurable: rows with minutesFromSignal 0-1 near a signal. Idempotent (join recomputed from the same ledger on a duplicate fire). Full suite 606/606.*
 
-- [ ] **5.2 — Per-playbook scorecard in Insights**
+- [x] **5.2 — Per-playbook scorecard in Insights**
 
   | Playbook | Fired | Valid | Rejected | Taken | Passed | Ignored | Win% | Avg R | Net |
   |---|---|---|---|---|---|---|---|---|---|
@@ -616,7 +616,7 @@ the prerequisite for Phase 5's scorecard.*
   **Do not display this until the H6 track reports PASS.** The scorecard reads per-trade P&L
   attribution, which is the one thing still unverified. A confident wrong scorecard would drive
   worse decisions than no scorecard.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). New pure UMD `renderer/scorecard.js` (computeScorecard: per-playbook fired/valid/rejected/taken/passed/ignored from the signal ledger, win%/net from signalBacked day rows; "Avg R" = realized profit factor — total won ÷ |total lost| — DEVIATION note: planned-R multiples are unknowable from the feed, so the column is the honest realized version) + 4 tests. H6 GATE implemented: server persists h6Status (DATA_DIR/h6-status.json), marks PASS the moment a real closed trade with non-zero P&L passes the balance-delta-vs-fills cross-check, broadcasts h6-status; renderer hides the Insights scorecard block with an explanatory line until H6 passes. Scorecard data served by a scorecard-get WS case (today's signal ledger + day rows), computed client-side by the shared module, rendered as the plan's exact table + the signal-backed-vs-freestyle two-liner (a). (b) passed-signals-that-would-have-won is DEFERRED — it needs live bar pulls after each passed signal and is recorded here as the remaining piece rather than claimed. NEEDS LIVE: the H6 PASS itself (a real trade). Full suite 616/616.*
 
 - [~] **5.3 — Mechanical detection for the remaining failure modes — fixes H4**
 
