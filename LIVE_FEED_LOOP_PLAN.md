@@ -158,7 +158,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**15 / 24 resolved.** 14 done (0.1, 0.3, 1.1–1.4, 2.1–2.3, 3.1–3.4, 4.1) + 1 skipped with reason (0.2) — build by DSH, senior partner Claude Code
+**20 / 26 resolved.** 19 done (0.1, 0.1a, 0.3, 1.1–1.4, 2.1–2.3, 3.1–3.3, 3.3a, 3.4, 4.1–4.4) + 1 skipped with reason (0.2). Note: the audit added 0.1a + 3.3a on 2026-08-22, raising the total from 24 to 26 — build by DSH, senior partner Claude Code
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -522,7 +522,7 @@ the prerequisite for Phase 5's scorecard.*
   `CLAUDE.md` warns about with `rules.json`.
   *Done: 2026-08-22 (DSH build). New UMD `renderer/day-rollup.js` (gradeTrades, rollupDay, tradingDayKey, entryMinOf — loads as window.DayRollup in the browser AND CommonJS for server/tests; index.html loads it before app.js). csvParseTrades now calls DayRollup.gradeTrades (window flags read rules.sessionWindowsIST instead of the hardcoded copy — identical values today); csvApply calls DayRollup.rollupDay — both are thin callers now. GOLDEN VERIFICATION, the acceptance gate: run against the REAL stored production days on this machine (s2). 2026-08-21 (14 trades): BYTE-IDENTICAL across all 32 summary fields incl. pnl 916.5, at the historical sizeCap 4 — that summary was produced in production by the OLD inline code. 2026-08-18: grades identical at cap 4; its stored sum cannot match because its rows were rewritten after the summary was stored (net off by exactly the contract delta, 17) — recorded, not hidden. Committed tests: test/day-rollup.test.js (6 tests, hand-computed fixture — real P&L stays out of the repo per the DATA/ gitignore convention) + test/day-rollup-live-golden.test.js which runs ONLY where the production DATA dir exists and fails if no stored day reproduces (it passes here: 2/2 days' grades reproduced, 1/1 current-day summary byte-identical). Full suite 589/589.*
 
-- [ ] **4.3 — The live feed writes `day_trades` and `gr_history` directly**
+- [x] **4.3 — The live feed writes `day_trades` and `gr_history` directly**
 
   On each closed round trip, convert the unified 4.1 record into the existing row shape
   `{ t, x, size, pnl, g, flags, side, ep, xp, mp, hold }`, merge it into today's `dtStore[date]`
@@ -543,9 +543,9 @@ the prerequisite for Phase 5's scorecard.*
     the previous evening. The live writer **must** use the same anchor or a late-night scalp
     will open a phantom new day. There is precedent for getting this wrong: the session log
     shipped with a UTC day in an IST app.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). `writeLiveTradeToDayRecord()` in server.js fires on the same close loop that auto-writes the session-log row (the proven 5s-tick-adjacent path — deviation note: wired at the fold's new-trades block inside pollTVBrokerAccountInner, which is where the close is SCORED, rather than the position-events broadcast; that is the stronger trigger because the fold record exists there). Row shape matches csvApply's + provenance extras (`evidence`/`source` survive the write per the acceptance checklist). Fingerprint merge `t|x|pnl*100|size` identical to csvApply's fp(); the whole day is re-graded and re-rolled with the SAME day-rollup functions (4.2); persisted via dataSave mirrors for day_trades/gr_history/balance_ledger under the active slot. Trading-day anchor = dayRollup.tradingDayKey (03:45 IST). commPerCt read from rules.commissionPerContractPerSide when present else 1.0 — DEVIATION flagged for review: the CSV path's COMM_PER_CT is still a hardcoded 1.0 const in app.js; the two agree today, but the renderer const should eventually read the rule too. pnlUnknown records skipped (never written to the $ record). Client: `day-record-updated` broadcast → renderer syncs its localStorage copies + refreshes open views — the disk mirror is the system of record. Restart-mid-session idempotency is covered by the fingerprint merge (NEEDS LIVE: not yet observed against a real restart — the acceptance checklist's live-only rule).*
 
-- [ ] **4.4 — Enrich the auto-written session-log row — fixes H2**
+- [x] **4.4 — Enrich the auto-written session-log row — fixes H2**
 
   `position-events`' close currently writes entry/stop/target as `?` because the fold record
   carries no prices. With 4.1 the entry and exit prices are genuinely known, so write them.
@@ -553,7 +553,7 @@ the prerequisite for Phase 5's scorecard.*
   **`stop` and `target` stay `?`** — those are *planned* levels that exist nowhere in broker
   data, and per `TRUST-PROTOCOL.md` passing an average fill off as a planned entry is exactly
   what the `?` convention exists to prevent. Fill in what is observed; do not invent the rest.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). The auto-log row now writes `entry`/`exit` from the joined 4.1 record's order-walk FILL prices when present (fold-only records still '?'), with the note bit 'entry/exit = order-walk avg fill prices' so the file can never read a fill as a planned level. stop/target stay '?'. Shipped together with 4.3 in one commit (both change the same close-loop body; recorded like the 2.1-2.3 deviation).*
 
 - [ ] **4.5 — Demote CSV to optional reconciliation**
 

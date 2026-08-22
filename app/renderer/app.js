@@ -1878,6 +1878,39 @@ function setupWsEvents() {
     });
   }
 
+  // 4.3: the server's live-feed writer wrote the durable day record — sync
+  // this client's localStorage copies so the UI, the guardrail and a later
+  // CSV reconciliation all read the same rows. Best-effort by design: the
+  // server's disk mirrors are the system of record; this only keeps an OPEN
+  // UI from going stale.
+  if (window.api.onDayRecordUpdated) {
+    window.api.onDayRecordUpdated(msg => {
+      try {
+        if (!msg || !msg.date || !Array.isArray(msg.rows)) return;
+        let dtStore = {};
+        try { dtStore = JSON.parse(localStorage.getItem('copilot_day_trades') || '{}'); } catch (e) {}
+        dtStore[msg.date] = msg.rows;
+        const keys = Object.keys(dtStore).sort();
+        while (keys.length > 90) { delete dtStore[keys.shift()]; }
+        localStorage.setItem('copilot_day_trades', JSON.stringify(dtStore));
+        let hist = [];
+        try { hist = JSON.parse(localStorage.getItem('copilot_gr_history') || '[]'); } catch (e) {}
+        hist = hist.filter(e => e.date !== msg.date);
+        if (msg.sum) hist.push(msg.sum);
+        hist.sort((a, b) => (a.date < b.date ? -1 : 1));
+        localStorage.setItem('copilot_gr_history', JSON.stringify(hist.slice(-60)));
+        if (msg.ledgerEntry) {
+          let ledger = {};
+          try { ledger = JSON.parse(localStorage.getItem('copilot_balance_ledger') || '{}'); } catch (e) {}
+          ledger[msg.date] = msg.ledgerEntry;
+          localStorage.setItem('copilot_balance_ledger', JSON.stringify(ledger));
+        }
+        if (typeof grRender === 'function') grRender();
+        if (typeof renderJournal === 'function' && document.getElementById('tab-journal') && document.getElementById('tab-journal').style.display !== 'none') renderJournal();
+      } catch (e) { /* sync is best-effort */ }
+    });
+  }
+
   window.api.onSFPCheck(chk => {
     const tf = (chk && chk.tf) || '15m';
     if (!state.sfp[tf]) return;

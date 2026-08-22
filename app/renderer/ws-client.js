@@ -403,6 +403,11 @@
         emit('signal:decisionResult', msg);
         break;
 
+      // 4.3: the server's live-feed writer updated the durable day record
+      case 'day-record-updated':
+        emit('dayRecord:updated', msg);
+        break;
+
       case 'playbook-b-signal':
         emit('sfp:playbookB', msg);
         break;
@@ -884,6 +889,8 @@
     onSignalDecisionResult:(cb) => on('signal:decisionResult', cb),
     signalDecision:    (signalTs, decision) => rawSend({ type: 'signal-decision', signalTs, decision }),
     getArmedSetup:     ()  => sendRequest({ type: 'armed-setup-get' }).then(r => r.setup),
+    // 4.3: live-feed day-record sync
+    onDayRecordUpdated: (cb) => on('dayRecord:updated', cb),
     onPlaybookBSignal: (cb) => on('sfp:playbookB',     cb),
     onLondonLevels:    (cb) => on('london:levels',     cb),
     onNyLevels:        (cb) => on('ny:levels',         cb), // FIX 2026-07-27 — see ws-client.js case 'ny-levels' note
