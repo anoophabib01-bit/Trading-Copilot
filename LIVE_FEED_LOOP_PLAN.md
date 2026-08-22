@@ -449,7 +449,7 @@ the prerequisite for Phase 5's scorecard.*
   *Done: 2026-08-22 (DSH build). Built the plan's RECOMMENDED scope: Playbook A (1H engulf WITH 4H trend only — new playbookAValid flag; against-trend and unclear-trend A signals never debate) and full Playbook B confirm. C stays alert-only — recorded as the chosen answer to the open green-signal question; widening is one call-site each. `triggerPlaybookDebate()` + `buildPlaybookDebateQuestion()` reuse PO3's global lastAutoDebateAt 10-min cooldown (deviation note: the plan said "per-symbol cooldown" but PO3's existing cooldown is global, and reusing it as-is is the consistent behavior; splitting it per-symbol is a small follow-up if a live session shows MNQ/MGC cross-suppression). reqId prefixed `playbook-debate-` so the ledger/transcript identifies the trigger. DEVIATION: `preGathered` is NOT used for these triggers — PO3's secondary-symbol path needs it because it gathers while parked on a DIFFERENT symbol; playbook triggers fire on whatever symbol is already on screen, so the normal internal gathering is correct and one-chart-read already (the fire path just read those bars). Debates fire only inside the signal's dedup block (once per candle/confirm), never on rejections.*
 
 
-- [ ] **3.3a — Give the auto-debate a per-source cooldown** — *added 2026-08-22 by audit*
+- [x] **3.3a — Give the auto-debate a per-source cooldown** — *added 2026-08-22 by audit*
 
   `triggerPlaybookDebate` and `autoTriggerDebate` share one `lastAutoDebateAt`. So a PO3
   phase-change debate **silently suppresses a full Playbook B confirm** that fires inside the
@@ -466,7 +466,7 @@ the prerequisite for Phase 5's scorecard.*
 
   *Keep as-is:* a single shared cooldown across Playbook A and Playbook B. Those are genuinely
   comparable in conviction and both are rare.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). `lastAutoDebateAt` replaced by `lastAutoDebateBySource = { po3, playbook }`. autoTriggerDebate (PO3) uses the po3 cooldown; triggerPlaybookDebate uses the playbook cooldown, and a FULL Playbook B confirm preempts (fires regardless of the shared cooldown, then sets it for A). The secondary-symbol pre-gather gate now reads the po3 cooldown. server.js syntax OK.*
 - [x] **3.4 — Telegram parity**
 
   Push the setup state, not just the raw candle event: playbook, direction, timeframe, validity

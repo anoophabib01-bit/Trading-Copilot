@@ -2767,7 +2767,13 @@ const po3Monitor = {
 // 3-agent Debate + Judge call to fire ONLY when it detects a real,
 // structural reason to check (leaving ACCUMULATION), instead of running on
 // a blind timer, which would spend tokens whether or not anything changed.
-let lastAutoDebateAt = 0;
+// 3.3a (audit): PER-SOURCE cooldowns. A PO3 phase-change debate must not
+// consume the budget for a full Playbook B confirm — that inverts the
+// conviction ordering (B-confirm is the highest-conviction event the
+// detection layer produces; an AMD transition is context). Playbook A and B
+// share one cooldown; a full B confirm PREEMPTS (fires regardless), and its
+// fire then sets the shared cooldown for A.
+const lastAutoDebateBySource = { po3: 0, playbook: 0 };
 const AUTO_DEBATE_COOLDOWN_MS = 10 * 60 * 1000; // floor against a choppy day flipping phases repeatedly
 let autoDebateReqCounter = 0;
 
@@ -2790,11 +2796,11 @@ function buildAutoDebateQuestion(phaseInfo) {
 
 function autoTriggerDebate(phaseInfo, preGathered) {
   const now = Date.now();
-  if (now - lastAutoDebateAt < AUTO_DEBATE_COOLDOWN_MS) {
-    console.log('[auto-debate] skipped — within ' + Math.round(AUTO_DEBATE_COOLDOWN_MS / 60000) + 'min cooldown of the last auto-triggered debate');
+  if (now - lastAutoDebateBySource.po3 < AUTO_DEBATE_COOLDOWN_MS) {
+    console.log('[auto-debate] skipped — within ' + Math.round(AUTO_DEBATE_COOLDOWN_MS / 60000) + 'min PO3 cooldown of the last auto-triggered debate');
     return Promise.resolve();
   }
-  lastAutoDebateAt = now;
+  lastAutoDebateBySource.po3 = now;
   const reqId = 'auto-debate-' + (++autoDebateReqCounter) + '-' + now;
   const question = buildAutoDebateQuestion(phaseInfo);
   console.log('[auto-debate] triggered by phase transition ' + (phaseInfo.from || '?') + ' -> ' + phaseInfo.phase + ', reqId=' + reqId);
@@ -2824,11 +2830,15 @@ function buildPlaybookDebateQuestion(fields) {
 
 function triggerPlaybookDebate(fields) {
   const now = Date.now();
-  if (now - lastAutoDebateAt < AUTO_DEBATE_COOLDOWN_MS) {
-    console.log('[playbook-debate] skipped — within ' + Math.round(AUTO_DEBATE_COOLDOWN_MS / 60000) + 'min cooldown of the last auto-triggered debate');
+  // 3.3a: a full Playbook B confirm PREEMPTS any cooldown — rare enough that
+  // it cannot become noise, and the highest-conviction event the detection
+  // layer produces. A shares the playbook cooldown with B.
+  const isFullB = fields.playbook === 'B';
+  if (!isFullB && now - lastAutoDebateBySource.playbook < AUTO_DEBATE_COOLDOWN_MS) {
+    console.log('[playbook-debate] skipped — within ' + Math.round(AUTO_DEBATE_COOLDOWN_MS / 60000) + 'min playbook cooldown of the last auto-triggered debate');
     return Promise.resolve();
   }
-  lastAutoDebateAt = now;
+  lastAutoDebateBySource.playbook = now;
   const reqId = 'playbook-debate-' + (++autoDebateReqCounter) + '-' + now;
   const question = buildPlaybookDebateQuestion(fields);
   console.log('[playbook-debate] triggered by ' + fields.playbook + ' ' + fields.direction + ', reqId=' + reqId);
@@ -3073,7 +3083,7 @@ async function checkPo3SecondarySymbol() {
           const phaseInfo = { from: prev, phase: res.phase, symLabel, biasLabel, time: istTime, message: msg };
           // Same cooldown check autoTriggerDebate itself does — skip the
           // (otherwise wasted) gathering below if it would just be dropped.
-          if (Date.now() - lastAutoDebateAt >= AUTO_DEBATE_COOLDOWN_MS) {
+          if (Date.now() - lastAutoDebateBySource.po3 >= AUTO_DEBATE_COOLDOWN_MS) {
             const question = buildAutoDebateQuestion(phaseInfo);
             const preGathered = {
               jessiContext: buildJessiContext(),
@@ -6413,6 +6423,25 @@ async function pollTVBrokerAccountInner() {
     // duplicates on disk that, unlike the feed state, no restart or day
     // rollover ever cleans up.
     const prevTradesLen = tvBrokerFeedState.trades.length;
+    // 4.1 AUDIT FIX (2026-08-22): captured for the SAME reason as
+    // prevTradesLen above, one comment block up — analyzeOrderWalk()
+    // re-derives `walk.closed` from ALL of today's orders on every single
+    // poll, so it is CUMULATIVE, while `newTrades` below is only the DELTA
+    // since the last poll. Passing the full cumulative walk.closed into
+    // joinFoldToWalk() against that small delta made every already-joined
+    // walk close from an earlier poll come back as a fresh "order-walk-only"
+    // unmatched record — re-written into the session log and re-broadcast
+    // to chat on every later close, compounding across the day (reproduced:
+    // a day's 2nd close re-emits the 1st as a duplicate; by the Nth close,
+    // N-1 stale rows re-appear). closedRoundTripsScored already tracks
+    // exactly "how many order-walk round trips has the fold accounted for
+    // as of the last poll" (tv-broker-feed.js sets it to walk.closed.length
+    // on every poll the walk is usable, independent of whether a NEW trade
+    // closed) and is already restart-safe via persistTVBrokerFeedState() —
+    // so slicing walk.closed by this, captured here before fold() advances
+    // it, gives the join the same per-poll DELTA on both sides with no new
+    // state invented.
+    const prevClosedRoundTripsScored = tvBrokerFeedState.closedRoundTripsScored || 0;
     // 2026-08-20: the broker's own count of CLOSED ROUND TRIPS today, from a
     // per-symbol signed-quantity net-position walk over the filled orders.
     // This is the unit the fold's tradeCount is supposed to be in — unlike
@@ -6468,7 +6497,12 @@ async function pollTVBrokerAccountInner() {
       // 4.1: join each fold-scored close with its order-walk round trip so the
       // downstream record carries symbol/side/prices/times AND the fold's
       // confirmed P&L. Unmatched halves are kept, never dropped.
-      const walkClosedSafe = (walk && !walkDesynced && walk.droppedRows === 0) ? walk.closed : [];
+      // 4.1 AUDIT FIX: slice to the delta since last poll (see
+      // prevClosedRoundTripsScored above) — NOT the full cumulative list,
+      // or already-joined closes from earlier polls re-appear as
+      // duplicates every poll for the rest of the day.
+      const walkClosedSafe = (walk && !walkDesynced && walk.droppedRows === 0)
+        ? walk.closed.slice(prevClosedRoundTripsScored) : [];
       const joined = tradeRecordJoin.joinFoldToWalk(newTrades, walkClosedSafe);
       if (joined.merged.length) {
         console.log(`[tv-broker] 4.1 join: ${joined.merged.length}/${newTrades.length} fold closes matched to order-walk round trips` +
