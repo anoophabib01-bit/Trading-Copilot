@@ -6065,7 +6065,14 @@ function writeLiveTradeToDayRecord(record) {
       console.warn('[signal-join] failed:', e.message);
     }
     const sizeCapCsv = typeof rules.sizeCap === 'number' ? rules.sizeCap : 2;
-    const commPerCt = rules.commissionPerContractPerSide != null ? Number(rules.commissionPerContractPerSide) : 1.0;
+    // 4.3 AUDIT FIX: rollupDay's commPerCt is a ROUND-TURN rate — its net is
+    // `gross - contracts * commPerCt`, with one `contracts` unit per closed
+    // trade, no doubling anywhere (compare expectedPnlFromFills, which spells
+    // the two sides out as `rate * size * 2`). rules.json's figure is
+    // per-SIDE, so feeding it in raw charged half the commission and
+    // overstated every live-written day's net by ~$0.59 a contract. The
+    // fallback stays the old 1.0 round-turn approximation, not 0.59.
+    const commPerCt = rules.commissionPerContractPerSide != null ? Number(rules.commissionPerContractPerSide) * 2 : 1.0;
     const gradeOpts = {
       tradingMode: rules.tradingMode || 'standard',
       cooldownAfterLossOnly: rules.cooldownAfterLossOnly,
