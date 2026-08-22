@@ -8841,7 +8841,14 @@ function csvApply(filename, parsed) {
     // shared with the live-feed writer (4.3). Byte-identical to the old
     // inline computation (live-golden verified on real stored days).
     const sum = DayRollup.rollupDay(d, day, {
-      commPerCt: COMM_PER_CT,
+      // 4.3/4.5 AUDIT FIX: read the rate from rules.json (per-side, so x2 for
+      // the round turn rollupDay expects) instead of the hardcoded 1.0. Since
+      // 4.3 the live feed and this function write the SAME day store through
+      // the SAME rollupDay — two different commission rates would have made a
+      // day's net depend on which writer touched it last. COMM_PER_CT stays
+      // as the fallback for a rules file without the key.
+      commPerCt: (getRules() && getRules().commissionPerContractPerSide != null)
+        ? Number(getRules().commissionPerContractPerSide) * 2 : COMM_PER_CT,
       sizeCapCsv: SIZE_CAP_CSV,
       tradingMode: getRules().tradingMode || 'standard',
     });
