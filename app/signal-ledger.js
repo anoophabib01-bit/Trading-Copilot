@@ -48,6 +48,7 @@ function buildSignalRow(fields, ctx) {
     symbol: c.symbol || null,
     accountSlot: c.accountSlot || null,
     mode: c.mode || null,
+    hourEdge: c.hourEdge != null ? c.hourEdge : null, // 6.2 reporting-only
     decision: f.decision || null,
     decidedAt: f.decidedAt || null,
     signalTs: f.signalTs != null ? f.signalTs : null,

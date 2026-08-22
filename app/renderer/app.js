@@ -8935,6 +8935,18 @@ function csvApply(filename, parsed) {
     const hitMilestones = checkEvalMilestones();
     hitMilestones.forEach(label => L.push('MILESTONE · ' + label));
   } catch (e) {}
+  // 6.1: distance-to-payout pace — a PACE INDICATOR, never permission to
+  // keep trading to reach it (plan's guard: displayed alongside the hard
+  // stops, never where it could read as a goal that overrides them).
+  try {
+    const prof = ACCOUNT_PROFILES[state.accountSize][state.mode];
+    const payTarget = state.mode === 'eval' ? (prof.evalTarget || 0) : (prof.payoutTarget || 0);
+    const trailing = hist.slice(-20).reduce((a, e) => a + (Number(e.pnl) || 0), 0);
+    const pace = PayoutPace.payoutPace({ balance: bal, payoutTarget: payTarget, trailing20DayNet: trailing });
+    if (pace) {
+      L.push('PAYOUT PACE (pace, not permission): $' + Math.round(Math.max(0, pace.distance)).toLocaleString() + ' to ' + (state.mode === 'eval' ? 'clear eval' : 'payout') + ' · trailing 20-day rate $' + (pace.dailyRate < 0 ? '-' : '') + Math.abs(Math.round(pace.dailyRate)) + '/day' + (pace.daysToTarget != null ? ' · ' + pace.daysToTarget + ' sessions at that rate' : ' · not on pace yet') + ' · fixed 20-session need $' + Math.round(pace.needPerDay) + '/day. The day stop and trade limit still rule.');
+    }
+  } catch (e) {}
   L.push('Next: tag today\'s trades with playbook A/B/C in Insights, then run MAE/MFE with the MNQ 1m chart open.');
   L.push('Account: balance $' + Math.round(bal).toLocaleString() + ' · floor $' + Math.round(floor).toLocaleString() + ' · cushion $' + Math.round(cushion).toLocaleString() + ' · to target $' + Math.max(0, (acc.evalTarget || 159000) - bal).toLocaleString());
   L.push('See it: left panel = balance/cushion · Insights tab = scorecard & history · bottom HUD = today.');
