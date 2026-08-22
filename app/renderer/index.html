@@ -253,7 +253,9 @@
            now auto-detects comma/tab/semicolon delimiters instead of
            assuming comma. Same handler (handleCsvFileSelected), same
            ledger/guardrail pipeline underneath either way. -->
-      <button class="qa-btn"          onclick="document.getElementById('csv-file-input').click()" title="Upload any trade-related report — CSV, Excel, PDF, or plain text export"><span class="btn-icon">▤</span> Update File</button>
+      <!-- 4.5: CSV demoted to reconciliation — the live feed is the writer; an
+           upload compares and flags differences, applies only on confirm. -->
+      <button class="qa-btn"          onclick="document.getElementById('csv-file-input').click()" title="Reconcile a broker export against the live-feed day record — differences are reported, applied only on confirm"><span class="btn-icon">▤</span> Reconcile with broker export</button>
       <input type="file" id="csv-file-input" accept=".csv,.pdf,.xlsx,.xls,.txt,.tsv" multiple style="display:none">
       <button class="qa-btn"          onclick="runIctPo3()" title="ICT Power of 3 — judges Accumulation / Manipulation / Distribution across 1H/15m/5m, Daily bias gate (weights 15m + 5m most)"><span class="btn-icon">◱</span> Power of 3 (AMD)</button>
       <button class="qa-btn" id="po3-monitor-btn" onclick="togglePo3Monitor()" title="Mechanical AMD phase monitor — polls 15m every 60s and alerts in chat on ANY phase change (Accumulation / Manipulation / Distribution). No AI call per poll, so no quota use."><span class="btn-icon">◱</span> P3 Monitor</button>
@@ -1202,6 +1204,9 @@
 <!-- 4.2: day-rollup.js (UMD) loads BEFORE app.js — csvParseTrades/csvApply
      grade and roll up days through these shared pure functions. -->
 <script src="day-rollup.js"></script>
+<!-- 4.5: trade-identity.js — tolerance-based CSV↔live matching (the fp()
+     fingerprint doubles trades across the two timestamp resolutions). -->
+<script src="trade-identity.js"></script>
 <script src="app.js"></script>
 <!-- Loaded after app.js: reuses insCoachNotes/insMoney/edToday from it. -->
 <script src="day-recap.js"></script>
