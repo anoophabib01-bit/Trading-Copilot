@@ -170,4 +170,53 @@ function checkRevengeCluster(trades, opts) {
   return { matched: false, kind: null, lossStreak, gapMinutes: null, message: null };
 }
 
-module.exports = { checkTradeCountEscalation, F1_WIN_THRESHOLD, checkRevengeCluster, F2_LOSS_STREAK };
+// ── F3: inverted R:R (2026-08-22, LIVE_FEED_LOOP_PLAN 5.3) ───────────────
+// SOURCE TEXT (verbatim, app/renderer/index.html):
+//   "Inverted R:R — avg win $15.75, avg loss $246. Cutting winners, holding
+//    losers. Use time stop: exit flat if no move in 60 seconds. Never move
+//    stop away."
+//
+// Signal (REALIZED, not planned): with >= f3MinWins confirmed wins and >= 1
+// confirmed loss today, fire when avgLoss >= f3Ratio × avgWin. His documented
+// ratio is ~15.6:1; f3Ratio = 2 is a deliberately early warning, not a
+// re-statement of the disaster. Counts are stated in the message so he can
+// judge whether it is behaviour or one bad trade. pnlUnknown trades are
+// excluded from the win/loss math (their sign is unknown — design rule 2).
+// The "time stop / never move stop" halves are NOT covered: the feed sees no
+// stop-modification events (per MISTAKE_PATTERNS_PLAN.md's F3 note).
+
+/**
+ * @param {Array} trades  today's trades (tv-broker-feed.js fold() shape)
+ * @param {object} [opts] { f3Ratio, f3MinWins } — from rules.json, never
+ *   hardcoded. Defaults: ratio 2, minWins 2.
+ * @returns {{matched: boolean, winCount: number, lossCount: number,
+ *            avgWin: number|null, avgLoss: number|null, ratio: number|null,
+ *            message: string|null}}
+ */
+function checkInvertedRR(trades, opts) {
+  const list = Array.isArray(trades) ? trades : [];
+  const ratio = (opts && Number(opts.f3Ratio)) || 2;
+  const minWins = (opts && Number(opts.f3MinWins)) || 2;
+  const known = list.filter(t => t && !t.pnlUnknown && typeof t.pnl === 'number');
+  const wins = known.filter(t => t.pnl > 0);
+  const losses = known.filter(t => t.pnl < 0);
+  if (wins.length < minWins || losses.length < 1) {
+    return { matched: false, winCount: wins.length, lossCount: losses.length, avgWin: null, avgLoss: null, ratio: null, message: null };
+  }
+  const avgWin = wins.reduce((a, t) => a + t.pnl, 0) / wins.length;
+  const avgLoss = Math.abs(losses.reduce((a, t) => a + t.pnl, 0) / losses.length);
+  const matched = avgLoss >= ratio * avgWin;
+  return {
+    matched,
+    winCount: wins.length,
+    lossCount: losses.length,
+    avgWin: Math.round(avgWin * 100) / 100,
+    avgLoss: Math.round(avgLoss * 100) / 100,
+    ratio: avgWin > 0 ? Math.round((avgLoss / avgWin) * 100) / 100 : null,
+    message: matched
+      ? `PATTERN F3 (your own data): "inverted R:R — avg win $15.75, avg loss $246. Cutting winners, holding losers." Today's realized trades average $${Math.round(avgWin * 100) / 100} won and $${Math.round(avgLoss * 100) / 100} lost (${wins.length} win${wins.length === 1 ? '' : 's'}, ${losses.length} loss${losses.length === 1 ? '' : 'es'}) — your losses are running ${avgWin > 0 ? (avgLoss / avgWin).toFixed(1) : '?'}× your wins. That is the exact shape of every blown account.`
+      : null,
+  };
+}
+
+module.exports = { checkTradeCountEscalation, F1_WIN_THRESHOLD, checkRevengeCluster, F2_LOSS_STREAK, checkInvertedRR };

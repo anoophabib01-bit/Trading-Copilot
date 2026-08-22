@@ -1748,6 +1748,13 @@ function formatLiveFeedContext() {
     const f2 = mistakePatterns.checkRevengeCluster(st.trades, { cooldownMinutes: getActiveRules().cooldownMinutes });
     if (f2.matched) lines.push(`⚠ ${f2.message}`);
   } catch (e) {}
+  // 5.3 (F3 inverted R:R): same current-state contract as F1/F2 — thresholds
+  // from rules.json (f3Ratio, f3MinWins), never hardcoded.
+  try {
+    const r = getActiveRules();
+    const f3 = mistakePatterns.checkInvertedRR(st.trades, { f3Ratio: r.f3Ratio, f3MinWins: r.f3MinWins });
+    if (f3.matched) lines.push(`⚠ ${f3.message}`);
+  } catch (e) {}
   return lines.join(' ');
 }
 
@@ -6754,6 +6761,23 @@ async function pollTVBrokerAccountInner() {
           }
         } catch (e) {
           console.log('[mistake-pattern] F2 check failed: ' + e.message);
+        }
+      }
+      // 5.3 (F3 inverted R:R): fires once per IST day, persisted in the feed
+      // state so a restart never re-fires mid-session. Advisory only, same
+      // contract as F1/F2. Thresholds from rules.json (f3Ratio/f3MinWins).
+      if (!tvBrokerFeedState.f3AdvisoryFired) {
+        try {
+          const activeRules = getActiveRules();
+          const f3 = mistakePatterns.checkInvertedRR(tvBrokerFeedState.trades, { f3Ratio: activeRules.f3Ratio, f3MinWins: activeRules.f3MinWins });
+          if (f3.matched) {
+            console.log('[mistake-pattern] F3 fired: ' + f3.message);
+            tvBrokerFeedState = { ...tvBrokerFeedState, f3AdvisoryFired: true };
+            persistTVBrokerFeedState();
+            broadcast({ type: 'mistake-pattern', pattern: 'F3', message: f3.message, winCount: f3.winCount, lossCount: f3.lossCount, avgWin: f3.avgWin, avgLoss: f3.avgLoss });
+          }
+        } catch (e) {
+          console.log('[mistake-pattern] F3 check failed: ' + e.message);
         }
       }
     }

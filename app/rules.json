@@ -114,5 +114,10 @@
   },
   "_biasAdherence_comment": "ADDED 2026-08-13 (Anoop, verbatim): 'I should follow the trade direction according to it. 70% to 80% should be in the same direction.' targetPct 75 is the midpoint of the range he named; warnPct 60 is where Jessi starts naming it rather than just reporting it. DIRECTION OF RECORD = the Daily Bias field from the pre-trade checklist (his call 2026-08-13); 4H and 1H are logged as CONTEXT and downgrade confidence when they disagree, they do not override or veto. This became computable only on 2026-08-13: before that the checklist record stored {date, score, tier} and threw the bias/h4/h1 away, so there was nothing to compare trades against. minTradesToJudge stops a 1-trade day reading as '0% adherence' - one counter-trend scratch is not a pattern. Set enabled:false to silence the whole feature.",
   "autoPostSessionReview": false,
+  "f3Ratio": 2,
+  "f3MinWins": 2,
+  "_f3_comment": "LIVE_FEED_LOOP_PLAN 5.3 (F3 inverted R:R): fire when realized avgLoss >= f3Ratio x avgWin with >= f3MinWins confirmed wins and >=1 confirmed loss today. His documented ratio is ~15.6:1; 2 is a deliberately early warning (MISTAKE_PATTERNS_PLAN.md F3). Advisory only.",
+  "signalJoinWindowMinutes": 15,
+  "_signalJoin_comment": "LIVE_FEED_LOOP_PLAN 5.1: a closed trade joins back to the nearest preceding armed signal on the same instrument and direction within this many minutes (measured to trade entry).",
   "_autoPostSessionReview_comment": "ADDED 2026-08-12 (Anoop): the full Post-Session Analyst report used to auto-fire 5s after EVERY CSV upload, on top of the auto-debrief - two AI calls per upload. The report is ~5-7K tokens in and ~1.5K out (roughly $0.014 on Haiku), and Anoop's words: 'it is such a long list of details... I cannot read the whole post-session review every time I upload a CSV'. Generating something unread is 100% waste at any price. Now OFF by default: the short debrief still fires on upload, and the full report runs only when explicitly asked - 'End Day & Save', or typing 'post session review' in chat. Set true to restore the old auto-fire behaviour."
 }
