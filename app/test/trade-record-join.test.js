@@ -68,3 +68,45 @@ test('empty inputs are safe', () => {
 test('default tolerance is 3 minutes', () => {
   assert.equal(DEFAULT_TOLERANCE_MS, 3 * 60 * 1000);
 });
+
+// ── Cross-poll caller contract (audit, 2026-08-22) ──────────────────────────
+// analyzeOrderWalk() re-derives walk.closed from ALL of today's orders on
+// EVERY poll — it is cumulative for the day. newTrades (the fold side) is
+// only the delta since the last poll. server.js's pollTVBrokerAccountInner
+// MUST slice walk.closed to the same delta window (via
+// closedRoundTripsScored, captured before fold() runs) before calling
+// joinFoldToWalk — passing the full cumulative walk.closed against a small
+// delta re-surfaces every already-joined earlier close as a fresh
+// order-walk-only record, which server.js then re-writes to the session log
+// and re-broadcasts to chat, compounding on every later close of the day.
+// This module has no way to enforce that at its own boundary (it correctly
+// joins whatever two arrays it's given) — this test pins the CONTRACT so a
+// future caller-side regression is caught here, not live.
+test('CONTRACT: caller must slice walk.closed to the delta, or old closes duplicate as order-walk-only', () => {
+  // Poll 1: one round trip closes.
+  const walk1 = [walkT(5000, 2)];
+  const fold1 = [foldT(5200, 2, 35.5)];
+  const p1 = joinFoldToWalk(fold1, walk1);
+  assert.equal(p1.records.length, 1);
+  assert.equal(p1.unmatchedWalk.length, 0);
+
+  // Poll 2: a second round trip closes. walk.closed is CUMULATIVE (as
+  // analyzeOrderWalk always returns it) — both trips. newTrades is only
+  // the new one, matching what pollTVBrokerAccountInner actually passes.
+  const walk2 = walk1.concat([walkT(12000, 1, { side: 'sell' })]);
+  const fold2 = [foldT(12200, 1, -20)];
+
+  // WRONG (what shipped in the 4.1 commit before this audit): pass the full
+  // cumulative walk.closed. The first trip re-appears as unmatched.
+  const wrong = joinFoldToWalk(fold2, walk2);
+  assert.equal(wrong.unmatchedWalk.length, 1, 'documents the bug this pins against — remove if joinFoldToWalk itself changes its matching contract');
+
+  // RIGHT (the fix): the caller slices walk.closed by how many entries were
+  // already accounted for as of the previous poll (walk1.length here,
+  // standing in for closedRoundTripsScored captured before fold()).
+  const alreadyJoined = walk1.length;
+  const right = joinFoldToWalk(fold2, walk2.slice(alreadyJoined));
+  assert.equal(right.records.length, 1);
+  assert.equal(right.unmatchedWalk.length, 0, 'no stale close should re-appear once the caller slices to the delta');
+  assert.equal(right.merged[0].pnl, -20);
+});
