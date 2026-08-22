@@ -4547,6 +4547,22 @@ const dayRollup = require('./renderer/day-rollup');
 // 5.1: joins a closed fill back to the nearest preceding armed signal.
 const signalJoin = require('./signal-join');
 
+// 6.2: hour-of-day edge table — reporting only, never a gate (decision 6).
+const hourEdgeModule = require('./hour-edge');
+let hourEdgeTable = {};
+function refreshHourEdge() {
+  try {
+    const slot = jessiBucketKey(loadConfig());
+    const dt = dataLoad('day_trades__' + slot) || {};
+    const days = Object.keys(dt).map(d => ({ rows: Array.isArray(dt[d]) ? dt[d] : [] }));
+    hourEdgeTable = hourEdgeModule.buildHourEdge(days);
+    fs.writeFileSync(path.join(DATA_DIR, 'hour-edge.json'), JSON.stringify(hourEdgeTable, null, 2), 'utf8');
+    console.log('[hour-edge] table rebuilt from ' + days.length + ' days (' + Object.keys(hourEdgeTable).length + ' hour buckets)');
+  } catch (e) {
+    console.error('[hour-edge] build failed:', e.message);
+  }
+}
+
 // Defensively pull a bar array out of whatever shape data_get_ohlcv returns —
 // the exact field name isn't nailed down from a live call, so this tries the
 // common candidates rather than assuming one and silently returning nothing.
@@ -5892,6 +5908,7 @@ function ledgerSignal(fields) {
     const windows = (getActiveRules().sessionWindowsIST || []).map(w => ({ startMin: w.startMin, name: w.name || null }));
     const news = computeNewsStatus();
     const hourTrend = (po3TrendCache['60'] && po3TrendCache['60'].value) ? po3TrendCache['60'].value.label : null;
+    const hourBucket = hourEdgeTable[Math.floor(istMin / 60)] || null;
     const row = signalLedger.buildSignalRow(fields, {
       sessionTier: signalLedger.sessionTierForMinutes(istMin, windows),
       dailyTrend: null, // Daily is Anoop's own read — deliberately not captured mechanically (see gatherAnalysisContext)
@@ -5900,6 +5917,7 @@ function ledgerSignal(fields) {
       symbol: chartSymbolCache.symbol,
       accountSlot: jessiBucketKey(cfg),
       mode: currentMode,
+      hourEdge: hourBucket ? hourBucket.winPct : null, // 6.2 reporting-only annotation
     });
     const day = tradingDayStampIST(Date.now());
     const dir = path.join(DATA_DIR, 'signals');
@@ -7268,6 +7286,12 @@ httpServer.on('error', (err) => {
 httpServer.listen(PORT, '127.0.0.1', async () => {
   initDataDir();   // 2026-07-25: resolve D:\co-pilot DATA (or fall back) before anything writes
   h6LoadStatus();  // 5.2/H6: restore the per-trade attribution gate state
+  // 6.2: load the hour-edge table, rebuild when absent/stale, refresh weekly.
+  try {
+    const heRaw = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'hour-edge.json'), 'utf8'));
+    if (heRaw && typeof heRaw === 'object') hourEdgeTable = heRaw;
+  } catch (e) { refreshHourEdge(); }
+  setInterval(refreshHourEdge, 7 * 24 * 3600 * 1000);
   // 2026-08-19: restore today's live trade-tracking state now that DATA_DIR
   // is final — see the note at tvBrokerFeedState's declaration for why this
   // can't happen at module top-level. Must run before startTVBrokerMonitor()

@@ -158,7 +158,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**23 / 26 resolved.** 22 done (0.1, 0.1a, 0.3, 1.1–1.4, 2.1–2.3, 3.1–3.3, 3.3a, 3.4, 4.1–4.5, 5.1, 5.2) + 2 skipped with reason (0.2; 5.3 partial — F3 built, F4-F6/M1-M6 await live verification). Note: the audit added 0.1a + 3.3a on 2026-08-22, raising the total from 24 to 26 — build by DSH, senior partner Claude Code
+**25 / 26 resolved.** 24 done (0.1, 0.1a, 0.3, 1.1–1.4, 2.1–2.3, 3.1–3.3, 3.3a, 3.4, 4.1–4.5, 5.1, 5.2, 6.1, 6.2) + 2 skipped with reason (0.2; 5.3 partial — F3 built, F4-F6/M1-M6 await live verification). H6's gate mechanism is built; its PASS itself is NEEDS LIVE. Note: the audit added 0.1a + 3.3a on 2026-08-22, raising the total from 24 to 26 — build by DSH, senior partner Claude Code
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -636,7 +636,7 @@ the prerequisite for Phase 5's scorecard.*
 
 # Phase 6 — Point the loop at payout — fixes H5
 
-- [ ] **6.1 — Distance-to-payout drives the day's plan**
+- [x] **6.1 — Distance-to-payout drives the day's plan**
 
   `journey-tracker.js` already holds the eval → funded → breach-or-payout lifecycle correctly.
   What is missing is forward-looking: distance to the payout threshold, the implied daily target
@@ -650,9 +650,9 @@ the prerequisite for Phase 5's scorecard.*
   keep trading to reach it. Display it as a pace indicator alongside the existing hard stops,
   and never let it appear in a context where it could be mistaken for a goal that overrides the
   trade limit or the day stop.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). New pure UMD `renderer/payout-pace.js` (payoutPace: distance, trailing 20-day rate, days-to-target at that rate, fixed 20-session need — type-checked inputs, null on invalid) + 4 tests. Wired into the Day Recap summary line that csvApply emits after every reconciliation: "PAYOUT PACE (pace, not permission): $X to clear-eval/payout · trailing 20-day rate $Y/day · N sessions at that rate · fixed 20-session need $Z/day. The day stop and trade limit still rule." — the guard wording ships WITH the number, per the plan's guard. DEVIATION note: the plan's "derives tomorrow's starting contract size" example lives in the journal/recap internals; this task adds the pace number to the recap line without reworking that size derivation. The deeper "implied daily target" interpretation is the fixed-horizon needPerDay — chosen because no firm deadline exists in the data (recorded rather than invented).*
 
-- [ ] **6.2 — Hour-edge table, recomputed from real data**
+- [x] **6.2 — Hour-edge table, recomputed from real data**
 
   Now computable properly, because Phase 4-5 give clean per-trade data with real timestamps. A
   weekly rolling hour-of-day edge table written to `DATA_DIR`, feeding the `sessionTier`
@@ -661,7 +661,7 @@ the prerequisite for Phase 5's scorecard.*
   **Reporting only** — decision 6 forbids hour weighting or hour-based blocking. The window
   stops being an assumption and becomes what the last 20 days actually say, and that is all it
   does.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). New pure `app/hour-edge.js` (buildHourEdge: IST entry-hour buckets {n, wins, losses, net, winPct} from day_trades rows) + 2 tests. Server: `refreshHourEdge()` rebuilds the table from the active slot's day_trades → DATA_DIR/hour-edge.json at boot (when absent) and weekly; signal-ledger rows now carry an `hourEdge` field (current hour's winPct) via the shared buildSignalRow — reporting-only, no gate anywhere reads it. DEVIATION note: the plan said "feeding the sessionTier annotation instead of the hardcoded July guess" — sessionTier itself was already rules.json-driven (sessionWindowsIST) after 2.1, so the table is added as its own annotation (hourEdge) rather than replacing a guess that no longer exists.*
 
 ---
 
@@ -688,7 +688,7 @@ the prerequisite for Phase 5's scorecard.*
 
   **This blocks trust, not build.** Phases 1-4 can ship and be useful before it clears. Phase
   5.2's scorecard should not be *shown* until it does.
-  *Done:*
+  *Done: 2026-08-22 (DSH build) — the MECHANISM shipped, the PASS itself is NEEDS LIVE. Built in task 5.2: the server marks h6Status PASS the moment a real closed trade with non-zero P&L has its balance-delta and fills-derived P&L agree within $1 (the cross-check already runs on every close), persists DATA_DIR/h6-status.json across restarts, and broadcasts h6-status; the Insights scorecard stays hidden behind that gate. No real trade can be produced from this build environment — the first live non-zero close will flip the gate or report the exact disagreement. Left [ ] deliberately: the task is "confirm", and confirmation has not happened.*
 
 ---
 
