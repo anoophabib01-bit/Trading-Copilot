@@ -404,13 +404,9 @@
 
           <div class="engulf-tf-panel" data-tf-panel="1h">
             <div class="engulf-header" style="margin-top:8px;">
-              <span class="stat-label" style="font-size:10px;">Watch this timeframe</span>
-              <label class="toggle-switch" title="Enable/disable engulfing candle monitor">
-                <input type="checkbox" id="engulf-toggle-1h" onchange="toggleEngulfMonitor('1h', this.checked)">
-                <span class="toggle-slider"></span>
-              </label>
+              <span class="stat-label" style="font-size:10px;">Watching — always on</span>
             </div>
-            <div id="engulf-status-1h" class="engulf-status off">Off — toggle to start watching</div>
+            <div id="engulf-status-1h" class="engulf-status off">Always on — no switches to forget.</div>
             <div class="engulf-actions">
               <button class="engulf-check-btn" onclick="checkEngulfNow('1h')" title="Run check now">↻ Check now</button>
               <div class="engulf-indicator-row">
@@ -423,13 +419,9 @@
 
           <div class="engulf-tf-panel" data-tf-panel="30m" style="display:none;">
             <div class="engulf-header" style="margin-top:8px;">
-              <span class="stat-label" style="font-size:10px;">Watch this timeframe</span>
-              <label class="toggle-switch" title="Enable/disable engulfing candle monitor">
-                <input type="checkbox" id="engulf-toggle-30m" onchange="toggleEngulfMonitor('30m', this.checked)">
-                <span class="toggle-slider"></span>
-              </label>
+              <span class="stat-label" style="font-size:10px;">Watching — always on</span>
             </div>
-            <div id="engulf-status-30m" class="engulf-status off">Off — toggle to start watching</div>
+            <div id="engulf-status-30m" class="engulf-status off">Always on — no switches to forget.</div>
             <div class="engulf-actions">
               <button class="engulf-check-btn" onclick="checkEngulfNow('30m')" title="Run check now">↻ Check now</button>
               <div class="engulf-indicator-row">
@@ -442,13 +434,9 @@
 
           <div class="engulf-tf-panel" data-tf-panel="15m" style="display:none;">
             <div class="engulf-header" style="margin-top:8px;">
-              <span class="stat-label" style="font-size:10px;">Watch this timeframe</span>
-              <label class="toggle-switch" title="Enable/disable engulfing candle monitor">
-                <input type="checkbox" id="engulf-toggle-15m" onchange="toggleEngulfMonitor('15m', this.checked)">
-                <span class="toggle-slider"></span>
-              </label>
+              <span class="stat-label" style="font-size:10px;">Watching — always on</span>
             </div>
-            <div id="engulf-status-15m" class="engulf-status off">Off — toggle to start watching</div>
+            <div id="engulf-status-15m" class="engulf-status off">Always on — no switches to forget.</div>
             <div class="engulf-actions">
               <button class="engulf-check-btn" onclick="checkEngulfNow('15m')" title="Run check now">↻ Check now</button>
               <div class="engulf-indicator-row">
@@ -466,12 +454,8 @@
         <div class="panel-section engulf-section">
           <div class="engulf-header">
             <div class="section-title" style="margin:0;">FVG Monitor (30M)</div>
-            <label class="toggle-switch" title="Enable/disable fair value gap monitor">
-              <input type="checkbox" id="fvg-toggle-30m" onchange="toggleFVGMonitor('30m', this.checked)">
-              <span class="toggle-slider"></span>
-            </label>
           </div>
-          <div id="fvg-status-30m" class="engulf-status off">Off — toggle to start watching</div>
+          <div id="fvg-status-30m" class="engulf-status off">Always on — no switches to forget.</div>
           <div class="engulf-actions">
             <button class="engulf-check-btn" onclick="checkFVGNow('30m')" title="Run check now">↻ Check now</button>
           </div>
@@ -484,16 +468,23 @@
         <div class="panel-section engulf-section">
           <div class="engulf-header">
             <div class="section-title" style="margin:0;">Playbook B / SFP Monitor (30M)</div>
-            <label class="toggle-switch" title="Enable/disable SFP + FVG (Playbook B) monitor">
-              <input type="checkbox" id="sfp-toggle-30m" onchange="toggleSFPMonitor('30m', this.checked)">
-              <span class="toggle-slider"></span>
-            </label>
           </div>
-          <div id="sfp-status-30m" class="engulf-status off">Off — toggle to start watching</div>
+          <div id="sfp-status-30m" class="engulf-status off">Always on — no switches to forget.</div>
           <div class="engulf-actions">
             <button class="engulf-check-btn" onclick="checkSFPNow('30m')" title="Run check now">↻ Check now</button>
           </div>
           <div id="sfp-history-30m" class="engulf-history"></div>
+        </div>
+
+        <!-- Chart Watchers panel (1.3) — the real running watcher set, read back
+             from the server, not what the client last requested. No toggles:
+             always on, per decision 2. -->
+        <div class="panel-section engulf-section">
+          <div class="engulf-header">
+            <div class="section-title" style="margin:0;">Chart Watchers</div>
+            <span class="stat-label" style="font-size:10px;" id="chart-watchers-note">Always on — no switches to forget.</span>
+          </div>
+          <div id="chart-watchers-panel" class="engulf-history"></div>
         </div>
       </div>
 

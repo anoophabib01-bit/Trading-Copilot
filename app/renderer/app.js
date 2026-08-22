@@ -1806,8 +1806,6 @@ function setupWsEvents() {
     if (!state.engulf[tf]) return;
     state.engulf[tf].running = running;
     updateEngulfStatus(tf, running ? 'watching' : 'off');
-    const toggle = document.getElementById('engulf-toggle-' + tf);
-    if (toggle) toggle.checked = running;
   });
 
   window.api.onEngulfSignal(signal => handleEngulfSignal(signal));
@@ -1828,8 +1826,6 @@ function setupWsEvents() {
     if (!state.fvg[tf]) return;
     state.fvg[tf].running = running;
     updateFVGStatus(tf, running ? 'watching' : 'off');
-    const toggle = document.getElementById('fvg-toggle-' + tf);
-    if (toggle) toggle.checked = running;
   });
 
   window.api.onFVGSignal(signal => handleFVGSignal(signal));
@@ -1850,8 +1846,6 @@ function setupWsEvents() {
     if (!state.sfp[tf]) return;
     state.sfp[tf].running = running;
     updateSFPStatus(tf, running ? 'watching' : 'off');
-    const toggle = document.getElementById('sfp-toggle-' + tf);
-    if (toggle) toggle.checked = running;
   });
 
   // A raw sweep is informational (Playbook B step 2 only) — log it in history
@@ -1860,6 +1854,16 @@ function setupWsEvents() {
   window.api.onSFPSignal(signal => handleSFPSweep(signal));
 
   window.api.onPlaybookBSignal(signal => handlePlaybookBSignal(signal));
+
+  // 1.3: Chart Watchers panel — renders the REAL running watcher set read back
+  // from the server (watchers-status), never what this client last requested.
+  if (window.api.onWatchersStatus) {
+    window.api.onWatchersStatus(data => renderChartWatchers(data));
+    window.api.getWatchers().then(renderChartWatchers).catch(() => {});
+    setInterval(() => {
+      if (window.api.getWatchers) window.api.getWatchers().then(renderChartWatchers).catch(() => {});
+    }, 15000);
+  }
 
   window.api.onSFPCheck(chk => {
     const tf = (chk && chk.tf) || '15m';
@@ -4778,6 +4782,27 @@ function renderTradeTicketCard(msg) {
   </div>`;
   msgs.appendChild(d);
   scrollToBottom();
+}
+
+// 1.3: Chart Watchers panel — renders the server's watchers-status snapshot.
+// (1.4 extends this with health states amber/red and lastError tooltips.)
+function renderChartWatchers(data) {
+  const panel = document.getElementById('chart-watchers-panel');
+  const note = document.getElementById('chart-watchers-note');
+  if (!panel) return;
+  const d = (data && typeof data === 'object') ? data : { tvConnected: false, rows: [] };
+  if (!d.tvConnected) {
+    if (note) note.textContent = 'TradingView not connected — watchers arm on reconnect.';
+    panel.innerHTML = '<div class="watcher-row"><span>⚪</span><span>watchers idle until TradingView connects</span></div>';
+    return;
+  }
+  if (note) note.textContent = 'Always on — no switches to forget.';
+  const rows = Array.isArray(d.rows) ? d.rows : [];
+  panel.innerHTML = rows.map(r => {
+    const dot = r.running ? '🟢' : '⚪';
+    const last = r.lastCheck ? new Date(r.lastCheck).toLocaleTimeString('en-IN', { hour12: false }) : '—';
+    return '<div class="watcher-row"><span>' + dot + '</span><span>' + escHtml(r.label || r.id) + '</span><span class="stat-label">' + (r.running ? 'watching · last check ' + last + ' IST' : 'stopped') + '</span></div>';
+  }).join('');
 }
 
 window.tcDismiss = function (id) {
