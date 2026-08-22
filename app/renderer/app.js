@@ -5273,9 +5273,13 @@ function updateBias(dir, note) {
 }
 
 function parseGoNogo(text) {
-  if (!text) return;
-  if (/\bGO\b/.test(text) && !/\bNO.GO\b/i.test(text)) setGoNogo('go');
-  else if (/\bNO.GO\b/i.test(text)) setGoNogo('nogo');
+  // 3.2: DELIBERATE NO-OP. This used to regex-scrape Claude's prose for
+  // GO/NO-GO and call setGoNogo(), overwriting the mechanically-computed
+  // badge — any reply containing the word GO clobbered the real state until
+  // the 30s mechanical timer restored it. The badge is computed mechanically
+  // only; LLM text never touches it (plan decision 8 — no LLM in any
+  // enforcement path).
+  void text;
 }
 
 function setGoNogo(s, reasons) {

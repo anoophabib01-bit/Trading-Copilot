@@ -158,7 +158,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**10 / 24 resolved.** 9 done (0.1, 0.3, 1.1–1.4, 2.1–2.3) + 1 skipped with reason (0.2) — build by DSH, senior partner Claude Code
+**14 / 24 resolved.** 13 done (0.1, 0.3, 1.1–1.4, 2.1–2.3, 3.1–3.4) + 1 skipped with reason (0.2) — build by DSH, senior partner Claude Code
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -360,7 +360,7 @@ the prerequisite for Phase 5's scorecard.*
 
 # Phase 3 — Live feed reaches every agent — fixes G3, G4
 
-- [ ] **3.1 — `marketStateLine()` — the chart's live state, as one context line**
+- [x] **3.1 — `marketStateLine()` — the chart's live state, as one context line**
 
   A pure formatter rendering the current `armedSetup` (or its absence) plus the Daily/1H bias:
 
@@ -384,18 +384,18 @@ the prerequisite for Phase 5's scorecard.*
   *Verification is manual per `CLAUDE.md`'s prompt-change convention:* run the app with a live
   setup armed, ask Jessi "should I take this", and read the actual reply. A prompt change with
   no observed response is unverified.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). New pure `app/market-state.js` (marketStateLine, tfSecondsFor, setupDetail) + `app/test/market-state.test.js` (4 tests). `formatMarketStateLine()` in server.js builds the line from readArmedSetup() + po3TrendCache 1H label/direction + sessionTier, and it is injected into the shared context block at all four readers: buildJessiContext (text AND voice), the Judge's live block, the Post-Session data context, the Scalper's seeded context. DEVIATION vs the plan's example line: the example's "Daily/1H: aligned bullish (4/5)" references a 4H/5-bar vote that was REPLACED by the 1H 30-bar gate on 2026-08-17 (see po3TrendRead comments) — the line reports the MECHANICAL 1H BIAS label + direction and states "Daily is Anoop's read — not provided". Analysis/PO3 debate agents are NOT given this line (decision 3) — verified: their context builders never call it. NOTE the manual live verification (ask Jessi with a setup armed) remains an on-machine item.*
 
-- [ ] **3.2 — Fix the stale-context defect this will otherwise inherit**
+- [x] **3.2 — Fix the stale-context defect this will otherwise inherit**
 
   `parseGoNogo` at `renderer/app.js:5186` still regex-scrapes Claude's prose for "GO"/"NO-GO"
   and calls `setGoNogo()`, overwriting the mechanically-computed badge. Any reply containing the
   word GO clobbers the real state until the 30s timer restores it. This is the exact
   LLM-in-the-enforcement-path pattern decision 8 forbids, and once the badge starts carrying
   setup state it becomes actively misleading. Make it a documented no-op.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). `parseGoNogo` body replaced with a documented no-op (comment explains the clobbering defect and cites decision 8). The onChatDone caller is left in place calling the no-op — deliberate: the call site documents where the scrape used to happen; the function name stays so the history is greppable.*
 
-- [ ] **3.3 — Playbooks A, B and C can convene the debate — fixes G4**
+- [x] **3.3 — Playbooks A, B and C can convene the debate — fixes G4**
 
   `autoTriggerDebate` has exactly two call sites today, both inside the PO3 phase check. Add a
   third trigger: a **validated** Playbook A/B/C signal.
@@ -414,14 +414,14 @@ the prerequisite for Phase 5's scorecard.*
   Playbook C on 15M can fire often, and a debate per 15M engulf is how a useful alert channel
   becomes noise that gets ignored — the exact failure `SIGNAL_LOOP_PLAN.md` 5.3 warns about for
   Telegram.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). Built the plan's RECOMMENDED scope: Playbook A (1H engulf WITH 4H trend only — new playbookAValid flag; against-trend and unclear-trend A signals never debate) and full Playbook B confirm. C stays alert-only — recorded as the chosen answer to the open green-signal question; widening is one call-site each. `triggerPlaybookDebate()` + `buildPlaybookDebateQuestion()` reuse PO3's global lastAutoDebateAt 10-min cooldown (deviation note: the plan said "per-symbol cooldown" but PO3's existing cooldown is global, and reusing it as-is is the consistent behavior; splitting it per-symbol is a small follow-up if a live session shows MNQ/MGC cross-suppression). reqId prefixed `playbook-debate-` so the ledger/transcript identifies the trigger. DEVIATION: `preGathered` is NOT used for these triggers — PO3's secondary-symbol path needs it because it gathers while parked on a DIFFERENT symbol; playbook triggers fire on whatever symbol is already on screen, so the normal internal gathering is correct and one-chart-read already (the fire path just read those bars). Debates fire only inside the signal's dedup block (once per candle/confirm), never on rejections.*
 
-- [ ] **3.4 — Telegram parity**
+- [x] **3.4 — Telegram parity**
 
   Push the setup state, not just the raw candle event: playbook, direction, timeframe, validity
   reason and level. Deliberately **not** pushed: rejections, readiness nags, watcher-liveness
   warnings. A channel that pings constantly gets muted, and then the real signal is lost with it.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). `armSetup()` now notifies Telegram with the uniform setup line "📡 SETUP ARMED — Playbook X direction · TF · level/gap · expires in 8 candles of TF" (the validity reason travels in setup.message for B). Rejections, watcher liveness and readiness paths send nothing (no new notify call sites added there). Note: Telegram delivery is currently disabled by TELEGRAM_ENABLED=false (2026-08-11, Anoop) — the parity call sites are wired and will fire the moment the flag flips back.*
 
 ---
 

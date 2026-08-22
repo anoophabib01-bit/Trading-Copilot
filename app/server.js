@@ -1785,6 +1785,9 @@ When his adherence is below target, say the number and name the pattern — do n
   // and full context — see formatLiveFeedContext() above.
   const liveCtx = [formatLiveFeedContext(), formatOpenPositionContext()].join(String.fromCharCode(10));
   if (liveCtx) parts.push(`\n### Live feed (today, real broker data)\n${liveCtx}`);
+  // 3.1: the shared market-state line (live chart setup + 1H bias).
+  const marketCtx = formatMarketStateLine();
+  if (marketCtx) parts.push(`\n### Market state (live chart)\n${marketCtx}`);
 
   if (minimal) return parts.join('\n');
 
@@ -2374,6 +2377,11 @@ async function handleDebateChat(ws, msg, preGathered) {
         liveBlock = `\n\n## LIVE BROKER FEED (today, real executed trades — ground truth, do not re-estimate or invent figures beyond these)\n${lc}\n`
           + `Treat any ⚠ pattern line above as a DISCIPLINE input of the same weight as Jessi's argument. It is computed from his own executed trades, not an opinion. If a documented failure pattern is already showing today, a technically valid setup is still a NO-GO on discipline grounds — say which pattern, and that it is the reason.`;
       }
+      // 3.1: the market-state line reaches the Judge through this block too.
+      try {
+        const msl = formatMarketStateLine();
+        if (msl) liveBlock += `\n\n## MARKET STATE (live chart setup — read-only context)\n${msl}`;
+      } catch (e) {}
     } catch (e) {}
 
     const judgeContext = `## JESSI'S ARGUMENT (Discipline & Psychology)\n${jessiArgument.text}\n\n## ANALYSIS AGENT'S ARGUMENT (Technical & Market)\n${analysisArgument.text}\n\n## ICT POWER OF 3 ARGUMENT (AMD phase — Accumulation / Manipulation / Distribution)\n${po3Argument.text}${biasBlock}${liveBlock}\n\n## ORIGINAL QUESTION\n${lastUserText}`;
@@ -2796,6 +2804,37 @@ function autoTriggerDebate(phaseInfo, preGathered) {
   // originating client for a background trigger.
   return handleDebateChat(null, { messages: [{ role: 'user', content: question }], reqId }, preGathered).catch((e) => {
     console.error('[auto-debate] handleDebateChat failed:', e.message);
+  });
+}
+
+// 3.3: a validated playbook setup can convene the debate — same cooldown as
+// PO3's auto-trigger. Scoped per the plan's own recommendation: Playbook A
+// (1H, WITH 4H trend only) and full Playbook B. C on the lower timeframes
+// stays alert-only — a debate per 15M engulf would turn a useful alert
+// channel into noise (SIGNAL_LOOP_PLAN 5.3's Telegram warning, applied here).
+function buildPlaybookDebateQuestion(fields) {
+  const detail = [
+    fields.direction || '',
+    fields.tfLabel || fields.tfCode || '',
+    fields.level != null ? 'level ' + fields.level : '',
+    fields.gapLow != null ? 'gap ' + fields.gapLow + '-' + fields.gapHigh : ''
+  ].filter(Boolean).join(', ');
+  return `Automated check (not typed by Anoop): Playbook ${fields.playbook} ${detail} just fired at ${fields.time || 'now'} IST. Is this a valid entry right now?`;
+}
+
+function triggerPlaybookDebate(fields) {
+  const now = Date.now();
+  if (now - lastAutoDebateAt < AUTO_DEBATE_COOLDOWN_MS) {
+    console.log('[playbook-debate] skipped — within ' + Math.round(AUTO_DEBATE_COOLDOWN_MS / 60000) + 'min cooldown of the last auto-triggered debate');
+    return Promise.resolve();
+  }
+  lastAutoDebateAt = now;
+  const reqId = 'playbook-debate-' + (++autoDebateReqCounter) + '-' + now;
+  const question = buildPlaybookDebateQuestion(fields);
+  console.log('[playbook-debate] triggered by ' + fields.playbook + ' ' + fields.direction + ', reqId=' + reqId);
+  broadcast({ type: 'auto-debate-triggered', reqId, reason: question });
+  return handleDebateChat(null, { messages: [{ role: 'user', content: question }], reqId }).catch((e) => {
+    console.error('[playbook-debate] handleDebateChat failed:', e.message);
   });
 }
 
@@ -3522,6 +3561,11 @@ async function handlePostSessionReview(ws, msg) {
       const lc = formatLiveFeedContext();
       if (lc) parts.push('\n## LIVE BROKER FEED (today, real executed trades — ground truth if it disagrees with the session data above)\n' + lc);
     } catch (e) {}
+    // 3.1: market state at review time.
+    try {
+      const msl = formatMarketStateLine();
+      if (msl) parts.push('\n## MARKET STATE AT REVIEW TIME\n' + msl);
+    } catch (e) {}
 
     const dataContext = parts.join('\n');
 
@@ -3778,6 +3822,11 @@ async function handleScalperChat(ws, msg) {
     try {
       const lc = formatLiveFeedContext();
       if (lc) seed.push('\n## LIVE BROKER FEED (today, real executed trades — ground truth over the CSV/scalp stats above if they disagree)\n' + lc);
+    } catch (e) {}
+    // 3.1: the market-state line reaches the Scalper through the shared block.
+    try {
+      const msl = formatMarketStateLine();
+      if (msl) seed.push('\n## MARKET STATE (live chart setup)\n' + msl);
     } catch (e) {}
 
     const seeded = [{ role: 'user', content: 'CONTEXT (auto-attached, not typed by Anoop):\n' + seed.join('\n') }]
@@ -4185,10 +4234,12 @@ async function checkEngulfingSignal(key) {
         // with the 4H trend. Only checked for the 1H monitor — that's the TF
         // Playbook A actually pairs with the 4H filter.
         let alignNote = '';
+        let playbookAValid = false; // 3.3: A debates only fire on a WITH-trend 1H engulf
         if (key === '1h') {
           const trend = await get4HTrend();
           if (trend === 'bullish' || trend === 'bearish') {
             const withTrend = (trend === 'bullish' && direction === 'BULLISH') || (trend === 'bearish' && direction === 'BEARISH');
+            playbookAValid = withTrend;
             alignNote = withTrend
               ? ` — WITH 4H trend (${trend}), Playbook A valid`
               : ` — AGAINST 4H trend (${trend}), Playbook A says NO ACTION`;
@@ -4220,6 +4271,10 @@ async function checkEngulfingSignal(key) {
         // 2.1/2.2: ledger the accepted setup + arm it (A on 1h, C on 30m/15m).
         ledgerSignal({ event: 'engulf-fire', playbook: key === '1h' ? 'A' : 'C', tf: cfg.tfCode, direction, source, structure: pbc ? pbc.structure : null });
         armSetup({ playbook: key === '1h' ? 'A' : 'C', tfCode: cfg.tfCode, tfLabel: cfg.label, direction, message: signalMessage });
+        // 3.3: validated Playbook A (1H WITH 4H trend) convenes the debate.
+        if (key === '1h' && playbookAValid) {
+          triggerPlaybookDebate({ playbook: 'A', tfCode: cfg.tfCode, tfLabel: cfg.label, direction, time: istTime });
+        }
       }
     }
 
@@ -4446,6 +4501,10 @@ const barLabelCache = new chartBarCache.ChartBarCache();
 // 2.1: signal ledger — server-side JSONL of every watcher fire AND rejection
 // (pure row building in signal-ledger.js; fs wiring below).
 const signalLedger = require('./signal-ledger');
+
+// 3.1: market-state line — pure formatter (market-state.js) for the armed
+// setup + mechanical 1H bias injected into the shared agent context block.
+const marketState = require('./market-state');
 
 // Defensively pull a bar array out of whatever shape data_get_ohlcv returns —
 // the exact field name isn't nailed down from a live call, so this tries the
@@ -4971,6 +5030,8 @@ async function checkSFPSignal(key) {
             // 2.1/2.2: ledger + arm the confirmed Playbook B setup.
             ledgerSignal({ event: 'playbook-b-confirm', playbook: 'B', tf: cfg.tfCode, direction: mon.pending.direction, level: mon.pending.level, gapLow: fvg.gapLow, gapHigh: fvg.gapHigh });
             armSetup({ playbook: 'B', tfCode: cfg.tfCode, tfLabel: cfg.label, direction: mon.pending.direction, level: mon.pending.level, gapLow: fvg.gapLow, gapHigh: fvg.gapHigh, message: confirmMsg });
+            // 3.3: a confirmed Playbook B convenes the debate.
+            triggerPlaybookDebate({ playbook: 'B', tfCode: cfg.tfCode, tfLabel: cfg.label, direction: mon.pending.direction, level: mon.pending.level, gapLow: fvg.gapLow, gapHigh: fvg.gapHigh, time: istTime });
             mon.pending = null;
           }
         }
@@ -5819,6 +5880,18 @@ function armSetup(fields) {
     expiresAt: now + ARMED_SETUP_EXPIRY_CANDLES * tfSecondsFor(fields.tfCode) * 1000,
   };
   broadcastArmedSetup();
+  // 3.4 Telegram parity: push the setup STATE (playbook, direction, TF,
+  // level/gap, expiry) — not just the raw candle event. Rejections, readiness
+  // nags and watcher-liveness warnings are deliberately never pushed.
+  try {
+    const detail = [
+      fields.direction || '',
+      fields.tfLabel || fields.tfCode || '',
+      fields.level != null ? 'level ' + fields.level : '',
+      fields.gapLow != null ? 'gap ' + fields.gapLow + '-' + fields.gapHigh : ''
+    ].filter(Boolean).join(' · ');
+    telegramBot.notify(`📡 SETUP ARMED — Playbook ${fields.playbook} ${detail} · expires in ${ARMED_SETUP_EXPIRY_CANDLES} candles of ${fields.tfCode}`);
+  } catch (e) { /* telegram is best-effort */ }
 }
 
 function readArmedSetup() {
@@ -5837,6 +5910,23 @@ function clearArmedSetup() { armedSetup = null; }
 function broadcastArmedSetup() {
   const setup = readArmedSetup();
   broadcast({ type: 'armed-setup', setup });
+}
+
+// 3.1: the shared market-state line. Injected into the agent context block
+// read by Jessi, the Judge, the Scalper and the Post-Session Analyst. NOT
+// injected into gatherAnalysisContext/gatherPO3Context — decision 3 keeps the
+// Analysis and PO3 debate agents denied live setup/account state.
+function formatMarketStateLine() {
+  const setup = readArmedSetup();
+  const hourTrend = (po3TrendCache['60'] && po3TrendCache['60'].value) || null;
+  const istMin = Math.floor((Date.now() + 5.5 * 3600000) % 86400000 / 60000);
+  const windows = (getActiveRules().sessionWindowsIST || []).map(w => ({ startMin: w.startMin, name: w.name || null }));
+  return marketState.marketStateLine(setup, {
+    nowMs: Date.now(),
+    hourTrendLabel: hourTrend ? hourTrend.label : null,
+    hourTrendDirection: hourTrend ? hourTrend.direction : null,
+    sessionTier: signalLedger.sessionTierForMinutes(istMin, windows),
+  });
 }
 
 // 2.3: Took it / Passed — one click, no form, no note field. Writes the
