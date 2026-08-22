@@ -4506,6 +4506,10 @@ const signalLedger = require('./signal-ledger');
 // setup + mechanical 1H bias injected into the shared agent context block.
 const marketState = require('./market-state');
 
+// 4.1: joins fold-scored closes (exact $ P&L) with order-walk round trips
+// (symbol/side/prices/times) into one record per trade.
+const tradeRecordJoin = require('./trade-record-join');
+
 // Defensively pull a bar array out of whatever shape data_get_ohlcv returns —
 // the exact field name isn't nailed down from a live call, so this tries the
 // common candidates rather than assuming one and silently returning nothing.
@@ -6461,6 +6465,15 @@ async function pollTVBrokerAccountInner() {
       const newTrades = tvBrokerFeedState.trades.slice(prevTradesLen);
       console.log(`[tv-broker] ${newTrades.length} trade(s) closed (balance-delta-at-flat, unverified live): ` +
         newTrades.map(t => `size ${t.size} pnl ${t.pnl.toFixed(2)}`).join(', '));
+      // 4.1: join each fold-scored close with its order-walk round trip so the
+      // downstream record carries symbol/side/prices/times AND the fold's
+      // confirmed P&L. Unmatched halves are kept, never dropped.
+      const walkClosedSafe = (walk && !walkDesynced && walk.droppedRows === 0) ? walk.closed : [];
+      const joined = tradeRecordJoin.joinFoldToWalk(newTrades, walkClosedSafe);
+      if (joined.merged.length) {
+        console.log(`[tv-broker] 4.1 join: ${joined.merged.length}/${newTrades.length} fold closes matched to order-walk round trips` +
+          (joined.unmatchedWalk.length ? `; ${joined.unmatchedWalk.length} walk closes the fold did not score (kept as order-walk-only)` : ''));
+      }
 
       // 2026-08-20 (Anoop's request — "be part of the workflow"): a closed
       // trade now writes its own row into today's session log instead of
@@ -6477,16 +6490,11 @@ async function pollTVBrokerAccountInner() {
       // a planned entry and a fill price off as a stop that was never set.
       // `direction` comes from the position watch's own `closed` event (the
       // side that was actually on), and stays '?' if that event wasn't seen.
-      for (const t of newTrades) {
+      // 4.1: t.symbol now exists for joined records (from the order walk);
+      // fold-only records carry symbol null and take the same safe fallback
+      // as before (single-instrument day → __any, else '?').
+      for (const t of joined.records) {
         try {
-          // 2026-08-20 (review): live-fold trade records are {size, pnl, at} —
-          // they carry NO `symbol` (only backfilled records do, and those never
-          // reach this loop). So the per-symbol lookup always missed and every
-          // row silently took the `__any` fallback. Harmless on a
-          // one-instrument day, but on an MNQ+MGC day it writes a CONFIDENT
-          // wrong direction to a file the Post-Session Analyst later reads back
-          // as fact — a TRUST-PROTOCOL violation. Fall back to '?' rather than
-          // to the other instrument's side whenever today wasn't single-symbol.
           const symbolsToday = Object.keys(tvLastClosedSide).filter(k => k !== '__any');
           const dir = tvLastClosedSide[t.symbol]
             || (symbolsToday.length <= 1 ? tvLastClosedSide.__any : null)
@@ -6527,34 +6535,39 @@ async function pollTVBrokerAccountInner() {
       // account and it captures fees. Disagreement is SURFACED, exactly like
       // the round-trip count reconciliation, so a wrong figure becomes a
       // signal rather than a silent input to size-freeze-guard/cooldown.
-      if (walk && !walkDesynced && walk.closed.length >= newTrades.length) {
+      if (joined.merged.length) {
         const commRate = getActiveRules().commissionPerContractPerSide;
-        const recentRts = walk.closed.slice(-newTrades.length);
-        newTrades.forEach((t, idx) => {
-          const rt = recentRts[idx];
-          const exp = tvBrokerFeed.expectedPnlFromFills(rt, commRate);
+        joined.merged.forEach(t => {
+          // 4.1: the joined record itself carries both halves — no index-
+          // slicing of the walk needed (which assumed fold closes and walk
+          // closes arrived 1:1 in the same order).
+          const exp = tvBrokerFeed.expectedPnlFromFills(t, commRate);
           if (!exp || t.pnlUnknown) return; // no verified multiplier, or nothing to compare
           const delta = t.pnl - exp.net;
           // $1 of slack absorbs exchange rounding and fee timing without
           // swallowing a real error - the 2026-08-20 miscounts were $50+ apart.
           const ok = Math.abs(delta) <= 1.0;
-          const line = rt.symbol + ': balance-delta ' + t.pnl.toFixed(2) + ' vs fills ' + exp.net.toFixed(2) +
-            ' (' + rt.side + ' ' + rt.size + ' @ ' + rt.entryPrice + ' -> ' + rt.exitPrice +
+          const line = t.symbol + ': balance-delta ' + t.pnl.toFixed(2) + ' vs fills ' + exp.net.toFixed(2) +
+            ' (' + t.side + ' ' + t.size + ' @ ' + t.entryPrice + ' -> ' + t.exitPrice +
             ', gross ' + exp.gross.toFixed(2) + ' - comm ' + exp.commission.toFixed(2) + '), diff ' + delta.toFixed(2);
           if (ok) console.log('[tv-broker] P&L cross-check OK on ' + line);
           else console.warn('[tv-broker] P&L CROSS-CHECK MISMATCH on ' + line + '. Enforcement still uses the balance delta.');
           broadcast({
-            type: 'pnl-cross-check', ok, symbol: rt.symbol,
+            type: 'pnl-cross-check', ok, symbol: t.symbol,
             balanceDelta: t.pnl, fromFills: exp.net, difference: delta,
-            side: rt.side, size: rt.size, entryPrice: rt.entryPrice, exitPrice: rt.exitPrice,
+            side: t.side, size: t.size, entryPrice: t.entryPrice, exitPrice: t.exitPrice,
           });
         });
       }
 
       broadcast({
         type: 'trade-closed-live',
-        trades: newTrades.map(t => ({
+        trades: joined.records.map(t => ({
           size: t.size, pnl: t.pnl, inferred: !!t.inferred, pnlUnknown: !!t.pnlUnknown,
+          symbol: t.symbol || null, side: t.side || null,
+          entryPrice: t.entryPrice != null ? t.entryPrice : null,
+          exitPrice: t.exitPrice != null ? t.exitPrice : null,
+          source: t.source,
         })),
         tradeCount: tvBrokerFeedState.tradeCount,
         dayPnl: tvBrokerFeedState.dayPnl,

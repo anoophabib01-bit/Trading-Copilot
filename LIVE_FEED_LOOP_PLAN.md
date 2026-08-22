@@ -158,7 +158,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**14 / 24 resolved.** 13 done (0.1, 0.3, 1.1–1.4, 2.1–2.3, 3.1–3.4) + 1 skipped with reason (0.2) — build by DSH, senior partner Claude Code
+**15 / 24 resolved.** 14 done (0.1, 0.3, 1.1–1.4, 2.1–2.3, 3.1–3.4, 4.1) + 1 skipped with reason (0.2) — build by DSH, senior partner Claude Code
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -430,7 +430,7 @@ the prerequisite for Phase 5's scorecard.*
 *The heart of decision 1, and the highest-leverage work in this plan. Independent of Phases
 1-3 — it can run first or in parallel.*
 
-- [ ] **4.1 — Unify the two trade representations**
+- [x] **4.1 — Unify the two trade representations**
 
   Two complementary record shapes exist today and neither is sufficient alone:
 
@@ -450,7 +450,7 @@ the prerequisite for Phase 5's scorecard.*
   Keep the provenance fields — `evidence: 'degraded'`, `inferred`, `source` — on the merged
   record. A unified record that loses the confidence labels would let an uncertain number reach
   a hard lock, which D1/D2 in `TODOS.md` were specifically built to prevent.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). New pure `app/trade-record-join.js` (joinFoldToWalk) + `app/test/trade-record-join.test.js` (7 tests). Matching: time-ordered greedy, 3-minute tolerance, size-equal candidate wins outright, else nearest. Output: `records` (merged + unmatchedFold + unmatchedWalk, sorted), `merged`, `unmatchedFold`, `unmatchedWalk` — nothing is dropped; a fold close with no walk match keeps source 'live-fold-only', a walk close the fold missed stays 'order-walk-only' with pnlUnknown (the flip case the fold cannot score). Provenance preserved on every record. Wired into pollTVBrokerAccountInner: the session-log loop, the expectedPnlFromFills cross-check (now on joined records instead of index-slicing the walk — fixes the 1:1-order assumption) and the trade-closed-live broadcast all consume `joined.records`/`joined.merged`. Full suite 583/583 (576 + 7 new).*
 
 - [ ] **4.2 — Extract the day rollup from `csvApply` as a pure module**
 
