@@ -4042,21 +4042,15 @@ for (const key of Object.keys(ENGULF_TFS)) {
   engulfMonitors[key] = { running: false, interval: null, lastSignalKey: null, lastCheck: null, lastRejectKey: null };
 }
 
-// 2026-08-19 (Anoop: "the live feed should ... be active always ... and
-// notify me when any of the 3 playbook setup appear"): mirrors
-// po3MonitorUserDisabled — a manual OFF must survive a TradingView reconnect,
-// but absent that, this monitor auto-starts the moment TradingView connects,
-// same as PO3 already does, instead of requiring the toggle to be flipped by
-// hand every session.
-let engulfMonitorUserDisabled = false;
+// 1.2 (plan decision 2): engulf watchers are always on — there is no
+// supported OFF and no *MonitorUserDisabled flag to flip. The toggle message
+// handler stays so an old client/Telegram 'off' is REFUSED with a status line
+// instead of leaving a watcher dark.
 function handleEngulfToggle(msg) {
   const key = ENGULF_TFS[msg.tf] ? msg.tf : '1h';
-  engulfMonitorUserDisabled = !msg.enabled;
-  if (msg.enabled) {
-    startEngulfMonitor(key);
-  } else {
-    stopEngulfMonitor(key);
-  }
+  if (msg.enabled) { startEngulfMonitor(key); return; }
+  broadcast({ type: 'engulf-monitor-status', tf: key, running: true, alwaysOn: true, note: `Engulf ${ENGULF_TFS[key].label} watcher is always on — 'off' is not supported.` });
+  console.log(`Engulf ${ENGULF_TFS[key].label}: 'off' refused — watchers are always on`);
 }
 
 function startEngulfMonitor(key) {
@@ -4305,13 +4299,14 @@ for (const k of Object.keys(FVG_TFS)) {
   fvgMonitors[k] = { running: false, interval: null, lastSignalKey: null, lastCheck: null };
 }
 
-// 2026-08-19: same auto-start-unless-user-disabled pattern as
-// engulfMonitorUserDisabled/po3MonitorUserDisabled above.
-let fvgMonitorUserDisabled = false;
+// 1.2 (plan decision 2): FVG watcher is always on — no supported OFF.
+// The handler stays so an old client/Telegram 'off' is refused with a status
+// line instead of leaving the watcher dark.
 function handleFVGToggle(msg) {
   const key = FVG_TFS[msg.tf] ? msg.tf : '30m';
-  fvgMonitorUserDisabled = !msg.enabled;
-  if (msg.enabled) startFVGMonitor(key); else stopFVGMonitor(key);
+  if (msg.enabled) { startFVGMonitor(key); return; }
+  broadcast({ type: 'fvg-monitor-status', tf: key, running: true, alwaysOn: true, note: `FVG ${FVG_TFS[key].label} watcher is always on — 'off' is not supported.` });
+  console.log(`FVG ${FVG_TFS[key].label}: 'off' refused — watchers are always on`);
 }
 
 function startFVGMonitor(key) {
@@ -4819,16 +4814,14 @@ for (const k of Object.keys(SFP_TFS)) {
   sfpMonitors[k] = { running: false, interval: null, lastCheck: null, lastSweepKey: null, lastConfirmKey: null, pending: null };
 }
 
-// 2026-08-19: same auto-start-unless-user-disabled pattern as
-// engulfMonitorUserDisabled/po3MonitorUserDisabled above. This is Playbook B
-// (SFP + FVG / liquidity raid) — one of the 3 playbook setups the checklist
-// tracks, so "notify me when any of the 3 playbook setups appear" needs this
-// one running by default too, not just PO3.
-let sfpMonitorUserDisabled = false;
+// 1.2 (plan decision 2): SFP/Playbook B watcher is always on — no
+// supported OFF. The handler stays so an old client/Telegram 'off' is refused
+// with a status line instead of leaving the watcher dark.
 function handleSFPToggle(msg) {
   const key = SFP_TFS[msg.tf] ? msg.tf : '30m';
-  sfpMonitorUserDisabled = !msg.enabled;
-  if (msg.enabled) startSFPMonitor(key); else stopSFPMonitor(key);
+  if (msg.enabled) { startSFPMonitor(key); return; }
+  broadcast({ type: 'sfp-monitor-status', tf: key, running: true, alwaysOn: true, note: `SFP ${SFP_TFS[key].label} watcher is always on — 'off' is not supported.` });
+  console.log(`SFP ${SFP_TFS[key].label}: 'off' refused — watchers are always on`);
 }
 
 function startSFPMonitor(key) {
@@ -5685,13 +5678,16 @@ function stopSessionPrepScheduler() {
 // duplication that hid FVG from auto-start). Each entry is idempotent to
 // start and respects its own *MonitorUserDisabled flag (1.2 removes the five
 // watchers' flags, PO3's stays per the plan).
+// 1.2: the five plan watchers have NO cond — always on, per decision 2.
+// PO3 alone keeps its user-disable flag (the plan's toggle removal list is
+// the five watchers only; PO3's UI toggle stays).
 const ALL_MONITORS = [
   { id: 'po3',        label: 'Power of 3 (AMD)', mon: () => po3Monitor,         cond: () => !po3MonitorUserDisabled,  run: () => startPo3Monitor() },
-  { id: 'engulf-1h',  label: 'Engulf 1H',        mon: () => engulfMonitors['1h'],  cond: () => !engulfMonitorUserDisabled, run: () => startEngulfMonitor('1h') },
-  { id: 'engulf-30m', label: 'Engulf 30M',       mon: () => engulfMonitors['30m'], cond: () => !engulfMonitorUserDisabled, run: () => startEngulfMonitor('30m') },
-  { id: 'engulf-15m', label: 'Engulf 15M',       mon: () => engulfMonitors['15m'], cond: () => !engulfMonitorUserDisabled, run: () => startEngulfMonitor('15m') },
-  { id: 'fvg-30m',    label: 'FVG 30M',          mon: () => fvgMonitors['30m'],    cond: () => !fvgMonitorUserDisabled,  run: () => startFVGMonitor('30m') },
-  { id: 'sfp-30m',    label: 'SFP / Playbook B 30M', mon: () => sfpMonitors['30m'], cond: () => !sfpMonitorUserDisabled, run: () => startSFPMonitor('30m') },
+  { id: 'engulf-1h',  label: 'Engulf 1H',        mon: () => engulfMonitors['1h'],  run: () => startEngulfMonitor('1h') },
+  { id: 'engulf-30m', label: 'Engulf 30M',       mon: () => engulfMonitors['30m'], run: () => startEngulfMonitor('30m') },
+  { id: 'engulf-15m', label: 'Engulf 15M',       mon: () => engulfMonitors['15m'], run: () => startEngulfMonitor('15m') },
+  { id: 'fvg-30m',    label: 'FVG 30M',          mon: () => fvgMonitors['30m'],    run: () => startFVGMonitor('30m') },
+  { id: 'sfp-30m',    label: 'SFP / Playbook B 30M', mon: () => sfpMonitors['30m'], run: () => startSFPMonitor('30m') },
 ];
 
 function armMonitorsStaggered() {
@@ -6820,9 +6816,11 @@ httpServer.listen(PORT, '127.0.0.1', async () => {
 });
 
 process.on('SIGINT', () => {
-  Object.keys(engulfMonitors).forEach(stopEngulfMonitor);
-  Object.keys(fvgMonitors).forEach(stopFVGMonitor);
-  Object.keys(sfpMonitors).forEach(stopSFPMonitor);
+  // 1.2 (SIGNAL_LOOP_PLAN A5): forEach passes (key, index, array) — pass the
+  // key explicitly so a future second parameter can never receive the index.
+  Object.keys(engulfMonitors).forEach(k => stopEngulfMonitor(k));
+  Object.keys(fvgMonitors).forEach(k => stopFVGMonitor(k));
+  Object.keys(sfpMonitors).forEach(k => stopSFPMonitor(k));
   stopNewsTracking();
   stopMechanicalAnalysis();
   stopSessionPrepScheduler();

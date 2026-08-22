@@ -158,7 +158,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**3 / 24 tasks complete.** (0.1, 0.3, 1.1 — build by DSH, senior partner Claude Code)
+**4 / 24 tasks complete.** (0.1, 0.3, 1.1, 1.2 — build by DSH, senior partner Claude Code)
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -255,7 +255,7 @@ degrade the whole chart layer.*
   three-way duplication is exactly how FVG got missed.
   *Done: 2026-08-22 (DSH build). `ALL_MONITORS` const introduced with all five plan watchers (engulf 1H/30M/15M, FVG 30M, SFP 30M) PLUS PO3 — deviation note: PO3 is listed alongside the five because the three connect sites armed it there too, keeping one list instead of two. The three connect sites already routed through the single `armMonitorsStaggered()` helper (task 0.1), which now iterates ALL_MONITORS — the 3-way duplication is structurally gone, not just patched. `startFVGMonitor` gains its first auto-start caller (pre-verified with the G1 grep: 2 call sites now — toggle handler + ALL_MONITORS). server.js syntax OK.*
 
-- [ ] **1.2 — Delete the `*MonitorUserDisabled` flags and refuse every "off" path**
+- [x] **1.2 — Delete the `*MonitorUserDisabled` flags and refuse every "off" path**
 
   Per decision 2, there is no supported way to disarm a watcher. Remove
   `engulfMonitorUserDisabled`, `fvgMonitorUserDisabled`, `sfpMonitorUserDisabled` and the
@@ -272,7 +272,7 @@ degrade the whole chart layer.*
   the same class of bug: `Object.keys(monitors).forEach(stopMonitor)` passes `(key, index,
   array)`, so the array index lands in the second parameter. Shutting down is not disarming —
   pass the skip-save flag explicitly.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). The three `*MonitorUserDisabled` flags and their guards removed (grep-verified: zero remaining references). Toggle handlers now honour `enabled:true` (idempotent) and REFUSE `enabled:false` with a status broadcast + log line — implemented as refuse-with-explanation (the plan's "no-op and reply" rendered as a visible status line, matching the Telegram wording). Telegram `/engulf off` and `/playbookb off` now refuse with an explanation; `on` still honoured; `/help` text updated. SIGINT fixed: explicit `k => stopX(k)` lambdas so forEach's (key,index,array) can never feed the index into a future second parameter — deviation note: the stop functions currently take one parameter, so today's bug was latent, not live; the fix is future-proofing per A5. Both files pass `node --check`.*
 
 - [ ] **1.3 — Remove the toggles from the UI, replace with a live watcher panel**
 
