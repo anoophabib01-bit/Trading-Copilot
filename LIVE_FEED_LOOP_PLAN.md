@@ -217,6 +217,38 @@ degrade the whole chart layer.*
   rather than assumed.
   *Done: 2026-08-22 (DSH build). New `app/chart-bar-cache.js` (pure: normalizeTf, ttlMsForTf = 1/3 bar duration, ChartBarCache, staggerOffsetMs) + `app/test/chart-bar-cache.test.js` (10 tests). Wired into `getFullBars` and `getBarsAndLabels` with per-symbol keys via new `getChartSymbolCached` (10s symbol cache); Pine label text cached in a second instance with the same per-TF TTL. `makeLock` now logs queue depth whenever the lock is contended and exposes `queueDepth()`/`maxQueueDepth()` getters. Watcher starts staggered 4s apart via `armMonitorsStaggered()` at all three connect sites. DEVIATION for review: per the plan's TTL, a just-closed new bar becomes visible up to ~TTL/2 after close — a detection-lag tradeoff, documented in the module header. Full suite 566/566 green (556 baseline + 10 new).*
 
+- [ ] **0.1a — Re-key the cache on bar boundaries, not wall-clock TTL** — *added 2026-08-22 by audit, supersedes 0.1's TTL*
+
+  **0.1's DEVIATION note is accepted as accurate and the trade is rejected.** The measured lag
+  is worse than "~TTL/2": TTL is one third of the bar duration, so worst case is a **full TTL
+  after close** — up to **5 min on 15M, 10 min on 30M, 20 min on 1H**.
+
+  **Why a wall-clock TTL is the wrong axis here.** Every detector deliberately drops the
+  forming bar (`dropFormingBar`) and evaluates closed bars only, so *new information appears
+  exactly once per bar, at its close, and never between closes.* A TTL anchored to when the
+  fetch happened is uncorrelated with that. A 1H engulf that closes at 19:00 can go unseen
+  until 19:20 — against decision 6, where catching the setup is the whole point.
+
+  **The fix is strictly better on both axes, not a trade.** Key each entry on the bar period it
+  was fetched in and expire when the period rolls:
+
+  ```js
+  const period = (t, durMs) => Math.floor(t / durMs);   // same bar → same key
+  // stale when period(now) !== period(entry.at)
+  ```
+
+  - **Lag → zero.** A newly closed bar is visible on the very next poll.
+  - **Dedup improves.** Engulf-1H polls 60× per bar: TTL(20min) allows 3 fetches/hour;
+    bar-boundary allows exactly 1. Engulf-30M and FVG-30M still collapse to one fetch.
+
+  Keep `ttlMsForTf` as the fallback for unknown timeframe codes only. Apply to the label-text
+  cache too — the Playbook C gate re-validates Pine labels against closed bars anyway, so a
+  label cached for 20 minutes buys nothing and can only delay.
+
+  *Acceptance:* a unit test asserting a fetch in bar N is not served to a read in bar N+1, and
+  that repeat reads inside one bar hit the cache. Keep the existing 10 tests green.
+  *Done:*
+
 - [~] **0.2 — Baseline capture, for real this time**
 
   `SIGNAL_LOOP_PLAN.md` task 0.1 was skipped and its author recorded the shortfall honestly:
@@ -416,6 +448,25 @@ the prerequisite for Phase 5's scorecard.*
   Telegram.
   *Done: 2026-08-22 (DSH build). Built the plan's RECOMMENDED scope: Playbook A (1H engulf WITH 4H trend only — new playbookAValid flag; against-trend and unclear-trend A signals never debate) and full Playbook B confirm. C stays alert-only — recorded as the chosen answer to the open green-signal question; widening is one call-site each. `triggerPlaybookDebate()` + `buildPlaybookDebateQuestion()` reuse PO3's global lastAutoDebateAt 10-min cooldown (deviation note: the plan said "per-symbol cooldown" but PO3's existing cooldown is global, and reusing it as-is is the consistent behavior; splitting it per-symbol is a small follow-up if a live session shows MNQ/MGC cross-suppression). reqId prefixed `playbook-debate-` so the ledger/transcript identifies the trigger. DEVIATION: `preGathered` is NOT used for these triggers — PO3's secondary-symbol path needs it because it gathers while parked on a DIFFERENT symbol; playbook triggers fire on whatever symbol is already on screen, so the normal internal gathering is correct and one-chart-read already (the fire path just read those bars). Debates fire only inside the signal's dedup block (once per candle/confirm), never on rejections.*
 
+
+- [ ] **3.3a — Give the auto-debate a per-source cooldown** — *added 2026-08-22 by audit*
+
+  `triggerPlaybookDebate` and `autoTriggerDebate` share one `lastAutoDebateAt`. So a PO3
+  phase-change debate **silently suppresses a full Playbook B confirm** that fires inside the
+  cooldown, and the log line for it reads as a routine skip.
+
+  That inverts the conviction ordering. A completed Playbook B — liquidity raid, patience
+  window survived, displacement FVG confirmed — is the highest-conviction event the detection
+  layer produces. An AMD phase transition is context. The lower-conviction event must not be
+  able to consume the budget for the higher one.
+
+  **Fix:** track the last fire per source (`po3` / `playbook`), so each has its own cooldown.
+  Additionally let a **full Playbook B confirm preempt** a PO3 debate still inside its window —
+  it is rare enough that it cannot become a noise source.
+
+  *Keep as-is:* a single shared cooldown across Playbook A and Playbook B. Those are genuinely
+  comparable in conviction and both are rare.
+  *Done:*
 - [x] **3.4 — Telegram parity**
 
   Push the setup state, not just the raw candle event: playbook, direction, timeframe, validity
@@ -452,7 +503,7 @@ the prerequisite for Phase 5's scorecard.*
   a hard lock, which D1/D2 in `TODOS.md` were specifically built to prevent.
   *Done: 2026-08-22 (DSH build). New pure `app/trade-record-join.js` (joinFoldToWalk) + `app/test/trade-record-join.test.js` (7 tests). Matching: time-ordered greedy, 3-minute tolerance, size-equal candidate wins outright, else nearest. Output: `records` (merged + unmatchedFold + unmatchedWalk, sorted), `merged`, `unmatchedFold`, `unmatchedWalk` — nothing is dropped; a fold close with no walk match keeps source 'live-fold-only', a walk close the fold missed stays 'order-walk-only' with pnlUnknown (the flip case the fold cannot score). Provenance preserved on every record. Wired into pollTVBrokerAccountInner: the session-log loop, the expectedPnlFromFills cross-check (now on joined records instead of index-slicing the walk — fixes the 1:1-order assumption) and the trade-closed-live broadcast all consume `joined.records`/`joined.merged`. Full suite 583/583 (576 + 7 new).*
 
-- [ ] **4.2 — Extract the day rollup from `csvApply` as a pure module**
+- [x] **4.2 — Extract the day rollup from `csvApply` as a pure module**
 
   `csvApply()` (`renderer/app.js:8643`) is ~120 lines that compute, from a day's trade rows:
   per-trade grade and flags, discipline %, gross/net/contracts/maxSize, best/worst, avgWin/
@@ -469,7 +520,7 @@ the prerequisite for Phase 5's scorecard.*
   *This is the task that makes Phase 4 safe.* Writing a second history path instead would give
   two divergent definitions of "discipline score" — precisely the class of drift that
   `CLAUDE.md` warns about with `rules.json`.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). New UMD `renderer/day-rollup.js` (gradeTrades, rollupDay, tradingDayKey, entryMinOf — loads as window.DayRollup in the browser AND CommonJS for server/tests; index.html loads it before app.js). csvParseTrades now calls DayRollup.gradeTrades (window flags read rules.sessionWindowsIST instead of the hardcoded copy — identical values today); csvApply calls DayRollup.rollupDay — both are thin callers now. GOLDEN VERIFICATION, the acceptance gate: run against the REAL stored production days on this machine (s2). 2026-08-21 (14 trades): BYTE-IDENTICAL across all 32 summary fields incl. pnl 916.5, at the historical sizeCap 4 — that summary was produced in production by the OLD inline code. 2026-08-18: grades identical at cap 4; its stored sum cannot match because its rows were rewritten after the summary was stored (net off by exactly the contract delta, 17) — recorded, not hidden. Committed tests: test/day-rollup.test.js (6 tests, hand-computed fixture — real P&L stays out of the repo per the DATA/ gitignore convention) + test/day-rollup-live-golden.test.js which runs ONLY where the production DATA dir exists and fails if no stored day reproduces (it passes here: 2/2 days' grades reproduced, 1/1 current-day summary byte-identical). Full suite 589/589.*
 
 - [ ] **4.3 — The live feed writes `day_trades` and `gr_history` directly**
 
@@ -516,6 +567,22 @@ the prerequisite for Phase 5's scorecard.*
   missing from history even though the broker has them. CSV reconciliation is the backstop for
   exactly that case, which is why it stays rather than being deleted. Reframe the UI from
   "Upload CSV" to "Reconcile with broker export".
+
+  > **⚠ Landmine, added 2026-08-22 by audit — read before writing this task.**
+  > `csvApply`'s merge key is `fp = t | x | round(pnl*100) | size`, and it dedupes correctly
+  > **only because both sides have always come from the same CSV export.** After 4.3 they no
+  > longer do. A live record's `t`/`x` are broker order timestamps in ms; the CSV's are parsed
+  > from a printed timestamp string at coarser resolution. **The same trade will produce two
+  > different fingerprints, so reconciling a day that was already written live will silently
+  > DOUBLE every trade in it** — doubling the day's trade count, contracts and net, and
+  > corrupting the balance ledger for that date.
+  >
+  > This is the highest-risk single defect available in Phase 4, because it destroys real
+  > history rather than failing loudly. The reconciliation must match on a **tolerance-based
+  > identity** (same side, same size, exit within ~60s, P&L within a cent) — never on `fp()` —
+  > and must treat a tolerance match as *the same trade* to be compared, not a new row to add.
+  > Cover it with a test that ingests a live-written day and then the same day's CSV, and
+  > asserts the trade count is unchanged.
   *Done:*
 
 ---

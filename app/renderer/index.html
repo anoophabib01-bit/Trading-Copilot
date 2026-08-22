@@ -1199,6 +1199,9 @@
   </div>
 </div>
 
+<!-- 4.2: day-rollup.js (UMD) loads BEFORE app.js — csvParseTrades/csvApply
+     grade and roll up days through these shared pure functions. -->
+<script src="day-rollup.js"></script>
 <script src="app.js"></script>
 <!-- Loaded after app.js: reuses insCoachNotes/insMoney/edToday from it. -->
 <script src="day-recap.js"></script>

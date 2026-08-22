@@ -8699,38 +8699,20 @@ function csvParseTrades(csvText) {
   });
   const byDate = {};
   trades.forEach(t => { (byDate[t.date] = byDate[t.date] || []).push(t); });
+  // 4.2: grading lives in day-rollup.js now — ONE definition shared with the
+  // live-feed writer (4.3), so the CSV path and the live path can never grade
+  // the same trade differently. Window flags now read rules.sessionWindowsIST
+  // instead of the hardcoded copy (identical values today).
+  const _R = getRules();
+  const gradeOpts = {
+    tradingMode: _R.tradingMode || 'standard',
+    cooldownAfterLossOnly: _R.cooldownAfterLossOnly,
+    maxHoldSeconds: _R.maxHoldSeconds,
+    sessionWindowsIST: _R.sessionWindowsIST,
+    sizeCapCsv: SIZE_CAP_CSV,
+  };
   Object.keys(byDate).forEach(d => {
-    const day = byDate[d].sort((a, b) => a.entryMs - b.entryMs);
-    let prevLossExit = null;
-    const _R = getRules();
-    const _isScalper = (_R.tradingMode || 'standard') === 'scalper';
-    const _cooldownLossOnly = _isScalper && _R.cooldownAfterLossOnly;
-    const _maxHold = _isScalper ? (_R.maxHoldSeconds || 1800) : Infinity;
-    let prevExitMs = null; // tracks ALL prior exits (for standard mode cooldown)
-    day.forEach(t => {
-      // Standard: 15-min break after EVERY trade (win or loss) — rule #7
-      // Scalper: 15-min break only after LOSING trades
-      let revenge;
-      if (_cooldownLossOnly) {
-        revenge = prevLossExit !== null && (t.entryMs - prevLossExit) / 60000 < 15 && (t.entryMs - prevLossExit) >= 0;
-      } else {
-        revenge = prevExitMs !== null && (t.entryMs - prevExitMs) / 60000 < 15 && (t.entryMs - prevExitMs) >= 0;
-      }
-      const inWin = (t.entryMin >= 810 && t.entryMin < 900) || (t.entryMin >= 1140 && t.entryMin < 1260);
-      const flags = []; let pts = 0;
-      if (t.size <= SIZE_CAP_CSV) pts++; else flags.push('oversize');
-      if (!revenge) pts++; else flags.push('revenge');
-      if (inWin) pts++; else flags.push('out-of-window');
-      // 4th flag slot: scalper mode checks hold time, standard assumes news-clear
-      if (_isScalper) {
-        if ((t.holdSec || 0) <= _maxHold) pts++; else flags.push('hold-exceeded');
-      } else {
-        pts++; // news not knowable historically — assume clear
-      }
-      t.pts = pts; t.flags = flags; t.g = ['D', 'D', 'C', 'B', 'A'][pts];
-      prevExitMs = t.exitMs;
-      if (t.pnl < 0) prevLossExit = t.exitMs;
-    });
+    byDate[d] = DayRollup.gradeTrades(byDate[d], gradeOpts);
   });
   return { byDate: byDate, duplicatesDropped };
 }
@@ -8764,48 +8746,16 @@ function csvApply(filename, parsed) {
     incoming.forEach(r => mergedMap.set(fp(r), r));
     const day = Array.from(mergedMap.values()).sort((a, b) => a.t - b.t);
 
-    const gross = day.reduce((a, t) => a + t.pnl, 0);
-    const contracts = day.reduce((a, t) => a + t.size, 0);
-    const net = Math.round((gross - contracts * COMM_PER_CT) * 100) / 100;
-    const maxSize = day.reduce((m, t) => Math.max(m, t.size), 0);
-    const over = day.filter(t => t.size > SIZE_CAP_CSV).length;
-    const revenge = day.filter(t => (t.flags || []).indexOf('revenge') >= 0).length;
-    const disc = Math.round(day.reduce((a, t) => a + (4 - (t.flags || []).length), 0) / (4 * day.length) * 100);
-    const dd = new Date(d + 'T00:00:00'); const dow = dd.getDay();
-    const pnls = day.map(t => t.pnl); const wins = pnls.filter(p => p > 0); const losses = pnls.filter(p => p < 0);
-    const avgWin = wins.length ? wins.reduce((a, b) => a + b, 0) / wins.length : 0;
-    const avgLoss = losses.length ? losses.reduce((a, b) => a + b, 0) / losses.length : 0;
-    const holds = day.map(t => t.hold || 0); const avgHold = Math.round(holds.reduce((a, b) => a + b, 0) / day.length);
-    const medHold = holds.slice().sort((a, b) => a - b)[Math.floor(day.length / 2)];
-    const gaps = []; for (let i = 1; i < day.length; i++) gaps.push((day[i].t - day[i - 1].x) / 1000);
-    const avgGap = gaps.length ? Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length) : 0;
-    const firstThreeMax = Math.max.apply(null, day.slice(0, 3).map(t => t.size));
-    let runp = 0, prevSize = 0, sizedUpIntoLoss = false;
-    day.forEach(t => { if (t.size > prevSize && runp < 0) sizedUpIntoLoss = true; prevSize = t.size; runp += t.pnl; });
-    let wseq = 0, bigAfterWins = false; for (const t of day) { if (t.size === maxSize) { bigAfterWins = wseq >= 2; break; } if (t.pnl > 0) wseq++; else wseq = 0; }
-    const under5 = holds.filter(hh => hh < 300).length, over15 = holds.filter(hh => hh > 900).length;
-    // Giveback: intraday peak vs close (gross, ordered by entry time)
-    let gbRun = 0, gbPeak = 0;
-    day.forEach(t => { gbRun += t.pnl; if (gbRun > gbPeak) gbPeak = gbRun; });
-    const giveback = Math.round((gbPeak - gbRun) * 100) / 100;
-    // Direction flip-flops (JadeCap: abandoning the thesis = revenge, not analysis):
-    // side changed vs previous trade AND re-entered within 15 min of its exit.
-    let flips = 0;
-    for (let fi = 1; fi < day.length; fi++) {
-      if (day[fi].side && day[fi - 1].side && day[fi].side !== day[fi - 1].side
-          && (day[fi].t - day[fi - 1].x) / 60000 < 15) flips++;
-    }
-    // Longest run of consecutive losses + whether he kept trading after 3 in a row
-    let consec = 0, maxConsec = 0, tradedPast3Losses = false;
-    day.forEach(t => {
-      if (t.pnl < 0) { consec++; if (consec > maxConsec) maxConsec = consec; }
-      else { if (consec >= 3) tradedPast3Losses = true; consec = 0; }
+    // 4.2: the day rollup is day-rollup.js's rollupDay now — ONE definition
+    // shared with the live-feed writer (4.3). Byte-identical to the old
+    // inline computation (live-golden verified on real stored days).
+    const sum = DayRollup.rollupDay(d, day, {
+      commPerCt: COMM_PER_CT,
+      sizeCapCsv: SIZE_CAP_CSV,
+      tradingMode: getRules().tradingMode || 'standard',
     });
-    if (maxConsec >= 3 && day[day.length - 1].pnl >= 0) tradedPast3Losses = true;
-    const _tMode = (getRules().tradingMode || 'standard');
-    // Count hold-exceeded flags (set by csvParse in scalper mode)
-    const holdExceeded = day.filter(t => (t.flags || []).indexOf('hold-exceeded') >= 0).length;
-    const sum = { date: d, dow: dow, n: day.length, pnl: net, gross: gross, contracts: contracts, maxSize: maxSize, over: over, revenge: revenge, disc: disc, best: Math.max.apply(null, pnls), worst: Math.min.apply(null, pnls), avgWin: avgWin, avgLoss: avgLoss, avgHold: avgHold, medHold: medHold, avgGap: avgGap, firstThreeMax: firstThreeMax, sizedUpIntoLoss: sizedUpIntoLoss, bigAfterWins: bigAfterWins, under5: under5, over15: over15, wins: wins.length, losses: losses.length, peak: Math.round(gbPeak), giveback: giveback, flips: flips, maxConsecLoss: maxConsec, tradedPast3Losses: tradedPast3Losses, tradingMode: _tMode, holdExceeded: holdExceeded };
+    const gross = sum.gross, net = sum.pnl, contracts = sum.contracts;
+    const over = sum.over, revenge = sum.revenge, disc = sum.disc, maxSize = sum.maxSize;
     hist = hist.filter(e => e.date !== d); hist.push(sum);
     ledger[d] = { gross: gross, net: net, contracts: contracts };
     perDay.push({ d: d, n: day.length, gross: gross, net: net, over: over, revenge: revenge, disc: disc, maxSize: maxSize });
