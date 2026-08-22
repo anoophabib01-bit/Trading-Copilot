@@ -4532,6 +4532,9 @@ const tradeRecordJoin = require('./trade-record-join');
 // two producers can never diverge.
 const dayRollup = require('./renderer/day-rollup');
 
+// 5.1: joins a closed fill back to the nearest preceding armed signal.
+const signalJoin = require('./signal-join');
+
 // Defensively pull a bar array out of whatever shape data_get_ohlcv returns —
 // the exact field name isn't nailed down from a live call, so this tries the
 // common candidates rather than assuming one and silently returning nothing.
@@ -5993,6 +5996,23 @@ function writeLiveTradeToDayRecord(record) {
     const slot = jessiBucketKey(loadConfig());
     const dayKey = dayRollup.tradingDayKey(record.at);
     const rules = getActiveRules();
+    // 5.1: join the fill back to the nearest preceding armed signal.
+    // minutesFromSignal is measured — both the signal and the fill happened
+    // while the app was running (see signal-join.js).
+    let join = { signalBacked: false, playbook: null, minutesFromSignal: null, signalTs: null };
+    try {
+      const signalsFile = path.join(DATA_DIR, 'signals', dayKey + '.jsonl');
+      let signals = [];
+      if (fs.existsSync(signalsFile)) {
+        signals = fs.readFileSync(signalsFile, 'utf8').split('\n')
+          .filter(l => l.trim())
+          .map(l => { try { return JSON.parse(l); } catch (e) { return null; } })
+          .filter(Boolean);
+      }
+      join = signalJoin.joinTradeToSignal(record, signals, { windowMinutes: rules.signalJoinWindowMinutes });
+    } catch (e) {
+      console.warn('[signal-join] failed:', e.message);
+    }
     const sizeCapCsv = typeof rules.sizeCap === 'number' ? rules.sizeCap : 2;
     const commPerCt = rules.commissionPerContractPerSide != null ? Number(rules.commissionPerContractPerSide) : 1.0;
     const gradeOpts = {
@@ -6019,6 +6039,10 @@ function writeLiveTradeToDayRecord(record) {
         : 0,
       evidence: record.evidence || null,
       source: record.source || null,
+      // 5.1: signal-backed stamping — the 5.2 scorecard's primary input.
+      signalBacked: join.signalBacked,
+      playbook: join.playbook,
+      minutesFromSignal: join.minutesFromSignal,
       g: null, flags: null, // graded below through the shared day-rollup
     };
     const dtStore = dataLoad('day_trades__' + slot) || {};
@@ -6031,13 +6055,20 @@ function writeLiveTradeToDayRecord(record) {
       side: r.side, ep: r.ep, xp: r.xp, mp: r.mp,
     }));
     const graded = dayRollup.gradeTrades(pre, gradeOpts);
-    const dayRows = graded.map(g => ({
-      t: g.entryMs, x: g.exitMs, size: g.size, pnl: g.pnl, g: g.g, flags: g.flags,
-      side: g.side || null, ep: g.ep != null ? g.ep : null, xp: g.xp != null ? g.xp : null,
-      mp: g.mp != null ? g.mp : null, hold: g.holdSec,
-      evidence: (mergedMap.get(fp({ t: g.entryMs, x: g.exitMs, pnl: g.pnl, size: g.size })) || {}).evidence || null,
-      source: (mergedMap.get(fp({ t: g.entryMs, x: g.exitMs, pnl: g.pnl, size: g.size })) || {}).source || null,
-    }));
+    const dayRows = graded.map(g => {
+      const base = mergedMap.get(fp({ t: g.entryMs, x: g.exitMs, pnl: g.pnl, size: g.size })) || {};
+      return {
+        t: g.entryMs, x: g.exitMs, size: g.size, pnl: g.pnl, g: g.g, flags: g.flags,
+        side: g.side || null, ep: g.ep != null ? g.ep : null, xp: g.xp != null ? g.xp : null,
+        mp: g.mp != null ? g.mp : null, hold: g.holdSec,
+        evidence: base.evidence || null,
+        source: base.source || null,
+        // 5.1: the signal join survives the re-grade (the 5.2 scorecard input).
+        signalBacked: base.signalBacked === true,
+        playbook: base.playbook || null,
+        minutesFromSignal: base.minutesFromSignal != null ? base.minutesFromSignal : null,
+      };
+    });
     const sum = dayRollup.rollupDay(dayKey, dayRows, { commPerCt, sizeCapCsv, tradingMode: gradeOpts.tradingMode });
     dtStore[dayKey] = dayRows;
     const keys = Object.keys(dtStore).sort();
@@ -6052,6 +6083,10 @@ function writeLiveTradeToDayRecord(record) {
     dataSave('day_trades__' + slot, dtStore);
     dataSave('gr_history__' + slot, hist.slice(-60));
     dataSave('balance_ledger__' + slot, ledger);
+    // 5.1: write the join into the day's signal ledger as it happens.
+    if (join.signalBacked) {
+      ledgerSignal({ event: 'signal-join', playbook: join.playbook, direction: row.side === 'LONG' ? 'BULLISH' : (row.side === 'SHORT' ? 'BEARISH' : null), signalTs: join.signalTs });
+    }
     broadcast({ type: 'day-record-updated', slot, date: dayKey, rows: dayRows, sum, ledgerEntry });
     console.log(`[day-record] live trade → ${dayKey}: ${row.size} ${row.side || '?'} pnl ${row.pnl} (evidence ${row.evidence || 'fold'}) → day net ${sum.pnl}`);
     return 'written';

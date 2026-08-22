@@ -589,7 +589,7 @@ the prerequisite for Phase 5's scorecard.*
 
 # Phase 5 — Join, score, learn — fixes H3, H4
 
-- [ ] **5.1 — Join fills to signals**
+- [x] **5.1 — Join fills to signals**
 
   On a close, match back to the nearest preceding signal on the same instrument and direction
   within a configurable window (start at 15 minutes). Stamp the trade record with
@@ -599,7 +599,7 @@ the prerequisite for Phase 5's scorecard.*
 
   `minutesFromSignal` also makes failure mode 7 (entering within a minute of a signal, before
   confirmation) precisely measurable for the first time.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). New pure `app/signal-join.js` (joinTradeToSignal, directionOfTrade, ARMING_EVENTS) + `app/test/signal-join.test.js` (7 tests). Only ARMED-setup events can back a trade (engulf-fire/fvg-fire/playbook-b-confirm); direction must match (buy→BULLISH, sell→BEARISH); preceding only, inside rules.json's new `signalJoinWindowMinutes` (15); nearest wins; trade time = entryAt else fold at. Wired into `writeLiveTradeToDayRecord`: reads the day's signal ledger (DATA_DIR/signals/<dayKey>.jsonl), stamps the row with `signalBacked`/`playbook`/`minutesFromSignal` (which survive the re-grade into the stored row), and appends a `signal-join` line to the day's ledger AS IT HAPPENS. Failure mode 7 is now measurable: rows with minutesFromSignal 0-1 near a signal. Idempotent (join recomputed from the same ledger on a duplicate fire). Full suite 606/606.*
 
 - [ ] **5.2 — Per-playbook scorecard in Insights**
 
