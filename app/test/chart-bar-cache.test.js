@@ -43,14 +43,44 @@ test('a request bigger than the cached fetch misses', () => {
   assert.equal(c.stats.misses, 1);
 });
 
-test('entry expires after its TTL', () => {
+// 0.1a: known timeframes expire on BAR-PERIOD boundaries, not wall-clock TTL.
+test('a fetch in bar N is not served to a read in bar N+1 (0.1a acceptance)', () => {
+  let now = 1000000; // inside some 15m bar period
+  const c = new ChartBarCache({ now: () => now });
+  c.set('MNQ1!', '15', 5, bars(5));
+  assert.ok(c.get('MNQ1!', '15', 5));           // same period → hit
+  now += 15 * 60 * 1000;                        // period rolls
+  assert.equal(c.get('MNQ1!', '15', 5), null);  // new bar → miss, lag zero
+  assert.equal(c.size(), 0);
+});
+
+test('repeat reads inside one bar hit the cache (0.1a acceptance)', () => {
+  let now = 1000000;
+  const c = new ChartBarCache({ now: () => now });
+  c.set('MNQ1!', '60', 5, bars(5));
+  assert.ok(c.get('MNQ1!', '60', 5));
+  now += 19 * 60 * 1000; // 19 min later — same 1H period, would have exceeded the old 20-min TTL anyway; still same bar
+  assert.ok(c.get('MNQ1!', '60', 5));
+  assert.equal(c.stats.hits, 2);
+  now += 41 * 60 * 1000; // period rolls past the fetch bar
+  assert.equal(c.get('MNQ1!', '60', 5), null);
+});
+
+test('unknown timeframes fall back to the wall-clock TTL', () => {
+  let now = 1000000;
+  const c = new ChartBarCache({ now: () => now });
+  c.set('MNQ1!', 'weird-tf', 5, bars(5));
+  assert.ok(c.get('MNQ1!', 'weird-tf', 5));
+  now += ttlMsForTf('weird-tf') + 1;
+  assert.equal(c.get('MNQ1!', 'weird-tf', 5), null);
+});
+
+test('clock skew backwards never marks an entry stale', () => {
   let now = 1000000;
   const c = new ChartBarCache({ now: () => now });
   c.set('MNQ1!', '15', 5, bars(5));
+  now -= 5000;
   assert.ok(c.get('MNQ1!', '15', 5));
-  now += ttlMsForTf('15') + 1;
-  assert.equal(c.get('MNQ1!', '15', 5), null);
-  assert.equal(c.size(), 0);
 });
 
 test('different symbols or timeframes never share an entry', () => {

@@ -7,12 +7,15 @@
 // uses (plan 0.1's own table). This cache makes reads on the same
 // (symbol, timeframe) share one fetch for the TTL window.
 //
-// TTL = one third of the timeframe's bar duration, per the plan (a 30m read
-// stays fresh for 10 minutes, a 1H read for 20). Deliberate consequence,
-// recorded for review: a just-closed NEW bar is not visible to a monitor
-// until the cached read expires, so worst-case detection lag after a bar
-// close is roughly TTL/2. The plan accepts this trade — the constant is one
-// edit away if live verification says otherwise.
+// 0.1a (audit, supersedes 0.1's TTL): entries are keyed on BAR PERIODS, not
+// wall-clock TTL. Every detector drops the forming bar and evaluates closed
+// bars only, so new information appears exactly once per bar, at its close —
+// a wall-clock TTL anchored to fetch time is uncorrelated with that and can
+// hide a fresh close for a full TTL (up to 20 min on 1H). An entry fetched in
+// bar period N is stale the moment the period rolls to N+1, so a newly closed
+// bar is visible on the very next poll (lag → zero), and repeat reads inside
+// one bar hit the cache (dedup → exactly one fetch per bar per (symbol, tf)).
+// ttlMsForTf remains ONLY as the fallback for unknown timeframe codes.
 //
 // A request for `count` bars is served from a cached entry that fetched
 // `count` OR MORE bars (take the last `count`). A request for MORE than
@@ -57,10 +60,33 @@ function normalizeTf(tfCode) {
   return s; // unknown code — keyed raw, TTL falls back to DEFAULT_TTL_MS
 }
 
+// Wall-clock fallback ONLY for unknown timeframe codes (0.1a). Known
+// timeframes use bar-period expiry instead (periodOf below).
 function ttlMsForTf(tfCode) {
   const dur = BAR_DURATION_MS[normalizeTf(tfCode)];
   if (!dur) return DEFAULT_TTL_MS;
   return Math.max(MIN_TTL_MS, Math.round(dur / 3));
+}
+
+// Bar duration for a KNOWN timeframe, or null (unknown → TTL fallback).
+function barDurationMsFor(tfCode) {
+  return BAR_DURATION_MS[normalizeTf(tfCode)] || null;
+}
+
+// Same bar → same period key. An entry fetched in period N is stale once the
+// period rolls to N+1 (0.1a).
+function periodOf(t, durMs) {
+  return Math.floor(t / durMs);
+}
+
+function isStale(entry, tfCode, now) {
+  const dur = barDurationMsFor(tfCode);
+  if (dur) {
+    // Clock-skew guard: a now before the fetch time can never be stale.
+    if (now < entry.at) return false;
+    return periodOf(now, dur) !== periodOf(entry.at, dur);
+  }
+  return now - entry.at > ttlMsForTf(tfCode);
 }
 
 // Stagger monitor start times so five timers don't align on the same tick.
@@ -83,7 +109,7 @@ class ChartBarCache {
     const key = this._key(symbol, tfCode);
     const e = this._entries.get(key);
     if (!e) { this.stats.misses++; return null; }
-    if (this._now() - e.at > ttlMsForTf(tfCode)) {
+    if (isStale(e, tfCode, this._now())) {
       this._entries.delete(key);
       this.stats.misses++;
       return null;
@@ -100,7 +126,7 @@ class ChartBarCache {
     if (Array.isArray(value) && value.length === 0) return false;
     const key = this._key(symbol, tfCode);
     const e = this._entries.get(key);
-    if (e && this._now() - e.at <= ttlMsForTf(tfCode) && e.count >= count) return false;
+    if (e && !isStale(e, tfCode, this._now()) && e.count >= count) return false;
     this._entries.set(key, { value: Array.isArray(value) ? value.slice() : value, count, at: this._now() });
     this.stats.sets++;
     return true;
@@ -109,4 +135,4 @@ class ChartBarCache {
   size() { return this._entries.size; }
 }
 
-module.exports = { ChartBarCache, normalizeTf, ttlMsForTf, staggerOffsetMs, BAR_DURATION_MS };
+module.exports = { ChartBarCache, normalizeTf, ttlMsForTf, staggerOffsetMs, BAR_DURATION_MS, barDurationMsFor, periodOf, isStale };
