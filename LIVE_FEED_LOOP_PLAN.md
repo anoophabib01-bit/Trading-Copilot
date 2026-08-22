@@ -158,7 +158,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**5 / 24 tasks complete.** (0.1, 0.3, 1.1, 1.2, 1.3 — build by DSH, senior partner Claude Code)
+**6 / 24 tasks complete.** (0.1, 0.3, 1.1–1.4 — build by DSH, senior partner Claude Code)
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -290,14 +290,14 @@ degrade the whole chart layer.*
   looking at the UI, and G1 was invisible for exactly that reason.
   *Done: 2026-08-22 (DSH build). All five toggle-switch blocks removed (grep-verified: zero `*-toggle-` references left in renderer/). Status defaults replaced with "Always on — no switches to forget."; the toggle-sync lines in app.js's monitor-status handlers removed. Chart Watchers panel added after the SFP section. Server: new `watchers-get` WS case → `buildWatchersStatus()` snapshot (tvConnected + per-watcher id/label/running/lastCheck) pushed as `watchers-status`; client pulls on load and every 15s via `getWatchers()` and re-renders on push — so restored/hand-toggled state displays correctly. PO3's own toggle was deliberately left in place: the plan's removal list is the five watchers only (recorded in 1.2's Done line). All four touched files pass `node --check`.*
 
-- [ ] **1.4 — Per-watcher liveness, so a silently dead monitor is visible**
+- [x] **1.4 — Per-watcher liveness, so a silently dead monitor is visible**
 
   A watcher that throws every poll currently just broadcasts an error status that scrolls away.
   With no toggle to power-cycle it, a wedged watcher is worse than before. Track `lastCheck`
   and `lastError` per monitor; the Chart Watchers panel shows amber if a watcher has not
   completed a check within 3× its interval, and the server attempts one restart before
   reporting red.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). `lastError` + `restartAttempted` added to all monitor objects (po3/engulf/fvg/sfp); every check function clears `lastError` on entry and sets it in its catch. PO3's TV-offline and outside-session-window branches now stamp `lastCheck` (the poll loop is alive — deviation note: without this the watchdog would flag PO3 stale during the hours it is intentionally idle). `buildWatchersStatus()` now returns per-watcher health (healthy/amber/red/tv-offline/stopped); `startWatcherLivenessWatch()` (30s tick, first pass at +10s) restarts a stale watcher ONCE via its idempotent start function, logs recovery/restart/RED transitions, and broadcasts `watchers-status` on change. Panel renders 🟢/🟡/🔴 with a last-error tooltip. Startup wired in the boot block. All touched files pass `node --check`.*
 
 ---
 
