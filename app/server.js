@@ -4520,6 +4520,11 @@ const marketState = require('./market-state');
 // (symbol/side/prices/times) into one record per trade.
 const tradeRecordJoin = require('./trade-record-join');
 
+// 4.2/4.3: the SAME day-rollup the renderer's CSV path uses (UMD module) —
+// the live writer grades and rolls up with the identical functions, so the
+// two producers can never diverge.
+const dayRollup = require('./renderer/day-rollup');
+
 // Defensively pull a bar array out of whatever shape data_get_ohlcv returns —
 // the exact field name isn't nailed down from a live call, so this tries the
 // common candidates rather than assuming one and silently returning nothing.
@@ -5964,6 +5969,91 @@ function handleSignalDecision(ws, msg) {
   console.log(`[signal-decision] ${decision.toUpperCase()} on ${setup.playbook} ${setup.tfLabel} ${setup.direction}`);
 }
 
+// 4.3: the live feed writes the day record. On each closed round trip the
+// joined 4.1 record becomes a row in the SAME shape csvApply writes
+// ({t,x,size,pnl,g,flags,side,ep,xp,mp,hold} + provenance fields), merged by
+// the SAME fingerprint, re-graded and rolled up by the SAME day-rollup
+// functions, and persisted through the SAME dataSave disk mirrors. The
+// renderer syncs its localStorage copy from the broadcast so the UI and a
+// later CSV reconciliation see the same rows. Idempotent: the fingerprint
+// merge makes a duplicate fire a no-op for the row; rollup recomputes from
+// the merged day every time. Trading-day anchor: dayRollup.tradingDayKey
+// (03:45 IST rollover) — never calendar/UTC.
+function writeLiveTradeToDayRecord(record) {
+  try {
+    if (!record || record.pnlUnknown) return 'skipped: pnlUnknown';
+    if (!(Number.isFinite(record.pnl) && record.at != null)) return 'skipped: unscoreable';
+    const slot = jessiBucketKey(loadConfig());
+    const dayKey = dayRollup.tradingDayKey(record.at);
+    const rules = getActiveRules();
+    const sizeCapCsv = typeof rules.sizeCap === 'number' ? rules.sizeCap : 2;
+    const commPerCt = rules.commissionPerContractPerSide != null ? Number(rules.commissionPerContractPerSide) : 1.0;
+    const gradeOpts = {
+      tradingMode: rules.tradingMode || 'standard',
+      cooldownAfterLossOnly: rules.cooldownAfterLossOnly,
+      maxHoldSeconds: rules.maxHoldSeconds,
+      sessionWindowsIST: rules.sessionWindowsIST,
+      sizeCapCsv,
+    };
+    const dirSign = record.side === 'sell' ? -1 : 1;
+    const row = {
+      t: record.entryAt != null ? record.entryAt : record.at,
+      x: record.exitAt != null ? record.exitAt : record.at,
+      size: record.size,
+      pnl: record.pnl,
+      side: record.side ? String(record.side).toUpperCase() : null,
+      ep: record.entryPrice != null ? record.entryPrice : null,
+      xp: record.exitPrice != null ? record.exitPrice : null,
+      mp: (record.entryPrice != null && record.exitPrice != null)
+        ? Math.round(dirSign * (record.exitPrice - record.entryPrice) * 100) / 100
+        : null,
+      hold: (record.exitAt != null && record.entryAt != null)
+        ? Math.max(0, Math.round((record.exitAt - record.entryAt) / 1000))
+        : 0,
+      evidence: record.evidence || null,
+      source: record.source || null,
+      g: null, flags: null, // graded below through the shared day-rollup
+    };
+    const dtStore = dataLoad('day_trades__' + slot) || {};
+    const fp = r => r.t + '|' + r.x + '|' + Math.round(r.pnl * 100) + '|' + r.size;
+    const mergedMap = new Map();
+    (Array.isArray(dtStore[dayKey]) ? dtStore[dayKey] : []).forEach(r => mergedMap.set(fp(r), r));
+    mergedMap.set(fp(row), row);
+    const pre = Array.from(mergedMap.values()).map(r => ({
+      entryMs: r.t, exitMs: r.x, entryMin: null, holdSec: r.hold, size: r.size, pnl: r.pnl,
+      side: r.side, ep: r.ep, xp: r.xp, mp: r.mp,
+    }));
+    const graded = dayRollup.gradeTrades(pre, gradeOpts);
+    const dayRows = graded.map(g => ({
+      t: g.entryMs, x: g.exitMs, size: g.size, pnl: g.pnl, g: g.g, flags: g.flags,
+      side: g.side || null, ep: g.ep != null ? g.ep : null, xp: g.xp != null ? g.xp : null,
+      mp: g.mp != null ? g.mp : null, hold: g.holdSec,
+      evidence: (mergedMap.get(fp({ t: g.entryMs, x: g.exitMs, pnl: g.pnl, size: g.size })) || {}).evidence || null,
+      source: (mergedMap.get(fp({ t: g.entryMs, x: g.exitMs, pnl: g.pnl, size: g.size })) || {}).source || null,
+    }));
+    const sum = dayRollup.rollupDay(dayKey, dayRows, { commPerCt, sizeCapCsv, tradingMode: gradeOpts.tradingMode });
+    dtStore[dayKey] = dayRows;
+    const keys = Object.keys(dtStore).sort();
+    while (keys.length > 90) { delete dtStore[keys.shift()]; }
+    let hist = dataLoad('gr_history__' + slot) || [];
+    hist = hist.filter(e => e.date !== dayKey);
+    hist.push(sum);
+    hist.sort((a, b) => (a.date < b.date ? -1 : 1));
+    const ledgerEntry = { gross: sum.gross, net: sum.pnl, contracts: sum.contracts };
+    let ledger = dataLoad('balance_ledger__' + slot) || {};
+    ledger[dayKey] = ledgerEntry;
+    dataSave('day_trades__' + slot, dtStore);
+    dataSave('gr_history__' + slot, hist.slice(-60));
+    dataSave('balance_ledger__' + slot, ledger);
+    broadcast({ type: 'day-record-updated', slot, date: dayKey, rows: dayRows, sum, ledgerEntry });
+    console.log(`[day-record] live trade → ${dayKey}: ${row.size} ${row.side || '?'} pnl ${row.pnl} (evidence ${row.evidence || 'fold'}) → day net ${sum.pnl}`);
+    return 'written';
+  } catch (e) {
+    console.error('[day-record] live write failed:', e.message);
+    return 'failed: ' + e.message;
+  }
+}
+
 // 1.4: liveness watchdog — a running watcher that hasn't completed a check
 // within 3× its own interval gets ONE automatic restart, then red. Skipped
 // while TradingView is down (nothing can be stale then; reconnect re-arms
@@ -6537,12 +6627,23 @@ async function pollTVBrokerAccountInner() {
           const noteBits = ['auto-logged from live feed'];
           if (t.inferred) noteBits.push('size not observed (opened+closed between polls)');
           if (!pnlKnown) noteBits.push('P&L NOT computed — read it off the broker');
+          // 4.4: entry/exit now come from the 4.1 join's order-walk FILL
+          // prices (observed, not planned). stop/target stay '?' — planned
+          // levels exist nowhere in broker data, and passing a fill off as a
+          // planned stop is exactly what the '?' convention exists to prevent.
+          if (t.entryPrice != null || t.exitPrice != null) noteBits.push('entry/exit = order-walk avg fill prices');
           const logged = sessionMgr.logTrade(sessionMgr.todayStr(), {
             direction: dir === '?' ? '?' : dir.toUpperCase(),
-            entry: '?', stop: '?', target: '?', exit: '?',
+            entry: t.entryPrice != null ? String(t.entryPrice) : '?',
+            stop: '?', target: '?',
+            exit: t.exitPrice != null ? String(t.exitPrice) : '?',
             pnl: pnlKnown ? Number(t.pnl.toFixed(2)) : undefined,
             notes: noteBits.join('; ') + (t.size ? `; size ${t.size}` : ''),
           });
+          // 4.3: the same closed trade writes the durable day record (rows +
+          // rollup + ledger) through the shared day-rollup — CSV is no longer
+          // the only writer. pnlUnknown records are skipped inside.
+          try { writeLiveTradeToDayRecord(t); } catch (e) { console.warn('[day-record] live write threw:', e.message); }
           // 2026-08-20 (review, H6): logTrade used to return success even when
           // its insert silently no-opped. It now reports honestly, so a
           // dropped trade is visible instead of vanishing — the whole point of
