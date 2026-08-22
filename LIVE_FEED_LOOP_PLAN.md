@@ -101,7 +101,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**0 / 24 tasks complete.** Nothing has started.
+**1 / 24 tasks complete.** (0.3 done — build started 2026-08-22 by DSH, senior partner Claude Code)
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -172,11 +172,11 @@ degrade the whole chart layer.*
   and it is the only chance to measure what arming the other four watchers actually adds.
   *Done:*
 
-- [ ] **0.3 — Branch and test baseline**
+- [x] **0.3 — Branch and test baseline**
 
   Branch off `master`. Confirm `cd app && npm test` is green before the first edit (538 tests
   as of the last recorded run) so any later failure is unambiguously ours.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). Branch `live-feed-loop` created off master @ 8e7b202 — the plan's stated base, verified. `npm test` baseline: 556/556 green — DEVIATION from the plan's recorded 538: the suite has grown since the plan was written (33 test files). LIVE_FEED_LOOP_PLAN.md was untracked on master; committed onto the branch as a setup commit so the tracker travels with it. `DSH build/` scratch dir git-ignored.*
 
 ---
 
