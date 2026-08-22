@@ -236,10 +236,12 @@ class TelegramBridge {
       return this._sendChunked(chatId, 'Usage: /engulf <1h|30m|15m> <on|off>');
     }
 
-    if (state === 'on') startEngulfMonitor(tf);
-    else stopEngulfMonitor(tf);
-
-    return this._sendChunked(chatId, `${ENGULF_TFS[tf].label} engulf monitor turned ${state.toUpperCase()}.`);
+    if (state === 'on') {
+      startEngulfMonitor(tf);
+      return this._sendChunked(chatId, `${ENGULF_TFS[tf].label} engulf monitor turned ON.`);
+    }
+    // 1.2 (decision 2): watchers are always on — 'off' is refused, never honoured.
+    return this._sendChunked(chatId, `${ENGULF_TFS[tf].label} engulf watcher is always on — 'off' is not supported.`);
   }
 
   // ── /check <1h|30m|15m> ─────────────────────────────────────────────────
@@ -272,8 +274,12 @@ class TelegramBridge {
         `Usage: /playbookb on|off\nCurrent: ${running ? 'ON' : 'OFF'}${pending ? ' — liquidity raid pending, awaiting displacement FVG' : ''}`
       );
     }
-    if (state === 'on') startSFPMonitor('30m'); else stopSFPMonitor('30m');
-    return this._sendChunked(chatId, `Playbook B monitor (30M) turned ${state.toUpperCase()}.`);
+    if (state === 'on') {
+      startSFPMonitor('30m');
+      return this._sendChunked(chatId, `Playbook B monitor (30M) turned ON.`);
+    }
+    // 1.2 (decision 2): watchers are always on — 'off' is refused, never honoured.
+    return this._sendChunked(chatId, `Playbook B monitor (30M) is always on — 'off' is not supported.`);
   }
 
   // ── /rules ──────────────────────────────────────────────────────────────
@@ -350,9 +356,9 @@ class TelegramBridge {
       'Commands:',
       '/status - balance, floor, buffer, P&L, GO/NO-GO',
       '/mode eval|funded - switch account mode',
-      '/engulf <1h|30m|15m> <on|off> - toggle engulf monitor',
+      '/engulf <1h|30m|15m> on - engulf watchers are always on (off not supported)',
       '/check <1h|30m|15m> - run an engulf check now',
-      '/playbookb on|off - toggle SFP + FVG (Playbook B) monitor',
+      '/playbookb on - Playbook B watcher is always on (off not supported)',
       '/rules - current mode rule summary',
       '/trade <long|short> <entry> <stop> <target> <pnl> [exit] - log a trade',
       '/help - this list',
