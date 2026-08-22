@@ -8827,10 +8827,15 @@ function csvApply(filename, parsed) {
       side: t.side || null, ep: t.entryPrice || null, xp: t.exitPrice || null,
       mp: t.movePts != null ? t.movePts : null, hold: t.holdSec
     }));
-    const mergedMap = new Map();
-    (dtStore[d] || []).forEach(r => mergedMap.set(fp(r), r));
-    incoming.forEach(r => mergedMap.set(fp(r), r));
-    const day = Array.from(mergedMap.values()).sort((a, b) => a.t - b.t);
+    // 4.5 AUDIT FIX: fp() alone is only safe when BOTH sides came from a CSV
+    // export. Since 4.3 the live feed writes this store with ms broker
+    // timestamps, so the same trade fingerprints differently and this merge
+    // ADDED a second copy of every live-written trade on apply — doubling
+    // contracts, gross, and the size-cap/revenge counts the guardrail reads.
+    // mergeCsvIntoStored replaces a tolerance-identical stored row in place
+    // (the same identity the reconciliation report already compares by) and
+    // keeps live-only provenance on the merged row.
+    const day = TradeIdentity.mergeCsvIntoStored(dtStore[d] || [], incoming, fp);
 
     // 4.2: the day rollup is day-rollup.js's rollupDay now — ONE definition
     // shared with the live-feed writer (4.3). Byte-identical to the old
@@ -9048,15 +9053,20 @@ function csvIngest(filename, csvText) {
     renderCsvReconcileCard(filename, parsed, anyDiff, csvOnlyIdxByDate);
   }).catch(() => {
     addSystemMessage('Could not read the live-feed day record for comparison — apply only if you are sure (confirm below).');
-    renderCsvReconcileCard(filename, parsed, null);
+    // No live store was readable, so there is nothing to tolerance-match
+    // against — null per date means "keep everything," the pre-4.5 behavior,
+    // which is correct here because there is no known live row to collide
+    // with (not a silent reintroduction of the landmine).
+    const noLiveIdx = {}; Object.keys(parsed.byDate).forEach(d => { noLiveIdx[d] = null; });
+    renderCsvReconcileCard(filename, parsed, null, noLiveIdx);
   });
 }
 
 // 4.5: the confirm card — Apply to app / Skip. csvApply runs ONLY from the
 // confirm button.
 let _csvReconcilePending = null;
-function renderCsvReconcileCard(filename, parsed, anyDiff) {
-  _csvReconcilePending = { filename, parsed };
+function renderCsvReconcileCard(filename, parsed, anyDiff, csvOnlyIdxByDate) {
+  _csvReconcilePending = { filename, parsed, csvOnlyIdxByDate: csvOnlyIdxByDate || {} };
   const existing = document.getElementById('csv-reconcile-card');
   if (existing) existing.remove();
   const msgs = document.getElementById('messages');
@@ -9081,7 +9091,33 @@ window.tcCsvReconcileApply = function () {
   _csvReconcilePending = null;
   const el = document.getElementById('csv-reconcile-card');
   if (el) el.remove();
-  if (pending) csvApply(pending.filename, pending.parsed);
+  if (!pending) return;
+  // AUDIT FIX 2026-08-22: this button used to call csvApply() with the raw
+  // parsed CSV, unfiltered — csvApply's own merge key (fp = t|x|pnl|size)
+  // dedupes correctly only when both sides share a timestamp source. A
+  // live-written row carries ms broker timestamps; a CSV row's come from a
+  // printed string at coarser resolution. Same trade, two fingerprints — so
+  // Apply silently DOUBLED every trade on a day the live feed had already
+  // written, even though the report above (built from the tolerance match
+  // in trade-identity.js) correctly said "no differences." The report and
+  // the write must use the SAME identity check, not two different ones —
+  // drop any CSV row that already tolerance-matched an existing live row
+  // for its date before csvApply ever sees it. A date with no live record
+  // (idxSet === null) passes through untouched — that's the ordinary
+  // CSV-only path and carries none of this risk.
+  const idxByDate = pending.csvOnlyIdxByDate || {};
+  const filteredByDate = {};
+  Object.keys(pending.parsed.byDate).forEach(d => {
+    const rows = pending.parsed.byDate[d] || [];
+    const idxSet = idxByDate[d];
+    filteredByDate[d] = idxSet ? rows.filter((_, i) => idxSet.has(i)) : rows;
+  });
+  const dropped = Object.keys(pending.parsed.byDate).reduce((n, d) =>
+    n + (pending.parsed.byDate[d] || []).length - (filteredByDate[d] || []).length, 0);
+  if (dropped > 0 && typeof addSystemMessage === 'function') {
+    addSystemMessage(dropped + ' row(s) already matched an existing live-feed trade and were not re-added.');
+  }
+  csvApply(pending.filename, Object.assign({}, pending.parsed, { byDate: filteredByDate }));
 };
 window.tcCsvReconcileSkip = function () {
   _csvReconcilePending = null;

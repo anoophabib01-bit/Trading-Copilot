@@ -57,5 +57,56 @@
     return { matched, csvOnly, liveOnly };
   }
 
-  return { isSameTrade, matchCsvToLive, EXIT_TOLERANCE_MS, PNL_TOLERANCE };
+  // ── The APPLY side of the landmine (4.5 audit fix) ────────────────────────
+  // matchCsvToLive above only powers the REPORT. csvApply — the thing the
+  // "Apply to app" button actually runs — merged by csvApply's fp()
+  // fingerprint alone (t|x|round(pnl*100)|size), which is exactly the key the
+  // header of this file says cannot be trusted across the two sources. So on
+  // any day the live feed had already written, confirming the reconciliation
+  // ADDED a second copy of every trade: doubled contracts, doubled gross,
+  // doubled the size-cap and revenge counts the guardrail reads.
+  //
+  // mergeCsvIntoStored does the merge the way the report already compares:
+  // an incoming CSV row that is the SAME TRADE as a stored row (tolerance
+  // identity, one-to-one) REPLACES that row in place; anything unmatched is
+  // added; stored rows the file doesn't have are kept, never deleted. The
+  // CSV's own fingerprint still short-circuits the scan, so re-uploading the
+  // same file over a CSV-written day behaves exactly as it always did.
+  //
+  // Live-only provenance (evidence/source/signalBacked/playbook/
+  // minutesFromSignal) and any field the CSV leaves null survive onto the
+  // merged row — the plan requires provenance to survive a write, and a
+  // reconciliation is a write.
+  const PROVENANCE_KEYS = ['evidence', 'source', 'signalBacked', 'playbook', 'minutesFromSignal'];
+
+  function mergeCsvIntoStored(storedRows, incomingRows, fp, opts) {
+    const stored = Array.isArray(storedRows) ? storedRows : [];
+    const incoming = Array.isArray(incomingRows) ? incomingRows : [];
+    const key = typeof fp === 'function'
+      ? fp
+      : (r => r.t + '|' + r.x + '|' + Math.round(r.pnl * 100) + '|' + r.size);
+    const map = new Map();
+    stored.forEach(r => map.set(key(r), r));
+    const claimed = new Set();
+    incoming.forEach(r => {
+      let k = key(r);
+      if (!map.has(k)) {
+        for (const [ek, ex] of map) {
+          if (claimed.has(ek)) continue;
+          if (isSameTrade(r, ex, opts)) { k = ek; break; }
+        }
+      }
+      claimed.add(k);
+      const prev = map.get(k);
+      const row = Object.assign({}, r);
+      if (prev) {
+        PROVENANCE_KEYS.forEach(f => { if (row[f] == null && prev[f] != null) row[f] = prev[f]; });
+        Object.keys(prev).forEach(f => { if (row[f] == null && prev[f] != null) row[f] = prev[f]; });
+      }
+      map.set(k, row);
+    });
+    return Array.from(map.values()).sort((a, b) => a.t - b.t);
+  }
+
+  return { isSameTrade, matchCsvToLive, mergeCsvIntoStored, EXIT_TOLERANCE_MS, PNL_TOLERANCE };
 });
