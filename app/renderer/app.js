@@ -9020,53 +9020,41 @@ function csvIngest(filename, csvText) {
     const lines = ['Reconciliation report — ' + filename];
     let anyDiff = false;
     let anyLive = false;
-    // AUDIT FIX 2026-08-22: what gets APPLIED must be built from the SAME
-    // tolerance match used for the report below, or the report can say "no
-    // differences" while the Apply button still doubles every trade — see
-    // the landmine note under plan task 4.5. csvOnlyIdxByDate carries the
-    // INDEX (into parsed.byDate[d], not the mapped csvRows copy) of every
-    // row that did NOT tolerance-match an existing live row for that date —
-    // i.e. exactly the rows Apply is allowed to add. A date with no live
-    // record at all (anyLive false for that date) is untouched — that is
-    // the legacy CSV-only path and carries none of this risk.
-    const csvOnlyIdxByDate = {};
+    // Report only — what Apply actually does is fixed centrally inside
+    // csvApply() itself now (see its 4.5 AUDIT FIX comment: mergeCsvIntoStored
+    // replaces a tolerance-identical stored row in place, so a real P&L
+    // correction from the CSV lands and the "no differences" case here stays
+    // truthful without this report needing to police what gets written).
     dates.forEach(d => {
       // 4.5 landmine: match by TOLERANCE IDENTITY (trade-identity.js), never
       // by the fp() fingerprint — live rows carry ms broker timestamps, CSV
       // rows carry coarser printed ones, and fp() would double every trade.
-      const csvRows = (parsed.byDate[d] || []).map((t, i) => ({ t: t.entryMs, x: t.exitMs, size: t.size, pnl: t.pnl, side: t.side, _i: i }));
+      const csvRows = (parsed.byDate[d] || []).map(t => ({ t: t.entryMs, x: t.exitMs, size: t.size, pnl: t.pnl, side: t.side }));
       const liveRows = Array.isArray(liveStore[d]) ? liveStore[d] : [];
       const m = TradeIdentity.matchCsvToLive(csvRows, liveRows);
-      const dayHasLive = liveRows.length > 0;
-      if (dayHasLive) anyLive = true;
-      csvOnlyIdxByDate[d] = dayHasLive ? new Set(m.csvOnly.map(r => r._i)) : null; // null = keep everything (no live record to collide with)
+      if (liveRows.length) anyLive = true;
       const bits = [];
       if (m.csvOnly.length) { bits.push(m.csvOnly.length + ' in the file only — the live feed MISSED these (server was down?)'); anyDiff = true; }
       if (m.liveOnly.length) { bits.push(m.liveOnly.length + ' live-feed trades the file does not have'); anyDiff = true; }
       const disagree = m.matched.filter(x => Math.abs(x.pnlDelta) > 0.01);
-      if (disagree.length) { bits.push(disagree.length + ' P&L disagreements (same trade matched, $ differs) — reported only, not auto-corrected'); anyDiff = true; }
+      if (disagree.length) { bits.push(disagree.length + ' P&L disagreements (same trade matched, $ differs) — applying will take the file\'s figure'); anyDiff = true; }
       if (bits.length) lines.push('  ' + d + ': ' + bits.join('; '));
     });
     if (!anyLive) lines.push('  No live-feed record exists for these days yet — the app has not seen them close live.');
     if (!anyDiff) lines.push('  No differences — the file matches the live-feed record. Nothing to apply.');
     addSystemMessage(lines.join('\n'));
-    renderCsvReconcileCard(filename, parsed, anyDiff, csvOnlyIdxByDate);
+    renderCsvReconcileCard(filename, parsed, anyDiff);
   }).catch(() => {
     addSystemMessage('Could not read the live-feed day record for comparison — apply only if you are sure (confirm below).');
-    // No live store was readable, so there is nothing to tolerance-match
-    // against — null per date means "keep everything," the pre-4.5 behavior,
-    // which is correct here because there is no known live row to collide
-    // with (not a silent reintroduction of the landmine).
-    const noLiveIdx = {}; Object.keys(parsed.byDate).forEach(d => { noLiveIdx[d] = null; });
-    renderCsvReconcileCard(filename, parsed, null, noLiveIdx);
+    renderCsvReconcileCard(filename, parsed, null);
   });
 }
 
 // 4.5: the confirm card — Apply to app / Skip. csvApply runs ONLY from the
 // confirm button.
 let _csvReconcilePending = null;
-function renderCsvReconcileCard(filename, parsed, anyDiff, csvOnlyIdxByDate) {
-  _csvReconcilePending = { filename, parsed, csvOnlyIdxByDate: csvOnlyIdxByDate || {} };
+function renderCsvReconcileCard(filename, parsed, anyDiff) {
+  _csvReconcilePending = { filename, parsed };
   const existing = document.getElementById('csv-reconcile-card');
   if (existing) existing.remove();
   const msgs = document.getElementById('messages');
@@ -9091,33 +9079,12 @@ window.tcCsvReconcileApply = function () {
   _csvReconcilePending = null;
   const el = document.getElementById('csv-reconcile-card');
   if (el) el.remove();
-  if (!pending) return;
-  // AUDIT FIX 2026-08-22: this button used to call csvApply() with the raw
-  // parsed CSV, unfiltered — csvApply's own merge key (fp = t|x|pnl|size)
-  // dedupes correctly only when both sides share a timestamp source. A
-  // live-written row carries ms broker timestamps; a CSV row's come from a
-  // printed string at coarser resolution. Same trade, two fingerprints — so
-  // Apply silently DOUBLED every trade on a day the live feed had already
-  // written, even though the report above (built from the tolerance match
-  // in trade-identity.js) correctly said "no differences." The report and
-  // the write must use the SAME identity check, not two different ones —
-  // drop any CSV row that already tolerance-matched an existing live row
-  // for its date before csvApply ever sees it. A date with no live record
-  // (idxSet === null) passes through untouched — that's the ordinary
-  // CSV-only path and carries none of this risk.
-  const idxByDate = pending.csvOnlyIdxByDate || {};
-  const filteredByDate = {};
-  Object.keys(pending.parsed.byDate).forEach(d => {
-    const rows = pending.parsed.byDate[d] || [];
-    const idxSet = idxByDate[d];
-    filteredByDate[d] = idxSet ? rows.filter((_, i) => idxSet.has(i)) : rows;
-  });
-  const dropped = Object.keys(pending.parsed.byDate).reduce((n, d) =>
-    n + (pending.parsed.byDate[d] || []).length - (filteredByDate[d] || []).length, 0);
-  if (dropped > 0 && typeof addSystemMessage === 'function') {
-    addSystemMessage(dropped + ' row(s) already matched an existing live-feed trade and were not re-added.');
-  }
-  csvApply(pending.filename, Object.assign({}, pending.parsed, { byDate: filteredByDate }));
+  // 4.5 AUDIT FIX: the tolerance-vs-doubling landmine is handled centrally
+  // inside csvApply() itself (TradeIdentity.mergeCsvIntoStored replaces a
+  // tolerance-identical stored row in place, provenance preserved) — no
+  // filtering needed here. Passing the raw parsed CSV straight through is
+  // correct.
+  if (pending) csvApply(pending.filename, pending.parsed);
 };
 window.tcCsvReconcileSkip = function () {
   _csvReconcilePending = null;
