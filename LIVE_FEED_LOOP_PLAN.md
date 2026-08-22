@@ -18,6 +18,63 @@ https://claude.ai/code/artifact/77e680b6-0984-440c-9afa-c4b091fb18d2
 
 ---
 
+## Acceptance checklist — read this BEFORE starting any task
+
+Known up front so the bar is not a surprise at review time. Anything here that a task
+genuinely cannot satisfy is fine — say so on the `Done:` line and why. A silent miss is the
+only real failure.
+
+### Before you start
+- [ ] Re-read the task's **why** paragraph, not just its instruction. Most tasks here exist to
+      prevent a specific named failure; a change that satisfies the letter and reinstates the
+      failure is a fail.
+- [ ] Confirm the thing the task claims is still true in the code. Line numbers and call-site
+      counts in this plan were correct on 2026-08-22 and drift.
+- [ ] One task per commit. A commit spanning three tasks cannot be reverted or bisected.
+
+### Before you tick `[x]`
+- [ ] **Full suite green**, compared against the baseline recorded in task 0.3 — not against
+      the number written elsewhere in this plan, which predates it. State the count.
+- [ ] **New pure logic ships with tests in the same commit.** Untested pure logic is the one
+      thing this codebase has consistently refused to accept.
+- [ ] **Server boots clean.** `cd app && node server.js` — no unhandled rejection, no crash
+      guard firing on startup.
+- [ ] **Deviations written on the `Done:` line**, including ones you consider obviously
+      correct. A documented deviation is a decision; an undocumented one is a defect found
+      three weeks later.
+- [ ] **Nothing in `## Explicitly out of scope` was touched.** Especially: no widening of the
+      order path, no LLM in an enforcement gate, no lifting of the Analysis/PO3 account-data
+      denial.
+- [ ] **Any number that exists in `rules.json` was read from it, not retyped.** A hardcoded
+      size cap drifting out of sync with the file is a bug this repo has already had.
+- [ ] If the task could not be finished as written, it is `[~]` with `Skipped:` — never a
+      quiet `[x]`.
+
+### Extra gate by task type
+
+| If the task… | then also |
+|---|---|
+| adds a **pure module** | pure in/pure out, no I/O, no `Date.now()` baked into the logic path; tests cover the null/empty/malformed input, not only the happy case |
+| **wires a monitor or a poll** | idempotent on re-entry; safe when TradingView is disconnected; cannot wedge the chart or broker lock; respects the existing `withChartLock` / `withBrokerLock` split |
+| **removes UI** | the underlying machinery and WS messages stay intact; no status text left that is now false; every non-toggle control kept |
+| **changes an agent prompt or context** | read the diff aloud as the agent receiving it; check no concrete number contradicts `rules.json`; **manual smoke test of that specific agent path** — an unobserved prompt change is unverified, per `CLAUDE.md` |
+| **writes trade or signal data** | idempotent on restart and on duplicate fire; uses the 03:45 IST trading-day anchor, never a calendar or UTC day; provenance fields (`degraded` / `inferred` / `pnlUnknown`) survive the write |
+| **touches `csvApply` or the rollup** | golden test against real stored days proving byte-identical summaries before anything new consumes it; lands as its own commit |
+
+### What the audit will re-check
+Stated up front so it can be pre-empted rather than discovered:
+1. The **gap itself is closed**, not just the code written — re-running the greps that found
+   G1–G5 and H1–H6 must now come back clean.
+2. **Call-site completeness** — the three connect sites, both `autoTriggerDebate` triggers,
+   every `Telegram` off-path. G1 existed because one of three sites was missed.
+3. **Task count vs plan** — a task that silently vanished between commits is the one thing a
+   diff review will not catch on its own.
+4. **Live-only items are declared, not assumed.** Chart-lock behaviour under five armed
+   watchers, monitor auto-restore, agent replies, and the H6 P&L cross-check need Anoop's
+   machine. Mark them `NEEDS LIVE` on the `Done:` line rather than implying they passed.
+
+---
+
 ## Decisions on record (Anoop, 2026-08-22)
 
 Verbatim, and each one's consequence for the build:
@@ -101,7 +158,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**2 / 24 tasks complete.** (0.1, 0.3 — build by DSH, senior partner Claude Code)
+**3 / 24 tasks complete.** (0.1, 0.3, 1.1 — build by DSH, senior partner Claude Code)
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -182,7 +239,7 @@ degrade the whole chart layer.*
 
 # Phase 1 — Watch everything, always — fixes G1, G2
 
-- [ ] **1.1 — All five watchers auto-start on TradingView connect**
+- [x] **1.1 — All five watchers auto-start on TradingView connect**
 
   `server.js` has three places that arm monitors on connect (the `tv-connected` handler, the
   `mcpBridge.ready` early-return branch, and after `await mcpBridge.start()`). All three
@@ -196,7 +253,7 @@ degrade the whole chart layer.*
   Introduce `ALL_MONITORS` as a single const listing the five, and have all three sites iterate
   it, so a sixth watcher added later cannot be forgotten in one of the three branches. That
   three-way duplication is exactly how FVG got missed.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). `ALL_MONITORS` const introduced with all five plan watchers (engulf 1H/30M/15M, FVG 30M, SFP 30M) PLUS PO3 — deviation note: PO3 is listed alongside the five because the three connect sites armed it there too, keeping one list instead of two. The three connect sites already routed through the single `armMonitorsStaggered()` helper (task 0.1), which now iterates ALL_MONITORS — the 3-way duplication is structurally gone, not just patched. `startFVGMonitor` gains its first auto-start caller (pre-verified with the G1 grep: 2 call sites now — toggle handler + ALL_MONITORS). server.js syntax OK.*
 
 - [ ] **1.2 — Delete the `*MonitorUserDisabled` flags and refuse every "off" path**
 

@@ -5677,18 +5677,26 @@ function stopSessionPrepScheduler() {
   if (sessionPrepInterval) { clearInterval(sessionPrepInterval); sessionPrepInterval = null; }
 }
 
-// 0.1: arm the always-on watchers with staggered start offsets so their
-// timers don't align on the same tick (chart-bar-cache.js staggerOffsetMs).
-// One helper for the three connect sites below so the stagger — and 1.1's
-// ALL_MONITORS expansion — can never drift between them.
+// 1.1: ALL_MONITORS — the single list of watchers armed on TradingView
+// connect, staggered by chart-bar-cache's staggerOffsetMs so the timers don't
+// align on one tick. PO3 is listed alongside the five plan watchers because
+// the connect sites armed it here too — one list means a watcher added later
+// cannot be forgotten in one of the three connect branches (the 3-way
+// duplication that hid FVG from auto-start). Each entry is idempotent to
+// start and respects its own *MonitorUserDisabled flag (1.2 removes the five
+// watchers' flags, PO3's stays per the plan).
+const ALL_MONITORS = [
+  { id: 'po3',        label: 'Power of 3 (AMD)', mon: () => po3Monitor,         cond: () => !po3MonitorUserDisabled,  run: () => startPo3Monitor() },
+  { id: 'engulf-1h',  label: 'Engulf 1H',        mon: () => engulfMonitors['1h'],  cond: () => !engulfMonitorUserDisabled, run: () => startEngulfMonitor('1h') },
+  { id: 'engulf-30m', label: 'Engulf 30M',       mon: () => engulfMonitors['30m'], cond: () => !engulfMonitorUserDisabled, run: () => startEngulfMonitor('30m') },
+  { id: 'engulf-15m', label: 'Engulf 15M',       mon: () => engulfMonitors['15m'], cond: () => !engulfMonitorUserDisabled, run: () => startEngulfMonitor('15m') },
+  { id: 'fvg-30m',    label: 'FVG 30M',          mon: () => fvgMonitors['30m'],    cond: () => !fvgMonitorUserDisabled,  run: () => startFVGMonitor('30m') },
+  { id: 'sfp-30m',    label: 'SFP / Playbook B 30M', mon: () => sfpMonitors['30m'], cond: () => !sfpMonitorUserDisabled, run: () => startSFPMonitor('30m') },
+];
+
 function armMonitorsStaggered() {
-  const entries = [
-    { cond: () => !po3MonitorUserDisabled, run: () => startPo3Monitor() },
-    { cond: () => !engulfMonitorUserDisabled, run: () => startEngulfMonitor('1h') },
-    { cond: () => !sfpMonitorUserDisabled, run: () => startSFPMonitor('30m') },
-  ];
-  entries.forEach((e, i) => {
-    if (e.cond()) setTimeout(e.run, chartBarCache.staggerOffsetMs(i));
+  ALL_MONITORS.forEach((e, i) => {
+    if (!e.cond || e.cond()) setTimeout(e.run, chartBarCache.staggerOffsetMs(i));
   });
 }
 
