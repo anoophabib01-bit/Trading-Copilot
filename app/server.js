@@ -882,6 +882,8 @@ wss.on('connection', (ws) => {
       case 'fvg-check-now': checkFVGSignal(msg.tf || '30m'); break;
       case 'sfp-monitor-toggle': handleSFPToggle(msg); break;
       case 'watchers-get': send(ws, { type: 'watchers-status', data: buildWatchersStatus() }); break;
+      case 'signal-decision': handleSignalDecision(ws, msg); break;
+      case 'armed-setup-get': send(ws, { type: 'armed-setup', setup: readArmedSetup() }); break;
       case 'sfp-check-now': checkSFPSignal(msg.tf || '30m'); break;
       case 'mark-london-levels': markLondonLevels(); break;
       case 'mark-ny-levels': markNYLevels(); break;
@@ -2909,6 +2911,9 @@ async function checkPo3Phase() {
         });
         console.log('[PO3 MONITOR][' + symLabel + '] ' + (prev || 'none') + ' -> ' + res.phase + ' | ' + res.reason);
 
+        // 2.1: ledger the phase change (UNCLEAR is a gate block → valid:false).
+        ledgerSignal({ event: 'po3-phase-change', playbook: 'PO3', tf: '15', direction: bias ? bias.direction : null, structure: res.reason + (res.detail ? ' | ' + res.detail : ''), valid: res.phase !== 'UNCLEAR', rejectReason: res.phase === 'UNCLEAR' ? res.reason : null });
+
         // 2026-08-17: auto-trigger the expensive Debate only on the one
         // transition that actually matters — LEAVING accumulation. Staying in
         // accumulation, or any other transition (e.g. back INTO accumulation),
@@ -4155,6 +4160,9 @@ async function checkEngulfingSignal(key) {
         if (rejectKey !== mon.lastRejectKey) {
           mon.lastRejectKey = rejectKey;
           console.log(`ENGULF REJECTED [${cfg.label}]: ${direction} — ${pbc.reason}`);
+          // 2.1: rejections are data — the Playbook C filter rate per TF is
+          // only measurable if rejections are written.
+          ledgerSignal({ event: 'playbook-c-reject', playbook: 'C', tf: cfg.tfCode, direction, source, valid: false, rejectReason: pbc.reason, structure: pbc.structure });
         }
         broadcast({
           type: 'engulf-check', tf: key, time: mon.lastCheck,
@@ -4209,6 +4217,9 @@ async function checkEngulfingSignal(key) {
         // header comment for what porting that would require.
         telegramBot.notify(`⚡ ${signalMessage}`);
         console.log(`ENGULF SIGNAL [${cfg.label}]: ${direction} [${source}]${alignNote}`);
+        // 2.1/2.2: ledger the accepted setup + arm it (A on 1h, C on 30m/15m).
+        ledgerSignal({ event: 'engulf-fire', playbook: key === '1h' ? 'A' : 'C', tf: cfg.tfCode, direction, source, structure: pbc ? pbc.structure : null });
+        armSetup({ playbook: key === '1h' ? 'A' : 'C', tfCode: cfg.tfCode, tfLabel: cfg.label, direction, message: signalMessage });
       }
     }
 
@@ -4376,6 +4387,9 @@ async function checkFVGSignal(key) {
         broadcast({ type: 'fvg-signal', tf: key, tfLabel: cfg.label, direction, gapLow, gapHigh, time: istTime, message: signalMessage });
         telegramBot.notify(`🔲 ${signalMessage}`);
         console.log(`FVG SIGNAL [${cfg.label}]: ${direction} ${gapLow.toFixed(2)}-${gapHigh.toFixed(2)}`);
+        // 2.1/2.2: ledger + arm the displacement FVG.
+        ledgerSignal({ event: 'fvg-fire', playbook: 'B', tf: cfg.tfCode, direction, gapLow, gapHigh, source: 'FVG OHLCV' });
+        armSetup({ playbook: 'B', tfCode: cfg.tfCode, tfLabel: cfg.label, direction, gapLow, gapHigh, message: signalMessage });
       }
     }
     broadcast({ type: 'fvg-check', tf: key, time: mon.lastCheck, found, direction });
@@ -4428,6 +4442,10 @@ const chartReads = require('./chart-reads');
 const chartBarCache = require('./chart-bar-cache');
 const barCache = new chartBarCache.ChartBarCache();
 const barLabelCache = new chartBarCache.ChartBarCache();
+
+// 2.1: signal ledger — server-side JSONL of every watcher fire AND rejection
+// (pure row building in signal-ledger.js; fs wiring below).
+const signalLedger = require('./signal-ledger');
 
 // Defensively pull a bar array out of whatever shape data_get_ohlcv returns —
 // the exact field name isn't nailed down from a live call, so this tries the
@@ -4916,6 +4934,9 @@ async function checkSFPSignal(key) {
         broadcast({ type: 'sfp-signal', tf: key, tfLabel: cfg.label, direction: sfp.direction, level: sfp.level, time: istTime, message: raidMsg });
         telegramBot.notify(`🎣 ${raidMsg}`);
         console.log(`SFP RAID [${cfg.label}]: ${sfp.direction} swept ${sfp.level.toFixed(2)}`);
+        // 2.1: ledger the raid. Deliberately NOT armed — a raid alone is
+        // "not a trade yet"; its confirming displacement (below) arms.
+        ledgerSignal({ event: 'sfp-raid', playbook: 'B', tf: cfg.tfCode, direction: sfp.direction, level: sfp.level });
         // A fresh raid replaces any stale pending one — the most recent liquidity event is what matters.
         // Patience window kept at 8 candles (was 8×15m=2h; now 8×30m=4h) — tied
         // to bar count, not wall clock, so it scales with the TF automatically.
@@ -4947,6 +4968,9 @@ async function checkSFPSignal(key) {
             });
             telegramBot.notify(`✅ ${confirmMsg}`);
             console.log(`PLAYBOOK B CONFIRMED [${cfg.label}]: ${mon.pending.direction}`);
+            // 2.1/2.2: ledger + arm the confirmed Playbook B setup.
+            ledgerSignal({ event: 'playbook-b-confirm', playbook: 'B', tf: cfg.tfCode, direction: mon.pending.direction, level: mon.pending.level, gapLow: fvg.gapLow, gapHigh: fvg.gapHigh });
+            armSetup({ playbook: 'B', tfCode: cfg.tfCode, tfLabel: cfg.label, direction: mon.pending.direction, level: mon.pending.level, gapLow: fvg.gapLow, gapHigh: fvg.gapHigh, message: confirmMsg });
             mon.pending = null;
           }
         }
@@ -5732,6 +5756,108 @@ function buildWatchersStatus() {
 }
 function broadcastWatchersStatus() {
   broadcast({ type: 'watchers-status', data: buildWatchersStatus() });
+}
+
+// ── 2.1 signal ledger + 2.2 armed-setup slot ────────────────────────────────
+// ledgerSignal: append one row to DATA_DIR/signals/<trading-day>.jsonl at
+// fire time, with context captured NOW (never reconstructed later). Failure-
+// tolerant: a disk problem must never break the live alert the user is seeing.
+function ledgerSignal(fields) {
+  try {
+    const cfg = loadConfig();
+    const istMin = Math.floor((Date.now() + 5.5 * 3600000) % 86400000 / 60000);
+    const windows = (getActiveRules().sessionWindowsIST || []).map(w => ({ startMin: w.startMin, name: w.name || null }));
+    const news = computeNewsStatus();
+    const hourTrend = (po3TrendCache['60'] && po3TrendCache['60'].value) ? po3TrendCache['60'].value.label : null;
+    const row = signalLedger.buildSignalRow(fields, {
+      sessionTier: signalLedger.sessionTierForMinutes(istMin, windows),
+      dailyTrend: null, // Daily is Anoop's own read — deliberately not captured mechanically (see gatherAnalysisContext)
+      hourTrend,
+      newsBlackout: news.inBlackout,
+      symbol: chartSymbolCache.symbol,
+      accountSlot: jessiBucketKey(cfg),
+      mode: currentMode,
+    });
+    const day = tradingDayStampIST(Date.now());
+    const dir = path.join(DATA_DIR, 'signals');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, day + '.jsonl'), signalLedger.serializeSignal(row), 'utf8');
+  } catch (e) {
+    console.error('[signal-ledger] write failed:', e.message);
+  }
+}
+
+// 2.2: the single live-setup slot. A newer valid setup replaces an older one.
+// Expiry = 8 candles of the signal's own timeframe (mirrors the SFP patience
+// window), evaluated lazily on read — no extra timer. Expiring with no
+// decision recorded writes decision:'ignored' to the ledger (an untouched
+// signal is itself a data point).
+const ARMED_SETUP_EXPIRY_CANDLES = 8;
+let armedSetup = null; // { signalTs, playbook, tfCode, tfLabel, direction, level, gapLow, gapHigh, message, expiresAt }
+
+function tfSecondsFor(tfCode) {
+  const tf = String(tfCode || '');
+  if (tf === 'D') return 86400;
+  if (tf === 'W') return 7 * 86400;
+  const n = parseInt(tf, 10);
+  if (Number.isFinite(n) && n > 0) return n * 60;
+  return 900; // unknown code → 15m (matches PO3's phase TF)
+}
+
+function armSetup(fields) {
+  const now = Date.now();
+  armedSetup = {
+    signalTs: now,
+    playbook: fields.playbook,
+    tfCode: fields.tfCode,
+    tfLabel: fields.tfLabel || fields.tfCode,
+    direction: fields.direction,
+    level: fields.level != null ? fields.level : null,
+    gapLow: fields.gapLow != null ? fields.gapLow : null,
+    gapHigh: fields.gapHigh != null ? fields.gapHigh : null,
+    message: fields.message || '',
+    expiresAt: now + ARMED_SETUP_EXPIRY_CANDLES * tfSecondsFor(fields.tfCode) * 1000,
+  };
+  broadcastArmedSetup();
+}
+
+function readArmedSetup() {
+  if (!armedSetup) return null;
+  if (Date.now() > armedSetup.expiresAt) {
+    const expired = armedSetup;
+    armedSetup = null;
+    ledgerSignal({ event: 'signal-expired', playbook: expired.playbook, tf: expired.tfCode, direction: expired.direction, decision: 'ignored', signalTs: expired.signalTs });
+    return null;
+  }
+  return armedSetup;
+}
+
+function clearArmedSetup() { armedSetup = null; }
+
+function broadcastArmedSetup() {
+  const setup = readArmedSetup();
+  broadcast({ type: 'armed-setup', setup });
+}
+
+// 2.3: Took it / Passed — one click, no form, no note field. Writes the
+// decision back into the day's ledger and clears the armed slot.
+function handleSignalDecision(ws, msg) {
+  const setup = readArmedSetup();
+  const decision = String((msg && msg.decision) || '').toLowerCase();
+  if (decision !== 'took' && decision !== 'passed') {
+    send(ws, { type: 'signal-decision-result', ok: false, error: "decision must be 'took' or 'passed'" });
+    return;
+  }
+  if (!setup || (msg && msg.signalTs && Number(msg.signalTs) !== setup.signalTs)) {
+    send(ws, { type: 'signal-decision-result', ok: false, error: 'no live setup to decide (expired or already decided)' });
+    return;
+  }
+  const decidedAt = new Date().toISOString();
+  ledgerSignal({ event: 'signal-decision', playbook: setup.playbook, tf: setup.tfCode, direction: setup.direction, decision, decidedAt, signalTs: setup.signalTs });
+  clearArmedSetup();
+  broadcast({ type: 'armed-setup', setup: null });
+  send(ws, { type: 'signal-decision-result', ok: true, decision, signalTs: setup.signalTs });
+  console.log(`[signal-decision] ${decision.toUpperCase()} on ${setup.playbook} ${setup.tfLabel} ${setup.direction}`);
 }
 
 // 1.4: liveness watchdog — a running watcher that hasn't completed a check

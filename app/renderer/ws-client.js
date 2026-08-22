@@ -394,6 +394,15 @@
         emit('watchers:status', msg.data || null);
         break;
 
+      // 2.3: armed-setup slot + decision result
+      case 'armed-setup':
+        emit('signal:armedSetup', msg.setup || null);
+        break;
+
+      case 'signal-decision-result':
+        emit('signal:decisionResult', msg);
+        break;
+
       case 'playbook-b-signal':
         emit('sfp:playbookB', msg);
         break;
@@ -870,6 +879,11 @@
     // 1.3: Chart Watchers panel
     getWatchers:       ()  => sendRequest({ type: 'watchers-get' }).then(r => r.data),
     onWatchersStatus:  (cb) => on('watchers:status', cb),
+    // 2.3: armed-setup slot + Took it / Passed decisions
+    onArmedSetup:          (cb) => on('signal:armedSetup', cb),
+    onSignalDecisionResult:(cb) => on('signal:decisionResult', cb),
+    signalDecision:    (signalTs, decision) => rawSend({ type: 'signal-decision', signalTs, decision }),
+    getArmedSetup:     ()  => sendRequest({ type: 'armed-setup-get' }).then(r => r.setup),
     onPlaybookBSignal: (cb) => on('sfp:playbookB',     cb),
     onLondonLevels:    (cb) => on('london:levels',     cb),
     onNyLevels:        (cb) => on('ny:levels',         cb), // FIX 2026-07-27 — see ws-client.js case 'ny-levels' note
