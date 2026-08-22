@@ -2696,3 +2696,47 @@ html.theme-dark .analysis-block { padding: 14px; margin-bottom: 14px; }
   border-top: 1px solid var(--border);
 }
 .acct-action-row .gate-status-btn { flex: 1; padding: 5px 6px; }
+
+/* ── Day Recap overlay (2026-08-22) ─────────────────────────────────────────
+   Interrupts once before the session, delivers ONE focus item, gets out of the
+   way. Heavier than a toast, lighter than a tab. */
+#recap-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:1200; align-items:center; justify-content:center; }
+#recap-overlay.visible { display:flex; }
+#recap-box { background:var(--surface); border:1px solid var(--border2); border-radius:var(--radius-lg); padding:24px 26px; width:560px; max-width:92vw; max-height:88vh; overflow-y:auto; box-shadow:var(--shadow-3); }
+#recap-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; }
+#recap-eyebrow { font-size:10px; letter-spacing:.12em; color:var(--text-dim); }
+#recap-box h2 { font-size:17px; margin:4px 0 0; }
+#recap-verdict { font-size:11px; font-weight:700; padding:5px 10px; border-radius:var(--radius-sm); white-space:nowrap; }
+#recap-focus { margin:16px 0 4px; padding:13px 15px; border-radius:var(--radius-sm); background:var(--amber-dim); border-left:3px solid var(--amber); }
+#recap-focus .rf-label { font-size:10px; letter-spacing:.1em; color:var(--amber); font-weight:700; }
+#recap-focus .rf-text { font-size:13px; margin-top:5px; line-height:1.5; }
+#recap-stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(96px,1fr)); gap:8px; margin:14px 0; }
+#recap-stats .rs { background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:var(--radius-sm); padding:8px 10px; }
+#recap-stats .rs-l { font-size:9px; letter-spacing:.08em; color:var(--text-dim); }
+#recap-stats .rs-v { font-size:15px; font-weight:700; margin-top:2px; font-variant-numeric:tabular-nums; }
+#recap-size { margin:12px 0 0; padding:11px 14px; border-radius:var(--radius-sm); background:rgba(255,255,255,0.03); border:1px solid var(--border); }
+.recap-size-row { display:flex; align-items:center; gap:14px; margin-top:6px; }
+.recap-size-num { font-size:30px; font-weight:800; line-height:1; font-variant-numeric:tabular-nums; min-width:46px; text-align:center; }
+.recap-size-why { font-size:12px; line-height:1.45; color:var(--text-dim); }
+#recap-last-trades { margin-top:14px; }
+.recap-trade { display:grid; grid-template-columns:62px 1fr auto; grid-template-areas:"dir px pnl" "dir meta pnl"; gap:1px 10px; align-items:center; padding:8px 11px; margin-bottom:5px; border-radius:var(--radius-sm); background:rgba(255,255,255,0.03); border:1px solid var(--border); }
+.rt-dir { grid-area:dir; font-size:10px; font-weight:800; letter-spacing:.06em; text-align:center; padding:3px 0; border-radius:3px; }
+.rt-dir.long { background:var(--green-dim); color:var(--green); }
+.rt-dir.short { background:var(--red-dim); color:var(--red); }
+.rt-px { grid-area:px; font-size:13px; font-variant-numeric:tabular-nums; }
+.rt-pts { font-size:11px; color:var(--text-dim); }
+.rt-meta { grid-area:meta; font-size:10px; color:var(--text-dim); }
+.rt-pnl { grid-area:pnl; font-size:14px; font-weight:700; font-variant-numeric:tabular-nums; }
+#recap-jessi { margin-top:14px; padding:11px 14px; border-radius:var(--radius-sm); background:rgba(99,102,241,0.10); border-left:3px solid #6366f1; }
+#recap-jessi-label { font-size:9px; letter-spacing:.11em; font-weight:700; color:#8b8ef5; }
+#recap-jessi-text { font-size:12.5px; line-height:1.55; margin-top:5px; }
+#recap-mistakes, #recap-good { margin-top:12px; }
+.recap-sec-title { font-size:10px; letter-spacing:.1em; color:var(--text-dim); margin-bottom:6px; }
+.recap-note { font-size:12px; line-height:1.5; padding:7px 11px; border-radius:var(--radius-sm); margin-bottom:5px; border-left:2px solid transparent; }
+.recap-note.bad { background:var(--red-dim); border-left-color:var(--red); }
+.recap-note.warn { background:var(--amber-dim); border-left-color:var(--amber); }
+.recap-note.good { background:var(--green-dim); border-left-color:var(--green); }
+#recap-quote { margin-top:16px; padding-top:13px; border-top:1px solid var(--border); }
+.recap-quote-text { font-size:13px; font-style:italic; line-height:1.55; }
+.recap-quote-src { font-size:10.5px; color:var(--text-dim); margin-top:5px; }
+#recap-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:20px; }
