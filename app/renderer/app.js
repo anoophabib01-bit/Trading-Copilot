@@ -7894,9 +7894,18 @@ function insProse(hist, acc) {
   if (prime.length) parts.push('Prime days (Tue–Thu, NY): avg ' + insMoney(avg(prime)) + '/day over ' + prime.length + '. This is where your edge should live — concentrate risk here.');
   if (low.length) parts.push('Low-vol days (Mon/Fri): avg ' + insMoney(avg(low)) + '/day. ' + (avg(low) < avg(prime) ? 'Weaker, as expected — trade these small or sit out.' : 'Keep size down regardless; the volume is not there.'));
   const bad = [].concat.apply([], enr.map(insCoachNotes)).filter(n => n.c === 'bad');
-  const freq = {}; bad.forEach(n => { const k = n.t.split('—')[0].trim(); freq[k] = (freq[k] || 0) + 1; });
+  // FIX 2026-08-22: this keyed on the text BEFORE the em-dash, which leads with
+  // the day's own count — "25 trades", "22 trades", "24 trades" are three
+  // different keys, so a habit repeated every single day was reported as three
+  // unrelated one-offs and "most-repeated mistake" almost never found a real
+  // repeat. recapNoteKey() strips digits so the habit groups; recapNoteLabel()
+  // keeps the full note for display (the meaning lives AFTER the dash).
+  const keyOf = t => (typeof recapNoteKey === 'function') ? recapNoteKey(t) : t.split('—')[0].trim();
+  const labelOf = t => (typeof recapNoteLabel === 'function') ? recapNoteLabel(t) : t.split('—')[0].trim();
+  const freq = {}, flabel = {};
+  bad.forEach(n => { const k = keyOf(n.t); if (!k) return; freq[k] = (freq[k] || 0) + 1; if (!flabel[k]) flabel[k] = labelOf(n.t); });
   const top = Object.keys(freq).sort((a, b) => freq[b] - freq[a])[0];
-  if (top) parts.push('Most-repeated mistake: ' + top + ' (' + freq[top] + '×). Fix this one first.');
+  if (top) parts.push('Most-repeated mistake: ' + (flabel[top] || top) + ' (' + freq[top] + '×). Fix this one first.');
   const rem = Math.max(0, (acc.evalTarget || 159000) - acc.balance), pAvg = avg(prime);
   if (pAvg > 0) parts.push('At ' + insMoney(pAvg) + '/prime-day, the ' + insMoney(rem) + ' to target is ~' + Math.ceil(rem / pAvg) + ' prime days (~' + Math.max(1, Math.ceil(rem / pAvg / 3)) + ' weeks). Protect the cushion and it is very doable.');
   return '<div class="analysis-block"><div class="block-title">Coach’s Notes</div><div class="ins-prose">' + parts.map(x => '<p>' + x + '</p>').join('') + '</div>'
