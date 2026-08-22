@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **New to this project?** Read `HANDOVER.md` (repo root) after this file — it's the
+> full cold-start handover: document map, module-by-module tour of `app/`, the complete
+> WebSocket message table, on-disk data layout, known-broken/unverified list, and how to
+> extend each subsystem. `ARCHITECTURE.md` and `AGENTS.md` are the deeper dives it indexes.
+
 ## ⚠️ THIS IS THE ONLY COPY — READ BEFORE TOUCHING ANYTHING
 
 **`G:\MNQ-CoPilot` is the single, canonical, live copy of this project. Nowhere else.**

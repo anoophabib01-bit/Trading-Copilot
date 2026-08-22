@@ -1555,6 +1555,80 @@ function setupWsEvents() {
     });
   }
 
+  // ── Live position open/close (2026-08-20) ───────────────────────
+  // Fires within one 5s watch tick, ahead of the fuller broker-account
+  // broadcast. Deliberately silent about P&L: at this instant the fold has
+  // not scored the trade yet, so any number here would be a guess.
+  if (window.api && window.api.onPositionEvent) {
+    window.api.onPositionEvent((msg) => {
+      if (!msg || !Array.isArray(msg.events)) return;
+      for (const e of msg.events) {
+        if (!e || !e.text) continue;
+        // D3 (2026-08-21): only CLOSED and FLIPPED speak in the transcript.
+        // 'opened' and 'scaled' update the HUD silently and reach Jessi via
+        // formatOpenPositionContext() on the server instead. You placed the
+        // order — you already know it opened; a chat line there is an
+        // interruption for information you have, and on a scale-in-heavy day
+        // it buries the actual coaching under a mechanical event log that
+        // stays in scroll-back forever.
+        if (e.kind === 'closed' || e.kind === 'flipped') {
+          const icon = e.kind === 'closed' ? '⬜' : '🔄';
+          if (typeof addSystemMessage === 'function') addSystemMessage(icon + ' ' + e.text);
+        }
+        // A flip still banners: it reverses risk without ever passing through
+        // flat, so no cooldown, no re-entry check and no fresh decision
+        // happened in between. That is worth interrupting for.
+        if (e.kind === 'flipped') showAlertBanner('🔄 ' + e.text + ' — reversed without going flat. No cooldown, no re-entry check.', 'amber');
+        // HUD state: what is on RIGHT NOW, always visible, never an interruption.
+        if (e.kind === 'closed') window._livePosition = null;
+        else window._livePosition = { side: e.side, qty: e.qty, symbol: e.symbol };
+      }
+      if (typeof grRender === 'function') grRender();
+      // NOTE: deliberately does NOT request a fresh account read here. The
+      // server already awaits pollTVBrokerAccount() right after emitting this
+      // event, so the authoritative broadcast is already on its way. Asking
+      // from here too added a third concurrent caller to a function that had
+      // no in-flight guard — which is what made a duplicate session-log row
+      // reachable.
+    });
+  }
+
+  // Two independent derivations of the same closed trade's P&L disagreed.
+  // Enforcement still uses the balance delta (it is the account, and it
+  // captures fees) — this only makes the disagreement impossible to miss,
+  // because a silently wrong per-trade figure feeds size-freeze-guard and the
+  // cooldown. Agreement is deliberately NOT announced: a confirmation on every
+  // trade is the alert-fatigue pattern that made the old banner worthless.
+  if (window.api && window.api.onPnlCrossCheck) {
+    const money2 = (n) => (Number(n) < 0 ? '-' : '') + '$' + Math.abs(Number(n) || 0).toFixed(2);
+    window.api.onPnlCrossCheck((msg) => {
+      if (!msg || msg.ok !== false) return;
+      const txt = 'P&L DISAGREEMENT on ' + msg.symbol + ' — the account balance says '
+        + money2(msg.balanceDelta) + ', the fill prices say ' + money2(msg.fromFills)
+        + ' (off by ' + money2(msg.difference) + '). The guardrail is using the balance figure. Check the broker.';
+      showAlertBanner('⚠ ' + txt, 'amber');
+      if (typeof addSystemMessage === 'function') addSystemMessage('⚠ ' + txt);
+    });
+  }
+
+  // The fold has scored a closed trade: real size/P&L, already written into
+  // today's session log by the server.
+  if (window.api && window.api.onTradeClosedLive) {
+    const fmt = (n) => (Number(n) < 0 ? '-' : '') + '$' + Math.abs(Math.round(Number(n) || 0)).toLocaleString();
+    window.api.onTradeClosedLive((msg) => {
+      if (!msg || !Array.isArray(msg.trades)) return;
+      for (const t of msg.trades) {
+        const pnlTxt = t.pnlUnknown ? 'P&L unknown — read it off the broker' : fmt(t.pnl);
+        const sizeTxt = t.inferred ? 'size not observed' : t.size + ' lot' + (t.size === 1 ? '' : 's');
+        if (typeof addSystemMessage === 'function') {
+          addSystemMessage('📕 Trade closed — ' + sizeTxt + ', ' + pnlTxt
+            + ' · day ' + fmt(msg.dayPnl) + ' · trade ' + msg.tradeCount
+            + ' · logged to the session file for today (entry/stop/target left blank for you).');
+        }
+      }
+    });
+  }
+
   // ── Power of 3 phase-change alerts (2026-07-29) ──────────────────────────
   // Mechanical detector on the server fires these; DISTRIBUTION is the
   // entry-relevant one (manipulation complete, reversal underway) so it gets
@@ -7469,11 +7543,19 @@ window.grInBlackout = false;
     if (typeof data.tradeCountMismatch === 'boolean') {
       s.tradeCountMismatch = data.tradeCountMismatch;
       s.brokerFilledCount = data.brokerFilledCount;
+      // 2026-08-20: compare ROUND TRIPS, not order rows — see server.js at
+      // brokerRoundTripCount for why the old wording compared incompatible
+      // units, and so fired on every single normal trading day.
+      s.brokerRoundTripCount = data.brokerRoundTripCount;
+      // D2 (2026-08-21): provenance of the enforced count.
+      s.countEvidence = data.countEvidence || 'verified';
+      s.degradedTradeCount = data.degradedTradeCount || 0;
+      s.feedDegraded = !!data.feedDegraded;
       s.foldTradeCount = data.foldTradeCount;
       if (data.tradeCountMismatch) {
         if (!s.tradeCountMismatchNotified) {
-          banner('LIVE FEED MISMATCH — broker\'s filled-order count reads ' + data.brokerFilledCount
-            + ', Co-Pilot\'s trade tracker says ' + data.foldTradeCount
+          banner('LIVE FEED MISMATCH — broker\'s order history shows ' + data.brokerRoundTripCount
+            + ' closed round trip(s) today, Co-Pilot\'s trade tracker says ' + data.foldTradeCount
             + '. Not changing enforcement on this — but a real trade or fold miscount may be hiding here, check the orders table.', 'amber');
           s.tradeCountMismatchNotified = true;
         }
@@ -7635,9 +7717,16 @@ window.grInBlackout = false;
     // 2026-08-19: same style as domTag above — trade-count reconciliation
     // (SEMI_AUTONOMOUS_SYSTEM_PLAN.md item 3).
     const tcTag = (live && s.tradeCountMismatch)
-      ? ' · ⚠ COUNT broker ' + s.brokerFilledCount + ' vs tracked ' + s.foldTradeCount
+      ? ' · ⚠ COUNT broker ' + s.brokerRoundTripCount + ' round trip(s) vs tracked ' + s.foldTradeCount
       : '';
-    document.getElementById('gr-meta').textContent = 'Day ' + money(dayPnl) + srcTag + ' · stop ' + money(-dayStop()) + ratchetTag + ' · size ' + (maxSize || 0) + '/' + SIZE_CAP + volTag + (disc !== null ? ' · disc ' + disc + '%' : '') + scTxt + (nn ? ' · ' + nn : '') + domTag + tcTag;
+    // D3: what is ON right now, highest-priority HUD item during a session.
+    const lp = window._livePosition;
+    const posTag = lp ? (String(lp.side || '').toUpperCase() + ' ' + lp.qty + ' ' + lp.symbol + ' · ') : '';
+    // D2: never show a provisional count as though it were confirmed.
+    const evTag = (live && s.countEvidence === 'degraded')
+      ? ' · ~COUNT PROVISIONAL (' + s.degradedTradeCount + ' scored on a degraded feed — cap is advisory)'
+      : (live && s.feedDegraded ? ' · ⚠ FEED DEGRADED — counts approximate' : '');
+    document.getElementById('gr-meta').textContent = posTag + 'Day ' + money(dayPnl) + srcTag + ' · stop ' + money(-dayStop()) + ratchetTag + ' · size ' + (maxSize || 0) + '/' + SIZE_CAP + volTag + (disc !== null ? ' · disc ' + disc + '%' : '') + scTxt + (nn ? ' · ' + nn : '') + domTag + tcTag + evTag;
     const logWrap = document.getElementById('gr-logwrap'); if (logWrap) logWrap.style.opacity = live ? '0.4' : '1';
     if (stopped && !s.acked) grShowStop(s); else stopAlarm.stop();
   };

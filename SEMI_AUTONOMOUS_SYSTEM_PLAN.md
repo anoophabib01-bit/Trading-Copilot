@@ -596,25 +596,47 @@ builder). Before this, Jessi's context sourced balance/P&L purely from the
 CSV-derived config bucket — never read the live broker feed at all, which is
 exactly the gap Anoop flagged.
 
-**NOT yet done** (deliberately, staged rollout — verify one integration live
-before extending): `gatherAnalysisContext()`/`gatherPO3Context()` (the
-Debate panel's Analysis/PO3 agents) and the Judge/Scalper/Post-Session
-Analyst context builders don't call `formatLiveFeedContext()` yet. Once
-Jessi's integration is confirmed working live, extending to the rest is a
-small, repetitive change (same function, same one-line call per builder) —
-intentionally not batched into this pass so a mistake in the shared function
-itself would be caught by ONE agent misbehaving, not five at once.
+### BUILT — item 2, second slice (Judge, Scalper, Post-Session): 2026-08-20
+`formatLiveFeedContext()` is now also called by the Judge (inside
+`handleDebateChat`, see item 3 below), `handleScalperChat`'s context seed,
+and the Post-Session Analyst's `dataContext`. Each labels it as ground truth
+over the CSV-derived figures in the same context, since those can be stale
+until a CSV is uploaded.
+
+**Deliberately NOT extended to `gatherAnalysisContext()`/`gatherPO3Context()`,
+reversing this section's original plan.** Both agents are explicitly *denied*
+account/P&L — `gatherAnalysisContext()` pushes "## ACCOUNT / P&L:
+deliberately not provided. You are the technical agent... If asked about
+money or his trading record, say that is Jessi's lane." That lane separation
+is load-bearing (it exists because of a real fabrication incident), and
+handing them today's P&L would contradict their own context text in the same
+prompt. The live feed reaches the Debate verdict through the Judge instead,
+which is where discipline is supposed to be weighed anyway.
 
 **WHAT ANOOP SHOULD TEST LIVE:** ask Jessi (text or voice) something like
 "how many trades have I taken today" mid-session and confirm the answer
 matches the HUD's live count, not a stale CSV figure.
 
-**Item 3 (surfacing in the Judge's discipline lane) — not started.** Once
-items 1-2 are confirmed live, wiring the F1 signal into `JUDGE_PERSONA`'s
-context (same discipline-weighted-highest hierarchy it already uses) is the
-next natural extension — deliberately sequenced after, not bundled in.
+### BUILT — item 3 (Judge's discipline lane): 2026-08-20
+`handleDebateChat` now builds a `liveBlock` from `formatLiveFeedContext()`
+(which carries the F1 check inline) and appends it to `judgeContext`, right
+after the existing `biasBlock`. It instructs the Judge to treat a ⚠ pattern
+line as a discipline input of the same weight as Jessi's argument, and to
+NO-GO a technically valid setup when a documented failure pattern is already
+showing today — naming the pattern as the reason.
 
-**Not started.** This section exists so the next building session starts
-from a precise scope instead of re-deriving it, and so "build it live, market
-open" happens against a plan that's already been thought through once, not
-improvised under time pressure the way Bug 7's first (wrong) answer was.
+Placed inside `judgeContext` on purpose: `verdict-grounding.js` checks every
+dollar figure in the verdict against what the Judge was actually given, so
+the live P&L must be part of that string or citing it would trip the
+grounding backstop.
+
+**WHAT ANOOP SHOULD TEST LIVE:** after 2 winning trades (F1 fired), run a
+Debate and confirm the Judge's verdict names the F1 pattern in its discipline
+reasoning rather than ignoring it. Also confirm the verdict-grounding warning
+does NOT fire on the live P&L figure. Then ask the Scalper "how many trades
+today" mid-session and check it matches the HUD.
+
+**Status of the whole feedback loop:** all three items now built (F1 only for
+the pattern set — F2-F6/M1-M6 deliberately not attempted until F1 is verified
+end-to-end live, per the 2026-08-19 decision to ship one pattern working
+rather than six half-working). Nothing here is live-verified yet.

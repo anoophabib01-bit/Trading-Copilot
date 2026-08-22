@@ -437,6 +437,26 @@
         emit('tv:mistakePattern', msg);
         break;
 
+      // 2026-08-20: the fast open/close/scale/flip tick (5s positions watch,
+      // see server.js's TV_POSITION_WATCH_MS). Arrives BEFORE the fuller
+      // tv-broker-account broadcast that follows it — this one says "something
+      // just changed", that one carries the authoritative P&L/count.
+      case 'position-event':
+        emit('tv:positionEvent', msg);
+        break;
+
+      // A trade the fold has actually closed and scored: already written to
+      // today's session log server-side, announced here so it lands in chat.
+      // 2026-08-20: per-trade P&L agreement between the balance-delta fold
+      // and an independent fill-price derivation. Visibility only.
+      case 'pnl-cross-check':
+        emit('tv:pnlCrossCheck', msg);
+        break;
+
+      case 'trade-closed-live':
+        emit('tv:tradeClosedLive', msg);
+        break;
+
       case 'tradovate-test-result':
         emit('tradovate:testResult', msg);
         break;
@@ -851,6 +871,13 @@
     onTvBrokerAccount: (cb) => on('tv:brokerAccount',   cb),
     onLiveFeedSelfTest: (cb) => on('tv:liveFeedSelfTest', cb),
     onMistakePattern:  (cb) => on('tv:mistakePattern',    cb),
+    onPositionEvent:   (cb) => on('tv:positionEvent',     cb),
+    onTradeClosedLive: (cb) => on('tv:tradeClosedLive',   cb),
+    onPnlCrossCheck:   (cb) => on('tv:pnlCrossCheck',     cb),
+    // Server already handles 'tv-broker-check-now' (an immediate out-of-band
+    // account read); there was simply no client-side caller for it until the
+    // position watch needed to pull the authoritative numbers forward.
+    checkTvBrokerNow:  ()   => rawSend({ type: 'tv-broker-check-now' }),
     onTradovateTestResult:(cb)=> on('tradovate:testResult', cb),
     testTradovate:     ()   => rawSend({ type: 'tradovate-test' }),
     restartTradovate:  ()   => rawSend({ type: 'tradovate-restart' }),

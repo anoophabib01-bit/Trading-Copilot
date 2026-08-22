@@ -48,4 +48,126 @@ function checkTradeCountEscalation(trades) {
   };
 }
 
-module.exports = { checkTradeCountEscalation, F1_WIN_THRESHOLD };
+// ── F2: revenge clusters (2026-08-20) ──────────────────────────────────────
+// SOURCE TEXT (verbatim, app/renderer/index.html):
+//   "F2 — Revenge clusters — rapid re-entries at same zone, increasing size
+//    after losses. Two losses in a row = close platform. Non-negotiable."
+//
+// That text contains THREE sub-signals. The size half — increasing size after
+// a loss — is ALREADY a hard stop with no override (size-freeze-guard.js's
+// sizeUpAfterLossViolation, wired into both grLog() and grIngestLive()), so
+// detecting it again here would only double-alert on something already
+// blocked. F2 covers the two halves nothing watches:
+//
+//   F2a  consecutive losses — the last two confirmed trades both lost. This
+//        is Risk Protocol rule 08 ("after 2 consecutive losses, close the
+//        platform, stop for the session") and his own note says it appears in
+//        4 of 6 blown accounts. ADVISORY here on purpose: the stop it argues
+//        for is his call, and forcing a session stop on a 2-loss streak is a
+//        larger behavioural change than a detection pass should make alone.
+//
+//   F2b  rapid re-entry after a loss — a trade closed within
+//        rules.cooldownMinutes of the previous LOSING trade's close.
+//
+// HONEST LIMITATION on F2b: the broker feed records CLOSE times only (fold()
+// stamps `at` when a position returns flat) — there is no entry timestamp per
+// trade today. So this measures close-to-close, which makes it a strict LOWER
+// BOUND: a trade that closed inside the cooldown certainly also entered
+// inside it, so every match is real, but a slow trade entered immediately
+// after a loss is missed. Adding entry timestamps closes that gap and is
+// tracked as its own pass in MISTAKE_PATTERNS_PLAN.md — deliberately not
+// approximated with a proxy here.
+//
+// Precedence: when both sub-signals match, F2a is what gets reported. A loss
+// streak is the more serious state and its instruction ("close the platform")
+// supersedes "slow down".
+
+const F2_LOSS_STREAK = 2; // "Two losses in a row = close platform" — his number
+
+/**
+ * @param {Array} trades  today's trades (tv-broker-feed.js fold() shape)
+ * @param {object} [opts] { cooldownMinutes } — from rules.json via
+ *   getActiveRules(), never hardcoded. Omitted/invalid disables F2b only;
+ *   F2a still runs.
+ * @returns {{matched: boolean, kind: string|null, lossStreak: number,
+ *            gapMinutes: number|null, message: string|null}}
+ */
+function checkRevengeCluster(trades, opts) {
+  const list = Array.isArray(trades) ? trades : [];
+
+  // 2026-08-20 FIX (found in review, before this ever ran live): the first
+  // version FILTERED OUT pnlUnknown trades and then counted the streak over
+  // what remained. That silently closes the gap a trade left behind — the
+  // sequence loss → (backfilled trade, P&L sign unknown) → loss reported
+  // "2 losing trades back to back" even though the middle trade may well have
+  // been a WIN. Backfilled trades are precisely the fast scalps the 10s poll
+  // aliases past, so that sequence is common, not exotic — and it would have
+  // fabricated the single most severe message in this file ("close the
+  // platform") on a day that never had a loss streak.
+  //
+  // A trade whose outcome we don't know BREAKS the evaluation rather than
+  // being deleted from it: adjacency is the whole signal here, so an
+  // indeterminate neighbour means we genuinely cannot say. Reported as
+  // `indeterminate: true` so callers can tell "no streak" apart from "cannot
+  // tell" — this is the same principle as pollTVBrokerAccount refusing to
+  // fold when the positions table is unreadable instead of guessing "flat".
+  let lossStreak = 0;
+  let indeterminate = false;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const t = list[i];
+    if (!t || t.pnlUnknown || typeof t.pnl !== 'number') { indeterminate = true; break; }
+    if (t.pnl < 0) lossStreak++;
+    else break;
+  }
+  if (indeterminate && lossStreak < F2_LOSS_STREAK) {
+    // An unknown trade cut the walk short before a streak was established.
+    // Whatever came before it cannot be reasoned about, so decline to judge —
+    // including F2b, whose adjacency assumption is broken by the same trade.
+    return { matched: false, kind: null, lossStreak, gapMinutes: null, indeterminate: true, message: null };
+  }
+  // Confirmed trades only, for F2b's adjacency check below.
+  const known = list.filter(t => t && !t.pnlUnknown && typeof t.pnl === 'number');
+
+  if (lossStreak >= F2_LOSS_STREAK) {
+    return {
+      matched: true,
+      kind: 'consecutive-losses',
+      lossStreak,
+      gapMinutes: null,
+      message: `PATTERN F2 (your own data): "revenge clusters — rapid re-entries, increasing size after losses. Two losses in a row = close platform. Non-negotiable." That's ${lossStreak} losing trade${lossStreak === 1 ? '' : 's'} back to back. Your 8-rule protocol says stop the session here, and this is the pattern in 4 of your 6 blown accounts.`,
+    };
+  }
+
+  // F2b — rapid re-entry after a loss. Needs the cooldown from rules.json.
+  const cooldownMinutes = opts && Number(opts.cooldownMinutes);
+  // Adjacency is read off the RAW list, not the filtered one, for the same
+  // reason as the streak above: if an unknown trade sits between the last two
+  // confirmed ones, the "gap since the previous trade" would be measured
+  // straight across a trade that actually happened in between.
+  if (Number.isFinite(cooldownMinutes) && cooldownMinutes > 0 && list.length >= 2) {
+    const last = list[list.length - 1];
+    const prev = list[list.length - 2];
+    const bothKnown = last && prev && !last.pnlUnknown && !prev.pnlUnknown
+      && typeof last.pnl === 'number' && typeof prev.pnl === 'number';
+    const bothTimed = bothKnown && typeof last.at === 'number' && typeof prev.at === 'number';
+    if (bothTimed && prev.pnl < 0) {
+      const gapMs = last.at - prev.at;
+      // A non-positive gap means the timestamps are out of order or identical
+      // — bad data, not a fast re-entry. Declining to judge is correct.
+      if (gapMs > 0 && gapMs < cooldownMinutes * 60000) {
+        const gapMinutes = gapMs / 60000;
+        return {
+          matched: true,
+          kind: 'rapid-reentry',
+          lossStreak,
+          gapMinutes,
+          message: `PATTERN F2 (your own data): "revenge clusters — rapid re-entries at same zone... after losses." You were back in and out again ${gapMinutes < 1 ? 'under a minute' : gapMinutes.toFixed(1) + ' minutes'} after a losing trade closed — inside your own ${cooldownMinutes}-minute cooldown. Measured close-to-close, so the real gap after the loss was even shorter than that.`,
+        };
+      }
+    }
+  }
+
+  return { matched: false, kind: null, lossStreak, gapMinutes: null, message: null };
+}
+
+module.exports = { checkTradeCountEscalation, F1_WIN_THRESHOLD, checkRevengeCluster, F2_LOSS_STREAK };

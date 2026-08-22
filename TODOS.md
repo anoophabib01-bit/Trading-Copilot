@@ -1,5 +1,95 @@
 # TODOS
 
+## Replay verification against a REAL day — 2026-08-20 reconciled exactly, and a real size bug found
+
+Anoop supplied ground truth this session: Tradeify's own P&L calendar (-$264.10 for 2026-08-20, "11 trades") and the raw Tradovate fill export (11 buy/sell-matched rows). Both independent of this codebase, both far stronger evidence than anything available before.
+
+**First finding: the earlier "dayPnl was probably still correct" claim is disproven, not just unverified.** The pre-fix persisted state for that exact day read tradeCount:9, dayPnl:-44.65. Real total is -$264.10 — a $219 gap, far beyond commission or the documented "baseline at first poll" blind spot. The entry-fill mis-scoring bug corrupted the balance-delta running anchor too, not just the count.
+
+**Reconciliation, verified to the penny:** every one of the 11 raw fills matches $2.00/point exactly (11/11, zero exceptions) — the strongest confirmation of the MNQ point value yet. Grouping fills into real position transitions gives 5 round trips (not 11 — Tradeify's badge counts fill-match pairs, same category of miscount as the order-rows-vs-round-trips bug already fixed, one level up). Gross -$228.00; the $36.10 gap to Tradeify's net divides across 19 traded contracts at exactly $1.90/contract-round-trip — clean enough to be Tradeify's real all-in fee, running higher than the $0.59/side ($1.18/RT) currently coded in `rules.json` (flagged, not changed — a live-enforcement constant, needs Anoop's sign-off).
+
+**`test/replay-2026-08-20.test.js`** replays these exact real fills, at realistic poll cadence (including landing mid-scale-in and mid-split-exit, the shapes that broke the old code), through the CURRENT fixed `fold()`/`analyzeOrderWalk()`. Reconstructs tradeCount:5 and dayPnl:-264.10 exactly, matching every individual round trip's P&L, zero degraded-evidence trades.
+
+**Second finding, a real bug the replay caught (not present before this session, since `analyzeOrderWalk` was itself new):** the closed round trip's `size` field was wrong for any multi-fill entry OR exit. Three attempts: `st.entry.qty` only captured the first fill's size (RT3's 6-fill, 12-lot scale-in reported 2); `abs(before)` at the closing fill fixed that but broke split exits the same way in reverse (RT4's 2-lot position, closed via 2 separate fills, reported 1). Correct answer: the PEAK absolute position size reached anywhere in the round trip's life, tracked per-fill but deliberately NOT updated on the crossing fill itself (that fill's resulting position belongs to the NEW leg on a reversal, and folding it into the peak would corrupt the leg that's closing). This bug fed two real consumers before being caught: the backfill (wrong size on any multi-fill round trip recovered after a restart) and `expectedPnlFromFills`' P&L cross-check (wrong gross P&L for exactly scale-ins/split-exits/reversals — the trade shapes most likely to trigger it). 3 new focused unit tests pin the mechanism directly.
+
+538/538 tests pass (9 new this pass: 3 replay + 3 size-tracking + 3 fee-model). This is the first time any part of this subsystem has been checked against real, independently-sourced ground truth rather than the app's own prior output.
+
+## The four deferred decisions — DECIDED and BUILT 2026-08-21
+
+**D1 — degraded feed: score it, tag it, enforce advisory.** `fold()` now stamps `evidence: 'degraded'` on any trade scored by the fill-edge fallback (orders table unreadable, walk desynced, or an unparseable row). The trade is still recorded — refusing would under-count and silently let him trade past the cap, the failure direction that costs money rather than time — but it is marked.
+
+**D2 — provenance, and only verified numbers hard-enforce.** `checkTradeAllowed` downgrades the `tradesPerDay` cap to `{allowed:true, advisory:true, warning}` when any trade behind the count is degraded. **Deliberately NOT downgraded:** `dayStop` and the size rules, which read BALANCE and SIZE — both directly observed and independent of how many trades we think happened. Only the count is uncertain, so only the count loses its teeth. No general override path was added: D1's tagging removes the need for one, because a number we cannot stand behind never reaches a hard lock. The HUD shows `~COUNT PROVISIONAL (n scored on a degraded feed — cap is advisory)` or `⚠ FEED DEGRADED`.
+
+**D3 — only `closed` and `flipped` speak in chat.** `opened`/`scaled` now update the HUD silently (a `SIDE QTY SYMBOL ·` prefix on the meta line — the highest-priority thing during a session). Crucially this shipped **with** the missing half: `formatOpenPositionContext()` puts the live position into every agent's context, so Jessi, the Judge, the Scalper and the Post-Session Analyst still know a trade is on. Without that, cutting the chat lines would have made her blind to open positions — the opposite of what was asked for. A flip still banners, because it reverses risk without passing through flat: no cooldown, no re-entry check, no fresh decision in between.
+
+**D4 — the review's premise was wrong; only the hand-off is skipped.** Order placement runs on `withChartLock` (it must serialise against `chart_set_symbol`, or an interleaving switch could place an order on the **wrong instrument**); the position watch runs on `withBrokerLock`. Different locks — they never queue behind each other, and that split is a deliberate 2026-08-19 fix for a real "poll queued for minutes behind chart monitors" bug. Suspending the watch would have undone it. The genuine residual is narrower: mid-placement the orders table is being rewritten, so the watch's follow-up **full account read** can catch it half-rendered and drop the feed into degraded mode at the worst possible moment. Only that hand-off is now deferred (`tvOrderPlacementInFlight`, cleared in a `finally` so a throw cannot wedge it on). The 5s positions read keeps running — that is exactly when you most want to see the fill appear.
+
+532/532 tests pass (6 new). Still no live verification of any of it.
+
+## Fold verification — 2026-08-21, the long-standing blocker is PARTLY closed
+
+Run it yourself: `cd app && node scripts/verify-fold.js --broker-balance <broker figure>`, or audit a past day with `--day-pnl <fold dayPnl> --day-start <balance at that day's open>`.
+
+**CONFIRMED — the point value.** 117/117 realized P&L values across 9 days of broker-confirmed history in `day_trades.json` are exact multiples of $0.50, zero violations, and they reconcile **exactly** to `balance_ledger.json` gross on all 9/9 days. MNQ is $2.00/point (0.25 tick = $0.50/tick). This retires the "no verified per-contract multiplier exists in this codebase" caveat that `tv-broker-feed.js` cited as its reason for refusing to compute price-derived P&L.
+
+**CONFIRMED — the balance-delta arithmetic at the endpoint.** On 2026-08-20 the fold's `balanceAtLastFlat` read 49,953.80 against a broker panel showing 49,953.80. Exact to the cent.
+
+**PARTIAL — the day total.** Fold `dayPnl` -44.65 vs the account's true day delta of -46.20 (49,953.80 against a 50,000 start). A **$1.55 gap**, in the direction of the documented "baseline at first poll" blind spot — the fold's implied day-start is 49,998.45. Plausible, **not proven**: $1.55 is not a clean multiple of the $0.59/contract/side commission, so it is not fully accounted for. The script reports this as FAIL by design rather than waving it through.
+
+**NOT CLOSED — per-trade attribution**, which is the one that matters: `size-freeze-guard` and the cooldown read per-trade `pnl` and `lastLossTs`, not the day total. A correct day total does not make the SPLIT correct, and the split is exactly what the count bug broke. 2026-08-20's own partition cannot be used to test this — it was produced by the buggy fold.
+
+**So the system now verifies itself instead of waiting on another manual audit.** `expectedPnlFromFills()` derives a second, independent P&L for every closed round trip from its fill prices (now that the point value is established), and `pollTVBrokerAccount` compares it against the balance delta on every close. Agreement is logged; disagreement over $1 raises a banner and a chat line. **Enforcement still uses the balance delta** — it is the account and it captures fees. This is a cross-check, not a replacement, same discipline as the round-trip count reconciliation. Deliberately silent on agreement: a confirmation toast on every trade is the alert-fatigue pattern that made the old banner worthless.
+
+Symbols with no verified multiplier (MGC — no trades in the checked history) return `null` and are skipped rather than guessed.
+
+**What closes the remaining gap:** one real closed MNQ trade with non-zero P&L. The cross-check will report PASS or the exact dollar disagreement in the log and the UI, with no further work needed.
+
+Also settled today: the IST rollover cleared the poisoned `tradeCount: 9`, and the server has since been restarted onto the fixed code (its state file now carries `schemaVersion: 2`), so the lockout is gone by both routes.
+
+## Live trade events + /autoplan review — 2026-08-20, all built, ZERO live verification
+
+Plan + full review report: `LIVE_TRADE_EVENTS_PLAN.md`. Built this session, then reviewed via /autoplan (Claude subagent voices only — **codex is not installed on this machine**, so no dual-voice consensus; DX phase skipped as this is not a developer product).
+
+**Feature:** 5s `trading_get_positions` watch (`app/position-events.js`, pure + 12 tests) emitting open/close/scale/flip, handing off to an immediate full account poll. Closed trades auto-write a session-log row and announce in chat. Telegram deliberately not wired.
+
+**Eight defects found and fixed during review** — three CRITICAL, all silent UNDER-counts (the direction that lets him over-trade, worse than the lockout that started this):
+- A **flip was never counted** — both fold branches required `isFlat`, so long→short never scored and the eventual close folded two round trips into one.
+- The backstop needed the fill **edge** and the round-trip **level** in the same poll; when they split, the re-anchor discarded the P&L *and* the count.
+- `pollTVBrokerAccount` had **no in-flight guard** and four callers — duplicate session-log rows were reachable. Now coalesced with one trailing re-run.
+- `STATE_SCHEMA_VERSION` bump so the poisoned `tradeCount: 9` cannot reload from disk after the fix.
+- `tvLastClosedSide[t.symbol]` was **dead code** (fold records carry no `symbol`), so every auto-logged row took the global fallback — a confident wrong direction on a two-symbol day.
+- Session log used a **UTC** day in an IST app (H7): a 01:00 IST close appended to yesterday's file.
+- Order-walk desync (H5): one unreadable row froze the count for the rest of the day, silently disabling the backstop. Walk now reports `droppedRows`/`netBySymbol` and is cross-checked against the positions panel; on disagreement the fold takes the degraded path instead of gating on a known-wrong number. Zero-crossing fills now book their close.
+- `logTrade` (H6) numbered rows ascending but inserted at the top, and returned success when its regex silently no-opped. Insert logic extracted as pure `insertTradeRow`; failures now surface as `session-log-failed`.
+
+519/519 tests pass (24 new). **Nothing here is live-verified.** Needs a real session with a scale-in, a split exit, and ideally a flip.
+
+**Still open, deliberately deferred to Anoop's call:** whether the degraded path should refuse to score rather than over-count (TRUST-PROTOCOL Rule 1 arguably says it must); whether a derived number should retain unilateral authority to end a session with no confidence label and no override; whether every open/scale event belongs in the chat transcript or only in Jessi's context; suspending the position watch during `handleTradeConfirm` to avoid lock contention. **And the long-standing blocker: the balance-delta fold has still never been checked against one real closed trade with non-zero P&L.**
+
+## Trade-count over-counting — FIXED 2026-08-20, needs live re-verification
+
+**Symptom (Anoop's screenshot):** HUD read `9/3 TRADES — DONE` and locked out the session; banner read `⚠ COUNT broker 16 vs tracked 9`. The broker's order history for the day showed **~4 real round trips**. All three numbers were wrong.
+
+**Two independent bugs, both in the "orders vs round trips" unit confusion:**
+
+1. **The fold fabricated a trade on every ENTRY fill** (`tv-broker-feed.js`). The 2026-08-19 `hasNewFill` guard proves *an order filled*, not that *a position closed* — an entry fill satisfies it identically. With the positions panel lagging a few seconds behind the fill, `flat → flat + balance moved (commission) + new fill` scored a trade for a position that had only just opened. Persisted state confirmed it: 1 observed trade + **8 `inferred` ones**, timestamped one-per-fill (14:42:53 **and** 14:43:23 for the single 14:42:47→14:43:14 round trip; 19:16:47 **and** 19:19:27 **and** 19:19:37 for the single 19:16:44→19:19:26 one; etc.). Fixed by requiring `closedRoundTrips` — the existing, already-tested `reconstructClosedTradesFromOrders` net-position walk — to have actually advanced. Note `dayPnl` *appeared* correct (it sums balance deltas, which still partition the same total) — but see the review entry above: that reasoning was partly circular, since the HUD reads from this same fold. The broker-balance match corroborates the endpoint only, not the day delta. What is certain is that the trade COUNT and per-trade `size` were wrong. But that count feeds `tradesPerDay`, `trade-confirm-rules` and `size-freeze-guard` — it ends real sessions early.
+2. **The reconciliation banner compared incompatible units** (`server.js`). It matched `filled.length` (ORDER ROWS) against the fold's `tradeCount` (ROUND TRIPS), 0-tolerance. A round trip is ≥2 orders and both scale-ins and exits split across rows — 2026-08-20 has one round trip made of **seven** order rows. So it fired on every normal day. Now compares round trips to round trips, both derived independently (order-history walk vs balance-delta fold). `brokerFilledCount` is still broadcast for diagnostics but no longer drives the banner.
+
+Caught while fixing #1, by the new tests rather than live: naively re-anchoring `balanceAtLastFlat` on the unscored entry-fill poll would move the baseline past the **entry commission**, dropping it from both the trade's `pnl` and `dayPnl` — trading an over-counted COUNT for a quietly understated P&L, the worse bug. The baseline is now deliberately held across an open position; verified it reproduces the +35.60/+67.00 the account actually recorded.
+
+483/483 app tests pass (6 new, including the exact live sequence). **Not live-verified** — needs a real session with a scale-in and a split exit.
+
+**Outstanding, needs Anoop:** `DATA/tv_broker_feed_state.json` still holds the corrupt `tradeCount: 9` from before the fix, and the server rewrites that file every poll — so the lockout persists until the server is restarted (or IST rollover clears it). Deliberately not touched while his session was live.
+
+## Live mistake-tracking feedback loop (2026-08-19 → 2026-08-20) — all 3 items built, F1 only, awaiting live verification
+
+Detail and per-item live-test checklists: `SEMI_AUTONOMOUS_SYSTEM_PLAN.md`'s "live mistake-tracking feedback loop" section. Summary:
+- **Item 1 — pattern matcher:** `app/mistake-patterns.js` (`checkTradeCountEscalation`, 10 tests), F1 only, advisory-only, fires once per IST day from `pollTVBrokerAccount()`, amber banner + permanent chat line. F2-F6/M1-M6 deliberately not attempted until F1 is verified live.
+- **Item 2 — shared live-feed accessor:** `formatLiveFeedContext()` in `server.js`. Jessi (2026-08-19), then Judge + Scalper + Post-Session Analyst (2026-08-20). **Not** given to the Analysis/PO3 agents — they are explicitly denied account/P&L by their own context text ("that is Jessi's lane"), and that separation exists because of a real fabrication incident; the live feed reaches the Debate verdict via the Judge instead.
+- **Item 3 — where it surfaces:** live block (F1 inline) appended to `judgeContext`, weighted as a discipline input equal to Jessi's argument, with an explicit "already-showing pattern ⇒ NO-GO on discipline grounds, name the pattern" instruction. Kept inside `judgeContext` so `verdict-grounding.js` can trace the live dollar figures.
+
+454/454 app tests pass. **Zero of this is live-verified** — no real session has run against it. Prompt/context changes have no automated eval coverage (see CLAUDE.md's Prompt/LLM changes convention); the next real Debate + a 2-win day are the actual tests.
+
 ## Semi-autonomous system hardening (2026-08-19) — all 5 items built, awaiting live verification
 
 Full detail, per-item build notes, and exact "what to test live" checklists live in `SEMI_AUTONOMOUS_SYSTEM_PLAN.md` — this is a pointer, not a duplicate. Built in response to a day of the live feed silently failing multiple different ways (0 trades counted, server crashing unnoticed for 15+ hours, TradingView auto-recovery permanently broken by a Windows ACL bug — see that file's "core problem" section for the full diagnosis).
