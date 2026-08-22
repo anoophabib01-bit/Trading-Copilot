@@ -24,6 +24,24 @@
     { name: 'NY', startMin: 1140, endMin: 1260 }
   ];
 
+  // Stored day_trades rows speak LONG/SHORT — that is the vocabulary every
+  // consumer already reads (MAE/MFE's `t.side === 'LONG'`, rollupDay's flip
+  // count, the reconciliation's side check, Jessi's trade lines). The live
+  // feed speaks the broker's buy/sell, because that is what the order rows
+  // say. Writing the broker's word straight into the row (4.3 originally
+  // did) put 'BUY'/'SELL' beside every historical 'LONG'/'SHORT': MAE/MFE
+  // silently read every live BUY as a short, and the 4.5 tolerance identity
+  // — which rejects a side mismatch — could never match a live row against
+  // its own CSV, re-opening the doubling landmine 4.5 exists to close.
+  // Anything already in the row vocabulary passes through untouched;
+  // anything unrecognised becomes null rather than a guess.
+  function normalizeSide(side) {
+    const s = String(side == null ? '' : side).trim().toUpperCase();
+    if (s === 'LONG' || s === 'BUY') return 'LONG';
+    if (s === 'SHORT' || s === 'SELL') return 'SHORT';
+    return null;
+  }
+
   // Trading-day key with the 03:45 IST Globex rollover anchor — the same
   // anchor csvParseTrades uses (a pre-rollover timestamp belongs to the
   // previous calendar day). Pure; the live writer (4.3) must use THIS.
@@ -148,5 +166,5 @@
     };
   }
 
-  return { gradeTrades, rollupDay, tradingDayKey, entryMinOf, DEFAULT_WINDOWS };
+  return { gradeTrades, rollupDay, tradingDayKey, entryMinOf, normalizeSide, DEFAULT_WINDOWS };
 });

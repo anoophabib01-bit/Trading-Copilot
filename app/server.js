@@ -6079,7 +6079,9 @@ function writeLiveTradeToDayRecord(record) {
       x: record.exitAt != null ? record.exitAt : record.at,
       size: record.size,
       pnl: record.pnl,
-      side: record.side ? String(record.side).toUpperCase() : null,
+      // 4.3 AUDIT FIX: LONG/SHORT, not the broker's raw buy/sell — see
+      // dayRollup.normalizeSide for what BUY/SELL in this field broke.
+      side: dayRollup.normalizeSide(record.side),
       ep: record.entryPrice != null ? record.entryPrice : null,
       xp: record.exitPrice != null ? record.exitPrice : null,
       mp: (record.entryPrice != null && record.exitPrice != null)

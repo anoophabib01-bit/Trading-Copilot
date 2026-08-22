@@ -9015,25 +9015,37 @@ function csvIngest(filename, csvText) {
     const lines = ['Reconciliation report — ' + filename];
     let anyDiff = false;
     let anyLive = false;
+    // AUDIT FIX 2026-08-22: what gets APPLIED must be built from the SAME
+    // tolerance match used for the report below, or the report can say "no
+    // differences" while the Apply button still doubles every trade — see
+    // the landmine note under plan task 4.5. csvOnlyIdxByDate carries the
+    // INDEX (into parsed.byDate[d], not the mapped csvRows copy) of every
+    // row that did NOT tolerance-match an existing live row for that date —
+    // i.e. exactly the rows Apply is allowed to add. A date with no live
+    // record at all (anyLive false for that date) is untouched — that is
+    // the legacy CSV-only path and carries none of this risk.
+    const csvOnlyIdxByDate = {};
     dates.forEach(d => {
       // 4.5 landmine: match by TOLERANCE IDENTITY (trade-identity.js), never
       // by the fp() fingerprint — live rows carry ms broker timestamps, CSV
       // rows carry coarser printed ones, and fp() would double every trade.
-      const csvRows = (parsed.byDate[d] || []).map(t => ({ t: t.entryMs, x: t.exitMs, size: t.size, pnl: t.pnl, side: t.side }));
+      const csvRows = (parsed.byDate[d] || []).map((t, i) => ({ t: t.entryMs, x: t.exitMs, size: t.size, pnl: t.pnl, side: t.side, _i: i }));
       const liveRows = Array.isArray(liveStore[d]) ? liveStore[d] : [];
       const m = TradeIdentity.matchCsvToLive(csvRows, liveRows);
-      if (liveRows.length) anyLive = true;
+      const dayHasLive = liveRows.length > 0;
+      if (dayHasLive) anyLive = true;
+      csvOnlyIdxByDate[d] = dayHasLive ? new Set(m.csvOnly.map(r => r._i)) : null; // null = keep everything (no live record to collide with)
       const bits = [];
       if (m.csvOnly.length) { bits.push(m.csvOnly.length + ' in the file only — the live feed MISSED these (server was down?)'); anyDiff = true; }
       if (m.liveOnly.length) { bits.push(m.liveOnly.length + ' live-feed trades the file does not have'); anyDiff = true; }
       const disagree = m.matched.filter(x => Math.abs(x.pnlDelta) > 0.01);
-      if (disagree.length) { bits.push(disagree.length + ' P&L disagreements (same trade matched, $ differs)'); anyDiff = true; }
+      if (disagree.length) { bits.push(disagree.length + ' P&L disagreements (same trade matched, $ differs) — reported only, not auto-corrected'); anyDiff = true; }
       if (bits.length) lines.push('  ' + d + ': ' + bits.join('; '));
     });
     if (!anyLive) lines.push('  No live-feed record exists for these days yet — the app has not seen them close live.');
     if (!anyDiff) lines.push('  No differences — the file matches the live-feed record. Nothing to apply.');
     addSystemMessage(lines.join('\n'));
-    renderCsvReconcileCard(filename, parsed, anyDiff);
+    renderCsvReconcileCard(filename, parsed, anyDiff, csvOnlyIdxByDate);
   }).catch(() => {
     addSystemMessage('Could not read the live-feed day record for comparison — apply only if you are sure (confirm below).');
     renderCsvReconcileCard(filename, parsed, null);
