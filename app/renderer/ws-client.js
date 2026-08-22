@@ -389,6 +389,11 @@
         emit('sfp:check', msg);
         break;
 
+      // 1.3: Chart Watchers panel — snapshot of the real running watcher set
+      case 'watchers-status':
+        emit('watchers:status', msg.data || null);
+        break;
+
       case 'playbook-b-signal':
         emit('sfp:playbookB', msg);
         break;
@@ -862,6 +867,9 @@
     onSFPSignal:       (cb) => on('sfp:signal',        cb),
     onSFPMonStatus:    (cb) => on('sfp:monitorStatus', cb),
     onSFPCheck:        (cb) => on('sfp:check',         cb),
+    // 1.3: Chart Watchers panel
+    getWatchers:       ()  => sendRequest({ type: 'watchers-get' }).then(r => r.data),
+    onWatchersStatus:  (cb) => on('watchers:status', cb),
     onPlaybookBSignal: (cb) => on('sfp:playbookB',     cb),
     onLondonLevels:    (cb) => on('london:levels',     cb),
     onNyLevels:        (cb) => on('ny:levels',         cb), // FIX 2026-07-27 — see ws-client.js case 'ny-levels' note

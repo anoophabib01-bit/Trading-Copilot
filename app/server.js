@@ -881,6 +881,7 @@ wss.on('connection', (ws) => {
       case 'fvg-monitor-toggle': handleFVGToggle(msg); break;
       case 'fvg-check-now': checkFVGSignal(msg.tf || '30m'); break;
       case 'sfp-monitor-toggle': handleSFPToggle(msg); break;
+      case 'watchers-get': send(ws, { type: 'watchers-status', data: buildWatchersStatus() }); break;
       case 'sfp-check-now': checkSFPSignal(msg.tf || '30m'); break;
       case 'mark-london-levels': markLondonLevels(); break;
       case 'mark-ny-levels': markNYLevels(); break;
@@ -5694,6 +5695,21 @@ function armMonitorsStaggered() {
   ALL_MONITORS.forEach((e, i) => {
     if (!e.cond || e.cond()) setTimeout(e.run, chartBarCache.staggerOffsetMs(i));
   });
+}
+
+// 1.3: snapshot of the real watcher set, read back from the server — the
+// Chart Watchers panel's data source (restored and hand-toggled state must
+// display correctly, so the client renders THIS, never what it last sent).
+function buildWatchersStatus() {
+  const tvDown = !(mcpBridge.ready && mcpBridge.tvConnected);
+  const rows = ALL_MONITORS.map(e => {
+    const mon = e.mon();
+    return { id: e.id, label: e.label, running: !!mon.running, lastCheck: mon.lastCheck || null };
+  });
+  return { tvConnected: !tvDown, rows };
+}
+function broadcastWatchersStatus() {
+  broadcast({ type: 'watchers-status', data: buildWatchersStatus() });
 }
 
 // ── MCP startup ────────────────────────────────────────────────────────────────

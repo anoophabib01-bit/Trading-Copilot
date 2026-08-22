@@ -158,7 +158,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**4 / 24 tasks complete.** (0.1, 0.3, 1.1, 1.2 — build by DSH, senior partner Claude Code)
+**5 / 24 tasks complete.** (0.1, 0.3, 1.1, 1.2, 1.3 — build by DSH, senior partner Claude Code)
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -274,7 +274,7 @@ degrade the whole chart layer.*
   pass the skip-save flag explicitly.
   *Done: 2026-08-22 (DSH build). The three `*MonitorUserDisabled` flags and their guards removed (grep-verified: zero remaining references). Toggle handlers now honour `enabled:true` (idempotent) and REFUSE `enabled:false` with a status broadcast + log line — implemented as refuse-with-explanation (the plan's "no-op and reply" rendered as a visible status line, matching the Telegram wording). Telegram `/engulf off` and `/playbookb off` now refuse with an explanation; `on` still honoured; `/help` text updated. SIGINT fixed: explicit `k => stopX(k)` lambdas so forEach's (key,index,array) can never feed the index into a future second parameter — deviation note: the stop functions currently take one parameter, so today's bug was latent, not live; the fix is future-proofing per A5. Both files pass `node --check`.*
 
-- [ ] **1.3 — Remove the toggles from the UI, replace with a live watcher panel**
+- [x] **1.3 — Remove the toggles from the UI, replace with a live watcher panel**
 
   In `renderer/index.html`, remove five `toggle-switch` blocks: `#engulf-toggle-1h`,
   `#engulf-toggle-30m`, `#engulf-toggle-15m` (each inside its `.engulf-tf-panel`),
@@ -288,7 +288,7 @@ degrade the whole chart layer.*
 
   *Why a panel and not nothing:* with no toggle, "is it watching?" becomes unanswerable by
   looking at the UI, and G1 was invisible for exactly that reason.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). All five toggle-switch blocks removed (grep-verified: zero `*-toggle-` references left in renderer/). Status defaults replaced with "Always on — no switches to forget."; the toggle-sync lines in app.js's monitor-status handlers removed. Chart Watchers panel added after the SFP section. Server: new `watchers-get` WS case → `buildWatchersStatus()` snapshot (tvConnected + per-watcher id/label/running/lastCheck) pushed as `watchers-status`; client pulls on load and every 15s via `getWatchers()` and re-renders on push — so restored/hand-toggled state displays correctly. PO3's own toggle was deliberately left in place: the plan's removal list is the five watchers only (recorded in 1.2's Done line). All four touched files pass `node --check`.*
 
 - [ ] **1.4 — Per-watcher liveness, so a silently dead monitor is visible**
 
