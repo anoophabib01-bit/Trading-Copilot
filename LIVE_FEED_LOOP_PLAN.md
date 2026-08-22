@@ -217,7 +217,7 @@ degrade the whole chart layer.*
   rather than assumed.
   *Done: 2026-08-22 (DSH build). New `app/chart-bar-cache.js` (pure: normalizeTf, ttlMsForTf = 1/3 bar duration, ChartBarCache, staggerOffsetMs) + `app/test/chart-bar-cache.test.js` (10 tests). Wired into `getFullBars` and `getBarsAndLabels` with per-symbol keys via new `getChartSymbolCached` (10s symbol cache); Pine label text cached in a second instance with the same per-TF TTL. `makeLock` now logs queue depth whenever the lock is contended and exposes `queueDepth()`/`maxQueueDepth()` getters. Watcher starts staggered 4s apart via `armMonitorsStaggered()` at all three connect sites. DEVIATION for review: per the plan's TTL, a just-closed new bar becomes visible up to ~TTL/2 after close — a detection-lag tradeoff, documented in the module header. Full suite 566/566 green (556 baseline + 10 new).*
 
-- [ ] **0.1a — Re-key the cache on bar boundaries, not wall-clock TTL** — *added 2026-08-22 by audit, supersedes 0.1's TTL*
+- [x] **0.1a — Re-key the cache on bar boundaries, not wall-clock TTL** — *added 2026-08-22 by audit, supersedes 0.1's TTL*
 
   **0.1's DEVIATION note is accepted as accurate and the trade is rejected.** The measured lag
   is worse than "~TTL/2": TTL is one third of the bar duration, so worst case is a **full TTL
@@ -247,7 +247,7 @@ degrade the whole chart layer.*
 
   *Acceptance:* a unit test asserting a fetch in bar N is not served to a read in bar N+1, and
   that repeat reads inside one bar hit the cache. Keep the existing 10 tests green.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). chart-bar-cache.js now keys entries on bar periods (periodOf/barDurationMsFor/isStale): an entry fetched in period N is stale the moment the period rolls — lag → zero, dedup → exactly one fetch per bar per (symbol,tf). ttlMsForTf kept ONLY as the unknown-timeframe fallback. Label-text cache uses the same class, so 0.1a applies to it too. Tests updated: the old TTL-expiry test became the bar-rollover test (its intent — entries expire — is preserved; the mechanism changed per the audit), plus acceptance tests (bar N not served to N+1; repeat reads inside one bar hit; unknown-tf TTL fallback; backwards clock-skew never stale). 13/13 green (10 previous + 3 new).*
 
 - [~] **0.2 — Baseline capture, for real this time**
 
