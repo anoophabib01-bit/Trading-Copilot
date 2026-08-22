@@ -158,7 +158,7 @@ and the reason it is bigger than it looks.
 
 ## Progress
 
-**20 / 26 resolved.** 19 done (0.1, 0.1a, 0.3, 1.1–1.4, 2.1–2.3, 3.1–3.3, 3.3a, 3.4, 4.1–4.4) + 1 skipped with reason (0.2). Note: the audit added 0.1a + 3.3a on 2026-08-22, raising the total from 24 to 26 — build by DSH, senior partner Claude Code
+**21 / 26 resolved.** 20 done (0.1, 0.1a, 0.3, 1.1–1.4, 2.1–2.3, 3.1–3.3, 3.3a, 3.4, 4.1–4.5) + 1 skipped with reason (0.2). Note: the audit added 0.1a + 3.3a on 2026-08-22, raising the total from 24 to 26 — build by DSH, senior partner Claude Code
 
 | Phase | Fixes | Tasks | Depends on |
 |---|---|---|---|
@@ -555,7 +555,7 @@ the prerequisite for Phase 5's scorecard.*
   what the `?` convention exists to prevent. Fill in what is observed; do not invent the rest.
   *Done: 2026-08-22 (DSH build). The auto-log row now writes `entry`/`exit` from the joined 4.1 record's order-walk FILL prices when present (fold-only records still '?'), with the note bit 'entry/exit = order-walk avg fill prices' so the file can never read a fill as a planned level. stop/target stay '?'. Shipped together with 4.3 in one commit (both change the same close-loop body; recorded like the 2.1-2.3 deviation).*
 
-- [ ] **4.5 — Demote CSV to optional reconciliation**
+- [x] **4.5 — Demote CSV to optional reconciliation**
 
   CSV upload stays, and stays useful, but changes role: parse it, compare it against the
   live-derived day record, and **report the differences** — trades the live feed missed
@@ -583,7 +583,7 @@ the prerequisite for Phase 5's scorecard.*
   > and must treat a tolerance match as *the same trade* to be compared, not a new row to add.
   > Cover it with a test that ingests a live-written day and then the same day's CSV, and
   > asserts the trade count is unchanged.
-  *Done:*
+  *Done: 2026-08-22 (DSH build). LANDMINE HANDLED. New pure UMD `renderer/trade-identity.js` (isSameTrade: same size, compatible side, exit within 60s, P&L within 1 cent; matchCsvToLive: greedy one-to-one → {matched, csvOnly, liveOnly}) + `app/test/trade-identity.test.js` (6 tests) including the demanded one: a live-written day reconciled with its own CSV matches 2/2, csvOnly 0, liveOnly 0 — the trade count does not change. csvIngest now parses, compares via TradeIdentity.matchCsvToLive against the live store (day_trades mirror), reports per-day differences (file-only = live feed missed them; live-only; same-trade P&L disagreements) as a system message, and renders a Reconcile card with Apply to app / Skip — csvApply runs ONLY from Apply. UI button reframed to "Reconcile with broker export". Full suite 599/599 (593 + 6 new).*
 
 ---
 

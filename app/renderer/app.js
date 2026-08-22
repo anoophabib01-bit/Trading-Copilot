@@ -8937,11 +8937,81 @@ function csvApply(filename, parsed) {
 }
 
 function csvIngest(filename, csvText) {
-  if (typeof addUserMessage === 'function') addUserMessage('📄 Ingesting ' + filename + ' (mechanical, no AI)…');
+  // 4.5: CSV is OPTIONAL RECONCILIATION now — the live feed is the day
+  // record's writer (4.3). Parse, compare against the live-derived store,
+  // REPORT the differences, and apply only on explicit confirmation. This is
+  // the backstop for "the server was down part of the session".
+  if (typeof addUserMessage === 'function') addUserMessage('📄 Parsing ' + filename + ' for reconciliation…');
   const parsed = csvParseTrades(csvText);
-  if (parsed.error) { addSystemMessage('Could not ingest ' + filename + ': ' + parsed.error); return; }
-  csvApply(filename, parsed);
+  if (parsed.error) { addSystemMessage('Could not parse ' + filename + ': ' + parsed.error); return; }
+  const dates = Object.keys(parsed.byDate).sort();
+  window.api.dataLoad(slotDataKey('day_trades')).then(liveStore => {
+    liveStore = liveStore || {};
+    const lines = ['Reconciliation report — ' + filename];
+    let anyDiff = false;
+    let anyLive = false;
+    dates.forEach(d => {
+      // 4.5 landmine: match by TOLERANCE IDENTITY (trade-identity.js), never
+      // by the fp() fingerprint — live rows carry ms broker timestamps, CSV
+      // rows carry coarser printed ones, and fp() would double every trade.
+      const csvRows = (parsed.byDate[d] || []).map(t => ({ t: t.entryMs, x: t.exitMs, size: t.size, pnl: t.pnl, side: t.side }));
+      const liveRows = Array.isArray(liveStore[d]) ? liveStore[d] : [];
+      const m = TradeIdentity.matchCsvToLive(csvRows, liveRows);
+      if (liveRows.length) anyLive = true;
+      const bits = [];
+      if (m.csvOnly.length) { bits.push(m.csvOnly.length + ' in the file only — the live feed MISSED these (server was down?)'); anyDiff = true; }
+      if (m.liveOnly.length) { bits.push(m.liveOnly.length + ' live-feed trades the file does not have'); anyDiff = true; }
+      const disagree = m.matched.filter(x => Math.abs(x.pnlDelta) > 0.01);
+      if (disagree.length) { bits.push(disagree.length + ' P&L disagreements (same trade matched, $ differs)'); anyDiff = true; }
+      if (bits.length) lines.push('  ' + d + ': ' + bits.join('; '));
+    });
+    if (!anyLive) lines.push('  No live-feed record exists for these days yet — the app has not seen them close live.');
+    if (!anyDiff) lines.push('  No differences — the file matches the live-feed record. Nothing to apply.');
+    addSystemMessage(lines.join('\n'));
+    renderCsvReconcileCard(filename, parsed, anyDiff);
+  }).catch(() => {
+    addSystemMessage('Could not read the live-feed day record for comparison — apply only if you are sure (confirm below).');
+    renderCsvReconcileCard(filename, parsed, null);
+  });
 }
+
+// 4.5: the confirm card — Apply to app / Skip. csvApply runs ONLY from the
+// confirm button.
+let _csvReconcilePending = null;
+function renderCsvReconcileCard(filename, parsed, anyDiff) {
+  _csvReconcilePending = { filename, parsed };
+  const existing = document.getElementById('csv-reconcile-card');
+  if (existing) existing.remove();
+  const msgs = document.getElementById('messages');
+  if (!msgs) return;
+  const d = document.createElement('div');
+  d.className = 'msg system-msg trade-ticket-card';
+  d.id = 'csv-reconcile-card';
+  d.innerHTML = '<div class="msg-bubble trade-ticket-bubble">'
+    + '<div class="tt-header">📄 Reconcile ' + escHtml(String(filename)) + '?</div>'
+    + '<div class="tt-row"><span class="stat-label">' + (anyDiff === null
+        ? 'Live record unreadable — applying merges the file into the app.'
+        : (anyDiff ? 'Differences found (see report above). Applying MERGES the file in — live-feed rows are not deleted.' : 'No differences — applying is a no-op merge.')) + '</span></div>'
+    + '<div class="tt-actions">'
+    + '<button class="gr-btn" onclick="tcCsvReconcileApply()">Apply to app</button>'
+    + '<button class="gr-btn gr-reset" onclick="tcCsvReconcileSkip()">Skip</button>'
+    + '</div></div>';
+  msgs.appendChild(d);
+  scrollToBottom();
+}
+window.tcCsvReconcileApply = function () {
+  const pending = _csvReconcilePending;
+  _csvReconcilePending = null;
+  const el = document.getElementById('csv-reconcile-card');
+  if (el) el.remove();
+  if (pending) csvApply(pending.filename, pending.parsed);
+};
+window.tcCsvReconcileSkip = function () {
+  _csvReconcilePending = null;
+  const el = document.getElementById('csv-reconcile-card');
+  if (el) el.remove();
+  addSystemMessage('Reconciliation skipped — live-feed record unchanged.');
+};
 
 // ── Panel drag-resize: left and right panels, widths persisted locally ────────
 // UPDATED 2026-08-02 (design-shotgun): the right panel carries 10 tabs
