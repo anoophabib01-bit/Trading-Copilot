@@ -884,6 +884,18 @@ wss.on('connection', (ws) => {
       case 'watchers-get': send(ws, { type: 'watchers-status', data: buildWatchersStatus() }); break;
       case 'signal-decision': handleSignalDecision(ws, msg); break;
       case 'armed-setup-get': send(ws, { type: 'armed-setup', setup: readArmedSetup() }); break;
+      case 'h6-get': send(ws, { type: 'h6-status', passed: h6Status.passed, at: h6Status.at, firstOk: h6Status.firstOk }); break;
+      case 'scorecard-get': {
+        const dayKey2 = tradingDayStampIST(Date.now());
+        let sigs = [];
+        try {
+          const f = path.join(DATA_DIR, 'signals', dayKey2 + '.jsonl');
+          if (fs.existsSync(f)) sigs = fs.readFileSync(f, 'utf8').split('\n').filter(l => l.trim()).map(l => { try { return JSON.parse(l); } catch (e) { return null; } }).filter(Boolean);
+        } catch (e) {}
+        const dt2 = dataLoad('day_trades__' + jessiBucketKey(loadConfig())) || {};
+        send(ws, { type: 'scorecard-data', h6: h6Status, day: dayKey2, signals: sigs, rows: Array.isArray(dt2[dayKey2]) ? dt2[dayKey2] : [] });
+        break;
+      }
       case 'sfp-check-now': checkSFPSignal(msg.tf || '30m'); break;
       case 'mark-london-levels': markLondonLevels(); break;
       case 'mark-ny-levels': markNYLevels(); break;
@@ -5848,6 +5860,27 @@ function broadcastWatchersStatus() {
   broadcast({ type: 'watchers-status', data: buildWatchersStatus() });
 }
 
+// ── H6: per-trade P&L attribution gate (5.2's display condition) ────────────
+// CONFIRMED only when a real closed MNQ trade with non-zero P&L passes the
+// balance-delta vs fills cross-check (expectedPnlFromFills). Until then the
+// scorecard stays hidden — a confident wrong scorecard drives worse decisions
+// than no scorecard (plan 5.2). Persisted to DATA_DIR/h6-status.json.
+let h6Status = { passed: false, at: null, firstOk: null };
+function h6LoadStatus() {
+  try {
+    const raw = fs.readFileSync(path.join(DATA_DIR, 'h6-status.json'), 'utf8');
+    const s = JSON.parse(raw);
+    if (s && typeof s.passed === 'boolean') h6Status = s;
+  } catch (e) { /* absent/unreadable → default not-passed */ }
+}
+function h6MarkPassed(tradeAt) {
+  if (h6Status.passed) return;
+  h6Status = { passed: true, at: new Date(tradeAt != null ? tradeAt : Date.now()).toISOString(), firstOk: h6Status.firstOk || new Date().toISOString() };
+  try { fs.writeFileSync(path.join(DATA_DIR, 'h6-status.json'), JSON.stringify(h6Status, null, 2), 'utf8'); } catch (e) {}
+  broadcast({ type: 'h6-status', passed: h6Status.passed, at: h6Status.at, firstOk: h6Status.firstOk });
+  console.log('[H6] per-trade P&L attribution CONFIRMED — the scorecard may be shown');
+}
+
 // ── 2.1 signal ledger + 2.2 armed-setup slot ────────────────────────────────
 // ledgerSignal: append one row to DATA_DIR/signals/<trading-day>.jsonl at
 // fire time, with context captured NOW (never reconstructed later). Failure-
@@ -6727,7 +6760,13 @@ async function pollTVBrokerAccountInner() {
           const line = t.symbol + ': balance-delta ' + t.pnl.toFixed(2) + ' vs fills ' + exp.net.toFixed(2) +
             ' (' + t.side + ' ' + t.size + ' @ ' + t.entryPrice + ' -> ' + t.exitPrice +
             ', gross ' + exp.gross.toFixed(2) + ' - comm ' + exp.commission.toFixed(2) + '), diff ' + delta.toFixed(2);
-          if (ok) console.log('[tv-broker] P&L cross-check OK on ' + line);
+          if (ok) {
+            console.log('[tv-broker] P&L cross-check OK on ' + line);
+            // H6: a real closed trade with non-zero P&L whose two independent
+            // derivations agree — that is exactly the confirmation the
+            // scorecard gate waits for (plan 5.2 / parallel track H6).
+            if (Math.abs(t.pnl) > 0.5 && !h6Status.passed) h6MarkPassed(t.at);
+          }
           else console.warn('[tv-broker] P&L CROSS-CHECK MISMATCH on ' + line + '. Enforcement still uses the balance delta.');
           broadcast({
             type: 'pnl-cross-check', ok, symbol: t.symbol,
@@ -7228,6 +7267,7 @@ httpServer.on('error', (err) => {
 
 httpServer.listen(PORT, '127.0.0.1', async () => {
   initDataDir();   // 2026-07-25: resolve D:\co-pilot DATA (or fall back) before anything writes
+  h6LoadStatus();  // 5.2/H6: restore the per-trade attribution gate state
   // 2026-08-19: restore today's live trade-tracking state now that DATA_DIR
   // is final — see the note at tvBrokerFeedState's declaration for why this
   // can't happen at module top-level. Must run before startTVBrokerMonitor()

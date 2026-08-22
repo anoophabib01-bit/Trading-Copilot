@@ -1878,6 +1878,24 @@ function setupWsEvents() {
     });
   }
 
+  // 5.2/H6: the per-trade attribution gate + scorecard data.
+  window._h6Passed = false;
+  if (window.api.getH6Status) {
+    window.api.getH6Status().then(h => { window._h6Passed = !!(h && h.passed); }).catch(() => {});
+  }
+  if (window.api.onH6Status) {
+    window.api.onH6Status(h => {
+      window._h6Passed = !!(h && h.passed);
+      if (document.getElementById('tab-insights') && document.getElementById('tab-insights').style.display !== 'none' && typeof renderInsights === 'function') renderInsights();
+    });
+  }
+  if (window.api.getScorecard) {
+    const pullScorecard = () => window.api.getScorecard().then(d => { _scorecardData = d; }).catch(() => {});
+    window.api.onScorecardData && window.api.onScorecardData(d => { _scorecardData = d; });
+    pullScorecard();
+    setInterval(pullScorecard, 60 * 1000);
+  }
+
   // 4.3: the server's live-feed writer wrote the durable day record — sync
   // this client's localStorage copies so the UI, the guardrail and a later
   // CSV reconciliation all read the same rows. Best-effort by design: the
@@ -8011,6 +8029,7 @@ function renderInsights() {
   h += insProse(hist, acc);
   h += insPassMath(hist, acc);
   h += insScoreCardBlock(hist);
+  h += insPlaybookScorecardBlock();
   h += '<div class="analysis-block"><div class="block-title">Day by day</div>' + hist.slice().reverse().map(insDeepCard).join('') + '</div>';
   h += insArchiveBlock();
   h += insClearBtn();
@@ -8020,6 +8039,40 @@ function renderInsights() {
 const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 function fmtDur(sec) { sec = Math.round(sec || 0); return sec < 90 ? sec + 's' : Math.round(sec / 60) + 'm'; }
 function insClearBtn() { return '<div style="margin-top:12px"><button class="btn-cancel" style="width:100%;border-color:var(--red);color:var(--red)" onclick="grClearInsights()">✕ Clear all insights (re-upload to rebuild)</button></div>'; }
+// 5.2: per-playbook scorecard + signal-backed vs freestyle. GATED on H6 —
+// hidden until the per-trade P&L attribution cross-check passes on a real
+// trade (plan 5.2: a confident wrong scorecard drives worse decisions than
+// none). Data pulled from the server (scorecard-get → today's signal ledger +
+// day rows), computed by the shared scorecard.js module.
+let _scorecardData = null;
+function insPlaybookScorecardBlock() {
+  const gate = window._h6Passed === true;
+  if (!gate) {
+    return '<div class="analysis-block"><div class="block-title">Per-playbook scorecard</div>'
+      + '<div class="no-trades">Hidden until the per-trade P&L attribution cross-check (H6) passes on a real closed trade — the app verifies its own numbers before showing this.</div></div>';
+  }
+  const rows = (_scorecardData && _scorecardData.rows) || [];
+  const signals = (_scorecardData && _scorecardData.signals) || [];
+  const s = Scorecard.computeScorecard(rows, signals);
+  const fmt = n => n == null ? '—' : (n < 0 ? '-$' + Math.abs(n).toFixed(2) : '$' + n.toFixed(2));
+  const pct = n => n == null ? '—' : n + '%';
+  const row = b => '<tr><td>' + escHtml(b.name) + '</td><td>' + b.fired + '</td><td>' + b.valid + '</td><td>' + b.rejected + '</td><td>' + b.taken + '</td><td>' + b.passed + '</td><td>' + b.ignored + '</td><td>' + pct(b.winPct) + '</td><td>' + b.avgR + '</td><td>' + fmt(b.net) + '</td></tr>';
+  let h = '<div class="analysis-block"><div class="block-title">Per-playbook scorecard (today, live feed)</div>';
+  h += '<table style="width:100%;font-size:11px;border-collapse:collapse;"><tr><th>Playbook</th><th>Fired</th><th>Valid</th><th>Rejected</th><th>Taken</th><th>Passed</th><th>Ignored</th><th>Win%</th><th>Avg R</th><th>Net</th></tr>';
+  h += row({ name: 'A', fired: s.byPlaybook.A.fired, valid: s.byPlaybook.A.valid, rejected: s.byPlaybook.A.rejected, taken: s.byPlaybook.A.taken, passed: s.byPlaybook.A.passed, ignored: s.byPlaybook.A.ignored, winPct: s.byPlaybook.A.winPct, avgR: s.byPlaybook.A.avgR, net: s.byPlaybook.A.net });
+  h += row({ name: 'B', fired: s.byPlaybook.B.fired, valid: s.byPlaybook.B.valid, rejected: s.byPlaybook.B.rejected, taken: s.byPlaybook.B.taken, passed: s.byPlaybook.B.passed, ignored: s.byPlaybook.B.ignored, winPct: s.byPlaybook.B.winPct, avgR: s.byPlaybook.B.avgR, net: s.byPlaybook.B.net });
+  h += row({ name: 'C', fired: s.byPlaybook.C.fired, valid: s.byPlaybook.C.valid, rejected: s.byPlaybook.C.rejected, taken: s.byPlaybook.C.taken, passed: s.byPlaybook.C.passed, ignored: s.byPlaybook.C.ignored, winPct: s.byPlaybook.C.winPct, avgR: s.byPlaybook.C.avgR, net: s.byPlaybook.C.net });
+  h += '</table>';
+  const wPct = (s.backed.wins + s.backed.losses) ? Math.round(s.backed.wins / (s.backed.wins + s.backed.losses) * 100) + '%' : '—';
+  const fPct = (s.freestyle.wins + s.freestyle.losses) ? Math.round(s.freestyle.wins / (s.freestyle.wins + s.freestyle.losses) * 100) + '%' : '—';
+  h += '<div style="margin-top:8px;font-size:11px;">'
+    + '<b>Signal-backed trades</b> (' + s.backed.count + '): ' + wPct + ' win, ' + fmt(s.backed.net) + ' net<br>'
+    + '<b>Freestyle trades</b> (' + s.freestyle.count + '): ' + fPct + ' win, ' + fmt(s.freestyle.net) + ' net<br>'
+    + '<span style="opacity:.7">This is the direct measurement of whether the playbooks beat improvisation — the single question this system exists to answer.</span></div>';
+  h += '</div>';
+  return h;
+}
+
 window.grClearInsights = function () {
   if (!confirm('Clear ALL insights, history, and the balance ledger? Re-upload your CSVs to rebuild.')) return;
   ['copilot_gr_history', 'copilot_balance_ledger', 'copilot_ck_history', 'copilot_guardrail_v1'].forEach(k => localStorage.removeItem(k));
