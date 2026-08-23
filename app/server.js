@@ -16,6 +16,7 @@ const http = require('http');
 const atomicWrite = require('./atomic-write');  // crash-safe writes — must load BEFORE any save path
 const providerChain = require('./provider-chain'); // provider selection + fail-open chain (unit-tested)
 const stageRules = require('./stage-rules');       // eval/funded risk layer (unit-tested)
+const payoutEligibility = require('./payout-eligibility'); // consistency-rule payout gate (unit-tested)
 const verdictGrounding = require('./verdict-grounding'); // Debate-verdict numeric grounding check (unit-tested)
 const postSessionOrch = require('./post-session-orchestrator'); // dynamic worker selection for post-session review (unit-tested)
 const chatIntent = require('./chat-intent'); // assistive mode-routing hint, advisory only (unit-tested)
@@ -35,6 +36,7 @@ const telegramBot = require('./telegram-bot');
 const booksIndex = require('./books-index');
 const tradovate = require('./tradovate');
 const tvBrokerFeed = require('./tv-broker-feed'); // balance-delta-at-flat P&L fold for the TradingView broker feed (unit-tested)
+const pointValueVerify = require('./point-value-verify'); // cross-checks the P&L multiplier against TradingView (unit-tested)
 const mistakePatterns = require('./mistake-patterns'); // live pattern-matching against Anoop's own documented failure history (2026-08-19, F1 first slice — advisory only, unit-tested)
 const positionEvents = require('./position-events'); // fast open/close/scale/flip detector for the 5s positions watch (2026-08-20, pure + unit-tested)
 const tradeConfirmRules = require('./trade-confirm-rules'); // Phase 2a/2b rule-check for the confirm/execute flow — unit-tested
@@ -1403,6 +1405,25 @@ function jessiAppGetData(section) {
     const totalFees = (fees.fees || []).reduce((s, f) => s + (Number(f.cost) || 0), 0);
     const totalPayouts = (fees.payouts || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
     out.push(`COST — lifetime prop spend: ${(fees.fees || []).length} accounts, fees $${totalFees.toFixed(2)}, payouts $${totalPayouts.toFixed(2)}, NET $${(totalPayouts - totalFees).toFixed(2)}.`);
+
+    // PAYOUT GATE (2026-08-23). The consistency rule is the actual gate on the
+    // goal this whole app exists for, and until now nothing computed it.
+    // Deliberately sits with COST: together they answer "what has this cost me,
+    // and what stands between me and being paid".
+    try {
+      const payTier = payoutEligibility.resolveTier(loadRules(), (loadConfig() || {}).mode);
+      if (payTier) {
+        const grDays = parseLS('copilot_gr_history', []) || [];
+        const elig = payoutEligibility.computePayoutEligibility(grDays, fees.payouts || [], payTier);
+        out.push(payoutEligibility.summarizePayout(elig) + ` (tier: ${payTier.label})`);
+        if (elig.consistencyOk === false && elig.totalProfit > 0) {
+          // The counter-intuitive half of the rule, stated outright so the
+          // coach does not have to derive it — and so it cannot derive it
+          // wrongly. After a big day, SMALLER green days shorten the distance.
+          out.push('PAYOUT NOTE — another big day makes this WORSE, not better: the ratio is biggest-day/total, so the fast route is more SMALL green days. A losing day hurts twice (the loss itself, plus a smaller denominator pushing the ratio up).');
+        }
+      }
+    } catch (e) { console.warn('[payout] eligibility line failed:', e.message); }
   }
   if (want('insights')) {
     const gr = (parseLS('copilot_gr_history', []) || []).slice(-7);
@@ -4534,6 +4555,7 @@ const barLabelCache = new chartBarCache.ChartBarCache();
 // 2.1: signal ledger — server-side JSONL of every watcher fire AND rejection
 // (pure row building in signal-ledger.js; fs wiring below).
 const signalLedger = require('./signal-ledger');
+const signalOutcome = require('./signal-outcome'); // MFE/MAE for signals whether or not they were taken (unit-tested)
 
 // 3.1: market-state line — pure formatter (market-state.js) for the armed
 // setup + mechanical 1H bias injected into the shared agent context block.
@@ -5857,6 +5879,8 @@ function armMonitorsStaggered() {
   ALL_MONITORS.forEach((e, i) => {
     if (!e.cond || e.cond()) setTimeout(e.run, chartBarCache.staggerOffsetMs(i));
   });
+  // Idempotent — safe on every reconnect, starts exactly one timer.
+  startSignalOutcomeResolver();
 }
 
 // 1.3: snapshot of the real watcher set, read back from the server — the
@@ -5930,6 +5954,98 @@ function ledgerSignal(fields) {
   } catch (e) {
     console.error('[signal-ledger] write failed:', e.message);
   }
+}
+
+// ── Signal outcome resolution (2026-08-23) ─────────────────────────────────
+// Closes the selection-bias hole in the detection loop. The ledger above
+// records every fire; signal-join.js matches TAKEN trades back to one. Until
+// now nothing scored the signals Anoop DIDN'T take — so per-playbook accuracy
+// was measured only on the subset his discretion had already filtered, which
+// measures the filter, not the detector.
+//
+// Runs on a slow timer and only ever resolves signals whose full bar horizon
+// has already elapsed, so it does no work the monitors' own bar reads have
+// not already made cheap (getFullBars is cached per bar period, and owns the
+// chart lock + timeframe restore). Outcomes are written to a SEPARATE file —
+// the ledger itself is append-only and must stay the untouched record of what
+// fired at the time.
+const SIGNAL_OUTCOME_HORIZON_BARS = 12;
+let signalOutcomeTimer = null;
+
+function signalOutcomePaths(day) {
+  const dir = path.join(DATA_DIR, 'signals');
+  return { dir, ledger: path.join(dir, day + '.jsonl'), outcomes: path.join(dir, day + '.outcomes.jsonl') };
+}
+
+function readJsonl(file) {
+  try {
+    if (!fs.existsSync(file)) return [];
+    return fs.readFileSync(file, 'utf8').split('\n')
+      .filter((l) => l.trim())
+      .map((l) => { try { return JSON.parse(l); } catch (e) { return null; } })
+      .filter(Boolean);
+  } catch (e) { return []; }
+}
+
+async function resolveSignalOutcomes() {
+  try {
+    const day = tradingDayStampIST(Date.now());
+    const { dir, ledger, outcomes } = signalOutcomePaths(day);
+    const rows = readJsonl(ledger).filter((r) => signalOutcome.isArmingEvent(r && r.event));
+    if (!rows.length) return;
+
+    // Already-resolved signals are keyed by their own timestamp+playbook, so a
+    // restart mid-day re-reads the files and picks up exactly where it left
+    // off rather than double-writing.
+    const done = new Set(readJsonl(outcomes).map((o) => `${o.signalTs}|${o.playbook}|${o.tf}`));
+    const pending = rows.filter((r) => !done.has(`${r.ts}|${r.playbook || null}|${r.tf || null}`));
+    if (!pending.length) return;
+
+    // One bar fetch per distinct timeframe, not one per signal.
+    const byTf = new Map();
+    for (const r of pending) {
+      const tf = String(r.tf || '15');
+      if (!byTf.has(tf)) byTf.set(tf, []);
+      byTf.get(tf).push(r);
+    }
+
+    let wrote = 0;
+    for (const [tf, sigs] of byTf) {
+      let bars = [];
+      try {
+        // Enough history to cover the oldest pending signal plus its horizon.
+        bars = await getFullBars(tf, SIGNAL_OUTCOME_HORIZON_BARS * 6);
+      } catch (e) {
+        console.warn(`[signal-outcome] bar read failed for tf ${tf}:`, e.message);
+        continue;
+      }
+      if (!Array.isArray(bars) || !bars.length) continue;
+
+      for (const s of sigs) {
+        const res = signalOutcome.resolveSignalOutcome(s, bars, { horizonBars: SIGNAL_OUTCOME_HORIZON_BARS });
+        // `pending` is the normal state for a signal whose horizon has not
+        // elapsed — not an error, and deliberately not written. It will
+        // resolve on a later pass.
+        if (!res.resolved) continue;
+        fs.mkdirSync(dir, { recursive: true });
+        fs.appendFileSync(outcomes, JSON.stringify(res) + '\n', 'utf8');
+        wrote++;
+      }
+    }
+    if (wrote) console.log(`[signal-outcome] resolved ${wrote} signal(s) for ${day}`);
+  } catch (e) {
+    console.warn('[signal-outcome] pass failed:', e.message);
+  }
+}
+
+function startSignalOutcomeResolver() {
+  if (signalOutcomeTimer) return;
+  // Slow on purpose: outcomes are a review-time artefact, not a live signal,
+  // and every pass competes with the monitors for the one CDP connection.
+  signalOutcomeTimer = setInterval(() => {
+    if (!mcpBridge.tvConnected) return;
+    resolveSignalOutcomes().catch((e) => console.warn('[signal-outcome] timer:', e.message));
+  }, 5 * 60 * 1000);
 }
 
 // 2.2: the single live-setup slot. A newer valid setup replaces an older one.
@@ -7231,6 +7347,35 @@ async function runLiveFeedSelfTest() {
   } catch (e) {
     failures.push('Quote: check threw — ' + e.message);
     checks[2].detail = 'check threw — ' + e.message;
+  }
+
+  // POINT-VALUE CROSS-CHECK (2026-08-23). Not a fourth step — deliberately
+  // kept out of the 3-step UI, which is about whether the feed is READING.
+  // This is about whether the number every P&L figure is multiplied by is
+  // still right. Silent on a match; loud only on a real disagreement.
+  //
+  // Advisory by design: a mismatch never rewrites the multiplier the fold
+  // uses. Quietly switching the constant behind day P&L, the loss tiers and
+  // payout consistency — on the strength of a metadata field nothing has
+  // validated — is exactly the silent corruption this system refuses
+  // everywhere else. It reports; a human decides.
+  try {
+    const raw = await withBrokerLock(() => mcpBridge.callTool('symbol_info', {}));
+    const text = (raw && raw.content) ? raw.content.map(c => c.text || '').join('') : null;
+    const info = text ? JSON.parse(text) : null;
+    if (info && info.success) {
+      const sym = info.symbol || null;
+      const verdict = pointValueVerify.verifyPointValue(sym, tvBrokerFeed.pointValueFor(sym), info);
+      if (verdict.status === 'mismatch') {
+        console.error('[point-value] ' + verdict.message);
+        broadcast({ type: 'point-value-warning', ...verdict });
+      } else if (verdict.message) {
+        console.log('[point-value] ' + verdict.message);
+      }
+    }
+  } catch (e) {
+    // Never let a diagnostic take the self-test down.
+    console.warn('[point-value] cross-check unavailable:', e.message);
   }
 
   const resultMsg = { type: 'live-feed-self-test', passed, total, failures, checks, at: Date.now() };

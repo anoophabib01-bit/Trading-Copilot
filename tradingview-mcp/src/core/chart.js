@@ -259,15 +259,36 @@ export async function scrollToDate({ date }) {
   return { success: true, date, centered_on: timestamp, resolution, window: { from, to } };
 }
 
-export async function symbolInfo() {
+// 2026-08-23: FIXED A LIVE BUG. This called a bare `evaluate(...)`, but the
+// module imports it as `_evaluate` and every other function in this file
+// resolves it through `_resolve(_deps)`. So symbol_info threw
+// "ReferenceError: evaluate is not defined" on EVERY call and had presumably
+// never worked. Found while wiring app/tv-broker-feed.js's point-value
+// cross-check to a real source instead of a hardcoded constant.
+//
+// Also now returns the contract's own price/value metadata. `pointvalue`
+// (with minmov/pricescale as the fallback derivation) is what lets the app
+// verify its VERIFIED_POINT_VALUE table against TradingView rather than
+// trusting a constant that governs every P&L figure it computes. Fields are
+// passed through as TradingView reports them — absent stays absent, because a
+// derived-but-wrong multiplier is worse than a missing one.
+export async function symbolInfo({ _deps } = {}) {
+  const { evaluate } = _resolve(_deps);
   const result = await evaluate(`
     (function() {
       var chart = ${CHART_API};
       var info = chart.symbolExt();
+      var series = null;
+      try { series = chart._chartWidget.model().mainSeries().symbolInfo(); } catch (e) { series = null; }
+      var src = series || info;
       return {
         symbol: info.symbol, full_name: info.full_name, exchange: info.exchange,
         description: info.description, type: info.type, pro_name: info.pro_name,
-        typespecs: info.typespecs, resolution: chart.resolution(), chart_type: chart.chartType()
+        typespecs: info.typespecs, resolution: chart.resolution(), chart_type: chart.chartType(),
+        pointvalue: (src && src.pointvalue !== undefined) ? src.pointvalue : null,
+        minmov: (src && src.minmov !== undefined) ? src.minmov : null,
+        pricescale: (src && src.pricescale !== undefined) ? src.pricescale : null,
+        currency_code: (src && src.currency_code !== undefined) ? src.currency_code : null
       };
     })()
   `);
