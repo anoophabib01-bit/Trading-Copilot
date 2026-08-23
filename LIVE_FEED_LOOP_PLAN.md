@@ -891,11 +891,32 @@ vault at the repo root is what replaced them.*
   correlating a block against a trades-table row is the post-session use). Two tests
   pin the property. Verified live: mtime held steady across four consecutive ticks.
 
-  **Not in it yet:** debate verdicts and trade tickets go through `emitTo(ws, …)`,
-  which only reaches `broadcast()` for auto-triggered debates, so they are not in
-  the ring. Adding them means instrumenting those sites the same way `rejectTicket`
-  does. **Not live-verified:** no real guardrail block has fired against this build,
-  so the block row has never rendered from a genuine refusal.
+  **7.3b — verdicts, tickets and real orders wired (2026-08-23, same day).**
+  Instrumented at the fire sites, not via a message tap — `emitTo(ws, …)` only
+  reaches `broadcast()` for auto-triggered debates, so a debate run BY HAND would
+  have been the one missing. Now recorded: debate verdict (GO **and** NO-GO — a
+  NO-GO later overridden is the most valuable line in the file; reuses
+  `go-verdict-detect.isGoVerdict` rather than re-deriving the "NO-GO contains GO"
+  trap), trade ticket (from structured fields, not model text), and
+  `trade-confirm-result` — a REAL ORDER on the live account, which until now
+  reached one socket and a console.log. `verified === false` renders as
+  ORDER UNCONFIRMED, never the same as a confirmed fill, matching the distinction
+  the UI already draws. Eight `recordLiveEvent` sites total.
+
+  **LIVE-VERIFIED 2026-08-23.** A real `trade-confirm-request` was fired at the
+  running server over a WebSocket. Live orders were disabled
+  (`TV_ALLOW_LIVE_ORDERS` unset), so `handleTradeConfirm` refused at the first
+  gate — before `placeMarketOrder` is reachable — exercising the genuine
+  `rejectTicket()` → `recordLiveEvent()` → `Now.md` chain with no order risk. The
+  row rendered as expected:
+  `| 23:30:49 | 🛑 | BLOCK | live orders are not enabled this session… |`
+
+  **Found by that verification:** only **one of the six** rejection branches ever
+  had a `console.log`. The other five (dedup replay, live-orders-disabled,
+  TV-not-connected, invalid side, invalid size) left **no durable trace anywhere** —
+  not even in the 14-day-pruned server log. Five of the six ways this system can
+  refuse a trade were previously unrecoverable after the moment they happened.
+  All six are now recorded.
 
 - [ ] **7.2 — Put guardrail blocks and verdicts in the ledger that already exists**
 

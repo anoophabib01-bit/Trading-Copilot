@@ -2462,6 +2462,20 @@ async function handleDebateChat(ws, msg, preGathered) {
           } catch (e) { console.error('[verdict-grounding] check failed:', e.message); }
 
           emitTo(ws, { type: 'debate-judge-done', reqId, fullText: outText, answeredBy });
+          // 7.3b: feed the glance surface. This site is why a broadcast() tap
+          // was never going to work — emitTo() only reaches broadcast() when
+          // ws is null (auto-triggered), so a debate Anoop ran BY HAND would
+          // have been the one missing from the record. Instrumented at the
+          // fire site instead, so both paths land.
+          //
+          // Reuses go-verdict-detect's isGoVerdict rather than re-deriving
+          // GO/NO-GO here: it already handles the "NO-GO contains GO" trap and
+          // is unit-tested. A NO-GO he later overrode is the most valuable
+          // line in the file, so both outcomes are recorded, not just GO.
+          try {
+            const isGo = goVerdictDetect.isGoVerdict(outText);
+            recordLiveEvent('decision', 'DEBATE', (isGo ? 'GO' : 'NO-GO') + ' — ' + String(outText || '').replace(/\s+/g, ' ').slice(0, 90));
+          } catch (_) {}
           // Archive the verdict AND the three arguments it was built from —
           // the verdict alone is not reviewable without knowing what each
           // agent actually said. Wrapped so a disk problem can never affect
@@ -2521,6 +2535,16 @@ async function handleDebateChat(ws, msg, preGathered) {
                     targetPrice: ticket.targetPrice,
                     symbol
                   });
+                  // 7.3b: same reasoning as the verdict above — emitTo, so a
+                  // hand-run debate's ticket never reaches broadcast(). Built
+                  // from the structured ticket fields, not the raw model text.
+                  try {
+                    recordLiveEvent('decision', 'TICKET',
+                      String(ticket.side || '?').toUpperCase() + ' ' + (symbol || '?') +
+                      ' ×' + (ticket.size != null ? ticket.size : '?') +
+                      (ticket.stopPrice != null ? ' · stop ' + ticket.stopPrice : '') +
+                      (ticket.targetPrice != null ? ' · target ' + ticket.targetPrice : ''));
+                  } catch (_) {}
                 })().catch((e) => console.error('[trade-ticket-suggested] failed:', e.message));
               }
             } catch (e) { console.error('[trade-ticket-parse] failed:', e.message); }
@@ -7607,6 +7631,9 @@ async function handleTradeConfirm(ws, msg) {
 
     if (!result || result.success === false) {
       send(ws, { type: 'trade-confirm-result', requestId, success: false, error: (result && result.error) || 'order placement failed' });
+      // 7.3b: an order that was ATTEMPTED against the live account and failed
+      // is at least as worth recording as one that was refused before trying.
+      try { recordLiveEvent('decision', 'ORDER FAILED', (result && result.error) || 'order placement failed'); } catch (_) {}
       return;
     }
     // 2026-08-19: placeMarketOrder() started returning verified/verifyDetail
@@ -7617,9 +7644,22 @@ async function handleTradeConfirm(ws, msg) {
     // the UI/user isn't presented a plain "success" when the order's real
     // state is still unconfirmed.
     send(ws, { type: 'trade-confirm-result', requestId, success: true, submittedLabel: result.submittedLabel, stopPrice: result.stopPrice, targetPrice: result.targetPrice, verified: result.verified, verifyDetail: result.verifyDetail });
+    // 7.3b: a REAL ORDER on the live account — the single most consequential
+    // event this process produces, and until now it reached one socket and a
+    // console.log that crash-logger prunes at 14 days. `verified === false`
+    // means the click fired but the readback found neither a matching position
+    // nor a Working/Filled order, so it must NOT be shown the same as a
+    // confirmed fill (same distinction the UI already draws).
+    try {
+      recordLiveEvent('decision',
+        result.verified === false ? 'ORDER UNCONFIRMED' : 'ORDER',
+        String(result.submittedLabel || (sideNorm + ' ' + resolvedSymbol + ' ×' + qtyNum)) +
+        (result.verified === false ? ' — not confirmed against broker' : ''));
+    } catch (_) {}
   } catch (e) {
     console.error(`[trade-confirm] requestId=${requestId} uncaught error:`, e.message);
     send(ws, { type: 'trade-confirm-result', requestId, success: false, error: e.message || 'unexpected error' });
+    try { recordLiveEvent('decision', 'ORDER ERROR', e.message || 'unexpected error'); } catch (_) {}
   }
 }
 
