@@ -21,3 +21,8 @@ roster-backups/
 
 # DSH build session working data (scratch — not part of the build itself)
 DSH build/
+
+# Accidentally tracked 2026-08-23 by a bare `git add -A` — another tool's
+# session data (screenshots) and plugin files, not part of this project.
+.dsh-filess/
+.dsh-plugins/
