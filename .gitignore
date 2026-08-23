@@ -26,3 +26,6 @@ DSH build/
 # session data (screenshots) and plugin files, not part of this project.
 .dsh-filess/
 .dsh-plugins/
+
+# Obsidian vault config (vault root = repo root, see sessions/)
+.obsidian/
