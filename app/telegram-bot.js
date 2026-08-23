@@ -12,7 +12,7 @@
 // renderer/app.js (checkForPatternWarnings), client-side only. This module
 // does NOT replicate that heuristic engine — it only pushes engulf-signal
 // alerts, which already fire from a single server-side broadcast() call site
-// in checkEngulfingSignal(). If the trader wants daily-loss-tier warnings pushed to
+// in checkEngulfingSignal(). If Anoop wants daily-loss-tier warnings pushed to
 // Telegram too, that logic needs to be ported server-side first; see the
 // notify() method below, which is the only push entry point this module has.
 
@@ -98,6 +98,22 @@ class TelegramBridge {
     this._sendChunked(cfg.telegramChatId, text).catch(err => {
       console.error('Telegram notify error:', err.message);
     });
+  }
+
+  // 2026-08-17: push a chart screenshot alongside a GO verdict — much faster
+  // to eyeball on a phone than reading a paragraph. Fails soft to a
+  // text-only notify() if the photo send fails for any reason (bad path,
+  // Telegram API error) — a GO alert must never go completely missing just
+  // because the screenshot step had a problem.
+  notifyPhoto(photoPath, caption) {
+    if (!this.bot || !this.deps) return;
+    const cfg = this.deps.loadConfig();
+    if (!cfg.telegramChatId) return;
+    this.bot.sendPhoto(cfg.telegramChatId, photoPath, { caption: (caption || '').slice(0, 1024) })
+      .catch((err) => {
+        console.error('Telegram notifyPhoto error, falling back to text:', err.message);
+        this.notify(caption || '(GO verdict — screenshot failed to send)');
+      });
   }
 
   // ── Internal ────────────────────────────────────────────────────────────
@@ -220,10 +236,12 @@ class TelegramBridge {
       return this._sendChunked(chatId, 'Usage: /engulf <1h|30m|15m> <on|off>');
     }
 
-    if (state === 'on') startEngulfMonitor(tf);
-    else stopEngulfMonitor(tf);
-
-    return this._sendChunked(chatId, `${ENGULF_TFS[tf].label} engulf monitor turned ${state.toUpperCase()}.`);
+    if (state === 'on') {
+      startEngulfMonitor(tf);
+      return this._sendChunked(chatId, `${ENGULF_TFS[tf].label} engulf monitor turned ON.`);
+    }
+    // 1.2 (decision 2): watchers are always on — 'off' is refused, never honoured.
+    return this._sendChunked(chatId, `${ENGULF_TFS[tf].label} engulf watcher is always on — 'off' is not supported.`);
   }
 
   // ── /check <1h|30m|15m> ─────────────────────────────────────────────────
@@ -256,8 +274,12 @@ class TelegramBridge {
         `Usage: /playbookb on|off\nCurrent: ${running ? 'ON' : 'OFF'}${pending ? ' — liquidity raid pending, awaiting displacement FVG' : ''}`
       );
     }
-    if (state === 'on') startSFPMonitor('30m'); else stopSFPMonitor('30m');
-    return this._sendChunked(chatId, `Playbook B monitor (30M) turned ${state.toUpperCase()}.`);
+    if (state === 'on') {
+      startSFPMonitor('30m');
+      return this._sendChunked(chatId, `Playbook B monitor (30M) turned ON.`);
+    }
+    // 1.2 (decision 2): watchers are always on — 'off' is refused, never honoured.
+    return this._sendChunked(chatId, `Playbook B monitor (30M) is always on — 'off' is not supported.`);
   }
 
   // ── /rules ──────────────────────────────────────────────────────────────
@@ -334,9 +356,9 @@ class TelegramBridge {
       'Commands:',
       '/status - balance, floor, buffer, P&L, GO/NO-GO',
       '/mode eval|funded - switch account mode',
-      '/engulf <1h|30m|15m> <on|off> - toggle engulf monitor',
+      '/engulf <1h|30m|15m> on - engulf watchers are always on (off not supported)',
       '/check <1h|30m|15m> - run an engulf check now',
-      '/playbookb on|off - toggle SFP + FVG (Playbook B) monitor',
+      '/playbookb on - Playbook B watcher is always on (off not supported)',
       '/rules - current mode rule summary',
       '/trade <long|short> <entry> <stop> <target> <pnl> [exit] - log a trade',
       '/help - this list',

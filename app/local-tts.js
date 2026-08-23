@@ -6,7 +6,7 @@
    edge-tts.js talks to an UNOFFICIAL Microsoft endpoint. It worked for weeks,
    then Microsoft added a Sec-MS-GEC token requirement and every call started
    returning 403 mid-session — read-aloud died with no warning. Even with the
-   token implemented, that endpoint can change again without notice, and the trader
+   token implemented, that endpoint can change again without notice, and Anoop
    trades on this app: he explicitly asked for something that will not break
    during trading hours.
 

@@ -2,7 +2,7 @@
 // Edge TTS — Microsoft's neural read-aloud voices over the same WebSocket
 // endpoint the Edge browser uses. Free, no API key, no documented quota, and
 // (unlike Groq's Orpheus, English/Arabic only) it has real Indian-English
-// neural voices, which is exactly what the trader asked for ("human interaction
+// neural voices, which is exactly what Anoop asked for ("human interaction
 // kind of voice", 2026-07-25).
 //
 // HONEST CAVEAT, stated up front: this is an UNOFFICIAL endpoint. It's the
@@ -23,7 +23,7 @@ const WSS_BASE = 'wss://speech.platform.bing.com/consumer/speech/synthesize/read
 const OUTPUT_FORMAT = 'audio-24khz-48kbitrate-mono-mp3';
 
 // ── Sec-MS-GEC token (FIX 2026-07-28) ────────────────────────────────────────
-// the trader hit "Unexpected server response: 403" on every read-aloud call after a
+// Anoop hit "Unexpected server response: 403" on every read-aloud call after a
 // restart. Cause: Microsoft added a DRM-style handshake requirement to this
 // endpoint — the connection URL must now carry a `Sec-MS-GEC` token and a
 // `Sec-MS-GEC-Version`. Requests without them are rejected at the WebSocket

@@ -25,7 +25,7 @@ function saveConfig(cfg) {
 }
 
 // ── Window position/size persistence ────────────────────────────────────────────
-// 2026-07-28: the trader asked the app to reopen on whatever screen/size he last
+// 2026-07-28: Anoop asked the app to reopen on whatever screen/size he last
 // closed it at, instead of always launching at a fixed 1500x940 on the
 // primary display. Bounds (x, y, width, height) + maximized flag are saved on
 // every move/resize (debounced) and on close, then restored on next launch —

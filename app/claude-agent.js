@@ -25,6 +25,29 @@ function isTokenOptDisabled() {
   }
 }
 
+// 2026-08-11: the model used to be hardcoded 'claude-sonnet-4-6' at the call
+// site, which meant changing it required editing this file. Anoop is funding
+// this from a small prepaid balance and needs to trade cost against quality
+// himself, so it now reads `claudeModel` from ~/.mnq-copilot-config.json.
+//
+// Default is Haiku 4.5, chosen deliberately: roughly a third of Sonnet's input
+// price, and — unlike the free models that broke the app on 08-10 — it is a
+// first-party model with reliable tool-calling, which is non-negotiable here
+// (Jessi is useless if she can't actually invoke app_get_data).
+// If coaching quality feels thin, set "claudeModel": "claude-sonnet-4-6" in that
+// config file and restart. No code change needed.
+// Note: Haiku 3.5 is NOT a valid option — it was retired on the first-party API
+// (Bedrock/Vertex only). Requesting it returns a model-not-found error.
+const DEFAULT_CLAUDE_MODEL = 'claude-haiku-4-5';
+function claudeModel() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    return cfg.claudeModel || DEFAULT_CLAUDE_MODEL;
+  } catch {
+    return DEFAULT_CLAUDE_MODEL;
+  }
+}
+
 // ── Mode-specific rule blocks ──────────────────────────────────────────────────
 const EVAL_RULES = `
 ## CURRENT MODE: EVALUATION (Stage 1)
@@ -59,7 +82,7 @@ const FUNDED_RULES = `
 ## CURRENT MODE: FUNDED (Stage 2 — LIVE MONEY)
 Account: LucidFlex Funded (account ID kept out of source control — pulled from Settings/local config, not hardcoded; activated Jun 17 2026)
 Starting Balance: $50,000 | Hard Floor: $48,000 (EOD trailing)
-Max Loss Limit: $2,000 EOD trailing | Profit Split: per prop-firm agreement
+Max Loss Limit: $2,000 EOD trailing | Profit Split: 90% Anoop / 10% Lucid
 Scaling: $0–$999 profit → 20 micros | $1K–$1.999K → 30 micros | $2K+ → 40 micros
 Max contracts per entry: 2 HARD CAP (no "high conviction" override)
 
@@ -96,7 +119,7 @@ Max contracts per entry: 2 HARD CAP (no "high conviction" override)
 
 const SHARED_RULES = `
 ## WHO YOU ARE TALKING TO
-the trader | IST (UTC+5:30)
+Anoop Habib | Hubballi, Karnataka, India (IST UTC+5:30)
 Instruments: MNQ (Micro Nasdaq), MGC (Micro Gold)
 Platforms: TradingView (charting, HTF) + Tradovate (execution, 3M/1M only)
 3-monitor setup: Monitor 1: 1H+15M | Monitor 2: 5M entry | Monitor 3: DOM+News+P&L
@@ -156,16 +179,16 @@ Playbook C — Engulfing Bar Validity Rules (gates Playbook A and any other engu
 - Never retroactive GO. Never foster emotional dependence — redirect to system.
 
 ## BOOK LIBRARY (search_books tool)
-the trader's uploaded trading library (Stock Market Wizards, Trading in the Zone, Intraday Trading Techniques, Prop Trading Secrets, TradeApp's Guide to Proprietary Trading) is searchable via search_books. Reach for it when a coaching point or rules violation would land harder grounded in what one of these books actually says (e.g. Douglas on probabilistic thinking when he's revenge trading, Schwager's trader interviews when discussing edge/discipline) — not on every message, only when it adds real weight.
+Anoop's uploaded trading library (Stock Market Wizards, Trading in the Zone, Intraday Trading Techniques, Prop Trading Secrets, TradeApp's Guide to Proprietary Trading) is searchable via search_books. Reach for it when a coaching point or rules violation would land harder grounded in what one of these books actually says (e.g. Douglas on probabilistic thinking when he's revenge trading, Schwager's trader interviews when discussing edge/discipline) — not on every message, only when it adds real weight.
 
 ## WATCHLIST CONTEXT SCANS (secondary — not a trading instruction)
-the trader keeps a TradingView watchlist named "focus" with other symbols worth tracking for broader market context. When he asks for a watchlist scan, call watchlist_get (reads whichever watchlist tab is currently active in TradingView — if it doesn't look like "focus", tell him to switch to it first, you have no way to select a watchlist by name yourself). Report a compact per-symbol read (price, change%, and a quick bias if you pull OHLCV). This is CONTEXT ONLY — it never changes the one-instrument-per-day rule or opens a case for trading anything outside MNQ/MGC. If a symbol in the watchlist looks like a screaming setup, note it, but do not encourage acting on it same-day as MNQ/MGC.
+Anoop keeps a TradingView watchlist named "focus" with other symbols worth tracking for broader market context. When he asks for a watchlist scan, call watchlist_get (reads whichever watchlist tab is currently active in TradingView — if it doesn't look like "focus", tell him to switch to it first, you have no way to select a watchlist by name yourself). Report a compact per-symbol read (price, change%, and a quick bias if you pull OHLCV). This is CONTEXT ONLY — it never changes the one-instrument-per-day rule or opens a case for trading anything outside MNQ/MGC. If a symbol in the watchlist looks like a screaming setup, note it, but do not encourage acting on it same-day as MNQ/MGC.
 
 ## LONDON SESSION LEVEL MARKING
-The app itself (not you) marks Previous Week High/Low, Previous Day High/Low, and Asia session High/Low (5:30 AM–1:30 PM IST) as drawn lines on the chart ahead of the London session, via a deterministic server-side action — not something you need to compute or trigger. If the trader asks whether London levels are marked, tell him to use the "Mark London Levels" button, or check the chart directly with draw_list.
+The app itself (not you) marks Previous Week High/Low, Previous Day High/Low, and Asia session High/Low (5:30 AM–1:30 PM IST) as drawn lines on the chart ahead of the London session, via a deterministic server-side action — not something you need to compute or trigger. If Anoop asks whether London levels are marked, tell him to use the "Mark London Levels" button, or check the chart directly with draw_list.
 
 ## NY SESSION LEVEL MARKING
-The app itself (not you) marks current Week High/Low and current Month High/Low as drawn lines on the chart ahead of the NY session, via a deterministic server-side action — not something you need to compute or trigger. Updated 2026-07-22: this used to be PDH/PDL + London session High/Low; it no longer marks either of those for NY, only current week/month H/L. If the trader asks whether NY levels are marked, tell him to use the "Mark NY Levels" button, or check the chart directly with draw_list.
+The app itself (not you) marks current Week High/Low and current Month High/Low as drawn lines on the chart ahead of the NY session, via a deterministic server-side action — not something you need to compute or trigger. Updated 2026-07-22: this used to be PDH/PDL + London session High/Low; it no longer marks either of those for NY, only current week/month H/L. If Anoop asks whether NY levels are marked, tell him to use the "Mark NY Levels" button, or check the chart directly with draw_list.
 
 ## TECHNICAL ANALYSIS WORKFLOW
 1. chart_get_state → current state
@@ -181,15 +204,27 @@ The app itself (not you) marks current Week High/Low and current Month High/Low 
 11. chart_set_timeframe("240") → restore to 4H
 Always output: bias direction, key level, setup validity NOW, what to wait for.
 
-Today is 2026-07-02. London Session: 1:30–3:00 PM IST (prep/small-size). NY Session: 7:00–9:00 PM IST (13:30–15:30 UTC, primary).
+London Session: 1:30–3:00 PM IST (prep/small-size). NY Session: 7:00–9:00 PM IST (13:30–15:30 UTC, primary).
 Primary: MNQ1!. Secondary: MGC (NEVER both on the same day, even across sessions).
-Long-term mission: erase $10,784.50 lifetime losses → payouts → 3 evals simultaneously → copy trading.
+Long-term mission: erase $10,784.50 lifetime losses → payouts → 3 evals simultaneously → copy trading.`;
 
-NOTE TO SELF: "Today is" above is a static string — it will go stale again. When reasoning about dates, prefer the actual current date from context/tools over this hardcoded value if they ever disagree.`;
+// Current date/time in IST, computed fresh per request. REPLACES a previously
+// hardcoded date line that sat in SHARED_RULES and went ~6 weeks stale — the AI
+// thought it was July when it was August, so every "today"/"yesterday" and
+// day-of-week was wrong. All app data and uploaded Tradovate reports are IST
+// wall-clock, so anchor the model in IST explicitly. Never hardcode a date here
+// again — app/test/date-anchor.test.js fails the build if a fixed date returns.
+function istDateLine() {
+  const now = new Date();
+  const date = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });        // YYYY-MM-DD
+  const weekday = now.toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata', weekday: 'long' });
+  const time = now.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false });
+  return `CURRENT DATE/TIME: Today is ${date} (${weekday}), ${time} IST. Everything in this app and in every uploaded trade report (Tradovate CSV) is Indian Standard Time (IST, UTC+5:30) — the trader is in India trading the US market. Resolve "today", "yesterday", and any day-of-week strictly in IST from this anchor. Never guess the date or day-of-week; use this line.`;
+}
 
 function buildSystemPrompt(mode) {
   const modeBlock = mode === 'eval' ? EVAL_RULES : FUNDED_RULES;
-  return `You are the trader's real-time trading co-pilot. You have live access to his TradingView Desktop chart via MCP tools. Your job: analyze live charts, enforce rules, call out violations, guide entries, and log sessions.\n${modeBlock}\n${SHARED_RULES}`;
+  return `You are Anoop Habib's real-time trading co-pilot. You have live access to his TradingView Desktop chart via MCP tools. Your job: analyze live charts, enforce rules, call out violations, guide entries, and log sessions.\n${istDateLine()}\n${modeBlock}\n${SHARED_RULES}`;
 }
 
 // ── TradingView tools ──────────────────────────────────────────────────────────
@@ -208,7 +243,7 @@ const TV_TOOLS = [
   { name: 'alert_create', description: 'Create a TradingView price alert.', input_schema: { type: 'object', properties: { name: { type: 'string' }, condition: { type: 'string' }, price: { type: 'number' }, message: { type: 'string' } }, required: ['name', 'condition', 'price'] } },
   { name: 'alert_list', description: 'List all active TradingView alerts.', input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'alert_delete', description: 'Delete a TradingView alert by ID.', input_schema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
-  { name: 'draw_shape', description: 'Draw on the chart: horizontal_ray (PREFERRED for marking a high/low level — anchors at point.time, the actual candle where that high/low occurred, extends rightward only, matching how the trader marks levels himself), horizontal_line (rarely wanted — spans the ENTIRE chart both directions regardless of point.time, only use if he explicitly asks for a full-chart line), trend_line, rectangle, or text.', input_schema: { type: 'object', properties: { shape: { type: 'string', enum: ['horizontal_ray', 'horizontal_line', 'trend_line', 'rectangle', 'text'] }, point: { type: 'object' }, point2: { type: 'object' }, text: { type: 'string' }, color: { type: 'string' } }, required: ['shape', 'point'] } },
+  { name: 'draw_shape', description: 'Draw on the chart: horizontal_ray (PREFERRED for marking a high/low level — anchors at point.time, the actual candle where that high/low occurred, extends rightward only, matching how Anoop marks levels himself), horizontal_line (rarely wanted — spans the ENTIRE chart both directions regardless of point.time, only use if he explicitly asks for a full-chart line), trend_line, rectangle, or text.', input_schema: { type: 'object', properties: { shape: { type: 'string', enum: ['horizontal_ray', 'horizontal_line', 'trend_line', 'rectangle', 'text'] }, point: { type: 'object' }, point2: { type: 'object' }, text: { type: 'string' }, color: { type: 'string' } }, required: ['shape', 'point'] } },
   { name: 'draw_list', description: 'List all drawings on the chart.', input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'draw_clear', description: 'Remove all drawings from the chart.', input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'chart_manage_indicator', description: 'Add or remove a study. Use FULL names: "Relative Strength Index" not "RSI".', input_schema: { type: 'object', properties: { action: { type: 'string', enum: ['add', 'remove'] }, name: { type: 'string' } }, required: ['action', 'name'] } },
@@ -218,23 +253,40 @@ const TV_TOOLS = [
   { name: 'watchlist_get', description: 'Get all symbols from the CURRENT TradingView watchlist (whatever tab is active there) with last price, change, and change%. Use this for broad market-context scans across a watchlist, not for trade signals — trading stays confined to MNQ/MGC.', input_schema: { type: 'object', properties: {}, required: [] } }
 ];
 
-// 2026-07-27: local (non-MCP) tool — searches the trader's 5-book trading library
+// 2026-07-27: local (non-MCP) tool — searches Anoop's 5-book trading library
 // (data/books/*.txt, indexed by books-index.js) instead of routing to the TV
 // bridge. Handled separately in the tool-execution loop below.
 const BOOK_TOOLS = [
-  { name: 'search_books', description: 'Search the trader\'s trading book library (Stock Market Wizards, Trading in the Zone, Intraday Trading Techniques, Prop Trading Secrets, TradeApp\'s Guide to Proprietary Trading) for passages relevant to a topic. Use when grounding a rules violation or coaching point in what one of these books actually says, e.g. "revenge trading", "probabilistic thinking", "position sizing".', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'topic or question to search for' }, book: { type: 'string', description: 'optional — restrict to one: stock_market_wizards, trading_in_the_zone, intraday_trading_techniques, prop_trading_secrets, tradeapp_prop_trading_guide' } }, required: ['query'] } }
+  { name: 'search_books', description: 'Search Anoop\'s trading book library (Stock Market Wizards, Trading in the Zone, Intraday Trading Techniques, Prop Trading Secrets, TradeApp\'s Guide to Proprietary Trading) for passages relevant to a topic. Use when grounding a rules violation or coaching point in what one of these books actually says, e.g. "revenge trading", "probabilistic thinking", "position sizing".', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'topic or question to search for' }, book: { type: 'string', description: 'optional — restrict to one: stock_market_wizards, trading_in_the_zone, intraday_trading_techniques, prop_trading_secrets, tradeapp_prop_trading_guide' } }, required: ['query'] } }
 ];
 const ALL_TOOLS = [...TV_TOOLS, ...BOOK_TOOLS];
 // Prompt-caching variant of ALL_TOOLS — identical tools, with a cache_control
 // breakpoint on the last one. Built once at module load (the tool list is
 // static) rather than per-call. Kept as a separate array so token-audit.js's
 // _debug.ALL_TOOLS (used for token counting, not live calls) stays the plain,
-// uncached shape. Standard ephemeral (5-min) TTL only — the SDK pinned here
-// (@anthropic-ai/sdk 0.39.0) has no `ttl` field on CacheControlEphemeral, so
-// the 1-hour TTL option isn't safe to use without an SDK upgrade + live
-// verification first (see TODOS.md: tool-scoping/cache-cadence follow-up).
+// uncached shape.
+//
+// 2026-08-11 — 1-HOUR TTL NOW ENABLED (was the 5-minute default).
+// The old note here said the pinned SDK 0.39.0 had no `ttl` field on
+// CacheControlEphemeral, so 1h wasn't safe to use. That's resolved: the SDK is
+// now 0.116.0, where CacheControlEphemeral declares `ttl?: '5m' | '1h'` on the
+// main (non-beta) messages resource — no beta header required. Verified against
+// the installed type definitions before flipping this on.
+//
+// Why it matters for Anoop specifically: the cached block is ~19.6K tokens
+// (system prompt + 23 tool schemas) and is byte-identical on every call. On the
+// 5m TTL his usage pattern — a burst of questions, then a long gap watching the
+// chart, then another burst — expired the cache between bursts, so most calls
+// paid a full-price cache WRITE instead of a 0.1x READ. A 1h window covers a
+// whole London or NY session in one cache lifetime.
+// Trade-off, deliberately accepted: a 1h cache write costs 2x base input vs
+// 1.25x for 5m. So this is a LOSS if he asks one question and closes the app,
+// and a large win from roughly the third call onward in a session. Given a
+// session is 20+ calls, that's the right side of the bet.
+const CACHE_TTL = '1h';
+const CACHE_CONTROL = { type: 'ephemeral', ttl: CACHE_TTL };
 const ALL_TOOLS_CACHED = ALL_TOOLS.map((t, i) =>
-  i === ALL_TOOLS.length - 1 ? { ...t, cache_control: { type: 'ephemeral' } } : t
+  i === ALL_TOOLS.length - 1 ? { ...t, cache_control: { ...CACHE_CONTROL } } : t
 );
 
 class ClaudeAgent {
@@ -270,7 +322,7 @@ class ClaudeAgent {
     const tokenOptOff = isTokenOptDisabled();
     const systemForRequest = tokenOptOff
       ? systemPrompt
-      : [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }];
+      : [{ type: 'text', text: systemPrompt, cache_control: { ...CACHE_CONTROL } }];
     const toolsForRequest = tokenOptOff ? ALL_TOOLS : ALL_TOOLS_CACHED;
     const abortCtrl = new AbortController();
     // 2026-08-06: real end-to-end cancellation. `signal` is an external
@@ -293,7 +345,7 @@ class ClaudeAgent {
       let stream;
       try {
         stream = await this.client.messages.stream({
-          model: 'claude-sonnet-4-6',
+          model: claudeModel(),
           max_tokens: 4096,
           system: systemForRequest,
           tools: toolsForRequest,
@@ -350,6 +402,26 @@ class ClaudeAgent {
         stopReason,
         toolCallCount: toolUseBlocks.length,
       });
+
+      // 2026-08-11: print the cache outcome of every call to the server console.
+      // Anoop asked "where do I check prompt caching is enabled?" — the startup
+      // banner only proves the kill switch is OFF, it does NOT prove the API
+      // actually cached anything. These are the API's own reported numbers, so
+      // they're the real evidence:
+      //   WRITE = first call of a cache lifetime (billed 2x input at 1h TTL)
+      //   READ  = a hit (billed 0.1x input) — this is where the money is saved
+      //   MISS  = neither, i.e. caching silently not working — investigate
+      // Expect one WRITE then READs for the rest of the hour. If you only ever
+      // see WRITE, the cached prefix is changing between calls and the 1h TTL
+      // is buying nothing.
+      try {
+        const u = finalMsg.usage || {};
+        const wrote = u.cache_creation_input_tokens || 0;
+        const read  = u.cache_read_input_tokens || 0;
+        const fresh = u.input_tokens || 0;
+        const tag = read ? `READ ${read}` : (wrote ? `WRITE ${wrote}` : 'MISS');
+        console.log(`[cache ${CACHE_TTL}] ${tag} · uncached-in ${fresh} · out ${u.output_tokens || 0}`);
+      } catch (e) {}
 
       if (stopReason === 'tool_use' && toolUseBlocks.length > 0) {
         const assistantContent = finalMsg.content;

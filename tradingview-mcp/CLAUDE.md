@@ -60,7 +60,7 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 6. `replay_stop` → return to realtime
 
 ### "Screen multiple symbols"
-- `batch_run` with `symbols: ["ES1!", "NQ1!", "YM1!"]` and `action: "screenshot"` or `"get_ohlcv"`
+- ⚠️ **`batch_run` is BROKEN (confirmed 2026-08-17 by reading `core/batch.js` directly)** — it switches symbol/timeframe per iteration and **never restores the original chart state** afterward, unlike every other multi-TF function in this project. Using it will leave the user's live chart parked on whatever it checked last. Do not wire it into anything automated. For a restore-safe multi-symbol pattern instead, see `app/server.js`'s `checkPo3SecondarySymbol()` in the MNQ-CoPilot app repo — switches, reads, and ALWAYS restores in a `finally`, same discipline as `withChartLock`/`getFullBars`.
 
 ### "Draw on the chart"
 - `draw_shape` → horizontal_line, trend_line, rectangle, text (pass point + optional point2)
@@ -69,9 +69,9 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 - `draw_clear` → remove all
 
 ### "Manage alerts"
-- `alert_create` → set price alert (condition: "crossing", "greater_than", "less_than")
-- `alert_list` → view active alerts
-- `alert_delete` → remove alerts
+- `alert_list` → view active alerts (works — uses TradingView's internal REST API, not DOM)
+- `alert_delete` with `delete_all: true` → remove ALL alerts (works, but no single-alert delete yet — see `core/alerts.js`)
+- ✅ **`alert_create` and `alert_delete` FIXED (2026-08-2x, live-verified).** Both now use TradingView's `pricealerts` REST API directly (`create_alert` / `delete_alerts`), discovered by capturing the UI's own network traffic. The old dialog-DOM automation was abandoned because this TradingView build's React-controlled price field ignores synthetic events, `Input.insertText`, AND per-keystroke `dispatchKeyEvent` — all verified live, the committed alert always landed at the market price regardless. The REST `create_alert` endpoint commits the requested price exactly (verified: `actual_price` === `requested_price`), and `delete_alerts` removes by ID or all. `alert_create` now returns `price_verified` by re-reading `alert_list`; `alert_delete` accepts `alert_ids: [...]`. See `core/alerts.js`'s header comment for the full trail. The dialog path remains only as a best-effort fallback.
 
 ### "Navigate the UI"
 - `ui_open_panel` → open/close pine-editor, strategy-tester, watchlist, alerts, trading

@@ -18,7 +18,7 @@
 <body>
 
 <!-- ── Startup account-confirmation gate (2026-07-21) ────────────────────────
-     Shown on every launch per the trader's request: "on start of the app it
+     Shown on every launch per Anoop's request: "on start of the app it
      should confirm which account i am trading." The app has already loaded
      the remembered account's real data behind this overlay (see
      showAccountGate() in app.js) -- this is a confirm/switch step, not a
@@ -65,12 +65,27 @@
     <button class="tmode-btn" id="tmode-scalper-btn" onclick="switchTradingMode('scalper')">SCALPER</button>
   </div>
 
+  <!-- Full-width kill bar, shown only when the chart feed is dead. The
+       titlebar chip alone was missable with the window partly covered. -->
+  <div id="tv-dead-bar">⚠ TRADINGVIEW DISCONNECTED — CHART DATA IS STALE — DO NOT OPEN NEW TRADES</div>
+
   <div id="tv-status">
     <div id="tv-dot"></div>
     <span id="tv-status-text">Connecting…</span>
   </div>
+  <!-- 2026-08-19: persistent (not a toast) self-test line — SEMI_AUTONOMOUS_SYSTEM_PLAN.md
+       item 2. Always visible once a result arrives, updates in place on every
+       reconnect re-test. See app.js's onLiveFeedSelfTest handler. -->
+  <div id="live-feed-selftest" style="display:none;" title="Click to re-run the checks" onclick="rerunLiveFeedSelfTest()"></div>
+  <!-- 2026-08-23: the live feed going dark is the worst failure this app has
+       (every guardrail depends on it) and it previously showed only as a thin
+       line that was easy to miss for a whole session. This banner is the loud
+       version: it appears ONLY when a check is failing, names which of the 3
+       legs is down, and offers the repair directly. Hidden entirely when all
+       3 pass, so it never becomes wallpaper. -->
+  <div id="live-feed-health" style="display:none;"></div>
   <div class="session-time" id="session-clock"></div>
-  <!-- Reopen the account picker any time (2026-07-25, the trader: "there should be
+  <!-- Reopen the account picker any time (2026-07-25, Anoop: "there should be
        an option to get to this page if i want to shift my account later on") -->
   <button class="api-btn" id="switch-acct-btn" onclick="showAccountGate(state.accountSize, state.mode)" title="Switch account — reopen the account picker">⇄ Account</button>
   <button class="api-btn" id="settings-open-btn">⚙ Settings</button>
@@ -114,7 +129,7 @@
             <span class="stat-label">DD Floor</span>
             <span class="stat-value" id="stat-floor-eval">$145,500</span>
           </div>
-          <!-- Buffer row removed from EVAL 2026-07-25 (the trader: "Buffer is not
+          <!-- Buffer row removed from EVAL 2026-07-25 (Anoop: "Buffer is not
                needed in the eval stage") — the DD Floor above is the number
                that matters. Kept hidden rather than deleted so updateAccountUI
                has nothing to break on. -->
@@ -164,6 +179,24 @@
         </div>
         <div class="progress-bar" title="MLL buffer used">
           <div class="progress-fill" id="buffer-bar" style="width:0%"></div>
+        </div>
+
+        <!-- 2026-08-13 (Anoop): "any account that I select has to be opened
+             totally... after I breach or clear it should show above today and
+             below 50K details." Was previously ONLY inside the ⇄ Account
+             picker modal — real functions (accountBreached/
+             accountClearedToFunded already exist and operate on whichever
+             slot is currently open), just not visible without an extra click.
+             Same eval-only/funded-only classes _renderMode() already toggles
+             everywhere else in this panel — no new JS needed, these show/hide
+             automatically with the account's stage. -->
+        <div class="eval-only acct-action-row" style="display:none;">
+          <button class="gate-status-btn gate-status-breach" onclick="accountBreached(event)" title="Mark THIS open account breached — archives its data and resets it fresh">Eval breached</button>
+          <button class="gate-status-btn gate-status-clear" onclick="accountClearedToFunded(event)" title="Mark THIS open account's eval cleared — moves it to FUNDED with a clean slate">Cleared → Funded</button>
+        </div>
+        <div class="funded-only acct-action-row">
+          <button class="gate-status-btn gate-status-breach" onclick="accountBreached(event)" title="Mark THIS open account breached — archives its data and resets it fresh">Funded breached</button>
+          <button class="gate-status-btn gate-status-clear" onclick="accountPaidOut(event)" title="Record first payout on THIS open funded account — archives the period's data, stays FUNDED with a fresh ledger">First payout</button>
         </div>
       </div>
 
@@ -220,8 +253,17 @@
       <button class="qa-btn"          onclick="quickAction('analyze')"><span class="btn-icon">◎</span> Full Analysis</button>
       <button class="qa-btn"          onclick="document.getElementById('goodtrade-input').click()"><span class="btn-icon">★</span> Analyze Good Trade</button>
       <input type="file" id="goodtrade-input" accept="image/*" style="display:none">
-      <button class="qa-btn"          onclick="document.getElementById('csv-file-input').click()"><span class="btn-icon">▤</span> Analyze CSV/PDF</button>
-      <input type="file" id="csv-file-input" accept=".csv,.pdf" multiple style="display:none">
+      <!-- 2026-08-17: renamed from "Analyze CSV/PDF" — extended to any
+           trade-related report, not just CSV/PDF. .xlsx/.xls parsed
+           server-side (SheetJS) and converted to CSV; .csv/.txt/.tsv (or any
+           unrecognized extension) go through the existing text path, which
+           now auto-detects comma/tab/semicolon delimiters instead of
+           assuming comma. Same handler (handleCsvFileSelected), same
+           ledger/guardrail pipeline underneath either way. -->
+      <!-- 4.5: CSV demoted to reconciliation — the live feed is the writer; an
+           upload compares and flags differences, applies only on confirm. -->
+      <button class="qa-btn"          onclick="document.getElementById('csv-file-input').click()" title="Reconcile a broker export against the live-feed day record — differences are reported, applied only on confirm"><span class="btn-icon">▤</span> Reconcile with broker export</button>
+      <input type="file" id="csv-file-input" accept=".csv,.pdf,.xlsx,.xls,.txt,.tsv" multiple style="display:none">
       <button class="qa-btn"          onclick="runIctPo3()" title="ICT Power of 3 — judges Accumulation / Manipulation / Distribution across 1H/15m/5m, Daily bias gate (weights 15m + 5m most)"><span class="btn-icon">◱</span> Power of 3 (AMD)</button>
       <button class="qa-btn" id="po3-monitor-btn" onclick="togglePo3Monitor()" title="Mechanical AMD phase monitor — polls 15m every 60s and alerts in chat on ANY phase change (Accumulation / Manipulation / Distribution). No AI call per poll, so no quota use."><span class="btn-icon">◱</span> P3 Monitor</button>
       <button class="qa-btn"          onclick="quickAction('watchlist')" title='Reads whichever watchlist tab is active in TradingView — switch to "focus" first'><span class="btn-icon">☰</span> Scan Watchlist</button>
@@ -317,6 +359,11 @@
       <div class="rtab" data-tab="cost" onclick="switchTab('cost')">Cost</div>
     </div>
 
+    <!-- Global checklist banner (2026-08-13). Lives OUTSIDE #right-content so
+         it is visible on every tab — a banner you escape by switching tabs is
+         not a banner. -->
+    <div id="ck-global-banner" class="ck-banner" style="display:none"></div>
+
     <div id="right-content">
 
       <!-- Analysis tab -->
@@ -366,13 +413,9 @@
 
           <div class="engulf-tf-panel" data-tf-panel="1h">
             <div class="engulf-header" style="margin-top:8px;">
-              <span class="stat-label" style="font-size:10px;">Watch this timeframe</span>
-              <label class="toggle-switch" title="Enable/disable engulfing candle monitor">
-                <input type="checkbox" id="engulf-toggle-1h" onchange="toggleEngulfMonitor('1h', this.checked)">
-                <span class="toggle-slider"></span>
-              </label>
+              <span class="stat-label" style="font-size:10px;">Watching — always on</span>
             </div>
-            <div id="engulf-status-1h" class="engulf-status off">Off — toggle to start watching</div>
+            <div id="engulf-status-1h" class="engulf-status off">Always on — no switches to forget.</div>
             <div class="engulf-actions">
               <button class="engulf-check-btn" onclick="checkEngulfNow('1h')" title="Run check now">↻ Check now</button>
               <div class="engulf-indicator-row">
@@ -385,13 +428,9 @@
 
           <div class="engulf-tf-panel" data-tf-panel="30m" style="display:none;">
             <div class="engulf-header" style="margin-top:8px;">
-              <span class="stat-label" style="font-size:10px;">Watch this timeframe</span>
-              <label class="toggle-switch" title="Enable/disable engulfing candle monitor">
-                <input type="checkbox" id="engulf-toggle-30m" onchange="toggleEngulfMonitor('30m', this.checked)">
-                <span class="toggle-slider"></span>
-              </label>
+              <span class="stat-label" style="font-size:10px;">Watching — always on</span>
             </div>
-            <div id="engulf-status-30m" class="engulf-status off">Off — toggle to start watching</div>
+            <div id="engulf-status-30m" class="engulf-status off">Always on — no switches to forget.</div>
             <div class="engulf-actions">
               <button class="engulf-check-btn" onclick="checkEngulfNow('30m')" title="Run check now">↻ Check now</button>
               <div class="engulf-indicator-row">
@@ -404,13 +443,9 @@
 
           <div class="engulf-tf-panel" data-tf-panel="15m" style="display:none;">
             <div class="engulf-header" style="margin-top:8px;">
-              <span class="stat-label" style="font-size:10px;">Watch this timeframe</span>
-              <label class="toggle-switch" title="Enable/disable engulfing candle monitor">
-                <input type="checkbox" id="engulf-toggle-15m" onchange="toggleEngulfMonitor('15m', this.checked)">
-                <span class="toggle-slider"></span>
-              </label>
+              <span class="stat-label" style="font-size:10px;">Watching — always on</span>
             </div>
-            <div id="engulf-status-15m" class="engulf-status off">Off — toggle to start watching</div>
+            <div id="engulf-status-15m" class="engulf-status off">Always on — no switches to forget.</div>
             <div class="engulf-actions">
               <button class="engulf-check-btn" onclick="checkEngulfNow('15m')" title="Run check now">↻ Check now</button>
               <div class="engulf-indicator-row">
@@ -428,12 +463,8 @@
         <div class="panel-section engulf-section">
           <div class="engulf-header">
             <div class="section-title" style="margin:0;">FVG Monitor (30M)</div>
-            <label class="toggle-switch" title="Enable/disable fair value gap monitor">
-              <input type="checkbox" id="fvg-toggle-30m" onchange="toggleFVGMonitor('30m', this.checked)">
-              <span class="toggle-slider"></span>
-            </label>
           </div>
-          <div id="fvg-status-30m" class="engulf-status off">Off — toggle to start watching</div>
+          <div id="fvg-status-30m" class="engulf-status off">Always on — no switches to forget.</div>
           <div class="engulf-actions">
             <button class="engulf-check-btn" onclick="checkFVGNow('30m')" title="Run check now">↻ Check now</button>
           </div>
@@ -446,16 +477,23 @@
         <div class="panel-section engulf-section">
           <div class="engulf-header">
             <div class="section-title" style="margin:0;">Playbook B / SFP Monitor (30M)</div>
-            <label class="toggle-switch" title="Enable/disable SFP + FVG (Playbook B) monitor">
-              <input type="checkbox" id="sfp-toggle-30m" onchange="toggleSFPMonitor('30m', this.checked)">
-              <span class="toggle-slider"></span>
-            </label>
           </div>
-          <div id="sfp-status-30m" class="engulf-status off">Off — toggle to start watching</div>
+          <div id="sfp-status-30m" class="engulf-status off">Always on — no switches to forget.</div>
           <div class="engulf-actions">
             <button class="engulf-check-btn" onclick="checkSFPNow('30m')" title="Run check now">↻ Check now</button>
           </div>
           <div id="sfp-history-30m" class="engulf-history"></div>
+        </div>
+
+        <!-- Chart Watchers panel (1.3) — the real running watcher set, read back
+             from the server, not what the client last requested. No toggles:
+             always on, per decision 2. -->
+        <div class="panel-section engulf-section">
+          <div class="engulf-header">
+            <div class="section-title" style="margin:0;">Chart Watchers</div>
+            <span class="stat-label" style="font-size:10px;" id="chart-watchers-note">Always on — no switches to forget.</span>
+          </div>
+          <div id="chart-watchers-panel" class="engulf-history"></div>
         </div>
       </div>
 
@@ -481,7 +519,7 @@
         </div>
       </div>
 
-      <!-- Alignment tab (added 2026-07-28, the trader) — closes the gap between
+      <!-- Alignment tab (added 2026-07-28, Anoop) — closes the gap between
            "what Jessi/Claude currently thinks the rules and plan are" and
            "what you're actually thinking day to day." Top half is NOT
            free-text — it's rendered live from rules.json + state.account, the
@@ -543,7 +581,7 @@
             <div class="rules-title">Account</div>
             <div class="rules-item"><span class="rules-key">Hard Floor</span><span class="rules-val" id="rules-floor-funded">$48,000 (EOD trailing)</span></div>
             <div class="rules-item"><span class="rules-key">Floor locks</span><span class="rules-val">$50,100 once bal >$52,100</span></div>
-            <div class="rules-item"><span class="rules-key">Profit split</span><span class="rules-val green">90% the trader / 10% the prop firm</span></div>
+            <div class="rules-item"><span class="rules-key">Profit split</span><span class="rules-val green">90% Anoop / 10% Lucid</span></div>
           </div>
           <div class="rules-block">
             <div class="rules-title">Daily Limits</div>
@@ -639,6 +677,36 @@
       <!-- Checklist tab — ported from Edgedesk (C:\Users\Admin\Claude\Projects\Edgedesk\EdgeDesk.html) -->
       <div id="tab-checklist" style="display:none;padding:12px;">
 
+        <!-- Sticky decision bar (2026-08-13). The verdict used to live ~2500px
+             down the scroll, so the one thing he needs before a session — am I
+             cleared — was never on screen. Progress + tier + the DONE/Skip
+             controls now stay pinned. The Skip button is STATIC HTML on purpose:
+             the gate's escape hatch must not be rendered by the same JS that
+             computes the gate, or an exception takes both. -->
+        <div class="ck-sticky">
+          <div class="ck-sticky-row">
+            <span class="ck-sticky-count"><span id="ck-sticky-progress">0/0</span> confirmed</span>
+            <span class="ck-sticky-tier is-nogo" id="ck-sticky-tier">NO-GO</span>
+            <span class="ck-streak" id="ck-streak" style="display:none"></span>
+            <span style="margin-left:auto;display:flex;gap:6px">
+              <button class="btn-save ck-sticky-done" onclick="ckMarkDone()">✓ PRE-TRADE DONE</button>
+              <button class="ck-skip-btn" onclick="ckSkipToday()" title="Recorded as SKIPPED — breaks your streak">Skip today</button>
+            </span>
+          </div>
+          <div id="ck-save-error" class="ck-save-error" style="display:none">⚠ NOT SAVING — this checklist is not being recorded. Check browser storage.</div>
+          <div id="ck-gate-hint" class="ck-gate-hint" style="display:none"></div>
+        </div>
+
+        <div class="analysis-block" id="ck-block-weekly">
+          <div class="block-title">Weekend Screen Time</div>
+          <div style="font-size:10px;color:var(--text-dim);margin-bottom:6px">Weekly, not part of the pre-trade gate. Log the hours to bring them down.</div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input class="form-input" id="ck-weekly-hours" type="number" min="0" step="0.5" placeholder="hours" style="width:110px" onchange="ckSaveWeekly()">
+            <span style="font-size:10px;color:var(--text-dim)">hours this week</span>
+          </div>
+          <pre id="ck-weekly-trend" class="ck-weekly-trend">No weeks logged yet.</pre>
+        </div>
+
         <div class="analysis-block">
           <div class="block-title">Body Check</div>
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px">
@@ -665,6 +733,15 @@
                 <button id="ck-napNo" class="ck-body-btn" onclick="ckSetBody('nap','no')">✗ No</button>
               </div>
             </div>
+          </div>
+          <!-- Stress routine (2026-08-13, Anoop): "routine to keep stress low
+               during trading hours". Ticks rather than a timed prompt — a
+               mid-session interrupt would fire while he is in a position. -->
+          <div class="ck-subtitle" style="margin-top:9px">Stress Routine</div>
+          <div style="display:flex;gap:5px;flex-wrap:wrap">
+            <button id="ck-stress-rec" class="ck-body-btn" onclick="ckSetStress('rec')">🔴 Recording on</button>
+            <button id="ck-stress-breath" class="ck-body-btn" onclick="ckSetStress('breath')">🌬️ 2 min breathing</button>
+            <button id="ck-stress-phone" class="ck-body-btn" onclick="ckSetStress('phone')">📵 Phone away</button>
           </div>
         </div>
 
@@ -800,13 +877,13 @@
 
       </div>
 
-      <!-- Roadmap tab — 90-Day Apprenticeship: the prop firm Prop Mastery via the Co-Pilot (added 2026-07-18) -->
+      <!-- Roadmap tab — 90-Day Apprenticeship: Lucid Prop Mastery via the Co-Pilot (added 2026-07-18) -->
       <div id="tab-apprentice" style="display:none;padding:12px;">
 
         <div id="plan-stage-banner" class="plan-stage-banner"></div>
 
         <div class="analysis-block">
-          <div class="block-title">90-Day Apprenticeship — the prop firm Prop Mastery via the Co-Pilot</div>
+          <div class="block-title">90-Day Apprenticeship — Lucid Prop Mastery via the Co-Pilot</div>
           <div class="plan-lede">2026-07-17. One framework. No new ones for 90 days — consuming another guru mid-plan is a rule break, logged like any other.</div>
           <div class="plan-readnote">Best read pre-session or on your Saturday review — not during the 19:00–20:00 window.</div>
 
@@ -860,7 +937,7 @@
             <li><b>Pre-session (10 min):</b> rules from memory → checklist → GO/NO-GO. NO-GO means no.</li>
             <li><b>Session (19:00–20:00):</b> 2-3 shots, one direction, flat size, loser cut at cap, winner held to level.</li>
             <li><b>Post-session (10 min):</b> CSV upload → read the grade → Feynman sentence per trade → tag playbooks.</li>
-            <li><b>21:30:</b> scheduled reconcile reports the prop firm vs app + streak. Read it, close the screens.</li>
+            <li><b>21:30:</b> scheduled reconcile reports Lucid vs app + streak. Read it, close the screens.</li>
             <li><b>Social:</b> X only, and only after step 5. Instagram/Snapchat/Facebook deleted from the phone, not "avoided" — friction beats willpower.</li>
             <li><b>App development:</b> before 16:00 IST only, and from Stage 1 onward the app is FROZEN except bug fixes — building features is your dopamine leak, and the loop only works on a stable instrument.</li>
           </ol>
@@ -893,8 +970,8 @@
         <!-- Account breach/clear actions — added 2026-07-22. Static (outside
              #ins-body) so they survive every renderInsights() re-render. -->
         <div style="display:flex;gap:8px;margin-bottom:10px;">
-          <button class="engulf-check-btn" style="flex:1;color:var(--red);" onclick="accountBreached()" title="Archives all current trade/insight data to a file, then wipes this account/stage clean for your next attempt">⚠ Account Breached</button>
-          <!-- "Cleared → Funded" removed 2026-07-25 (the trader: "Do not have the
+          <button class="engulf-check-btn" style="flex:1;color:var(--red);" onclick="accountBreached(event)" title="Archives all current trade/insight data to a file, then wipes this account/stage clean for your next attempt">⚠ Account Breached</button>
+          <!-- "Cleared → Funded" removed 2026-07-25 (Anoop: "Do not have the
                account reach the account cleared to funded option in this
                insight"). Promotion is an account-level event — do it from the
                ⇄ Account picker by setting that slot's stage to FUNDED, so the
@@ -912,6 +989,18 @@
       <!-- Cost tab: lifetime prop-account spend vs payouts -> breakeven -->
       <div id="tab-cost" style="display:none;padding:12px;">
         <div id="cost-body"><div class="no-trades">Loading cost ledger…</div></div>
+
+        <!-- Unified account database (2026-08-13, Anoop: "gather all the
+             information of all the accounts and make one database to
+             analyse"). Reads every slot folder under DATA/accounts/, combines
+             them read-only, writes DATA/account_database.json. Static so it
+             survives every renderCost() re-render. -->
+        <div class="analysis-block" style="margin-top:14px;">
+          <div class="block-title">All-Accounts Database</div>
+          <div style="font-size:10px;color:var(--text-dim);margin-bottom:8px;">Combines every account slot (s1–s5) into one readable report — opens right in a new tab, no software needed. Also saves a CSV (for Excel) and the raw JSON. Read-only: never changes any account's own data.</div>
+          <button class="engulf-check-btn" id="account-db-rebuild-btn" onclick="accountDbRebuildAndShow()">Open all-accounts report</button>
+          <pre id="account-db-summary" class="ck-weekly-trend" style="display:none;margin-top:9px;"></pre>
+        </div>
       </div>
 
     </div>
@@ -1020,7 +1109,7 @@
 
     <div class="settings-subhead">Tradovate Live Feed (read-only, optional)</div>
     <div class="settings-field">
-      <label><input type="checkbox" id="settings-tv-enabled" style="width:auto;margin-right:6px;vertical-align:middle;">Enable live feed — only if the prop firm permits API access</label>
+      <label><input type="checkbox" id="settings-tv-enabled" style="width:auto;margin-right:6px;vertical-align:middle;">Enable live feed — only if Lucid permits API access</label>
     </div>
     <div class="settings-field">
       <label>Environment</label>
@@ -1047,7 +1136,7 @@
     </div>
     <div class="settings-field">
       <button class="btn-cancel" onclick="testTradovateConn()" style="width:100%">Test Connection</button>
-      <div id="settings-tv-status" style="font-size:11px;margin-top:6px;color:var(--text-dim);line-height:1.5">Not tested. Confirm the prop firm allows API access before enabling.</div>
+      <div id="settings-tv-status" style="font-size:11px;margin-top:6px;color:var(--text-dim);line-height:1.5">Not tested. Confirm Lucid allows API access before enabling.</div>
     </div>
 
     <div class="settings-subhead">Token Optimization (Jessi / Claude path)</div>
@@ -1068,8 +1157,70 @@
      hand-rolled regex alone can cover (e.g. "last five trades" spelled out,
      "trades from two days ago"). Exposes a global `nlp` function. -->
 <script src="compromise.js"></script>
+<!-- loss-ratchet.js must load BEFORE app.js: the guardrail HUD reads
+     window.LossRatchet when it computes today's cap. Same file Node requires
+     for the unit tests, so the rule can't drift between test and runtime. -->
+<script src="loss-ratchet.js"></script>
+<script src="checklist-logic.js"></script>
+<script src="volume-budget.js"></script>
+<!-- size-freeze-guard.js: must load before app.js — grLog() in app.js reads
+     window.SizeFreezeGuard when grading a newly-logged trade. Same file Node
+     requires for the unit tests (test/size-freeze-guard.test.js). -->
+<script src="size-freeze-guard.js"></script>
+<!-- stop-alarm.js: must load before app.js — the guardrail's stop-overlay
+     reads window.StopAlarm for its escalation cadence and mandatory ack
+     delay. Same file Node requires for test/stop-alarm.test.js. -->
+<script src="stop-alarm.js"></script>
+<!-- points-tracker.js: same points/expectancy/sizing math the Node tests
+     replay against real trade history — see app/test/points-tracker.test.js.
+     Journal's points chart and the Scalper's sizing guidance both read
+     window.PointsTracker so neither can quietly disagree with the other. -->
+<script src="points-tracker.js"></script>
 <script src="ws-client.js"></script>
+<!-- ── Day Recap overlay (2026-08-22) ──────────────────────────────────────
+     Shows once per trading day, on first launch, BEFORE the session. The point
+     is not a report — it is putting yesterday's specific mistake in front of
+     Anoop while he can still act on it. Dismissing records the date. -->
+<div id="recap-overlay">
+  <div id="recap-box">
+    <div id="recap-head">
+      <div>
+        <div id="recap-eyebrow">YESTERDAY — <span id="recap-date"></span></div>
+        <h2 id="recap-title">Day Recap</h2>
+      </div>
+      <div id="recap-verdict"></div>
+    </div>
+    <div id="recap-focus"></div>
+    <div id="recap-stats"></div>
+    <div id="recap-size"></div>
+    <div id="recap-last-trades"></div>
+    <div id="recap-jessi">
+      <div id="recap-jessi-label">TODAY’S READ</div>
+      <div id="recap-jessi-text"></div>
+    </div>
+    <div id="recap-mistakes"></div>
+    <div id="recap-good"></div>
+    <div id="recap-quote"></div>
+    <div id="recap-actions">
+      <button class="btn-cancel" onclick="recapDismiss(true)">Skip for today</button>
+      <button class="btn-save" onclick="recapDismiss(false)">Start the day →</button>
+    </div>
+  </div>
+</div>
+
+<!-- 4.2: day-rollup.js (UMD) loads BEFORE app.js — csvParseTrades/csvApply
+     grade and roll up days through these shared pure functions. -->
+<script src="day-rollup.js"></script>
+<!-- 4.5: trade-identity.js — tolerance-based CSV↔live matching (the fp()
+     fingerprint doubles trades across the two timestamp resolutions). -->
+<script src="trade-identity.js"></script>
+<!-- 5.2: scorecard.js — per-playbook + signal-backed-vs-freestyle computation -->
+<script src="scorecard.js"></script>
+<!-- 6.1: payout-pace.js — distance-to-payout pace math for the Day Recap -->
+<script src="payout-pace.js"></script>
 <script src="app.js"></script>
+<!-- Loaded after app.js: reuses insCoachNotes/insMoney/edToday from it. -->
+<script src="day-recap.js"></script>
 <!-- Resilience layer — MUST load after app.js. Error traps, stall watchdog,
      and chat transcript persistence. See renderer/resilience.js. -->
 <script src="resilience.js"></script>
@@ -1103,7 +1254,7 @@
     setTheme(next);
   }
   (function initTheme(){
-    // G5 default = Indigo (2026-08-08, the trader: "indigo is the most used and it
+    // G5 default = Indigo (2026-08-08, Anoop: "indigo is the most used and it
     // should feel premium like G5"). Fresh load with no explicit choice opens
     // in Indigo; Paper/Graphite are still honoured if the user picked one.
     var saved = null;

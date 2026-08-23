@@ -104,6 +104,56 @@ body {
 #tv-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
 #tv-dot.error { background: var(--red); }
 
+/* ── DISCONNECT: LOUD ──────────────────────────────────────────────────────
+   2026-08-12. Anoop, after losing $855.50 on 08-10 to a mid-session drop:
+   "no sound when connected and no intimation". A 7px dot in a 11px strip is
+   not an alert — it is a decoration you scan past while watching price on a
+   different monitor. When the chart feed is dead the app is not merely
+   degraded, it is UNSAFE TO TRADE FROM, and it should be impossible to look
+   at the window and not know that.
+
+   Deliberately obnoxious. The failure mode being designed against is him
+   NOT noticing, so subtlety is the bug. Motion is limited to opacity so it
+   costs nothing during a live session.                                     */
+#tv-status.tv-dead {
+  background: var(--red);
+  color: #fff;
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  padding: 3px 12px;
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.25), 0 0 16px rgba(255,60,60,0.55);
+  animation: tv-dead-pulse 1.1s ease-in-out infinite;
+}
+#tv-status.tv-dead #tv-dot { background: #fff; box-shadow: none; }
+
+/* Second, unmissable layer: a bar across the whole app. The titlebar chip can
+   sit off-screen when the window is partly covered by TradingView. */
+#tv-dead-bar {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 99999;
+  background: var(--red);
+  color: #fff;
+  font-weight: 800;
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  text-align: center;
+  padding: 7px 12px;
+  box-shadow: 0 2px 14px rgba(0,0,0,0.55);
+  animation: tv-dead-pulse 1.1s ease-in-out infinite;
+  pointer-events: none;
+}
+#tv-dead-bar.show { display: block; }
+
+@keyframes tv-dead-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+@media (prefers-reduced-motion: reduce) {
+  #tv-status.tv-dead, #tv-dead-bar { animation: none; }
+}
+
 #titlebar .session-time {
   margin-left: auto;
   font-size: 11px;
@@ -425,6 +475,21 @@ body {
   border-radius: var(--radius-sm);
 }
 
+/* Phase 2b: trade ticket card (2026-08-17) */
+.trade-ticket-bubble {
+  border: 1px solid var(--accent, #3b82f6) !important;
+  background: var(--surface2) !important;
+  color: var(--text-mid) !important;
+  font-size: 12px !important;
+  padding: 10px 12px !important;
+}
+.tt-header { font-weight: 700; color: var(--white); margin-bottom: 6px; }
+.tt-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.tt-row label { flex: 0 0 110px; color: var(--text-dim); font-size: 11px; }
+.tt-row input { flex: 1; max-width: 120px; }
+.tt-actions { display: flex; gap: 8px; margin-top: 8px; }
+.tt-result { margin-top: 6px; font-size: 11px; color: var(--text-mid); min-height: 14px; }
+
 /* Tool use indicator */
 .tool-indicator {
   display: inline-flex;
@@ -629,8 +694,8 @@ body.panel-resizing * { user-select: none !important; }
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  font-weight: 700; /* bold text throughout the right tab panel, per the trader's ask (earlier).
-    SUPERSEDED 2026-08-05: the trader asked to make the right panel match G5 exactly
+  font-weight: 700; /* bold text throughout the right tab panel, per Anoop's ask (earlier).
+    SUPERSEDED 2026-08-05: Anoop asked to make the right panel match G5 exactly
     and explicitly overwrite this — see "G5 FINAL POLISH" near the end of this
     file, which resets this to 400 and re-bolds only what G5 itself keeps
     bold (tab labels, section headers, headline figures, mini-btn). Left here
@@ -1044,7 +1109,7 @@ body.panel-resizing * { user-select: none !important; }
 .gate-confirm-btn:hover { opacity: 0.9; }
 .gate-switch-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); margin-bottom: 8px; }
 .gate-account-rows { display: flex; flex-direction: column; gap: 6px; }
-.gate-row { display: flex; justify-content: space-between; align-items: center; padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface2); cursor: pointer; transition: all 0.15s; }
+.gate-row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface2); cursor: pointer; transition: all 0.15s; }
 .gate-row:hover { border-color: var(--border2); background: var(--surface3); }
 .gate-row.current { border-color: var(--green); background: var(--green-dim); cursor: default; }
 .gate-row.not-opened { opacity: 0.55; }
@@ -1466,17 +1531,28 @@ input.ladder-in{width:62px;background:var(--surface);border:1px solid var(--bord
 #gr-hud.gr-stop{background:var(--red-dim);}
 #gr-hud .gr-state{font-weight:700;color:var(--text);}
 #gr-hud .gr-meta{color:var(--text-mid);}
+/* Phase 2b: persistent pending-trade-ticket pill (2026-08-17) */
+#gr-hud .gr-ticket-pill{font-weight:700;color:#fff;background:var(--accent,#3b82f6);padding:2px 10px;border-radius:999px;cursor:pointer;animation:gr-ticket-pulse 1.6s ease-in-out infinite;}
+@keyframes gr-ticket-pulse{0%,100%{opacity:1;}50%{opacity:.55;}}
 #gr-hud .gr-log{margin-left:auto;display:flex;align-items:center;gap:5px;}
 #gr-hud .gr-in{width:66px;height:22px;padding:0 6px;font-size:11px;border:1px solid var(--border2);border-radius:var(--radius-xs);background:var(--surface);color:var(--text);}
 #gr-hud .gr-btn{height:22px;padding:0 10px;font-size:11px;border:1px solid var(--border2);border-radius:var(--radius-xs);background:var(--surface2);color:var(--text);cursor:pointer;}
 #gr-hud .gr-btn:hover{background:var(--surface3);}
 #gr-hud .gr-reset{padding:0 7px;}
 #gr-stop-overlay{display:none;position:fixed;inset:0;z-index:10000;background:rgba(120,0,0,.55);align-items:center;justify-content:center;}
-#gr-stop-overlay .gr-stop-box{background:var(--surface);border:2px solid var(--red);border-radius:var(--radius-md);padding:26px 30px;max-width:440px;text-align:center;box-shadow:var(--shadow-3);}
+#gr-stop-overlay .gr-stop-box{background:var(--surface);border:2px solid var(--red);border-radius:var(--radius-md);padding:26px 30px;max-width:440px;text-align:center;box-shadow:var(--shadow-3);animation:gr-stop-pulse 1.6s ease-in-out infinite;}
+@media (prefers-reduced-motion: reduce){#gr-stop-overlay .gr-stop-box{animation:none;}}
+@keyframes gr-stop-pulse{0%,100%{box-shadow:var(--shadow-3),0 0 0 0 rgba(220,38,38,.45);}50%{box-shadow:var(--shadow-3),0 0 0 14px rgba(220,38,38,0);}}
 #gr-stop-overlay .gr-stop-title{font-size:22px;font-weight:800;color:var(--red);margin-bottom:10px;}
 #gr-stop-overlay .gr-stop-sub{font-size:13px;color:var(--text-mid);line-height:1.6;margin-bottom:16px;}
+/* 2026-08-16: mandatory-pause message — visible only while the ack control
+   below is disabled (grShowStop() sets its text; empty when unlocked, so an
+   empty div takes no visual space). */
+#gr-stop-overlay .gr-stop-countdown{font-size:12px;font-weight:700;color:var(--red);margin-bottom:10px;min-height:16px;}
 #gr-stop-overlay .gr-stop-inp{width:100%;height:34px;padding:0 10px;font-size:13px;border:1px solid var(--border2);border-radius:var(--radius-sm);background:var(--surface2);color:var(--text);margin-bottom:10px;text-align:center;}
+#gr-stop-overlay .gr-stop-inp:disabled{opacity:.5;cursor:not-allowed;}
 #gr-stop-overlay .gr-stop-btn{width:100%;background:var(--red);color:#fff;border-color:var(--red);height:34px;}
+#gr-stop-overlay .gr-stop-btn:disabled{opacity:.5;cursor:not-allowed;}
 
 /* ── Tier-3 Insights ─────────────────────────────────────────────────────── */
 #tab-insights .ins-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
@@ -1565,7 +1641,7 @@ html.theme-dark ::-webkit-scrollbar-thumb:hover{background:#4a4f5c;}
 #scalper-agent-btn{margin-left:6px;}
 #scalper-agent-btn.active{background:#22d3ee;color:#000;border-color:#22d3ee;}
 .debate-arguments{display:flex;gap:8px;margin:6px 0;}
-/* 2026-08-06 (the trader: "i do not want to scroll to read text for each agent,
+/* 2026-08-06 (Anoop: "i do not want to scroll to read text for each agent,
    it should visible in one go"): was max-height:180px + overflow-y:auto,
    truncating every argument into its own tiny scrollbox. Panel now grows to
    fit its full argument — the page scrolls if needed, not each individual box. */
@@ -1707,7 +1783,7 @@ input:focus, textarea:focus, select:focus {
 
 /* ═══════════════════════════════════════════════════════════════════════════
    DESIGN PASS 3 — 2026-07-25, skill-driven
-   Applied from the three installed skills (per the trader's Instagram find):
+   Applied from the three installed skills (per Anoop's Instagram find):
    • animate-emil-motion (Emil Kowalski / animations.dev rules)
    • design-redesign-taste (Leonxlnx taste-skill, redesign variant)
    • impeccable-polish (distilled from Paul Bakaus's Impeccable)
@@ -2402,7 +2478,7 @@ html.theme-dark .analysis-block {
    G5 FINAL POLISH (2026-08-05)
    The pass above (2026-08-02) already fixed colors and killed the glass/blur
    treatment on Indigo — that part was correct. What was still visibly off,
-   per the trader comparing live screenshots against variant-G5-themes.html side by
+   per Anoop comparing live screenshots against variant-G5-themes.html side by
    side: the right-panel tabs were still full-width uppercase underline tabs
    (G5 uses small rounded pills), and body/label text throughout was bold
    everywhere (G5 is normal-weight except headers and headline figures).
@@ -2412,7 +2488,7 @@ html.theme-dark .analysis-block {
    G5 itself is theme-independent on shape/weight — only color changes
    between its three variants. Wins by source order (same or higher
    specificity, later in file).
-   the trader, 2026-08-05: "make the right panel exactly like G5, overwrite my
+   Anoop, 2026-08-05: "make the right panel exactly like G5, overwrite my
    request [the bold-everywhere ask below at #right-panel] ... there should
    not be any difference." That line is left in place (history), overridden
    here — G5 itself only bolds headers/headline figures, not everything.
@@ -2493,3 +2569,232 @@ html.theme-dark .analysis-block { padding: 14px; margin-bottom: 14px; }
 .toggle-switch { width: 34px; height: 18px; }
 .toggle-slider::before { width: 12px; height: 12px; left: 2px; top: 2px; }
 .toggle-switch input:checked + .toggle-slider::before { transform: translateX(16px); }
+
+/* ── Checklist: gate, sticky decision bar, completion feel (2026-08-13) ───────
+   Appended at the END of the file on purpose. `.analysis-block` and the ck-*
+   classes are re-skinned by later override blocks (~1703, ~2448, ~2508); a new
+   rule placed earlier gets silently overridden — the same specificity trap the
+   "G5 premium pass v2" commit already had to fix once. */
+
+/* Sticky decision bar — the verdict used to sit ~2500px down the scroll. */
+.ck-sticky {
+  position: sticky; top: 0; z-index: 20;
+  margin: -12px -12px 10px; padding: 9px 12px;
+  background: var(--surface2, #161b22);
+  border-bottom: 1px solid var(--border, #30363d);
+  backdrop-filter: blur(6px);
+}
+.ck-sticky-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ck-sticky-count { font-size: 11px; color: var(--text-mid, #8b949e); }
+.ck-sticky-count #ck-sticky-progress { font-weight: 700; color: var(--text, #e6edf3); }
+.ck-sticky-tier {
+  font-size: 10px; font-weight: 700; letter-spacing: .06em;
+  padding: 2px 7px; border-radius: 999px; border: 1px solid currentColor;
+}
+.ck-sticky-tier.is-go      { color: var(--green, #3fb950); }
+.ck-sticky-tier.is-caution { color: var(--amber, #d29922); }
+.ck-sticky-tier.is-nogo    { color: var(--red, #f85149); }
+.ck-sticky-done { padding: 5px 12px !important; font-size: 11px !important; }
+.ck-skip-btn {
+  font-size: 10px; padding: 5px 9px; border-radius: var(--radius-sm, 6px);
+  background: transparent; color: var(--text-dim, #6e7681);
+  border: 1px solid var(--border, #30363d); cursor: pointer;
+}
+.ck-skip-btn:hover { color: var(--amber, #d29922); border-color: var(--amber, #d29922); }
+
+/* Streak. He has zero completions; a counter that starts at 1 and grows is the
+   cheapest psychological payoff available on top of a record we already keep. */
+.ck-streak {
+  font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 999px;
+  color: var(--amber, #d29922); background: var(--amber-dim, rgba(210,153,34,.15));
+}
+
+/* Write failures must be LOUD. The original checklist bug was invisible for 19
+   days precisely because every failure was swallowed. */
+.ck-save-error {
+  margin-top: 7px; padding: 6px 9px; border-radius: var(--radius-sm, 6px);
+  font-size: 11px; font-weight: 600;
+  color: var(--red, #f85149);
+  background: var(--red-dim, rgba(248,81,73,.15));
+  border: 1px solid var(--red, #f85149);
+}
+.ck-gate-hint {
+  margin-top: 7px; padding: 6px 9px; border-radius: var(--radius-sm, 6px);
+  font-size: 11px; color: var(--text-mid, #8b949e);
+  background: var(--surface, #0d1117); border-left: 3px solid var(--amber, #d29922);
+}
+
+/* Global banner — outside #right-content so switching tabs cannot escape it. */
+.ck-banner {
+  padding: 7px 12px; font-size: 11px; font-weight: 600;
+  border-bottom: 1px solid var(--border, #30363d);
+}
+.ck-banner-todo { color: var(--amber, #d29922); background: var(--amber-dim, rgba(210,153,34,.12)); }
+.ck-banner-skip { color: var(--red, #f85149);   background: var(--red-dim, rgba(248,81,73,.12)); }
+/* 2026-08-13 (autoplan Design review, most severe finding): a fail-open must
+   never look like a real pass. Dashed border deliberately distinguishes this
+   from every other banner state at a glance, not just by color. */
+.ck-banner-degraded { color: var(--amber, #d29922); background: var(--amber-dim, rgba(210,153,34,.12)); border-bottom-style: dashed; }
+
+/* A locked tab must read as "not yet", not as "the app is refusing me". */
+.rtab.rtab-locked { opacity: .38; cursor: not-allowed; }
+.rtab.rtab-locked::after { content: ' 🔒'; font-size: 9px; }
+
+/* Progress should FEEL like progress. Ticks were white-on-grey, so the screen
+   read monochrome while completion read as a footnote — the texture of
+   paperwork. Green accumulates visibly as he works. */
+#tab-checklist .ck-chk-item.on {
+  border-left: 2px solid var(--green, #3fb950) !important;
+  background: var(--green-dim, rgba(63,185,80,.12)) !important;
+}
+#tab-checklist .ck-chk-item.on .ck-cbox {
+  background: var(--green, #3fb950) !important;
+  border-color: var(--green, #3fb950) !important;
+}
+
+.ck-weekly-trend {
+  margin: 8px 0 0; padding: 7px 9px; white-space: pre;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 10px; line-height: 1.5; color: var(--text-mid, #8b949e);
+  background: var(--surface, #0d1117); border-radius: var(--radius-sm, 6px);
+  overflow-x: auto;
+}
+
+/* ── Per-account breach/clear status buttons (2026-08-13) ─────────────────────
+   Anoop: "a button... beside the account in a minimalist style" that marks an
+   account breached, or an eval cleared to funded. Sits inside each ⇄ Account
+   picker row. .gate-row got flex-wrap:wrap above so this strip drops to its
+   own line under the name/size/stage controls at the picker's 420px width
+   instead of overflowing — still visually part of that one account's row. */
+.gate-status-actions {
+  width: 100%; display: flex; gap: 6px; justify-content: flex-end;
+  margin-top: 2px;
+}
+.gate-status-btn {
+  font-size: 9px; font-weight: 700; letter-spacing: .02em;
+  padding: 3px 7px; border-radius: 999px;
+  background: transparent; cursor: pointer;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  transition: all 0.12s;
+}
+.gate-status-btn:hover { filter: none; }
+.gate-status-btn.gate-status-breach:hover {
+  color: var(--red); border-color: var(--red); background: var(--red-dim);
+}
+.gate-status-btn.gate-status-clear:hover {
+  color: var(--green); border-color: var(--green); background: var(--green-dim);
+}
+
+/* Account-card breach/clear row (2026-08-13) — same buttons, moved onto the
+   always-visible left panel per Anoop's feedback that the ⇄ Account picker
+   was "creating confusion" (buttons hidden behind an extra click). Reuses
+   .gate-status-btn styling; this just gives it room in a wider panel context
+   and separates it visually from the buffer bar above. */
+.acct-action-row {
+  display: flex; gap: 6px; margin-top: 9px; padding-top: 9px;
+  border-top: 1px solid var(--border);
+}
+.acct-action-row .gate-status-btn { flex: 1; padding: 5px 6px; }
+
+/* ── Day Recap overlay (2026-08-22) ─────────────────────────────────────────
+   Interrupts once before the session, delivers ONE focus item, gets out of the
+   way. Heavier than a toast, lighter than a tab. */
+#recap-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:1200; align-items:center; justify-content:center; }
+#recap-overlay.visible { display:flex; }
+#recap-box { background:var(--surface); border:1px solid var(--border2); border-radius:var(--radius-lg); padding:24px 26px; width:560px; max-width:92vw; max-height:88vh; overflow-y:auto; box-shadow:var(--shadow-3); }
+#recap-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; }
+#recap-eyebrow { font-size:10px; letter-spacing:.12em; color:var(--text-dim); }
+#recap-box h2 { font-size:17px; margin:4px 0 0; }
+#recap-verdict { font-size:11px; font-weight:700; padding:5px 10px; border-radius:var(--radius-sm); white-space:nowrap; }
+#recap-focus { margin:16px 0 4px; padding:13px 15px; border-radius:var(--radius-sm); background:var(--amber-dim); border-left:3px solid var(--amber); }
+#recap-focus .rf-label { font-size:10px; letter-spacing:.1em; color:var(--amber); font-weight:700; }
+#recap-focus .rf-text { font-size:13px; margin-top:5px; line-height:1.5; }
+#recap-stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(96px,1fr)); gap:8px; margin:14px 0; }
+#recap-stats .rs { background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:var(--radius-sm); padding:8px 10px; }
+#recap-stats .rs-l { font-size:9px; letter-spacing:.08em; color:var(--text-dim); }
+#recap-stats .rs-v { font-size:15px; font-weight:700; margin-top:2px; font-variant-numeric:tabular-nums; }
+#recap-size { margin:12px 0 0; padding:11px 14px; border-radius:var(--radius-sm); background:rgba(255,255,255,0.03); border:1px solid var(--border); }
+.recap-size-row { display:flex; align-items:center; gap:14px; margin-top:6px; }
+.recap-size-num { font-size:30px; font-weight:800; line-height:1; font-variant-numeric:tabular-nums; min-width:46px; text-align:center; }
+.recap-size-why { font-size:12px; line-height:1.45; color:var(--text-dim); }
+#recap-last-trades { margin-top:14px; }
+.recap-trade { display:grid; grid-template-columns:62px 1fr auto; grid-template-areas:"dir px pnl" "dir meta pnl"; gap:1px 10px; align-items:center; padding:8px 11px; margin-bottom:5px; border-radius:var(--radius-sm); background:rgba(255,255,255,0.03); border:1px solid var(--border); }
+.rt-dir { grid-area:dir; font-size:10px; font-weight:800; letter-spacing:.06em; text-align:center; padding:3px 0; border-radius:3px; }
+.rt-dir.long { background:var(--green-dim); color:var(--green); }
+.rt-dir.short { background:var(--red-dim); color:var(--red); }
+.rt-px { grid-area:px; font-size:13px; font-variant-numeric:tabular-nums; }
+.rt-pts { font-size:11px; color:var(--text-dim); }
+.rt-meta { grid-area:meta; font-size:10px; color:var(--text-dim); }
+.rt-pnl { grid-area:pnl; font-size:14px; font-weight:700; font-variant-numeric:tabular-nums; }
+#recap-jessi { margin-top:14px; padding:11px 14px; border-radius:var(--radius-sm); background:rgba(99,102,241,0.10); border-left:3px solid #6366f1; }
+#recap-jessi-label { font-size:9px; letter-spacing:.11em; font-weight:700; color:#8b8ef5; }
+#recap-jessi-text { font-size:12.5px; line-height:1.55; margin-top:5px; }
+#recap-mistakes, #recap-good { margin-top:12px; }
+.recap-sec-title { font-size:10px; letter-spacing:.1em; color:var(--text-dim); margin-bottom:6px; }
+.recap-note { font-size:12px; line-height:1.5; padding:7px 11px; border-radius:var(--radius-sm); margin-bottom:5px; border-left:2px solid transparent; }
+.recap-note.bad { background:var(--red-dim); border-left-color:var(--red); }
+.recap-note.warn { background:var(--amber-dim); border-left-color:var(--amber); }
+.recap-note.good { background:var(--green-dim); border-left-color:var(--green); }
+#recap-quote { margin-top:16px; padding-top:13px; border-top:1px solid var(--border); }
+.recap-quote-text { font-size:13px; font-style:italic; line-height:1.55; }
+.recap-quote-src { font-size:10.5px; color:var(--text-dim); margin-top:5px; }
+#recap-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:20px; }
+
+/* ── Live-feed 3-step health check (2026-08-23) ─────────────────────────────
+   The live feed going dark takes every guardrail down with it, and the old
+   thin status line was missable for an entire session. This is the loud
+   version: shown ONLY while something is failing, so it can never become
+   wallpaper the eye learns to skip. */
+#live-feed-health {
+  position: fixed;
+  top: 46px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9997;
+  min-width: 420px;
+  max-width: 720px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  background: var(--panel, #171b21);
+  border: 1px solid var(--red, #ff5c5c);
+  box-shadow: 0 10px 34px -12px rgba(0, 0, 0, .75);
+  font-size: 12px;
+  line-height: 1.5;
+}
+#live-feed-health .lfh-title {
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--red, #ff5c5c);
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: space-between;
+}
+#live-feed-health .lfh-row {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  padding: 3px 0;
+}
+#live-feed-health .lfh-mark { flex: none; width: 14px; font-weight: 700; }
+#live-feed-health .lfh-ok   { color: var(--green, #3ecf8e); }
+#live-feed-health .lfh-bad  { color: var(--red, #ff5c5c); }
+#live-feed-health .lfh-label { flex: none; min-width: 168px; color: var(--text, #e3e8ed); font-weight: 600; }
+#live-feed-health .lfh-detail { color: var(--text-dim, #97a1ad); }
+#live-feed-health .lfh-actions { margin-top: 10px; display: flex; gap: 8px; }
+#live-feed-health button {
+  font: inherit;
+  font-size: 11px;
+  padding: 5px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+  border: 1px solid var(--border, #2a2f37);
+  background: var(--panel-2, #1e242b);
+  color: var(--text, #e3e8ed);
+}
+#live-feed-health button:hover { border-color: var(--red, #ff5c5c); }
+#live-feed-selftest { cursor: pointer; }

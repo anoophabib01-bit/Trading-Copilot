@@ -1,4 +1,4 @@
-# 90-Day Apprenticeship — the prop firm Prop Mastery via the Co-Pilot
+# 90-Day Apprenticeship — Lucid Prop Mastery via the Co-Pilot
 *(2026-07-17. One framework. No new ones for 90 days — consuming another guru mid-plan is a rule break, logged like any other.)*
 
 ## The learning-science engine (mapped to app features you already have)
@@ -36,7 +36,7 @@
 2. Pre-session (10 min): rules from memory → checklist → GO/NO-GO. NO-GO means no.
 3. Session (19:00–20:00): 2-3 shots, one direction, flat size, loser cut at cap, winner held to level.
 4. Post-session (10 min): CSV upload → read the grade → Feynman sentence per trade → tag playbooks.
-5. 21:30: scheduled reconcile reports the prop firm vs app + streak. Read it, close the screens.
+5. 21:30: scheduled reconcile reports Lucid vs app + streak. Read it, close the screens.
 6. Social: X only, and only after step 5. Instagram/Snapchat/Facebook deleted from the phone, not "avoided" — friction beats willpower.
 7. App development: before 16:00 IST only, and from Stage 1 onward the app is FROZEN except bug fixes — building features is your dopamine leak, and the loop only works on a stable instrument.
 

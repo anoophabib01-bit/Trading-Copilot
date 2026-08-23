@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// BOOKS INDEX (2026-07-27) — the trader's trading book library, searchable by both
+// BOOKS INDEX (2026-07-27) — Anoop's trading book library, searchable by both
 // agents (Jessi/groq-agent.js and the Claude analysis agent/claude-agent.js).
 // Books live as plain .txt in data/books/ (extracted once from PDFs the user
 // uploaded — Stock Market Wizards, Trading in the Zone, Intraday Trading

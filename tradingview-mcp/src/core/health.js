@@ -3,7 +3,7 @@
  */
 import { getClient, getTargetInfo, evaluate } from '../connection.js';
 import { existsSync, readdirSync } from 'fs';
-import { execSync, spawn } from 'child_process';
+import { execSync, execFileSync, spawn } from 'child_process';
 
 export async function healthCheck() {
   await getClient();
@@ -173,7 +173,32 @@ export async function launch({ port, kill_existing } = {}) {
       `${process.env.LOCALAPPDATA}\\TradingView\\TradingView.exe`,
       `${process.env.PROGRAMFILES}\\TradingView\\TradingView.exe`,
       `${process.env['PROGRAMFILES(X86)']}\\TradingView\\TradingView.exe`,
-      // Windows Store (MSIX) install — enumerate versioned WindowsApps subdirectory
+      // 2026-08-19 BUG FIX (found live, mid-outage): C:\Program Files\WindowsApps
+      // is ACL-restricted by Windows — a normal (non-elevated) process gets
+      // EPERM on readdirSync against it, full stop, regardless of whether the
+      // app is actually installed and runnable. The old code below caught that
+      // EPERM and silently returned [], so the WindowsApps candidate was ALWAYS
+      // empty on this exact setup — tv_launch could never find TradingView via
+      // this branch, ever. It went unnoticed because TradingView was always
+      // already running; the day it actually crashed and auto-recovery needed
+      // to relaunch it, recovery failed with no visible TradingView window and
+      // no useful error ("relaunch attempted but still not connected").
+      // FIX: resolve the MSIX install path via the AppX package registry
+      // instead (`Get-AppxPackage`), which is a per-user Windows API that does
+      // NOT require directory-listing permission on WindowsApps — confirmed
+      // live on this exact machine. Falls back to the old enumeration attempt
+      // (harmless no-op here, but keeps behavior for setups where it isn't
+      // ACL-restricted) if the AppX lookup itself fails for any reason.
+      ...(() => {
+        try {
+          const out = execFileSync('powershell', [
+            '-NoProfile', '-NonInteractive', '-Command',
+            '(Get-AppxPackage -Name *TradingViewInc.TradingView*).InstallLocation'
+          ], { timeout: 5000 }).toString().trim();
+          if (out) return [`${out}\\TradingView.exe`];
+        } catch { /* fall through to directory enumeration below */ }
+        return [];
+      })(),
       ...(() => { try { const base = 'C:\\Program Files\\WindowsApps'; return readdirSync(base).filter(d => d.startsWith('31178TradingViewInc.TradingView')).map(d => `${base}\\${d}\\TradingView.exe`); } catch { return []; } })(),
     ],
     linux: [

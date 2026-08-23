@@ -9,14 +9,14 @@
    on top: sheen gradients, drop shadows, radial ambient glows, glassy
    translucent panels. G5 has NONE of those. It is deliberately FLAT — solid
    card fills, one hairline border, no shadow anywhere. So every pass made the
-   app look "premium-ish" but never actually look like G5, which is what the trader
+   app look "premium-ish" but never actually look like G5, which is what Anoop
    kept reporting. This version stops interpreting and instead ports G5's
    stylesheet rule-for-rule onto the app's own class names.
 
    THREE ROOT CAUSES this file fixes (all confirmed in styles.css):
      1. styles.css:1811 sets body font to 'Outfit'. G5 is 'Inter'. Inter is
         already @font-face-loaded at styles.css:13-17 but was going unused —
-        that is the "wrong font style" in the trader's screenshot.
+        that is the "wrong font style" in Anoop's screenshot.
      2. styles.css:1819+ ("floating panel" pass) adds two radial ambient glows,
         translucent rgba surfaces, and a 12px gap/padding that detaches the
         columns. G5 columns are solid and flush, separated only by a 6px
@@ -105,7 +105,7 @@ body{
 #titlebar .logo{ font-weight:800 !important; letter-spacing:.5px !important; font-size:14px !important; }
 
 /* G5 .seg — the segmented pill groups (EVAL/FUNDED, 50K/100K/150K,
-   STANDARD/SCALPER). the trader called out STANDARD/SCALPER by name. */
+   STANDARD/SCALPER). Anoop called out STANDARD/SCALPER by name. */
 .mode-toggle, .acct-size-toggle, .trading-mode-toggle{
   display:flex !important;
   background:var(--surface2) !important;
@@ -290,7 +290,7 @@ body{
 }
 
 /* G5 .cbtn — Refresh / Debate / Scalper / Voice.
-   the trader called this row out explicitly: "the scalping refreshment, voice,
+   Anoop called this row out explicitly: "the scalping refreshment, voice,
    debate, written style ... I want the same exact thing."
    G5 assigns FIXED colours by role, not by active-state:
      .cbtn         → card2 fill, dim text   (Refresh, Debate)

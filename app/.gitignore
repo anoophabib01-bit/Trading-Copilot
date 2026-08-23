@@ -10,6 +10,6 @@ Thumbs.db
 *.bak
 *.synccheck
 
-# Real trade/account history — the trader asked this not be uploaded at all.
+# Real trade/account history — Anoop asked this not be uploaded at all.
 data/
 

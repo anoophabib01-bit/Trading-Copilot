@@ -4,7 +4,7 @@
 // OpenAI-compatible chat-completions endpoint instead of Anthropic's API.
 //
 // 2026-07-22: upgraded from plain streaming text to real tool-calling so
-// Jessi can read AND mark/draw on the TradingView chart (the trader explicitly
+// Jessi can read AND mark/draw on the TradingView chart (Anoop explicitly
 // asked for write access after being warned this was untested). The tool
 // loop mirrors claude-agent.js's runLoop but parses OpenAI-style streamed
 // tool_call deltas (indexed, accumulated by index) instead of Anthropic's
@@ -17,12 +17,14 @@
 // unsupervised model gets to do from a chat reply — full stop.
 const BLOCKED_TOOLS = new Set([
   'trade_submit', 'trade_open_limit', 'trade_dismiss',
-  'chart_set_symbol', 'chart_set_timeframe' // also excluded: don't let casual chat disrupt the trader's live chart setup
+  'chart_set_symbol', 'chart_set_timeframe' // also excluded: don't let casual chat disrupt Anoop's live chart setup
 ]);
 
 const https = require('https');
 const http = require('http');
 const mcpBridge = require('./mcp-bridge');
+const callLogger = require('./call-logger');
+const anthropicNative = require('./anthropic-native');
 
 // 2026-07-25: was 'llama-3.3-70b-versatile', which Groq DEPRECATED on
 // 2026-06-17 (alongside llama-3.1-8b-instant, retiring 08/16/26). Groq's own
@@ -68,27 +70,53 @@ const GEMINI_HOST = 'generativelanguage.googleapis.com';
 const GEMINI_PATH = '/v1beta/openai/chat/completions';
 
 // OmniRoute — self-hosted, locally-run LLM routing proxy (OpenAI-compatible),
-// added 2026-08-07 per the approved office-hours design doc. the trader runs it
+// added 2026-08-07 per the approved office-hours design doc. Anoop runs it
 // himself at localhost:20128 with his own API key/account pool behind it, so
 // this is plain http to a local port, same shape as the Ollama branch below.
 // DELIBERATE SCOPE NOTE: some models OmniRoute exposes ride pooled/shared
 // "free" CLI-subscription accounts (its Tier-1 stealth layer) rather than
 // real paid API keys — a real account-ban risk, acknowledged and accepted by
-// the trader for the reasoning/large-context capability it unlocks. This is why
+// Anoop for the reasoning/large-context capability it unlocks. This is why
 // OmniRoute is wired as the PRIMARY provider with the existing Gemini/Groq
 // chain kept as an unmodified fail-open fallback (see server.js
 // primaryProviderModel()/fallbackChainFor()) — a ban or outage here falls
 // through to the same chain that worked before OmniRoute existed, not a dead
 // end. Host/port are read from config at call time (initOmniRoute), not
-// hardcoded, since this runs on the trader's machine only.
+// hardcoded, since this runs on Anoop's machine only.
 const OMNIROUTE_PATH = '/v1/chat/completions';
-// 2026-08-07 (revised, same day): the trader's explicit pick — oc/deepseek-v4-flash-free
+// 2026-08-07 (revised, same day): Anoop's explicit pick — oc/deepseek-v4-flash-free
 // as the starting model, verified working via a direct curl before wiring in.
 // Was 'auto/best-reasoning'. The shift-down-on-failure "plan" this starts is
 // unchanged: server.js's fallbackChainFor() still degrades OmniRoute -> Gemini
 // (x3 candidates) -> Groq exactly as before — only the OmniRoute starting
 // model changed, not the fail-open chain around it.
 const OMNIROUTE_MODEL = 'oc/deepseek-v4-flash-free';
+
+// Normalize message content for the target provider.
+// The renderer constructs Anthropic-style image blocks. Those are valid for
+// Anthropic's native /v1/messages, but OpenAI-compatible providers (Groq,
+// Gemini, OmniRoute) expect image_url blocks instead. Convert here so the
+// same client code works across the whole fallback chain.
+function normalizeMessages(messages, provider) {
+  if (!Array.isArray(messages)) return messages;
+  if (provider === 'anthropic') return messages;
+  return messages.map(m => {
+    if (!m || typeof m !== 'object') return m;
+    if (Array.isArray(m.content)) {
+      const normalized = m.content.map(block => {
+        if (!block || typeof block !== 'object') return block;
+        if (block.type === 'image' && block.source && block.source.type === 'base64') {
+          const mediaType = block.source.media_type || 'image/png';
+          const data = block.source.data || '';
+          return { type: 'image_url', image_url: { url: `data:${mediaType};base64,${data}` } };
+        }
+        return block;
+      });
+      return { ...m, content: normalized };
+    }
+    return m;
+  });
+}
 
 // Build the HTTP(S) request for whichever provider. Returns the transport
 // module too so the caller uses http for Ollama/OmniRoute (both local), https
@@ -115,7 +143,7 @@ function buildRequest(provider, apiKey, payload, omniRouteBase) {
           'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Content-Length': Buffer.byteLength(body),
           // 2026-08-07: forces OmniRoute's "stacked" compression pipeline
           // (RTK -> Caveman, ~78-95% token savings per OmniRoute's own docs)
-          // on every request — the trader asked to use compression "in a token
+          // on every request — Anoop asked to use compression "in a token
           // optimal way (less)". Per-request header is the HIGHEST-precedence
           // control OmniRoute exposes (beats dashboard panel defaults and
           // named profiles), so this guarantees it applies regardless of what
@@ -126,6 +154,31 @@ function buildRequest(provider, apiKey, payload, omniRouteBase) {
         }
       },
       body
+    };
+  }
+  if (provider === 'anthropic') {
+    // 2026-08-12 (task #31): switched from Anthropic's OpenAI-COMPAT endpoint
+    // to the NATIVE /v1/messages API. The compat route worked but cannot do
+    // prompt caching, so every call re-paid full price on ~19.6K tokens of
+    // byte-identical system prompt + tool schemas. Native + a 1h cache TTL
+    // bills repeat calls inside the hour at 0.1x input — a 3-5x difference on
+    // a small prepaid balance.
+    // The OpenAI-shaped payload is translated here, and the native SSE events
+    // are translated BACK to OpenAI shape in the parser below, so this module's
+    // tool loop stays a single implementation shared by every provider.
+    const nativeBody = JSON.stringify(anthropicNative.toAnthropicRequest(payload, { cacheTtl: '1h' }));
+    return {
+      mod: https,
+      options: {
+        hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,                 // native API uses x-api-key, NOT Bearer
+          'anthropic-version': '2023-06-01',
+          'Content-Length': Buffer.byteLength(nativeBody)
+        }
+      },
+      body: nativeBody
     };
   }
   if (provider === 'gemini') {
@@ -148,7 +201,60 @@ function buildRequest(provider, apiKey, payload, omniRouteBase) {
   };
 }
 
-const PROVIDER_LABEL = { groq: 'Groq', gemini: 'Gemini', ollama: 'Ollama (local)', omniroute: 'OmniRoute' };
+const PROVIDER_LABEL = { anthropic: 'Anthropic', groq: 'Groq', gemini: 'Gemini', ollama: 'Ollama (local)', omniroute: 'OmniRoute' };
+
+// ── Conversation repair (2026-08-18) ────────────────────────────────────────
+// Every provider this file talks to requires user/assistant turns to
+// alternate. Nothing in this app enforced that, and a failed turn leaves its
+// user message in history with no assistant reply — so the NEXT request is
+// malformed, fails, and leaves another orphan. The conversation degrades
+// permanently after one bad turn; the user only sees a generic timeout.
+//
+// Rules, in order:
+//   • drop empty/blank turns (an aborted stream can persist an empty
+//     assistant message, which is itself an alternation break)
+//   • collapse consecutive same-role turns into one, newest content last,
+//     rather than dropping them — a re-sent auto-debrief must not be silently
+//     discarded, and merging preserves what was asked
+//   • never start with an assistant turn (providers reject a leading
+//     assistant message)
+// Exported for unit testing; pure, no I/O.
+function isBlankContent(c) {
+  if (c == null) return true;
+  if (typeof c === 'string') return c.trim() === '';
+  if (Array.isArray(c)) {
+    if (!c.length) return true;
+    // A content-block array is blank only if every block is a blank text
+    // block. Image/tool blocks are never blank.
+    return c.every(b => b && typeof b === 'object' && b.type === 'text'
+      ? String(b.text || '').trim() === ''
+      : false);
+  }
+  return false;
+}
+
+function mergeContent(a, b) {
+  if (typeof a === 'string' && typeof b === 'string') return a + '\n\n' + b;
+  const toArr = (x) => Array.isArray(x) ? x : [{ type: 'text', text: String(x == null ? '' : x) }];
+  return [...toArr(a), ...toArr(b)];
+}
+
+function sanitizeConversation(messages) {
+  if (!Array.isArray(messages)) return [];
+  const out = [];
+  for (const m of messages) {
+    if (!m || typeof m !== 'object' || !m.role) continue;
+    if (isBlankContent(m.content)) continue;
+    const prev = out[out.length - 1];
+    if (prev && prev.role === m.role) {
+      out[out.length - 1] = { ...prev, content: mergeContent(prev.content, m.content) };
+    } else {
+      out.push({ ...m });
+    }
+  }
+  while (out.length && out[0].role === 'assistant') out.shift();
+  return out;
+}
 
 // ── Fallback-loop cap decision (extracted 2026-08-03 for unit testing) ──────
 // Pure function: given the current retry state, should the model chain loop
@@ -175,6 +281,9 @@ class GroqAgent {
     this.geminiApiKey = null;  // Google Gemini — separate vendor, separate quota
     this.omniRouteApiKey = null;
     this.omniRouteBase = { host: '127.0.0.1', port: 20128 }; // local instance, see buildRequest
+    this._omniRouteHealthy = false;   // true only after a successful health probe
+    this._omniRouteLastCheck = 0;     // Date.now() of last probe attempt
+    this._omniRouteCheckInterval = 30000; // re-probe every 30s
   }
 
   init(apiKey) {
@@ -185,8 +294,30 @@ class GroqAgent {
     this.geminiApiKey = (apiKey || '').trim() || null;
   }
 
+  // 2026-08-11: Anthropic as a first-class provider here, so all nine of the
+  // app's AI call sites can run on it via primaryProviderModel() instead of
+  // only handleChat.
+  //
+  // Routed through Anthropic's OpenAI-COMPATIBLE endpoint
+  // (https://api.anthropic.com/v1/chat/completions), which lets it reuse this
+  // module's existing request/SSE/tool-loop pipeline unchanged rather than
+  // needing a hand-written parser for Anthropic's native event stream.
+  //
+  // KNOWN TRADE-OFF, accepted deliberately: the compat layer does NOT support
+  // prompt caching (Anthropic's docs are explicit), and Anthropic labels it
+  // "not a long-term or production-ready solution". So this path pays full
+  // input price on every call, and the 1h cache TTL in claude-agent.js does
+  // NOT apply here. That is affordable at this app's shape — the debate agents
+  // carry no tool schemas, so their context is ~7K tokens, roughly $0.02-0.04
+  // per interaction on Haiku — but it is the reason a NATIVE adapter is still
+  // worth building later (task #31): native gets caching back and is the
+  // supported path.
+  initAnthropic(apiKey) {
+    this.anthropicApiKey = (apiKey || '').trim() || null;
+  }
+
   // baseUrl (optional): e.g. "http://localhost:20128" — parsed for host/port,
-  // falls back to the 127.0.0.1:20128 default (the trader's local instance) if
+  // falls back to the 127.0.0.1:20128 default (Anoop's local instance) if
   // omitted or unparseable.
   initOmniRoute(apiKey, baseUrl) {
     this.omniRouteApiKey = (apiKey || '').trim() || null;
@@ -204,12 +335,37 @@ class GroqAgent {
 
   isGeminiReady() { return !!this.geminiApiKey; }
 
-  isOmniRouteReady() { return !!this.omniRouteApiKey; }
+  isOmniRouteReady() { return !!this.omniRouteApiKey && this._omniRouteHealthy; }
+
+  // Probes OmniRoute's health endpoint; caches result for 30s so we don't
+  // hammer it on every chat turn.  Called by server.js before routing a
+  // request through primaryProviderModel().
+  async probeOmniRouteHealth() {
+    if (!this.omniRouteApiKey) { this._omniRouteHealthy = false; return false; }
+    const now = Date.now();
+    if (now - this._omniRouteLastCheck < this._omniRouteCheckInterval) return this._omniRouteHealthy;
+    this._omniRouteLastCheck = now;
+    const base = this.omniRouteBase || { host: '127.0.0.1', port: 20128 };
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000); // 5s timeout
+      const res = await fetch(`http://${base.host}:${base.port}/api/monitoring/health`, {
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+      this._omniRouteHealthy = res.ok;
+    } catch {
+      this._omniRouteHealthy = false;
+    }
+    if (!this._omniRouteHealthy) console.log('[OmniRoute] health probe failed — will skip to Gemini fallback');
+    return this._omniRouteHealthy;
+  }
 
   // Which providers can actually serve a chat turn right now. Ollama needs no
   // key (local), so it's always considered available at this layer — a
   // connection failure surfaces as a normal request error instead.
   keyFor(provider) {
+    if (provider === 'anthropic') return this.anthropicApiKey;
     if (provider === 'gemini') return this.geminiApiKey;
     if (provider === 'omniroute') return this.omniRouteApiKey;
     if (provider === 'ollama') return null;
@@ -221,7 +377,32 @@ class GroqAgent {
   // tools: OpenAI-style tool defs (optional) — [{type:'function', function:{name, description, parameters}}]
   async stream(messages, systemPrompt, tools, opts = {}) {
     const { onToken, onToolStart, onToolDone, onDone, onError, onFallback, onQuota, onWait, model, fallbackModel, fallbackProvider, fallbackChain, toolExecutor } = opts;
-    const VALID_PROVIDERS = ['groq', 'gemini', 'ollama', 'omniroute'];
+    // ── 2026-08-18: REPAIR THE CONVERSATION BEFORE SENDING ──────────────────
+    // Found live: DATA/chat_transcript.json ended with THREE consecutive
+    // `user` turns and no assistant replies — each a CSV auto-debrief that
+    // got no answer. Once one turn fails and leaves an orphan user message in
+    // history, the conversation no longer alternates, and every provider here
+    // (Gemini and Anthropic both) rejects that outright. So a single transient
+    // failure permanently poisons the chat: every later message fails too, and
+    // it presents to Anoop as "connection may have dropped" over and over,
+    // including right after a fix that had nothing to do with it. Repairing
+    // here — the one chokepoint all nine agent call sites share — means no
+    // caller can send a malformed conversation, and an already-poisoned
+    // history heals itself on the next message instead of needing a wipe.
+    {
+      const before = Array.isArray(messages) ? messages.length : 0;
+      messages = sanitizeConversation(messages);
+      if (before !== messages.length) {
+        console.warn(`[groq-agent] conversation repaired before send: ${before} turns -> ${messages.length} (blank/consecutive same-role turns merged or dropped). A prior turn almost certainly failed and left an orphan message.`);
+      }
+    }
+    // 2026-08-18: the chat path had NO logging whatsoever — when a turn hung
+    // or failed, the server log showed nothing at all, so "connection may have
+    // dropped" could not be diagnosed after the fact. One line per turn.
+    const _turnStart = Date.now();
+    const _turnLabel = `${messages.length} turns, ${(tools || []).length} tools`;
+    console.log(`[groq-agent] turn start — ${_turnLabel}`);
+    const VALID_PROVIDERS = ['anthropic', 'groq', 'gemini', 'ollama', 'omniroute'];
     const startProvider = VALID_PROVIDERS.includes(opts.provider) ? opts.provider : 'groq';
     const DEFAULT_MODEL = { groq: GROQ_MODEL, gemini: GEMINI_MODEL, ollama: 'llama3.1:8b', omniroute: OMNIROUTE_MODEL };
 
@@ -232,7 +413,7 @@ class GroqAgent {
     // fallback step and only advanced on 429/413. A retired model ID returns
     // 404 ("This model models/gemini-2.5-flash-lite is no longer available to
     // new users") and hard-failed the whole turn — exactly what happened on
-    // the trader's first try with a valid key. Google retires model IDs often
+    // Anoop's first try with a valid key. Google retires model IDs often
     // enough that a single hardcoded ID is inherently fragile, so this is now
     // an ordered list of candidates and 404 is treated as retryable alongside
     // the capacity errors. Entries whose provider has no configured key are
@@ -284,7 +465,7 @@ class GroqAgent {
     let lapCount = 1; // 1 = first pass through the chain, not yet a "lap"
 
     let settled = false;
-    const finishError = (msg) => { if (!settled) { settled = true; onError && onError(msg); } };
+    const finishError = (msg) => { if (!settled) { settled = true; console.warn(`[groq-agent] turn FAILED after ${Math.round((Date.now() - _turnStart) / 1000)}s — ${msg}`); onError && onError(msg); } };
     // 2026-08-07: onDone now also reports WHICH provider/model actually
     // produced this reply (activeProvider/activeModel reflect wherever the
     // chain/lap logic above landed by completion time) — added so the UI can
@@ -292,7 +473,7 @@ class GroqAgent {
     // fallback events and server console logs. Kept as a plain object (not
     // threaded through every caller as a new positional arg) so existing
     // onDone(fullText) callers that ignore the 2nd arg keep working untouched.
-    const finishDone = (fullText) => { if (!settled) { settled = true; onDone && onDone(fullText, { provider: activeProvider, model: activeModel, label: `${PROVIDER_LABEL[activeProvider] || activeProvider}/${activeModel}` }); } };
+    const finishDone = (fullText) => { if (!settled) { settled = true; console.log(`[groq-agent] turn done in ${Math.round((Date.now() - _turnStart) / 1000)}s via ${activeProvider}/${activeModel} — ${(fullText || '').length} chars`); onDone && onDone(fullText, { provider: activeProvider, model: activeModel, label: `${PROVIDER_LABEL[activeProvider] || activeProvider}/${activeModel}` }); } };
 
     // 2026-07-25: was a single fixed `const` 90s timer. Now restartable, because
     // a per-minute-429 wait (up to 30s, below) plus a full retried stream can
@@ -332,14 +513,14 @@ class GroqAgent {
         model: activeModel,
         stream: true,
         // 0.85 for chat (passed by server — variety in coaching phrasing was an
-        // explicit the trader complaint), default 0.7 elsewhere.
+        // explicit Anoop complaint), default 0.7 elsewhere.
         temperature: opts.temperature || 0.7,
         // 2026-08-05: was 1536 — too low once the tool-call JSON for all 14
         // tools got large enough, so the model hit finish_reason:'length'
         // before completing a single tool call, returning empty content on
         // an otherwise-200-OK response.
         max_tokens: 4096,
-        messages: [{ role: 'system', content: systemPrompt }, ...msgs]
+        messages: normalizeMessages([{ role: 'system', content: systemPrompt }, ...msgs], activeProvider)
       };
       if (tools && tools.length) { payload.tools = tools; payload.tool_choice = 'auto'; }
 
@@ -442,7 +623,7 @@ class GroqAgent {
               // actually the 10-15 RPM per-MINUTE cap, not the 1,500/day):
               // a per-minute 429 is a "wait a few seconds" problem, and
               // advancing the chain on it needlessly abandons the best model
-              // for the rest of the turn — exactly the inconsistency the trader
+              // for the rest of the turn — exactly the inconsistency Anoop
               // complained about. So: if the 429 body says per-minute (or
               // carries a retryDelay under a minute — Gemini returns
               // RetryInfo like "retryDelay":"22s"), wait that long (capped
@@ -457,7 +638,24 @@ class GroqAgent {
                   minuteWaited = true;
                   const waitSec = Math.min(delaySec || 15, 30);
                   onWait && onWait(activeModel, waitSec, detail);
-                  await new Promise(r => setTimeout(r, waitSec * 1000));
+                  // AUDIT H2 (2026-08-12): this wait used to ignore opts.signal
+                  // entirely, so pressing cancel during a rate-limit wait did
+                  // nothing for up to 30 seconds — the worst possible moment to
+                  // be unresponsive, since a 429 wait is exactly when a trader
+                  // gives up and clicks away. Now the timer races the abort.
+                  await new Promise((r) => {
+                    const t = setTimeout(done, waitSec * 1000);
+                    function done() {
+                      clearTimeout(t);
+                      if (opts.signal) opts.signal.removeEventListener('abort', done);
+                      r();
+                    }
+                    if (opts.signal) {
+                      if (opts.signal.aborted) return done();
+                      opts.signal.addEventListener('abort', done, { once: true });
+                    }
+                  });
+                  if (opts.signal && opts.signal.aborted) { resolveReq(); return; }
                   startGlobalTimer(); // timer measures work, not deliberate waiting
                   next = { msgs, text: accumulatedText };
                   resolveReq();
@@ -546,6 +744,16 @@ class GroqAgent {
           let buffer = '';
           let fullText = accumulatedText || '';
           let finishReason = null;
+          let lastUsage = null;   // token usage from the stream — see logCall below
+          // 2026-08-12 (task #8): wall-clock latency for THIS provider attempt.
+          // Declared per-attempt, not per-request, so a fallback hop is timed
+          // separately from the primary that failed before it — otherwise the
+          // slow provider's cost would be blamed on whoever eventually answered.
+          const callStartedAt = Date.now();
+          // Anthropic addresses content blocks by its own index; OpenAI
+          // addresses tool calls by a separate counter. This carries the
+          // mapping across events for one request. Unused by other providers.
+          const anthropicState = {};
           // Tool calls accumulate by index (Groq/OpenAI stream them incrementally,
           // splitting the JSON arguments string across many delta chunks).
           const toolCallsByIndex = {};
@@ -560,26 +768,82 @@ class GroqAgent {
               if (!t.startsWith('data:')) continue;
               const payloadStr = t.slice(5).trim();
               if (payloadStr === '[DONE]') continue;
-              let json;
-              try { json = JSON.parse(payloadStr); } catch { continue; }
+              let parsed;
+              try { parsed = JSON.parse(payloadStr); } catch { continue; }
+              // Anthropic's native stream emits its own event vocabulary
+              // (message_start / content_block_delta / message_delta / ...).
+              // Translate each event into zero or more OpenAI-shaped chunks so
+              // everything below this line — including the tool loop — is
+              // provider-agnostic and has exactly one implementation.
+              const chunks = activeProvider === 'anthropic'
+                ? anthropicNative.translateEvent(parsed, anthropicState)
+                : [parsed];
+              for (const json of chunks) {
               const choice = json.choices && json.choices[0];
               if (!choice) continue;
               if (choice.finish_reason) finishReason = choice.finish_reason;
+              if (json.usage) lastUsage = json.usage;
               const delta = choice.delta || {};
               if (delta.content) { fullText += delta.content; onToken && onToken(delta.content); }
               if (delta.tool_calls) {
                 for (const tc of delta.tool_calls) {
-                  const idx = tc.index;
-                  if (!toolCallsByIndex[idx]) toolCallsByIndex[idx] = { id: null, name: null, args: '' };
+                  // AUDIT H1 (2026-08-12): tc.index can be undefined and tc.id
+                  // can be null on some providers' streams. Both used to be
+                  // stored as-is, so the follow-up request carried
+                  // tool_call_id: null — which providers reject, killing the
+                  // turn AFTER the tool already ran. Synthesise stable
+                  // substitutes instead: a missing index appends rather than
+                  // colliding on the key `undefined`, and a missing id gets a
+                  // deterministic one so the tool_result can still be matched.
+                  const idx = (typeof tc.index === 'number' && tc.index >= 0)
+                    ? tc.index
+                    : Object.keys(toolCallsByIndex).length;
+                  if (!toolCallsByIndex[idx]) {
+                    toolCallsByIndex[idx] = { id: null, name: null, args: '' };
+                  }
                   if (tc.id) toolCallsByIndex[idx].id = tc.id;
+                  if (!toolCallsByIndex[idx].id) toolCallsByIndex[idx].id = `call_${callStartedAt}_${idx}`;
                   if (tc.function && tc.function.name) toolCallsByIndex[idx].name = tc.function.name;
                   if (tc.function && tc.function.arguments) toolCallsByIndex[idx].args += tc.function.arguments;
                 }
+              }
               }
             }
           });
 
           res.on('end', async () => {
+            // ── 2026-08-11: TOKEN LOGGING FOR EVERY PROVIDER ──────────────
+            // call-logger was only ever wired into claude-agent.js. When all
+            // nine call sites moved here, token/cost tracking silently died —
+            // DATA/token-usage.jsonl stopped being written at all. Logged here
+            // so `node token-usage-report.js` reflects REAL usage again.
+            // Field mapping: the OpenAI-compatible shape (Anthropic compat,
+            // Gemini, Groq, OmniRoute) reports prompt_tokens/completion_tokens;
+            // call-logger and token-audit.js both expect Anthropic's native
+            // input_tokens/output_tokens, so translate here rather than
+            // teaching every consumer two vocabularies.
+            try {
+              if (lastUsage) {
+                callLogger.logCall({
+                  mode: activeProvider + '/' + activeModel,
+                  usage: {
+                    input_tokens: lastUsage.input_tokens != null ? lastUsage.input_tokens : lastUsage.prompt_tokens,
+                    output_tokens: lastUsage.output_tokens != null ? lastUsage.output_tokens : lastUsage.completion_tokens,
+                    // The OpenAI-compat layer does NOT report cache hits (it
+                    // does not support prompt caching at all), so these stay
+                    // null on this path by design, not by omission.
+                    cache_creation_input_tokens: lastUsage.cache_creation_input_tokens || null,
+                    cache_read_input_tokens: lastUsage.cache_read_input_tokens || null
+                  },
+                  stopReason: finishReason,
+                  toolCallCount: Object.keys(toolCallsByIndex).length,
+                  latencyMs: Date.now() - callStartedAt,
+                  provider: activeProvider,
+                  model: activeModel
+                });
+              }
+            } catch (e) {}
+
             const toolCalls = Object.values(toolCallsByIndex).filter(tc => tc.name);
 
             // BUG FIX 2026-07-25 (live: "hello" produced an empty grey bubble,
@@ -691,7 +955,7 @@ class GroqAgent {
   // pairing for this. KNOWN GAP: Orpheus only ships English + Arabic (Saudi)
   // voices as of this writing — no Hindi/Indian-accented voice exists on
   // Groq. Defaulting to "autumn" (closest neutral female English voice).
-  // If the accent gap actually matters once the trader hears it, swapping to a
+  // If the accent gap actually matters once Anoop hears it, swapping to a
   // vendor with en-IN voices (Azure, Google Cloud TTS, ElevenLabs) is a
   // contained change — only synthesizeSpeech() below needs to move, nothing
   // upstream of it.
@@ -835,4 +1099,4 @@ module.exports = new GroqAgent();
 // Internal-only accessor for unit tests (app/test/fallback-loop.test.js) —
 // namespaced under _debug rather than exported directly, same pattern as
 // claude-agent.js's _debug, so nothing else in the app depends on it.
-module.exports._debug = { shouldLoopChain, loopGiveUpReason, RETRYABLE_STATUSES };
+module.exports._debug = { shouldLoopChain, loopGiveUpReason, RETRYABLE_STATUSES, sanitizeConversation, isBlankContent };

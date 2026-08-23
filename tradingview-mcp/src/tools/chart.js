@@ -3,8 +3,10 @@ import { jsonResult } from './_format.js';
 import * as core from '../core/chart.js';
 
 export function registerChartTools(server) {
-  server.tool('chart_get_state', 'Get current chart state (symbol, timeframe, chart type, indicators)', {}, async () => {
-    try { return jsonResult(await core.getState()); }
+  server.tool('chart_get_state', 'Get current chart state (symbol, timeframe, chart type, indicators). By default reads whichever pane TradingView considers "active" (last clicked/focused) — if a multi-pane/split layout is open and that pane is dead (0 bars, e.g. "This symbol doesn\'t exist"), this tool auto-corrects to the first pane in the layout with real data and reports auto_corrected_from_active:true. The response also reports multi_pane_layout + all_panes (symbol/bar_count per pane). Pass pane_index to target a specific pane explicitly instead of relying on "active"/auto-correction.', {
+    pane_index: z.number().int().optional().describe('Read this specific pane by index instead of whichever pane is "active". Get valid indices from a prior call\'s all_panes, or from pane_list.'),
+  }, async ({ pane_index }) => {
+    try { return jsonResult(await core.getState({ pane_index })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 

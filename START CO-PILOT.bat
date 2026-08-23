@@ -52,7 +52,7 @@ if not exist "%TV_EXE%" (
 
 echo.
 echo  [2/3] Waiting for TradingView's debug port to actually respond...
-REM FIX 2026-08-06 (the trader: "the app doesn't get connected to MCP on start
+REM FIX 2026-08-06 (Anoop: "the app doesn't get connected to MCP on start
 REM up"): this used to be a blind 30-second sleep. TradingView cold-start
 REM boot time genuinely varies 20-60s+ depending on the machine/day, so a
 REM fixed 30s wait meant the Co-Pilot server sometimes started probing CDP

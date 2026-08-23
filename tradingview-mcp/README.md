@@ -301,9 +301,10 @@ Read `line.new()`, `label.new()`, `table.new()`, `box.new()` output from any vis
 |------|-------------|
 | `draw_shape` | Draw horizontal_line, trend_line, rectangle, text |
 | `draw_list` / `draw_remove_one` / `draw_clear` | Manage drawings |
-| `alert_create` / `alert_list` / `alert_delete` | Manage price alerts |
-| `capture_screenshot` | Screenshot (regions: full, chart, strategy_tester) |
-| `batch_run` | Run action across multiple symbols/timeframes |
+| `alert_list` / `alert_delete` | Manage price alerts — both work |
+| `alert_create` | Create a price alert — ⚠️ dialog opens reliably, but **price-setting is confirmed broken live** (creates the alert at the current market price, not the requested one). See `CLAUDE.md`'s "Manage alerts" section and `src/core/alerts.js`'s header comment before using this. |
+| `capture_screenshot` | Screenshot (regions: full, chart, strategy_tester) — works |
+| `batch_run` | Run action across multiple symbols/timeframes — ⚠️ **confirmed broken**: never restores the original chart symbol/timeframe after iterating, unlike every other multi-TF tool here. Do not use for automated/unattended checks. See `CLAUDE.md`. |
 | `watchlist_get` / `watchlist_add` | Read/modify watchlist |
 | `layout_list` / `layout_switch` | Manage saved layouts |
 | `ui_open_panel` / `ui_click` / `ui_evaluate` | UI automation |

@@ -31,7 +31,7 @@ const LOG_PATH = path.join(DATA_DIR, 'token-usage.jsonl');
 let sessionCallCount = 0;
 const sessionStartedAt = new Date().toISOString();
 
-function logCall({ mode, usage, stopReason, toolCallCount }) {
+function logCall({ mode, usage, stopReason, toolCallCount, latencyMs, provider, model }) {
   sessionCallCount += 1;
   try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -44,6 +44,14 @@ function logCall({ mode, usage, stopReason, toolCallCount }) {
       cache_read_input_tokens: (usage && usage.cache_read_input_tokens) || null,
       stop_reason: stopReason || null,
       tool_call_count: toolCallCount || 0,
+      // 2026-08-12 (task #8): wall-clock latency per call, plus provider/model
+      // split out of the free-text `mode` field so they can be aggregated.
+      // This is the metric that would have caught the free-model failure on
+      // 08-10 IMMEDIATELY — those models took 14-20s on a one-word prompt and
+      // blew a 90s timeout under real load, and nothing was recording it.
+      latency_ms: (typeof latencyMs === 'number' && latencyMs >= 0) ? Math.round(latencyMs) : null,
+      provider: provider || null,
+      model: model || null,
       session_call_index: sessionCallCount,
     };
     fs.appendFile(LOG_PATH, JSON.stringify(entry) + '\n', () => {});

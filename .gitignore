@@ -5,17 +5,24 @@ Thumbs.db
 *.bak
 *.synccheck
 
-# Runtime state — trade/account history, chat transcripts, session recordings.
+# Real trade/account history and personal chat transcripts — not for the repo.
 DATA/
-data/
 sessions/
+_backup_before_move/
+.gbrain-source
 app/.firecrawl/
 .gstack/
-.gbrain-source
-_backup_before_move/
+.context/
+.firecrawl/
+.kilo/
+_backups/
+hive/
+roster-backups/
 
-# Secrets — never commit real keys. Config lives at ~/.mnq-copilot-config.json.
-.env
-.env.*
-*.key
-*.pem
+# DSH build session working data (scratch — not part of the build itself)
+DSH build/
+
+# Accidentally tracked 2026-08-23 by a bare `git add -A` — another tool's
+# session data (screenshots) and plugin files, not part of this project.
+.dsh-filess/
+.dsh-plugins/

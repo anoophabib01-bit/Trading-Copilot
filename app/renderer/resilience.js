@@ -3,7 +3,7 @@
    RESILIENCE LAYER — added 2026-07-28
    ----------------------------------------------------------------------------
    WHY THIS FILE EXISTS
-   the trader hit a hard chat lock mid-build ("the chat is crashed" — red stop icon,
+   Anoop hit a hard chat lock mid-build ("the chat is crashed" — red stop icon,
    input dead, every message silently swallowed). Root cause that time was a
    wrong element id in the debate UI: getElementById returned null, appendChild
    threw, and because the throw happened AFTER setStreaming(true) but OUTSIDE
