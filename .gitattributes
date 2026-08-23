@@ -1,0 +1,3 @@
+# Markdown is edited by Obsidian (vault root = repo root), which rewrites
+# line endings on files it opens. Normalise so that churn never shows as a diff.
+*.md text eol=lf
