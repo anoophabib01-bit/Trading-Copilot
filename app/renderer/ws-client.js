@@ -258,6 +258,16 @@
         emit('trade:confirmRejected', msg);
         break;
 
+      // 2026-08-23: the server has broadcast this since 2026-08-20 and NOTHING
+      // listened, so a trade row the auto-log refused to write reported into
+      // the void — the exact silent-failure mode that logTrade's own honest
+      // return value was added to prevent. Reachable more often since 7.0 made
+      // writeAtomic failures report too (an Obsidian/Defender handle on the .md
+      // is now normal, because the vault root is the repo).
+      case 'session-log-failed':
+        emit('session:logFailed', msg);
+        break;
+
       // ── Post-Session Analyst ─────────────────────────────────────────────
       case 'post-review-status':
         if (msg.reqId === currentPostReviewReqId) emit('postReview:status', msg.phase);
@@ -947,6 +957,7 @@
     },
     onTradeConfirmResult:   (cb) => on('trade:confirmResult',   cb),
     onTradeConfirmRejected: (cb) => on('trade:confirmRejected', cb),
+    onSessionLogFailed:     (cb) => on('session:logFailed',     cb),
 
     // Rules (rules.json on the server is the single source of truth)
     getRules:  () => sendRequest({ type: 'rules-get' }).then(r => r.data),

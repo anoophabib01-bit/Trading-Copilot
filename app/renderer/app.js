@@ -1760,6 +1760,33 @@ function setupWsEvents() {
     window.api.onTradeConfirmRejected((msg) => tcHandleResult(null, msg));
   }
 
+  // ── Session-log write failure (wired 2026-08-23) ──────────────────────
+  // The server has broadcast session-log-failed since 2026-08-20 with no
+  // listener anywhere, so a trade the auto-log REFUSED to write vanished
+  // silently — defeating the point of the honest return value that was added
+  // alongside it. The whole reason to auto-log is that the record is complete
+  // without him thinking about it, so the one case that must never be quiet
+  // is the record being incomplete.
+  //
+  // Rate-limited to once per reason per session: every failure mode here is
+  // persistent (disk full, permissions, a lock on the .md), so an unthrottled
+  // message on a 10s poll is alert fatigue within a minute. The reason is the
+  // key rather than a flat once-ever, so a NEW failure still gets through.
+  if (window.api.onSessionLogFailed) {
+    const seenLogFailures = new Set();
+    window.api.onSessionLogFailed((msg) => {
+      const reason = (msg && msg.reason) ? String(msg.reason) : 'unknown reason';
+      if (seenLogFailures.has(reason)) return;
+      seenLogFailures.add(reason);
+      addSystemMessage(
+        '⚠️ The session log did NOT record that trade — ' + reason +
+        '. The trade itself is unaffected; the written record of it is incomplete, ' +
+        'so add the row by hand before the post-session review' +
+        (msg && msg.path ? ' (' + msg.path + ').' : '.')
+      );
+    });
+  }
+
   // ── Auto-triggered Debate (2026-08-17) ────────────────────────────────
   // Anoop: "i wanted it to keep a watch for me full time... tell me when
   // the setup appears." The server's PO3 monitor now auto-runs a full

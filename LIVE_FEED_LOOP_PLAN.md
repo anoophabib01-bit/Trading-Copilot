@@ -765,6 +765,37 @@ vault at the repo root is what replaced them.*
   reported into the void since 2026-08-20. That is a renderer change, a different
   file, and belongs in its own commit under the plan's one-task-per-commit rule.
 
+- [x] **7.0a — Wire `session-log-failed` to the UI** — *added 2026-08-23 by the 7.1 review*
+
+  **Why.** `server.js:6913` has broadcast `session-log-failed` since 2026-08-20 and
+  **nothing anywhere listened** — no case in `renderer/ws-client.js`, no consumer in
+  `app.js`. A trade row the auto-log refused to write reported into the void, which
+  is precisely the silent-failure mode that logTrade's honest return value was added
+  to prevent. The whole point of auto-logging is that the record is complete without
+  him thinking about it, so the one case that must never be quiet is the record being
+  incomplete.
+
+  7.0 makes this path **more** reachable: `writeAtomic` failures now report too, and
+  an Obsidian/Defender handle on the `.md` is the normal state since the vault root
+  became the repo.
+
+  *Done: 2026-08-23. `renderer/ws-client.js` — new `case 'session-log-failed'` →
+  `emit('session:logFailed')`, plus `onSessionLogFailed` on the public API next to the
+  other trade-confirm subscribers. `renderer/app.js` — handler beside
+  `onTradeConfirmRejected`, surfacing through `addSystemMessage()` (persistent in the
+  chat stream via `resilience.js`, so it survives a reload — unlike a toast).
+  Message states plainly that the TRADE is unaffected and only the RECORD is
+  incomplete, and names the file to fix by hand. Rate-limited to once per distinct
+  reason per session: every failure mode here is persistent (disk full, permissions,
+  a lock on the file), so an unthrottled message on a 10s poll is alert fatigue within
+  a minute — keyed on reason rather than once-ever so a NEW failure still gets through.
+  Suite 715/715. `node --check` clean on both renderer files. Server verified up and
+  serving on 7433 (renderer files are read per request, so no restart was needed).*
+
+  **Not verified live:** no real write failure has been induced, so the handler has
+  never fired against a genuine `{ok:false}`. Reaching it deliberately means locking
+  the session note while a trade closes.
+
 - [~] **7.1 — Mirror the live event stream into today's session note**
 
   *Skipped: 2026-08-23, killed by its own review before any code was written. /autoplan,
