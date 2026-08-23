@@ -706,6 +706,201 @@ the prerequisite for Phase 5's scorecard.*
 
 ---
 
+### Phase 7 — Obsidian as the live session surface
+
+*Added 2026-08-23. Context: the vault root is now the repo itself (`G:\MNQ-CoPilot`),
+so `sessions/*.md` are the live files Obsidian renders — no copy, no sync, no link.
+`G:` is exFAT, so symlinks and junctions are impossible on this volume; pointing the
+vault at the repo root is what replaced them.*
+
+- [x] **7.0 — Fix the three session-note defects the 7.1 review surfaced**
+
+  **Why.** All three are pre-existing, all three were visible in
+  `sessions/2026-08-21.md` on disk, and none were introduced by 7.1 — the review
+  found them while reading the code 7.1 would have sat beside. They are fixed
+  independently of 7.1's fate because two of them were actively corrupting the
+  live trade record on every close.
+
+  *Done: 2026-08-23. `app/session-manager.js`, one commit, 6 new tests.*
+
+  1. **False compliance record.** The `15m break?` cell was
+     `trade.breakTaken ? 'Yes' : 'No'`, so an UNOBSERVED value rendered as `No` —
+     asserting a discipline failure that was never measured, in the one column the
+     post-session review grades compliance on. The live feed never sets
+     `breakTaken`, so every auto-logged row on disk carries a false record (all
+     three rows of 2026-08-21 read `No`). Unknown now renders `?`, matching the
+     convention the other unobserved fields in the same row already use. An
+     explicit `false` still renders `No` — the fix does not swallow a real
+     observation. Extracted to a pure `formatTradeRow(num, trade, nowTimeStr)`
+     so it is testable without the hardcoded `SESSIONS_DIR`; `nowTimeStr` is
+     injected for deterministic tests.
+
+  2. **Silent write failure.** `logTrade` discarded `writeAtomic`'s return value
+     and returned `{ok:true}` unconditionally. `writeAtomic` reports `{ok:false}`
+     only when BOTH the atomic rename and the plain-write fallback throw — on
+     Windows that is exactly what an Obsidian / OneDrive / Defender handle on the
+     `.md` produces as EPERM/EBUSY, and the vault root is now this repo, so a
+     handle on that file is the normal state. The 2026-08-20 fix made the
+     regex-miss failure honest and left this one silent. Same hole closed in
+     `startSession` and `updateVerdict`. Note `startSession`'s matters more than
+     it looks: `logTrade` only builds the template when the file is ABSENT, so a
+     silently-failed `startSession` leaves a note with no trades-table header and
+     every later `logTrade` that day returns `{ok:false}`.
+
+  3. **File-wide row counting.** `content.match(/^|s*d+s*|/gm)` counted
+     pipe-digit-pipe lines across the WHOLE note, not the trades table, so any
+     other line of that shape silently inflated every subsequent trade number.
+     Extracted to a pure `countTradeRows(content)` scoped to the contiguous row
+     block under the table header; returns 0 when the header is missing rather
+     than falling back to a file-wide tally.
+
+  *Suite: 715/715 green (709 baseline + 6 new). `node --check` clean. Server NOT
+  restarted — Anoop's standing instruction. Both `startSession` callers
+  (`main.js:231`, `server.js:4124`) pass the result straight through, so the added
+  `ok` field is additive; `updateVerdict` has zero callers repo-wide (dead code —
+  its own regressions are noted under 7.1's review findings and left untouched).*
+
+  **Not fixed here, deliberately** — `session-log-failed` is broadcast at
+  `server.js:6913` with no renderer handler anywhere, so dropped trade rows have
+  reported into the void since 2026-08-20. That is a renderer change, a different
+  file, and belongs in its own commit under the plan's one-task-per-commit rule.
+
+- [~] **7.1 — Mirror the live event stream into today's session note**
+
+  *Skipped: 2026-08-23, killed by its own review before any code was written. /autoplan,
+  branch live-feed-loop. Codex unavailable on this machine, so every voice is
+  `[subagent-only]` — CEO, Design and DX ran independently and converged on the same
+  blocker. Each claim below was re-verified against the code by hand before being recorded.*
+
+  **Why it died — the tap point does not carry the event the task existed for.**
+  The task asserted `broadcast()` was "the one choke point every such event already
+  passes through." False. All six guardrail-block rejections are `send(ws, …)`
+  (`server.js:7417-7449`); debate verdicts and trade tickets go through `emitTo()`
+  (`server.js:974`), which only degrades to `broadcast()` for auto-triggered debates.
+  A `broadcast()` tap captures **zero** guardrail blocks — the event the task named as
+  its single highest-value case. It would have captured only monitor detections and PO3
+  transitions, which task 2.1's ledger already records with more context.
+
+  **Second blocker — CORRECTED 2026-08-23. The race three reviewers asserted does not exist.**
+  The CEO, Design and DX voices independently claimed an `appendFileSync` could land
+  between `logTrade()`'s `readFileSync` and its `renameSync` and be silently discarded.
+  **That is wrong, and the Eng voice disproved it by walking the actual interleaving.**
+  `logTrade()` (`session-manager.js:81-114`) contains no `await`, promise, callback or
+  timer between the read and the write, and `writeAtomic` is `openSync`/`writeFileSync`/
+  `fsyncSync`/`closeSync`/`renameSync` — synchronous throughout. Node runs one JS stack to
+  completion, so nothing in this process can execute in that window. A **synchronous**
+  mirror cannot lose a line. Recorded here because three of four voices agreed on a
+  conclusion that reading the code refutes; majority agreement was not evidence.
+  **The caveat is load-bearing:** the race becomes real under `fs.appendFile` (callback),
+  `fsp.appendFile`, or any debounced / `setImmediate` flush — i.e. exactly the batching
+  variant open question 3 floated. Any successor must stay synchronous.
+
+  **The real second blocker — file-creation ordering silently disables trade logging.**
+  `fs.appendFileSync` **creates the file if absent**, and `logTrade()` only builds the
+  template when it is absent (`session-manager.js:77-79`). So if any allowlisted event
+  fires before the day's first `startSession`, the mirror creates a session note containing
+  only log lines; `startSession` is then skipped forever for that day, the trades-table
+  header never exists, `insertTradeRow` returns `null`, and **every closed trade that day
+  fails to record**. The watchers auto-start on TradingView connect (task 1.1), so
+  mirror-before-startSession is the *normal* morning ordering, not an edge case. A logging
+  convenience would have silently destroyed real trade records on a live-money account.
+
+  **Third — this repeats a decision already recorded in this file.** Task 0.2 states the
+  broadcast tap is *"SUPERSEDED by task 2.1's signal-ledger … which captures strictly more."*
+  7.1 proposed the superseded architecture twelve tasks later without citing that decision.
+
+  **Successor: 7.2.** Not a rewrite of this one — a much smaller thing.
+
+- [ ] **7.2 — Put guardrail blocks and verdicts in the ledger that already exists**
+
+  **Why.** The residual gap the review agreed is real: monitor fires and PO3 transitions
+  are already in `DATA/signals/<trading-day>.jsonl` via `ledgerSignal()` (10 call sites),
+  but **guardrail blocks are not**. Their only record is
+  `console.log('[trade-confirm] BLOCKED …')` (`server.js:7448`), mirrored to
+  `app/logs/server-*.log` by `crash-logger.js` — which `pruneOldLogs` deletes at 14 days.
+  So "every time the system said no, over a year" is genuinely unanswerable today, and
+  becomes answerable with three `ledgerSignal()` calls and no new file format, no new
+  writer, no new day-anchor, and no filesystem write on the session-note path.
+
+  **Scope.** Collapse the eight `send(…'trade-confirm-rejected')` calls into one local
+  `rejectTicket(ws, requestId, reason)` helper so there is a single site, then
+  `ledgerSignal({ event: 'guardrail-block', reason, … })` there. Same at
+  `debate-judge-done` (`server.js:2463`) and `trade-ticket-suggested` (`server.js:2514`).
+  Trading-day anchor is `tradingDayStampIST()`, matching every other ledger row.
+
+  **Rendering into Obsidian is deliberately NOT part of this task.** Once the events are
+  in JSONL, a read-only renderer (an end-of-day generated markdown file, written once,
+  by one writer, with no live append) is a separate, reversible decision. That ordering
+  is what the review actually argued for: fix capture first, choose display later.
+
+  **Gate — do not start until the ledger is proven live.** `DATA/signals/` does not exist
+  on disk. Task 2.1 is marked `[x]` but has never written a line in a real session, and
+  `grep BLOCKED app/logs/server-2026-08-*.log` returns 0 across six days. Adding rows to
+  an unexercised ledger would stack an unverified feature on an unverified feature. One
+  live session producing a non-empty `DATA/signals/*.jsonl` clears this gate.
+
+
+  **Why.** Every monitor detection, PO3 phase change, debate verdict and guardrail
+  block currently exists only as a transient message in the renderer. It scrolls away
+  and is gone. The single highest-value case is the **guardrail block**: when
+  `trade-confirm-rules.js` refuses a ticket, nothing durable records that it happened,
+  so "what did I try to do when the system said no, and what happened next" is a
+  question the system cannot answer today — across one session or across the year.
+  `broadcast()` (`server.js:966`) is the one choke point every such event already
+  passes through, so one tap captures all of them.
+
+  **Scope.** Append a timestamped line per material event to a `## Live Log` section
+  of `sessions/YYYY-MM-DD.md`. **Day key — corrected 2026-08-23 by design review.**
+  An earlier draft of this task claimed `todayStr()` already encodes the 03:45 IST
+  trading-day anchor. **That is false.** `session-manager.js:27` is plain IST-midnight
+  (`Date.now() + 330min`, sliced to a date); the 03:45 anchor is `tradingDayStampIST()`
+  at `server.js:496`, a different function. Between 00:00 and 03:45 IST — which straddles
+  the NY close, i.e. the end of every session — the two disagree. Resolve this task's day
+  key from `tradingDayStampIST()`, stamped ONCE at event time and passed through, never
+  re-derived at write time. Note on the `Done:` line that this deliberately diverges from
+  `logTrade()`'s day key, and that the divergence is a pre-existing defect in `logTrade()`
+  that 7.1 neither introduced nor fixes.
+
+  **Explicitly NOT the trades table.** `logTrade()`/`insertTradeRow()` own that, they
+  are audited, and they already survived one duplicate-row bug (see 4.1's audit note).
+  This task writes to a different section of the same file and must never touch the
+  table region.
+
+  **Hard constraints.**
+  - Must never take the process down. `server.js`'s crash guards exist because this
+    runs live-money sessions; a disk error here must be swallowed, not thrown.
+  - Must never block or delay `broadcast()`. A trade ticket reaching the UI cannot
+    wait on a filesystem write.
+  - Append-only. No read-modify-write of the whole file on every event — that races
+    `logTrade()`, which rewrites the file by regex.
+  - No new runtime dependencies (plan-wide constraint).
+  - An allowlist of event types, not a firehose. Broadcasting every WebSocket message
+    would make the note unreadable within an hour.
+
+  **Open questions for review.**
+  1. Append-only vs. section-anchored insert: a plain append puts the Live Log at EOF,
+     but `logTrade()` inserts into the table above it by regex. Do the two writers
+     provably not corrupt each other, given both target one file?
+  2. Day rollover mid-session — a 03:45 IST boundary crossing while events are in
+     flight. Which day's note does an in-flight event land in?
+  3. Write cadence. Per-event `appendFileSync` is simplest and crash-safest, but the
+     5s position watch plus five chart monitors could make it chatty. Is a debounced
+     buffer worth the added failure mode of losing buffered lines on a crash?
+  4. Which event types earn a line? Proposed: guardrail blocks, debate verdicts,
+     trade tickets, PO3 phase transitions, monitor detections. Not: heartbeats,
+     account polls, chat tokens.
+  5. Obsidian re-renders on file change. At what append rate does that become a
+     visible distraction on a second monitor during a live session?
+
+  **Acceptance.** Pure formatting/allowlist logic extracted to its own module with
+  unit tests in the same commit (plan rule, line 38). Server boots clean. Full suite
+  green against the 0.3 baseline. Live-verified: a real guardrail block appears in
+  the note within a second, and `logTrade()` still writes a correct table row on the
+  same day's file afterwards.
+
+
+---
+
 ## Risks, stated up front
 
 1. **Chart-lock saturation is the biggest technical risk in this plan.** Going from three armed
