@@ -320,7 +320,8 @@ be worthless, and #5 is what would prove it either way.
 
 **Items 1-3 are built (2026-08-23); 4-9 are not started.** Say which you want next.
 
-**Open question blocking nothing but worth settling:** 
- is set to , inferred from the live account id
-. Confirm against the Tradeify dashboard — an inferred tier
-quietly becoming fact is exactly how the wrong  got into the config.
+**Open question, blocking nothing but worth settling:** `rules.json`'s
+`payout.accountFamily` is set to `select`, inferred from the live account id
+`TDFYSL50413184562`. Confirm it against your Tradeify dashboard — an inferred
+tier quietly becoming fact is exactly how the wrong `50` got into the config.
+If it is wrong, change that one value; every threshold follows from it.
