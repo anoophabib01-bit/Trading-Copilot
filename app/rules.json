@@ -55,8 +55,44 @@
     "start": 150000,
     "startDate": "2026-07-08",
     "maxDrawdown": 4500,
-    "profitTarget": 9000,
-    "consistencyPctMax": 50
+    "profitTarget": 9000
+  },
+  "_payout_comment": "ADDED 2026-08-23. REPLACES eval.consistencyPctMax, which was 50 — a number matching NO published Tradeify tier, and which grep showed was read by no code anywhere in the repo. The consistency rule is the hard gate on the entire goal of this app (reach a payout), and it was both mis-specified and untracked. Figures below are from Tradeify's own help centre: https://help.tradeify.co/en/articles/10468320-rules-consistency-rule (limits) and /11083796 (Growth day counts). Read by payout-eligibility.js. Per this repo's convention, no consistency figure may be hardcoded in code or in a persona string — it lives here.",
+  "payout": {
+    "_accountFamily_comment": "⚠ UNCONFIRMED — inferred, needs Anoop to verify against his Tradeify dashboard. The live broker account reads TDFYSL50413184562; the TDFY+SL prefix reads as Tradeify SELECT. If that is wrong, change this one value — everything else follows from it. Do NOT let an inferred tier silently become fact; that is exactly how the wrong 50 got here.",
+    "accountFamily": "select",
+    "_profitField_comment": "The firm writes 'no single day's profit (commissions are not included in profit)', which reads as evaluating GROSS. Defaulting to net ('pnl') is deliberately conservative: net is smaller, so the computed ratio is HIGHER and the app calls him ineligible slightly BEFORE the firm does, never after. Switch to 'gross' only once a real payout request settles the ambiguity.",
+    "profitField": "pnl",
+    "tiers": {
+      "selectEval": {
+        "label": "Select Evaluation",
+        "consistencyPct": 40,
+        "minProfitableDays": 3,
+        "minDayProfit": 0,
+        "_comment": "40% during the evaluation phase. The 3-day minimum is a consequence of the rule, not a separate gate: no single day may exceed 40% of total, so it cannot be passed in 1-2 days."
+      },
+      "selectFunded": {
+        "label": "Select Funded",
+        "consistencyPct": null,
+        "minProfitableDays": 0,
+        "minDayProfit": 0,
+        "_comment": "Tradeify publishes NO consistency rule for Select once funded. null means 'no limit configured' — payout-eligibility.js treats that as not-computable rather than as automatically satisfied."
+      },
+      "growthFunded": {
+        "label": "Growth Sim Funded",
+        "consistencyPct": 35,
+        "minProfitableDays": 5,
+        "minDayProfit": 250,
+        "_comment": "35%, plus 5+ days each showing profit above a size-dependent floor ($100 on 25k, $150 on 50k, $200 on 100k, $250 on 150k). 250 matches eval.start of 150000 above — re-check this if the account size changes. The day count resets after each successful payout."
+      },
+      "lightningFunded": {
+        "label": "Lightning Funded",
+        "consistencyPct": 20,
+        "minProfitableDays": 0,
+        "minDayProfit": 0,
+        "_comment": "Accounts bought after 2025-09-12 08:00 EST scale 20% → 25% → 30% by payout number; earlier accounts stay at 20% flat. Only the first-payout figure is encoded here — if this family ever becomes active, the scaling must be implemented rather than left at 20."
+      }
+    }
   },
   "tradingMode": "standard",
   "scalperRules": {
