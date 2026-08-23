@@ -192,6 +192,22 @@ kind of change that feels obviously right and is worth nothing.
 
 ### C3. Nothing scores the detector — this is the foundational gap
 
+> **CORRECTED 2026-08-23, after checking the code rather than trusting this
+> document.** The claim below that "detections are broadcast and then forgotten"
+> was **wrong**. `signal-ledger.js` exists, is wired, and is unit-tested: it
+> writes every watcher fire *and* every Playbook C rejection to
+> `DATA_DIR/signals/<date>.jsonl` with the context captured at fire time. And
+> `signal-join.js` already matches taken trades back to the signal that armed
+> them. I grepped for the wrong symbol names in an earlier session and trusted
+> that null result.
+>
+> **The real gap is narrower and worth stating precisely: selection bias.**
+> Signals are recorded, and *taken* signals are scored — but signals Anoop
+> skipped are never resolved. Judging a detector on the trades it produced
+> judges it on the subset his discretion already filtered, which measures the
+> filter, not the detector. Built 2026-08-23 as `signal-outcome.js`: MFE/MAE
+> and at-horizon outcome for **every** armed signal, taken or not.
+
 There is no record of *"the detector fired at 14:32 → price did X over the next
 N bars."* Detections are broadcast and then forgotten.
 
@@ -288,9 +304,9 @@ Ordered by *payout impact per unit of work*, not by technical interest.
 
 | # | Work | Loop | Why first |
 |---|---|---|---|
-| 1 | Payout eligibility tracking + fix the wrong/dead `consistencyPctMax` | 2 | The actual gate on your stated goal. Currently invisible and mis-specified. |
-| 2 | Detection outcome ledger (C3) | 1 | Prerequisite for every adaptive ambition. Cheap. |
-| 3 | `symbol_info` point-value verification | both | Tiny; removes a silent-corruption class. |
+| ~~1~~ ✅ | Payout eligibility tracking + fix the wrong/dead `consistencyPctMax` | 2 | **BUILT 2026-08-23** — payout-eligibility.js, 23 tests against the firm's own worked examples. |
+| ~~2~~ ✅ | Signal outcome resolution (C3 — ledger already existed; the gap was selection bias) | 1 | **BUILT 2026-08-23** — signal-outcome.js, 18 tests. |
+| ~~3~~ ✅ | `symbol_info` point-value verification | both | **BUILT 2026-08-23** — point-value-verify.js, 9 tests. Fixed a live MCP bug: symbol_info threw on every call. |
 | 4 | Pine-based single definition + `data_get_pine_labels` | 1 | Makes live detection and backtest the same thing. |
 | 5 | Backtest harness on `data_get_strategy_results` | 1 | The capability you asked for; mostly wiring. |
 | 6 | Per-playbook attribution in the recap | 2 | Falls out of #2 nearly free. |
@@ -302,5 +318,9 @@ Items 1–3 are independent of each other and of everything else. Item 8 is
 deliberately last: it is the change most likely to feel productive and turn out to
 be worthless, and #5 is what would prove it either way.
 
-**Nothing above has been implemented.** This is the research and the plan; say
-which items you want and I will build them in this order.
+**Items 1-3 are built (2026-08-23); 4-9 are not started.** Say which you want next.
+
+**Open question blocking nothing but worth settling:** 
+ is set to , inferred from the live account id
+. Confirm against the Tradeify dashboard — an inferred tier
+quietly becoming fact is exactly how the wrong  got into the config.
