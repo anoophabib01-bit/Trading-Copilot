@@ -1526,20 +1526,73 @@ function setupWsEvents() {
   // AND every reconnect re-test), never a toast that can be missed.
   if (window.api && window.api.onLiveFeedSelfTest) {
     window.api.onLiveFeedSelfTest((msg) => {
-      const el = document.getElementById('live-feed-selftest');
-      if (!el) return;
-      const passed = msg && msg.passed, total = (msg && msg.total) || 3;
+      const passed = (msg && msg.passed) || 0;
+      const total = (msg && msg.total) || 3;
       const failures = (msg && msg.failures) || [];
-      el.style.display = 'block';
-      if (passed === total) {
-        el.textContent = `Live feed: ${passed}/${total} checks passed`;
-        el.style.color = 'var(--green, #3ecf8e)';
-      } else {
-        el.textContent = `Live feed: ${passed}/${total} checks passed — ` + failures.join(' | ');
-        el.style.color = 'var(--red, #ff5c5c)';
+      // Server sends per-step results since 2026-08-23; fall back to the old
+      // collapsed shape so an older server can never blank the indicator.
+      const checks = (msg && Array.isArray(msg.checks) && msg.checks.length)
+        ? msg.checks
+        : null;
+
+      const line = document.getElementById('live-feed-selftest');
+      if (line) {
+        line.style.display = 'block';
+        line.textContent = passed === total
+          ? `Live feed: ${passed}/${total} checks passed`
+          : `Live feed: ${passed}/${total} checks passed — ` + failures.join(' | ');
+        line.style.color = passed === total ? 'var(--green, #3ecf8e)' : 'var(--red, #ff5c5c)';
       }
+
+      // The loud panel. Shown ONLY while a check is failing — an always-on
+      // banner becomes wallpaper, and this one has to still be noticeable on
+      // the day it actually matters.
+      const el = document.getElementById('live-feed-health');
+      if (!el) return;
+      if (passed === total) {
+        el.style.display = 'none';
+        el.innerHTML = '';
+        return;
+      }
+      const rows = checks
+        ? checks.map(c =>
+            '<div class="lfh-row">' +
+              '<span class="lfh-mark ' + (c.ok ? 'lfh-ok' : 'lfh-bad') + '">' + (c.ok ? '✓' : '✗') + '</span>' +
+              '<span class="lfh-label">' + escHtml(String(c.label || c.key || '')) + '</span>' +
+              '<span class="lfh-detail">' + escHtml(String(c.detail || '')) + '</span>' +
+            '</div>').join('')
+        : failures.map(f => '<div class="lfh-row"><span class="lfh-mark lfh-bad">✗</span>' +
+            '<span class="lfh-detail">' + escHtml(String(f)) + '</span></div>').join('');
+      el.innerHTML =
+        '<div class="lfh-title"><span>⚠ LIVE FEED CHECK ' + passed + '/' + total + ' PASSED</span>' +
+        '<span style="font-weight:600;letter-spacing:0;text-transform:none;color:var(--text-dim,#97a1ad)">trades are NOT being counted while this is red</span></div>' +
+        rows +
+        '<div class="lfh-actions">' +
+          '<button onclick="rerunLiveFeedSelfTest()">Repair &amp; re-check</button>' +
+          '<button onclick="dismissLiveFeedHealth()">Dismiss</button>' +
+        '</div>';
+      el.style.display = 'block';
     });
   }
+
+  // Exposed for the panel's own buttons. The server-side check REPAIRS an
+  // unmounted broker panel as part of step 2, so this is a real fix attempt,
+  // not just a re-report.
+  window.rerunLiveFeedSelfTest = function () {
+    const el = document.getElementById('live-feed-health');
+    if (el) {
+      const t = el.querySelector('.lfh-title');
+      if (t) t.innerHTML = '<span>… RE-CHECKING AND REPAIRING</span>';
+    }
+    if (window.api && window.api.runLiveFeedSelfTest) window.api.runLiveFeedSelfTest();
+  };
+  // Dismiss is per-result, not sticky: the next failing check re-shows it.
+  // A permanently dismissible warning about a dark live feed would defeat
+  // the entire point of surfacing it.
+  window.dismissLiveFeedHealth = function () {
+    const el = document.getElementById('live-feed-health');
+    if (el) el.style.display = 'none';
+  };
 
   // 2026-08-19 (Anoop's request, first slice — see SEMI_AUTONOMOUS_SYSTEM_PLAN.md
   // "Next requested: live mistake-tracking feedback loop"): a live pattern

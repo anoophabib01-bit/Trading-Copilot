@@ -877,6 +877,10 @@ wss.on('connection', (ws) => {
       case 'engulf-monitor-toggle': handleEngulfToggle(msg); break;
       case 'engulf-check-now': checkEngulfingSignal(msg.tf || '1h'); break;
       case 'tv-broker-check-now': pollTVBrokerAccount(); break;
+      // 2026-08-23: manual re-run of the visible 3-step check. runLiveFeedSelfTest
+      // now REPAIRS an unmounted broker panel as part of check 2, so this button
+      // is a genuine 'fix it now', not just a re-report.
+      case 'live-feed-selftest-run': runLiveFeedSelfTest().catch(e => console.warn('[self-test] manual run failed:', e.message)); break;
       case 'trade-confirm-request': handleTradeConfirm(ws, msg); break;
       case 'fvg-monitor-toggle': handleFVGToggle(msg); break;
       case 'fvg-check-now': checkFVGSignal(msg.tf || '30m'); break;
@@ -6459,7 +6463,7 @@ async function pollTVBrokerAccountInner() {
     // the same withChartLock every other chart-mutating caller already uses.
     const raw = await withBrokerLock(() => mcpBridge.callTool('trading_get_account', {}));
     const text = (raw && raw.content) ? raw.content.map(c => c.text || '').join('') : null;
-    const result = text ? JSON.parse(text) : null;
+    let result = text ? JSON.parse(text) : null; // let, not const: the self-heal retry below may replace it with a fresh read
     if (!result || !result.success) {
       // CDP to the chart can be up (mcpBridge.tvConnected=true) while the
       // Trading Panel/broker isn't actually open or linked — trading.js's
@@ -6491,12 +6495,49 @@ async function pollTVBrokerAccountInner() {
     // If it wasn't, refuse to fold — a wrong "flat" corrupts the guardrail's
     // trade count, day P&L and size-after-loss state, which are the things
     // standing between Anoop and a blown account. Report it loudly instead.
-    const positionsReadable = !!(result.positions && result.positions.success);
+    let positionsReadable = !!(result.positions && result.positions.success);
+    // 2026-08-23 SELF-HEAL. Root cause of a full session with the live feed
+    // dark: TradingView LAZILY MOUNTS each Trading Panel tab's table, so a tab
+    // not yet rendered this session has no table in the DOM at all.
+    // tradingview-mcp's getAccount() now repairs that itself before every read
+    // (visiting the tab, then restoring whichever one Anoop had showing), so a
+    // recoverable case is already fixed by the time we get here. This second
+    // attempt covers a panel that re-rendered between that repair and this
+    // read: one forced retry, then give up loudly exactly as before.
+    //
+    // Refusing to fold on an unknown flat/open state remains the correct end
+    // state - a wrong 'flat' corrupts the trade count, day P&L and
+    // size-after-loss guard, which is far worse than a visible stop.
     if (!positionsReadable) {
-      const reason = 'positions table not readable — cannot determine flat/open state, so trades CANNOT be counted. Open the Trading Panel\'s Positions tab in TradingView.';
+      try {
+        const fix = await withBrokerLock(() => mcpBridge.callTool('trading_ensure_panel_ready', { want: ['positions', 'orders'] }));
+        const fixText = (fix && fix.content) ? fix.content.map(c => c.text || '').join('') : null;
+        const fixed = fixText ? JSON.parse(fixText) : null;
+        if (fixed && fixed.success) {
+          console.log('[tv-broker] panel self-heal: mounted ' + ((fixed.recovered || []).join(', ') || 'nothing missing') + ' - re-reading');
+          const raw2 = await withBrokerLock(() => mcpBridge.callTool('trading_get_account', {}));
+          const text2 = (raw2 && raw2.content) ? raw2.content.map(c => c.text || '').join('') : null;
+          const result2 = text2 ? JSON.parse(text2) : null;
+          if (result2 && result2.positions && result2.positions.success) {
+            result = result2;
+            positionsReadable = true;
+            console.log('[tv-broker] panel self-heal SUCCEEDED - live feed is back, trades are being counted again');
+            broadcast({ type: 'tv-broker-selfheal', ok: true, recovered: fixed.recovered || [], at: Date.now() });
+          }
+        }
+      } catch (e) {
+        console.warn('[tv-broker] panel self-heal attempt threw:', e.message);
+      }
+    }
+    if (!positionsReadable) {
+      const reason = "positions table not readable - cannot determine flat/open state, so trades CANNOT be counted. Auto-repair was tried and did not work. Open the broker panel at the BOTTOM of the TradingView window (click the 'Tradovate' tab on the bottom bar) and leave it open.";
       if (tvBrokerFeedReadOk !== false) console.warn('[tv-broker] ' + reason);
       tvBrokerFeedReadOk = false;
       broadcast({ type: 'tv-broker-account', success: false, connected: false, reason });
+      // A dark feed is the worst state this app can be in - every guardrail
+      // depends on it. Re-run the visible 3-step check so the UI reflects
+      // reality immediately instead of showing a stale pass from startup.
+      scheduleLiveFeedSelfTest(1500);
       return;
     }
     if (tvBrokerFeedReadOk !== true) console.log('[tv-broker] broker feed readable — positions/orders tables found, trade tracking is live');
@@ -7079,13 +7120,25 @@ async function runLiveFeedSelfTest() {
   const failures = [];
   let passed = 0;
   const total = 3;
+  // 2026-08-23: per-step results, so the UI can show three NAMED lines with
+  // their own pass/fail instead of one collapsed string. Anoop asked for the
+  // 3-step check to be visible in the app; a single sentence that says '2/3'
+  // does not tell him WHICH leg is down or what to do about it.
+  const checks = [
+    { key: 'cdp',    label: 'TradingView connection', ok: false, detail: '' },
+    { key: 'broker', label: 'Broker panel / live feed', ok: false, detail: '' },
+    { key: 'quote',  label: 'Live price data',        ok: false, detail: '' },
+  ];
 
   // Check 1: CDP reachable — already tracked continuously by mcpBridge, this
   // just folds it into the same PASS/FAIL report rather than re-probing.
   if (mcpBridge.ready && mcpBridge.tvConnected) {
     passed++;
+    checks[0].ok = true;
+    checks[0].detail = 'CDP connected on :9222';
   } else {
     failures.push('CDP: TradingView chart connection not established');
+    checks[0].detail = 'not connected — is TradingView Desktop running?';
   }
 
   // Check 2: broker panel readable — reuses getAccount()'s degraded/unreadable
@@ -7103,10 +7156,55 @@ async function runLiveFeedSelfTest() {
     const summaryOk = !!(result && result.summary && result.summary.success);
     if (result && result.success && positionsOk && ordersOk && summaryOk) {
       passed++;
+      checks[1].ok = true;
+      checks[1].detail = 'positions, orders and summary tables all readable';
     } else {
-      const unreadable = (result && result.unreadable) ||
-        ['positions', 'orders', 'summary'].filter((k, i) => ![positionsOk, ordersOk, summaryOk][i]);
-      failures.push('Broker panel: unreadable — ' + (unreadable.join(', ') || 'unknown reason') + ' (open the Trading Panel in TradingView)');
+      // 2026-08-23: don't just REPORT an unreadable panel - repair it. This
+      // is the failure that took the live feed down for a whole session, and
+      // the cause is almost always a tab TradingView has not rendered yet.
+      // getAccount() self-heals on its own read path too; doing it here as
+      // well means the visible 3-step check actively fixes the box it is
+      // about to mark red, rather than telling Anoop to go clicking.
+      let healed = false;
+      try {
+        const fixRaw = await withBrokerLock(() => mcpBridge.callTool('trading_ensure_panel_ready', {}));
+        const fixText = (fixRaw && fixRaw.content) ? fixRaw.content.map(c => c.text || '').join('') : null;
+        const fixed = fixText ? JSON.parse(fixText) : null;
+        if (fixed && fixed.success) {
+          const reRaw = await withBrokerLock(() => mcpBridge.callTool('trading_get_account', {}));
+          const reText = (reRaw && reRaw.content) ? reRaw.content.map(c => c.text || '').join('') : null;
+          const re = reText ? JSON.parse(reText) : null;
+          if (re && re.positions && re.positions.success && re.orders && re.orders.success) {
+            healed = true;
+            passed++;
+            checks[1].ok = true;
+            // Say WHICH repair happened. "the bottom panel was collapsed" is
+            // actionable; "mounted: panel tabs" taught nobody anything.
+            const wasCollapsed = !!(fixed.panelBefore && fixed.panelBefore.collapsed);
+            const mounted = (fixed.recovered || []).join(', ');
+            checks[1].detail = wasCollapsed
+              ? 'repaired automatically - the broker panel at the bottom of TradingView was collapsed, so its tables were not rendered. Re-opened it; leave it open.'
+              : 'repaired automatically' + (mounted ? ' (mounted: ' + mounted + ')' : '');
+            console.log('[self-test] broker panel repaired automatically');
+          }
+        }
+      } catch (e) {
+        console.warn('[self-test] panel repair attempt threw:', e.message);
+      }
+      if (!healed) {
+        const unreadable = (result && result.unreadable) ||
+          ['positions', 'orders', 'summary'].filter((k, i) => ![positionsOk, ordersOk, summaryOk][i]);
+        // When ALL THREE read unreadable at once, that is the signature of a
+        // broker panel that has been collapsed since TradingView launched —
+        // its tables are never rendered, so there is nothing to read. Name
+        // that case explicitly instead of listing three symptoms.
+        const allThree = unreadable.length >= 3;
+        const why = allThree
+          ? 'all broker tables missing - the panel at the BOTTOM of the TradingView window is closed. Click the "Tradovate" tab on the bottom bar to open it, and leave it open. Auto-repair could not do it.'
+          : 'unreadable: ' + (unreadable.join(', ') || 'unknown reason') + ' - auto-repair failed. Open the broker panel at the bottom of TradingView.';
+        failures.push('Broker panel: ' + why);
+        checks[1].detail = why;
+      }
     }
   } catch (e) {
     failures.push('Broker panel: check threw — ' + e.message);
@@ -7122,14 +7220,20 @@ async function runLiveFeedSelfTest() {
     const hasPrice = !!(result && result.success && (typeof result.last === 'number' || typeof result.close === 'number'));
     if (hasPrice) {
       passed++;
+      checks[2].ok = true;
+      const px = (typeof result.last === 'number') ? result.last : result.close;
+      checks[2].detail = 'last price ' + px;
     } else {
-      failures.push('Quote: ' + ((result && result.error) || 'no readable price returned (chart may be loading/blank)'));
+      const why = (result && result.error) || 'no readable price returned (chart may be loading/blank)';
+      failures.push('Quote: ' + why);
+      checks[2].detail = why;
     }
   } catch (e) {
     failures.push('Quote: check threw — ' + e.message);
+    checks[2].detail = 'check threw — ' + e.message;
   }
 
-  const resultMsg = { type: 'live-feed-self-test', passed, total, failures, at: Date.now() };
+  const resultMsg = { type: 'live-feed-self-test', passed, total, failures, checks, at: Date.now() };
   console.log(`[self-test] live feed: ${passed}/${total} checks passed` + (failures.length ? ' — ' + failures.join(' | ') : ''));
   broadcast(resultMsg);
   return resultMsg;

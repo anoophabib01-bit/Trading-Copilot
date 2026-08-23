@@ -76,7 +76,14 @@
   <!-- 2026-08-19: persistent (not a toast) self-test line — SEMI_AUTONOMOUS_SYSTEM_PLAN.md
        item 2. Always visible once a result arrives, updates in place on every
        reconnect re-test. See app.js's onLiveFeedSelfTest handler. -->
-  <div id="live-feed-selftest" style="display:none;"></div>
+  <div id="live-feed-selftest" style="display:none;" title="Click to re-run the checks" onclick="rerunLiveFeedSelfTest()"></div>
+  <!-- 2026-08-23: the live feed going dark is the worst failure this app has
+       (every guardrail depends on it) and it previously showed only as a thin
+       line that was easy to miss for a whole session. This banner is the loud
+       version: it appears ONLY when a check is failing, names which of the 3
+       legs is down, and offers the repair directly. Hidden entirely when all
+       3 pass, so it never becomes wallpaper. -->
+  <div id="live-feed-health" style="display:none;"></div>
   <div class="session-time" id="session-clock"></div>
   <!-- Reopen the account picker any time (2026-07-25, Anoop: "there should be
        an option to get to this page if i want to shift my account later on") -->

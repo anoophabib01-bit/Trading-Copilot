@@ -25,6 +25,19 @@ export function registerTradingTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
+  // 2026-08-23: explicit repair entry point. getAccount() already self-heals
+  // on every read, but the app's startup self-test needs to be able to FORCE
+  // a mount attempt and report exactly what it did, so a human looking at the
+  // 3-step check sees "recovered positions tab" rather than a silent pass.
+  // Only ever clicks tab controls — never a ticket, never anything that can
+  // transmit an order. See ensurePanelTablesMounted's safety contract.
+  server.tool('trading_ensure_panel_ready', "Ensure the broker Trading Panel's positions/orders tables are mounted in the DOM, clicking their tabs if TradingView has not rendered them yet, then restoring whichever tab was showing. Use when a broker read reports a table as unreadable. Never places or modifies orders.", {
+    want: z.array(z.enum(['positions', 'orders', 'summary'])).optional().describe('Which tables must be mounted. Defaults to all three.'),
+  }, async ({ want }) => {
+    try { return jsonResult(await core.ensurePanelTablesMounted({ want })); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
   server.tool('trading_get_account', 'Get everything from the connected broker account in one call: account summary, open positions, and orders. Prefer this over three separate calls when the caller needs the full picture.', {}, async () => {
     try { return jsonResult(await core.getAccount()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
