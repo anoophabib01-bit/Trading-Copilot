@@ -921,6 +921,7 @@
     // account read); there was simply no client-side caller for it until the
     // position watch needed to pull the authoritative numbers forward.
     checkTvBrokerNow:  ()   => rawSend({ type: 'tv-broker-check-now' }),
+    runLiveFeedSelfTest: () => rawSend({ type: 'live-feed-selftest-run' }),
     onTradovateTestResult:(cb)=> on('tradovate:testResult', cb),
     testTradovate:     ()   => rawSend({ type: 'tradovate-test' }),
     restartTradovate:  ()   => rawSend({ type: 'tradovate-restart' }),

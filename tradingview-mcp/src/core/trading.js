@@ -30,6 +30,18 @@
  * Tradeify's white-label — the same selectors should hold for any
  * Tradovate-based broker connection.
  *
+ * ⚠ THE PARAGRAPH ABOVE IS TRUE ONLY WHILE THE BOTTOM PANEL IS EXPANDED.
+ * Corrected 2026-08-23 after the live feed was dark for a full session.
+ * These tables live in `[class*="layout__area--bottom"]`. COLLAPSE that
+ * panel and TradingView unmounts its whole subtree — all four tables vanish
+ * from the DOM simultaneously, leaving a 38px title bar with just the broker
+ * name on it. Tab selection genuinely does not matter (an unselected tab's
+ * table is present with offsetParent === null); PANEL EXPANSION does. If
+ * every table reads not-found at once, the panel is collapsed — that is the
+ * signature. See ensurePanelTablesMounted() at the foot of this file, which
+ * detects and repairs exactly this, and never re-collapses the panel
+ * afterwards (re-collapsing would immediately re-break the feed).
+ *
  * WHAT IS NOT YET VERIFIED: the account this was built against was fresh
  * (zero trades), so every row shape below is confirmed for HEADERS only —
  * "There are no open positions" / "There is no trading data here yet" was
@@ -508,7 +520,31 @@ export async function placeMarketOrder({ side, qty, symbol, stopPrice, targetPri
 // transition never fired, and a real trading day recorded ZERO trades.
 // `success` stays true for backward compatibility (it never meant anything
 // stricter); the truth is now reported additively so callers can check it.
-export async function getAccount() {
+export async function getAccount({ autoRecover = true } = {}) {
+  let recovery = null;
+  // 2026-08-23: SELF-HEAL BEFORE READING. When the bottom panel is collapsed
+  // TradingView unmounts every broker table, so they all read "unreadable" at
+  // once. Because flatness is derived from the positions table, that
+  // correctly but fatally shut the whole live feed down for a real session.
+  // Re-mount first (expanding the panel), THEN read. Only positions and
+  // orders are requested: they are the two the fold actually depends on, and
+  // the summary has the header strip as a fallback — though in practice one
+  // expand remounts all of them together. See ensurePanelTablesMounted.
+  if (autoRecover) {
+    try {
+      const pre = await evaluate(mountedTablesJS());
+      const panel = await evaluate(bottomPanelStateJS());
+      // Repair when a table is missing OR the panel is collapsed. The second
+      // condition matters even with the tables present: a collapsed panel is
+      // not provably still updating them, and a stale positions table reads
+      // as flat. See ensurePanelTablesMounted's requireExpanded note.
+      const needsWork = (pre && (pre.positions === false || pre.orders === false))
+        || !!(panel && panel.present && panel.collapsed);
+      if (needsWork) recovery = await ensurePanelTablesMounted({ want: ['positions', 'orders'] });
+    } catch (e) {
+      recovery = { success: false, error: String((e && e.message) || e) };
+    }
+  }
   const [positions, orders, summary] = await Promise.all([
     getPositions(),
     getOrders(),
@@ -522,8 +558,295 @@ export async function getAccount() {
     success: true,
     degraded: unreadable.length > 0,
     unreadable,
+    // Non-null only when a mount recovery was actually attempted this call,
+    // so callers can log/surface "the feed healed itself" without guessing.
+    recovery,
     summary,
     positions,
     orders,
+  };
+}
+
+// ── Broker panel mounting + auto-recovery (2026-08-23, rev 2) ───────────────
+// ROOT CAUSE, established by probing the LIVE DOM rather than by reasoning
+// (2026-08-23, TradingView Desktop 3.3.0 / Electron 38):
+//
+//   The three broker tables live in the BOTTOM panel — the DOM subtree under
+//   `[class*="layout__area--bottom"]`. When that panel is COLLAPSED,
+//   TradingView unmounts its entire contents. What is left is a 38px title
+//   bar containing a single button labelled with the broker name
+//   ("Tradovate"). Collapsed, querySelector for any of the three tables
+//   returns null — all three at once, which is the tell.
+//
+//   Measured live, before and after one click on that button:
+//       layout__area--bottom clientHeight        38  ->  657
+//       [class*="collapsed-"] present          true  ->  false
+//       TRADOVATE.positions-table             absent ->  present
+//       TRADOVATE.orders-table                absent ->  present
+//       TRADOVATE.summary.accountSummary-table absent ->  present
+//
+// TWO EARLIER BELIEFS ABOUT THIS FILE ARE NOW SETTLED:
+//
+//  1. The file header's claim that "all tables exist in the DOM AT ONCE
+//     regardless of which tab is showing" is CORRECT — but only while the
+//     bottom panel is expanded. Orders and summary read fine with their tab
+//     hidden (offsetParent === null yet fully in the DOM). Tab selection is
+//     therefore NOT what governs readability; panel expansion is.
+//
+//  2. The first attempt at this fix (rev 1, same day) assumed per-tab lazy
+//     mounting and clicked tabs inside `.trading-panel-content`. That
+//     selector resolves to the RIGHT-HAND ORDER TICKET (Buy/Sell/Market/
+//     Limit), not the bottom panel — so it searched the order ticket for a
+//     "Positions" tab, found nothing, and reported "auto-repair failed"
+//     while changing nothing. Wrong about both the mechanism and the
+//     container. It is deleted, not patched.
+//
+// This has now cost two live sessions:
+//   • 2026-08-19 — orders table read empty; worked around defensively in
+//     app/server.js (ordersTableSuspect) with a manual "open the Orders tab".
+//   • 2026-08-23 — all three tables unreadable for a full session. Flatness
+//     derives from the positions table, so the feed correctly REFUSED to
+//     fold (a wrong "flat" corrupts trade count, day P&L and size-after-loss
+//     state) and every dependent guardrail went dark.
+//
+// STRATEGY — expand first, tab-click only as a fallback:
+//   1. Report which wanted tables are actually in the DOM.
+//   2. If any are missing, EXPAND the bottom panel (the fix in ~every case).
+//   3. Re-check. If something is still missing, fall back to clicking that
+//      table's tab — correctly scoped to the bottom panel this time.
+//
+// DELIBERATELY NEVER RE-COLLAPSES THE PANEL. Collapsing is what unmounts the
+// tables; restoring that state would re-break the feed the instant we fixed
+// it. The panel staying open is a hard requirement of reading the account,
+// not a preference. Sub-tab selection IS restored, since that is cosmetic
+// and costs nothing.
+//
+// SAFETY CONTRACT: every click is confined to the bottom panel's tab strip
+// (`[class*="layout__area--bottom"]` and its tab controls). It excludes
+// `menuButton*` (which opens a context menu) and anything not visible. It
+// can never reach the order ticket, a buy/sell button, or anything that
+// transmits. It is strictly read-enablement: if it cannot find a control it
+// reports so and changes nothing, and callers keep their existing
+// refuse-to-fold behaviour for whatever stays unreadable.
+
+// Matched by SUFFIX so a non-Tradovate broker integration still resolves —
+// the "TRADOVATE." prefix is TradingView's component name for this broker
+// and would silently stop matching if the account were ever moved.
+const PANEL_TABLES = {
+  positions: 'positions-table',
+  orders: 'orders-table',
+  summary: 'accountSummary-table',
+};
+
+// Visible-text patterns per tab, lowercase substring. Loose on purpose: the
+// live label is "Account summary" (lowercase s) and the panel appends counts
+// like "Positions (1)".
+const TAB_TEXT = {
+  positions: ['position'],
+  orders: ['order'],
+  summary: ['account summary', 'summary'],
+};
+
+const BOTTOM_PANEL_SEL = '[class*="layout__area--bottom"]';
+
+export function mountedTablesJS() {
+  return `
+(function() {
+  var names = ${JSON.stringify(PANEL_TABLES)};
+  var out = {};
+  for (var k in names) {
+    out[k] = !!document.querySelector('table[data-name$="' + names[k] + '"]');
+  }
+  return out;
+})()
+`;
+}
+
+// Diagnostic snapshot of the bottom panel, so callers (and the app's UI
+// health check) can say "the panel is collapsed" specifically, instead of
+// the useless generic "table not found".
+export function bottomPanelStateJS() {
+  return `
+(function() {
+  var root = document.querySelector('${BOTTOM_PANEL_SEL}');
+  if (!root) return { present: false, collapsed: null, height: 0, brokerTab: null };
+  var collapsedEl = root.querySelector('[class*="collapsed-"]');
+  var brokerTab = null;
+  var btns = Array.prototype.slice.call(root.querySelectorAll('[class*="tabbar-"] button'));
+  for (var i = 0; i < btns.length; i++) {
+    var tx = ((btns[i].innerText || btns[i].textContent || '') + '').trim();
+    if (tx && tx.length < 40 && !/menuButton/.test((btns[i].className || '') + '')) { brokerTab = tx; break; }
+  }
+  return {
+    present: true,
+    collapsed: !!collapsedEl || root.clientHeight < 80,
+    height: root.clientHeight,
+    brokerTab: brokerTab
+  };
+})()
+`;
+}
+
+// Expands the bottom panel by clicking the broker-name tab in its tab strip.
+// That button is a toggle: clicking it while collapsed expands it. We only
+// ever click it after confirming the panel IS collapsed, so it can never be
+// the thing that collapses it.
+export function expandBottomPanelJS() {
+  return `
+(function() {
+  var root = document.querySelector('${BOTTOM_PANEL_SEL}');
+  if (!root) return { ok: false, error: 'bottom panel container not found' };
+  var collapsed = !!root.querySelector('[class*="collapsed-"]') || root.clientHeight < 80;
+  if (!collapsed) return { ok: true, already: true, height: root.clientHeight };
+  var heightBefore = root.clientHeight;
+  var btns = Array.prototype.slice.call(root.querySelectorAll('[class*="tabbar-"] button'));
+  for (var i = 0; i < btns.length; i++) {
+    var b = btns[i];
+    var tx = ((b.innerText || b.textContent || '') + '').trim();
+    if (!tx || tx.length > 40) continue;                        // unlabelled/fake tab
+    if (/menuButton/.test((b.className || '') + '')) continue;   // opens a menu, not a toggle
+    if (b.offsetParent === null) continue;                       // not visible
+    b.click();
+    return { ok: true, already: false, clicked: tx, heightBefore: heightBefore };
+  }
+  return { ok: false, error: 'no labelled broker tab button in the bottom tab strip' };
+})()
+`;
+}
+
+// Clicks a sub-tab (Positions / Orders / Account summary) inside the bottom
+// panel. Fallback only — with the panel expanded all three tables are
+// normally mounted regardless of which sub-tab is selected.
+export function clickPanelTabJS(patterns) {
+  return `
+(function() {
+  var pats = ${JSON.stringify(patterns)};
+  var root = document.querySelector('${BOTTOM_PANEL_SEL}');
+  if (!root) return { ok: false, error: 'bottom panel container not found' };
+  var cands = Array.prototype.slice.call(
+    root.querySelectorAll('[role="tab"], button, [class*="roundTabButton"]')
+  );
+  function textOf(el) { return ((el.innerText || el.textContent || '') + '').trim().toLowerCase(); }
+  function isActive(el) {
+    var c = (el.className || '') + '';
+    return el.getAttribute('aria-selected') === 'true' || c.indexOf('active') !== -1 || c.indexOf('selected') !== -1;
+  }
+  var prevActive = null;
+  for (var i = 0; i < cands.length; i++) {
+    if (isActive(cands[i])) { var t = textOf(cands[i]); if (t && t.length <= 40) { prevActive = t; break; } }
+  }
+  for (var p = 0; p < pats.length; p++) {
+    for (var j = 0; j < cands.length; j++) {
+      var el = cands[j];
+      var txt = textOf(el);
+      if (!txt || txt.length > 40) continue;                       // a container, not a tab
+      if (/menuButton/.test((el.className || '') + '')) continue;   // opens a menu
+      if (txt.indexOf(pats[p]) === -1) continue;
+      if (el.offsetParent === null) continue;                       // not visible
+      el.click();
+      return { ok: true, clicked: txt, prevActive: prevActive };
+    }
+  }
+  return { ok: false, error: 'no visible bottom-panel tab matched: ' + pats.join(', '), prevActive: prevActive };
+})()
+`;
+}
+
+// Ensure every panel table the caller needs is mounted in the DOM. Returns
+// what was missing, what was recovered, what is still missing, and enough
+// diagnostics for the UI to tell the human something actionable.
+export async function ensurePanelTablesMounted({ want, requireExpanded = true } = {}) {
+  const keys = Array.isArray(want) && want.length ? want : Object.keys(PANEL_TABLES);
+  const before = await evaluate(mountedTablesJS());
+  const missing = keys.filter((k) => before && before[k] === false);
+  const panelBefore = await evaluate(bottomPanelStateJS());
+
+  // WHY `requireExpanded` DEFAULTS TO TRUE — measured 2026-08-23:
+  // Collapsing the panel does NOT immediately unmount the tables; once
+  // rendered they persist in the DOM. The real lifecycle is "lazy mount on
+  // FIRST expand, then persist", which is exactly how a whole session went
+  // dark: the panel had been collapsed since launch, so the tables were
+  // never rendered even once.
+  //
+  // That leaves a question that could NOT be settled from a flat, idle
+  // account: does a collapsed panel keep receiving updates, or does its DOM
+  // freeze at the last rendered values? Sampling it 12s apart showed no
+  // change, which proves nothing either way with no position open.
+  //
+  // Presence is therefore NOT accepted as sufficient. A frozen positions
+  // table reads as "no open positions" — i.e. FLAT — and a false flat is the
+  // precise corruption this whole guard exists to prevent (it fabricates a
+  // round trip, mis-scores day P&L, and unlocks size-after-loss). Requiring
+  // the panel expanded costs screen space; assuming liveness we cannot
+  // demonstrate costs real money. Callers that only want presence (a
+  // diagnostic, a test) can opt out with requireExpanded: false.
+  const needExpand = !!(requireExpanded && panelBefore && panelBefore.present && panelBefore.collapsed);
+
+  if (!missing.length && !needExpand) {
+    return {
+      success: true, alreadyMounted: true, missing: [], recovered: [],
+      stillMissing: [], expanded: null, clicks: [], panelBefore, panelAfter: panelBefore,
+    };
+  }
+
+  // STEP 1 — expand the bottom panel. This is the actual fix in essentially
+  // every observed case: it both mounts tables that were never rendered and
+  // guarantees the ones already there are being kept current.
+  let expanded = null;
+  if (panelBefore && panelBefore.present && panelBefore.collapsed) {
+    expanded = await evaluate(expandBottomPanelJS());
+    await new Promise((r) => setTimeout(r, 700)); // let the panel render its tables
+  }
+
+  let after = await evaluate(mountedTablesJS());
+  let stillMissing = keys.filter((k) => after && after[k] === false);
+
+  // STEP 2 — fallback: if something is STILL unmounted with the panel open,
+  // try selecting its own tab. Not expected to be needed; kept because the
+  // 2026-08-19 orders incident predates this understanding and a cheap
+  // second attempt beats a dark feed.
+  const clicks = [];
+  let restoreTo = null;
+  if (stillMissing.length) {
+    for (const key of stillMissing) {
+      const res = await evaluate(clickPanelTabJS(TAB_TEXT[key] || [key]));
+      clicks.push(Object.assign({ table: key }, res || { ok: false, error: 'evaluate returned nothing' }));
+      // Only the FIRST click sees the human's real tab; after that "previous"
+      // is a tab we selected ourselves.
+      if (restoreTo == null && res && res.prevActive) restoreTo = res.prevActive;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    after = await evaluate(mountedTablesJS());
+    stillMissing = keys.filter((k) => after && after[k] === false);
+  }
+
+  const recovered = missing.filter((k) => stillMissing.indexOf(k) === -1);
+
+  // Restore the sub-tab the human had selected — cosmetic only, and
+  // deliberately non-fatal: failing to restore a tab must never turn a
+  // successful recovery into a reported failure. The PANEL is never
+  // re-collapsed; that would unmount the tables again.
+  let restored = null;
+  if (restoreTo) {
+    try {
+      const r = await evaluate(clickPanelTabJS([restoreTo]));
+      restored = !!(r && r.ok);
+    } catch (e) { restored = false; }
+  }
+
+  const panelAfter = await evaluate(bottomPanelStateJS());
+
+  return {
+    success: stillMissing.length === 0,
+    alreadyMounted: false,
+    missing,
+    recovered,
+    stillMissing,
+    expanded,
+    clicks,
+    restoredTab: restoreTo,
+    restored,
+    panelBefore,
+    panelAfter,
   };
 }

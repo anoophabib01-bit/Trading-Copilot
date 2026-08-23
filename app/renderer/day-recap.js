@@ -256,7 +256,13 @@ function recapRequestJessi(day, last, size) {
   const label = document.getElementById('recap-jessi-label');
   if (label) label.textContent = 'JESSI — READING YESTERDAY…';
   window.api.sendJessiChat([{ role: 'user', content: recapJessiPrompt(day, last, size) }])
-    .then(function (text) {
+    .then(function (res) {
+      // sendJessiChat resolves { text, answeredBy }, NOT a bare string. This
+      // read it as a string, and since an object is truthy the empty-guard
+      // passed too — so the recap rendered the literal "[object Object]"
+      // under "JESSI — ON YESTERDAY". Fixed 2026-08-23 after seeing it on
+      // screen. Still tolerates a bare string in case a caller changes back.
+      const text = (res && typeof res === 'object') ? res.text : res;
       if (!text || !String(text).trim()) return;
       el.textContent = String(text).trim();
       if (label) label.textContent = 'JESSI — ON YESTERDAY';
@@ -353,7 +359,10 @@ function recapRender(day, today) {
     if (!last.length) {
       ltEl.innerHTML = '<div class="recap-sec-title">LAST 2 TRADES</div>' +
         '<div class="recap-note warn">No per-trade detail stored for ' + recapEsc(day.date) +
-        ' — upload that day’s CSV to see exits.</div>';
+        // Phase 4 (4.3): the live feed now writes this on its own — a missing
+        // day means the app wasn't running when it closed, not a missing
+        // upload. CSV reconciliation (4.5) is the backstop for exactly that.
+        ' — the app wasn’t running for that day’s closes. Reconcile a CSV export to backfill it.</div>';
     } else {
       ltEl.innerHTML = '<div class="recap-sec-title">LAST 2 TRADES — COMPARE AGAINST TODAY’S PRICE</div>' +
         last.map(function (t) {
