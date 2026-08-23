@@ -842,6 +842,61 @@ vault at the repo root is what replaced them.*
 
   **Successor: 7.2.** Not a rewrite of this one — a much smaller thing.
 
+- [x] **7.3 — `sessions/Now.md`: the live glance surface** — *added 2026-08-23*
+
+  **Why.** Anoop, plainly: *"i want to use the graph live while i use the app… make
+  something genuinely live and meaningful."* The Obsidian graph is the wrong
+  instrument — it maps link structure and sits perfectly still during a session,
+  because `logTrade()` adds a table ROW, not a file or a link. (Measured: 106 vault
+  notes, exactly one wikilink between them.) 7.2 is the right plumbing but is
+  invisible by design, which is why it read as pointless.
+
+  **What this is.** A small fixed-size file the server REWRITES WHOLE every tick,
+  pinned in a second Obsidian pane. Current state at the top, newest events first.
+
+  **Why rewrite and not append — this is the whole design.** Every reason 7.1 died
+  is a constraint here, and rewriting dissolves all four at once:
+  - Own file, never the session note → cannot race `logTrade()` or break its table.
+  - Never `appendFileSync` → cannot create a file ahead of `startSession()` and
+    silently disable trade logging for the day (7.1's real killer).
+  - Fixed size, newest first → readable at a glance; Obsidian does not auto-scroll,
+    which is what made an append-log unreadable below the fold.
+  - It is a PROJECTION, not a record → if Obsidian clobbers it (observed: it rewrote
+    four tracked docs minutes after the vault opened) the next tick regenerates it
+    and nothing is lost. The session note and the ledger stay the records.
+
+  *Done: 2026-08-23. New pure `app/live-status.js` (`renderNowMarkdown`, `istClock`,
+  `istClockShort`, `money`, `cell`, `lossTierStatus`) + `app/test/live-status.test.js`
+  (24 tests). Server: `recordLiveEvent()` ring (40 max), `writeNowFile()` on a 5s
+  timer via `atomicWrite.writeAtomic`, started at boot next to the other monitors.
+  All numbers come from `getActiveRules()` every tick — nothing from rules.json is
+  retyped, and a mid-session mode switch is reflected. Because the guardrail reads
+  the same accessor, the displayed cap cannot disagree with the enforced one.
+  Suite 739/739. Verified live: file written at boot, real balance $50,811.80,
+  TV-offline state shown honestly.*
+
+  **7.3a — block instrumentation (the useful half of 7.2), done in the same change.**
+  All six `send(…'trade-confirm-rejected')` calls collapsed into one `rejectTicket()`
+  helper that owns both the reply and the recording, so a future rejection branch
+  cannot forget to record — the only way to reject is to call it. Order-path
+  behaviour is unchanged: same message, same socket, same early return. This is what
+  makes a block reachable by any live surface at all; previously it hit one socket
+  and a console.log that `crash-logger` prunes at 14 days.
+
+  **Defect caught in my own build, before shipping:** the header clock originally
+  carried seconds, so the rendered text differed every tick and the
+  write-suppression check could never fire — the file would have been rewritten
+  every 5s forever, flickering an Obsidian pane in his peripheral vision all
+  session for no information. Header is now HH:MM (event rows keep seconds, since
+  correlating a block against a trades-table row is the post-session use). Two tests
+  pin the property. Verified live: mtime held steady across four consecutive ticks.
+
+  **Not in it yet:** debate verdicts and trade tickets go through `emitTo(ws, …)`,
+  which only reaches `broadcast()` for auto-triggered debates, so they are not in
+  the ring. Adding them means instrumenting those sites the same way `rejectTicket`
+  does. **Not live-verified:** no real guardrail block has fired against this build,
+  so the block row has never rendered from a genuine refusal.
+
 - [ ] **7.2 — Put guardrail blocks and verdicts in the ledger that already exists**
 
   **Why.** The residual gap the review agreed is real: monitor fires and PO3 transitions

@@ -32,6 +32,7 @@ const { resolveDataDir, DEFAULT_DATA_DIR, FALLBACK_DATA_DIR } = require('./resol
 const edgeTts = require('./edge-tts');
 const localTts = require('./local-tts'); // offline Windows SAPI fallback (2026-07-28)
 const sessionMgr = require('./session-manager');
+const liveStatus = require('./live-status');   // 7.3 — pure renderer for sessions/Now.md
 const telegramBot = require('./telegram-bot');
 const booksIndex = require('./books-index');
 const tradovate = require('./tradovate');
@@ -2985,6 +2986,11 @@ async function checkPo3Phase() {
           ' at ' + istTime + ' IST | 1H bias: ' + biasLabel +
           (res.rangeHigh != null ? ' | opening range ' + res.rangeLow + '–' + res.rangeHigh : '') +
           '\n' + res.reason + (res.detail ? '\n' + res.detail : '');
+        // 7.3: phase TRANSITIONS only — the detector emits here only when the
+        // phase actually changed, so this is ~3-4 lines a session, not one per
+        // 60s poll. Built from the structured fields rather than `msg`, which
+        // is deliberately multi-line and would be collapsed anyway.
+        try { recordLiveEvent('phase', 'PO3', symLabel + ' ' + prev + ' → ' + res.phase); } catch (_) {}
         broadcast({
           type: 'po3-phase-change',
           from: prev,
@@ -5904,6 +5910,76 @@ function broadcastWatchersStatus() {
   broadcast({ type: 'watchers-status', data: buildWatchersStatus() });
 }
 
+// ── 7.3: sessions/Now.md — the live glance surface ──────────────────────────
+// A PROJECTION of state, rewritten whole every tick. Never appended, never a
+// record. See live-status.js's header for why each of those words is load
+// bearing — the short version is that task 7.1 tried to append a live log into
+// the day's session note and the review found four separate ways that silently
+// destroys real trade data.
+//
+// Everything below is defensive by policy: this runs on a timer inside the
+// process that also enforces the guardrail and places live orders. It may
+// never throw, and may never delay anything.
+const LIVE_EVENT_RING = [];
+const LIVE_EVENT_RING_MAX = 40;   // > the render cap, so a burst still leaves history
+let nowFileTimer = null;
+let nowFileLastText = '';
+
+/** Push one event onto the ring. Cheap, synchronous, cannot throw. */
+function recordLiveEvent(kind, label, detail) {
+  try {
+    LIVE_EVENT_RING.push({ ts: Date.now(), kind, label, detail });
+    if (LIVE_EVENT_RING.length > LIVE_EVENT_RING_MAX) LIVE_EVENT_RING.shift();
+  } catch (_) { /* bookkeeping must never break a caller */ }
+}
+
+function writeNowFile() {
+  try {
+    const rules = getActiveRules();
+    const md = liveStatus.renderNowMarkdown({
+      mode: currentMode,
+      feed: tvBrokerFeedState,
+      // Read from rules.json every tick rather than captured once — a mid
+      // session mode switch (eval/funded, standard/scalper) must be reflected,
+      // and CLAUDE.md forbids a second copy of any number that lives there.
+      rules: {
+        sizeCap: rules.sizeCap,
+        tradesPerDay: rules.tradesPerDay,
+        dailyLossTiers: rules.dailyLossTiers,
+      },
+      watchers: buildWatchersStatus(),
+      recent: LIVE_EVENT_RING,
+    }, Date.now());
+
+    // Skip the write when nothing changed. Obsidian re-renders on every file
+    // event, and a pane that flickers once a second in his peripheral vision
+    // during a live session is a cost, not a feature. The clock is in the
+    // header so this only no-ops within the same second — which is exactly
+    // the burst case worth suppressing.
+    if (md === nowFileLastText) return;
+    nowFileLastText = md;
+
+    // Atomic whole-file write, NOT an append: one writer, one inode swap, and
+    // a torn projection on the second monitor is worse than a stale one.
+    // sessionMgr owns the directory; reuse it rather than re-deriving a path.
+    const p = path.join(sessionMgr.SESSIONS_DIR, 'Now.md');
+    atomicWrite.writeAtomic(p, md, 'utf8');
+  } catch (e) {
+    // Swallowed on purpose — a glance surface must never be able to take down
+    // the process that runs the guardrail. console.warn is mirrored to
+    // app/logs by crash-logger, so this is recorded, not silent.
+    console.warn('[now-file] write skipped:', e && e.message);
+  }
+}
+
+function startNowFileWriter() {
+  if (nowFileTimer) return;
+  writeNowFile();
+  nowFileTimer = setInterval(writeNowFile, 5000);
+  if (nowFileTimer.unref) nowFileTimer.unref();
+  console.log('✓ Live status file: ' + path.join(sessionMgr.SESSIONS_DIR, 'Now.md') + ' (rewritten every 5s)');
+}
+
 // ── H6: per-trade P&L attribution gate (5.2's display condition) ────────────
 // CONFIRMED only when a real closed MNQ trade with non-zero P&L passes the
 // balance-delta vs fills cross-check (expectedPnlFromFills). Until then the
@@ -7187,6 +7263,13 @@ async function pollTVPositions() {
       events: events.map(e => ({ ...e, text: positionEvents.describeEvent(e) })),
       at: Date.now(),
     });
+    // 7.3: feed the glance surface. describeEvent() is the same text the HUD
+    // shows, so the two can never disagree. Only transitions reach here (the
+    // watch emits nothing when nothing changed), so this is a handful of lines
+    // per session, not one per 5s tick.
+    for (const e of events) {
+      try { recordLiveEvent('position', 'POSITION', positionEvents.describeEvent(e)); } catch (_) {}
+    }
 
     // D4 (2026-08-21): skip ONLY this hand-off while an order is mid-placement.
     // The orders table is being rewritten at that moment, so a full account
@@ -7408,34 +7491,50 @@ function scheduleLiveFeedSelfTest(delayMs) {
 const tradeConfirmDedupState = tradeConfirmDedup.createDedupState();
 const TRADE_CONFIRM_DEDUP_WINDOW_MS = 30 * 60 * 1000; // 30 min — well past any plausible legitimate retry
 
+// 2026-08-23 (7.3): every rejection used to be its own bare `send(ws, ...)`,
+// six of them, so a block reached exactly one socket and nothing else — no
+// durable record beyond a console.log that crash-logger prunes at 14 days, and
+// no way for any live surface to show it. That made "show me every time the
+// system said no" unanswerable, which was the whole reason the live-surface
+// work started. One helper now owns the reply AND the recording, so a future
+// rejection branch cannot forget to record: the only way to reject is to call
+// this. Behaviour of the order path itself is unchanged — same message, same
+// socket, same early return.
+function rejectTicket(ws, requestId, reason) {
+  send(ws, { type: 'trade-confirm-rejected', requestId: requestId || null, reason });
+  // Never let bookkeeping break the refusal — the refusal is the safety
+  // behaviour, the record is a convenience.
+  try { recordLiveEvent('block', 'BLOCK', reason); } catch (_) {}
+}
+
 async function handleTradeConfirm(ws, msg) {
   const requestId = msg && msg.requestId;
   const { sourceVerdictId, side, symbol, qty, stopPrice, targetPrice } = msg || {};
 
   const dedup = tradeConfirmDedup.checkAndMark(tradeConfirmDedupState, requestId, sourceVerdictId, Date.now(), TRADE_CONFIRM_DEDUP_WINDOW_MS);
   if (!dedup.ok) {
-    send(ws, { type: 'trade-confirm-rejected', requestId: requestId || null, reason: dedup.reason });
+    rejectTicket(ws, requestId, dedup.reason);
     return;
   }
 
   try {
     if (process.env.TV_ALLOW_LIVE_ORDERS !== '1') {
-      send(ws, { type: 'trade-confirm-rejected', requestId, reason: 'live orders are not enabled this session (TV_ALLOW_LIVE_ORDERS was not set at launch)' });
+      rejectTicket(ws, requestId, 'live orders are not enabled this session (TV_ALLOW_LIVE_ORDERS was not set at launch)');
       return;
     }
     if (!mcpBridge.ready || !mcpBridge.tvConnected) {
-      send(ws, { type: 'trade-confirm-rejected', requestId, reason: 'TradingView is not connected' });
+      rejectTicket(ws, requestId, 'TradingView is not connected');
       return;
     }
 
     const sideNorm = String(side || '').toLowerCase();
     const qtyNum = Number(qty);
     if (sideNorm !== 'buy' && sideNorm !== 'sell') {
-      send(ws, { type: 'trade-confirm-rejected', requestId, reason: `invalid side: ${side}` });
+      rejectTicket(ws, requestId, `invalid side: ${side}`);
       return;
     }
     if (!Number.isFinite(qtyNum) || qtyNum <= 0 || Math.floor(qtyNum) !== qtyNum) {
-      send(ws, { type: 'trade-confirm-rejected', requestId, reason: `invalid size: ${qty}` });
+      rejectTicket(ws, requestId, `invalid size: ${qty}`);
       return;
     }
 
@@ -7446,7 +7545,7 @@ async function handleTradeConfirm(ws, msg) {
     const check = tradeConfirmRules.checkTradeAllowed(rules, currentMode, tvBrokerFeedState.trades, qtyNum);
     if (!check.allowed) {
       console.log(`[trade-confirm] BLOCKED requestId=${requestId}: ${check.reason}`);
-      send(ws, { type: 'trade-confirm-rejected', requestId, reason: check.reason });
+      rejectTicket(ws, requestId, check.reason);
       return;
     }
 
@@ -7596,6 +7695,7 @@ httpServer.listen(PORT, '127.0.0.1', async () => {
   console.log('✓ TradingView broker-account monitor started (10s cadence, polls only while TV is connected)');
   startTVPositionWatch();
   console.log(`✓ Live position watch started (${TV_POSITION_WATCH_MS / 1000}s cadence — open/close/scale detected here, then folded immediately by the account poll)`);
+  startNowFileWriter();
   console.log(`✓ Mode: ${(cfg.mode || 'funded').toUpperCase()}`);
 
   // 2026-08-11 (Anoop): "I don't want telegram to work... remove them."
