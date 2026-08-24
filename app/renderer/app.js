@@ -4,6 +4,10 @@
 const state = {
   messages: [],
   trades: [],
+  // 2026-08-24: watcher-detection chime. Persisted so a mute survives the
+  // reload it usually follows — muting and then having it come back on the
+  // next refresh, mid-session, is worse than never having the sound.
+  signalMuted: (() => { try { return localStorage.getItem('copilot-signal-muted') === '1'; } catch (e) { return false; } })(),
   // FIX (2026-07-21): default account is the 150K eval (the $50K funded
   // account is blown — see Settings for the account ID, kept out of source
   // control). These initial literal values are
@@ -1435,6 +1439,32 @@ const tvAudio = {
     this.tone(880, 0.12, 0.14, 0.12);
   },
 
+  // 2026-08-24: a watcher found something.
+  //
+  // Deliberately NEUTRAL in pitch — two taps at the same frequency, neither
+  // rising nor falling. playDisconnect() descends because it means "stop";
+  // playConnect() rises because it means "recovered". A detection means
+  // neither: it is information, not a verdict, and the setup it points at may
+  // well be one to skip. An ascending chime here would sound like a reward for
+  // a signal appearing, which is exactly the wrong reflex to train into
+  // someone who is trying not to overtrade.
+  playSignal() {
+    const ctx = this.ensureCtx();
+    if (!ctx || ctx.state === 'suspended') return;
+    this.tone(720, 0.00, 0.07, 0.10);
+    this.tone(720, 0.11, 0.09, 0.10);
+  },
+
+  // PO3 phase change — same neutral character, one extra tap and slightly more
+  // present, because this is the transition that can auto-trigger the debate.
+  playPhase() {
+    const ctx = this.ensureCtx();
+    if (!ctx || ctx.state === 'suspended') return;
+    this.tone(620, 0.00, 0.07, 0.12);
+    this.tone(620, 0.11, 0.07, 0.12);
+    this.tone(830, 0.22, 0.13, 0.13);
+  },
+
   warnBlocked() {
     if (this.blockedWarned) return;
     this.blockedWarned = true;
@@ -1688,6 +1718,10 @@ function setupWsEvents() {
   // the loudest treatment. ACCUMULATION deliberately reads as "do nothing".
   window.api.onPo3PhaseChange(info => {
     if (!info) return;
+    // Chime before rendering — this is the transition that can auto-trigger the
+    // debate, so it earns its own sound. Safe despite announceSignal being
+    // declared further down: this is a callback, it runs long after setup.
+    announceSignal('po3', info);
     const msgs = document.getElementById('messages');
     if (!msgs) return;
     const phase = info.phase || info.to || 'UNCLEAR';
@@ -1888,7 +1922,53 @@ function setupWsEvents() {
     updateEngulfStatus(tf, running ? 'watching' : 'off');
   });
 
-  window.api.onEngulfSignal(signal => handleEngulfSignal(signal));
+  // ── Watcher detection alerts (2026-08-24) ─────────────────────────────
+  // Sound + a chat line whenever a watcher actually FINDS something.
+  //
+  // The decision of what counts as a new detection lives in
+  // renderer/signal-alert.js, pure and unit-tested, because getting it wrong is
+  // audible every 30 seconds: the *-check events are poll heartbeats carrying
+  // found:false, and a real signal re-fires on later polls while it stays valid
+  // (observed live 2026-08-24 — the same 30M FVG announced at 17:00:20 and
+  // again at 17:15:17). One setup must make one sound.
+  const signalSeen = Object.create(null);
+
+  // Mute without a reload, from the console or a future button:
+  //   copilotMuteSignals()      -> toggle
+  //   copilotMuteSignals(true)  -> silence
+  // The chat line still appears when muted; only the sound stops. Losing the
+  // written record of a detection because the room got noisy would be the
+  // wrong trade.
+  window.copilotMuteSignals = function (on) {
+    state.signalMuted = (on === undefined) ? !state.signalMuted : !!on;
+    try { localStorage.setItem('copilot-signal-muted', state.signalMuted ? '1' : '0'); } catch (e) {}
+    addSystemMessage(state.signalMuted
+      ? '🔕 Watcher chime muted — detections still post here.'
+      : '🔔 Watcher chime on.');
+    return state.signalMuted;
+  };
+
+  function announceSignal(kind, msg) {
+    try {
+      if (!window.SignalAlert) return;
+      const now = Date.now();
+      window.SignalAlert.pruneSeen(signalSeen, now);
+      const r = window.SignalAlert.shouldAnnounce(signalSeen, kind, msg, now);
+      if (!r.announce) return;
+      // Mute silences the SOUND only. The chat line is the durable half — losing
+      // the written record of a detection because the room got noisy would be
+      // the wrong trade.
+      if (!state.signalMuted) {
+        try { kind === 'po3' ? tvAudio.playPhase() : tvAudio.playSignal(); } catch (_) {}
+      }
+      addSystemMessage((state.signalMuted ? '🔕 ' : '🔔 ') + r.text);
+    } catch (e) {
+      // An alert must never be the thing that breaks the trading UI.
+      console.warn('[signal-alert]', e && e.message);
+    }
+  }
+
+  window.api.onEngulfSignal(signal => { announceSignal('engulf', signal); handleEngulfSignal(signal); });
 
   window.api.onEngulfCheck(chk => {
     const tf = (chk && chk.tf) || '1h';
@@ -1908,7 +1988,7 @@ function setupWsEvents() {
     updateFVGStatus(tf, running ? 'watching' : 'off');
   });
 
-  window.api.onFVGSignal(signal => handleFVGSignal(signal));
+  window.api.onFVGSignal(signal => { announceSignal('fvg', signal); handleFVGSignal(signal); });
 
   window.api.onFVGCheck(chk => {
     const tf = (chk && chk.tf) || '15m';
@@ -1931,7 +2011,7 @@ function setupWsEvents() {
   // A raw sweep is informational (Playbook B step 2 only) — log it in history
   // but don't treat it as the tradeable signal. handlePlaybookBSignal below is
   // the one that fires the popup/notification, since that's steps 2+3 combined.
-  window.api.onSFPSignal(signal => handleSFPSweep(signal));
+  window.api.onSFPSignal(signal => { announceSignal('sfp', signal); handleSFPSweep(signal); });
 
   window.api.onPlaybookBSignal(signal => handlePlaybookBSignal(signal));
 

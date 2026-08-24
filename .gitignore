@@ -29,3 +29,12 @@ DSH build/
 
 # Obsidian vault config (vault root = repo root, see sessions/)
 .obsidian/
+
+# Obsidian scratch created by clicking New canvas / New base / Daily note.
+# The vault root is the repo root, so these land here rather than in a vault
+# folder. Ignored, not deleted — an empty one is an accidental click, but a
+# named one may be real work.
+Untitled.canvas
+Untitled.base
+*.canvas
+*.base

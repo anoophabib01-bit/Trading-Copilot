@@ -1218,6 +1218,9 @@
 <script src="scorecard.js"></script>
 <!-- 6.1: payout-pace.js — distance-to-payout pace math for the Day Recap -->
 <script src="payout-pace.js"></script>
+<!-- signal-alert.js — decides whether a watcher detection is NEW and worth a
+     chime. Must load BEFORE app.js, which reads window.SignalAlert. -->
+<script src="signal-alert.js"></script>
 <script src="app.js"></script>
 <!-- Loaded after app.js: reuses insCoachNotes/insMoney/edToday from it. -->
 <script src="day-recap.js"></script>
