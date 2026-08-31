@@ -38,14 +38,69 @@ const booksIndex = require('./books-index');
 const tradovate = require('./tradovate');
 const tvBrokerFeed = require('./tv-broker-feed'); // balance-delta-at-flat P&L fold for the TradingView broker feed (unit-tested)
 const pointValueVerify = require('./point-value-verify'); // cross-checks the P&L multiplier against TradingView (unit-tested)
+const brokerVerify = require('./broker-verify'); // three-way check against the broker before any figure reaches an agent (2026-08-26)
+const mindLog = require('./mind-log'); // Alignment + Lessons merged into one store (2026-08-25, pure + unit-tested)
+const armedDetectors = require('./armed-detectors'); // self-authored guardrails from the Lessons tab (2026-08-25, pure + unit-tested)
+const journalNotes = require('./journal-notes'); // Daily Journal notes -> coaching context (2026-08-25, pure + unit-tested)
+const weekRollup = require('./week-rollup'); // Weekly Report fold — quadrant verdict, loss attribution, findings (2026-08-29, pure + unit-tested)
+const weekStore = require('./week-store');   // Weekly Report persistence: frozen weeks, commitments, doctrine, sessions/Week-*.md (2026-08-29)
 const mistakePatterns = require('./mistake-patterns'); // live pattern-matching against Anoop's own documented failure history (2026-08-19, F1 first slice — advisory only, unit-tested)
 const positionEvents = require('./position-events'); // fast open/close/scale/flip detector for the 5s positions watch (2026-08-20, pure + unit-tested)
 const tradeConfirmRules = require('./trade-confirm-rules'); // Phase 2a/2b rule-check for the confirm/execute flow — unit-tested
 const tradeTicketParse = require('./trade-ticket-parse'); // Phase 2b: pure parser for JUDGE_PERSONA's TRADE_TICKET line — unit-tested
-const playbookC = require('./playbook-c'); // Playbook C engulfing validity + shared closed-bar helper — unit-tested
+const playbookC = require('./playbook-c');
+// Bar-pattern detectors, extracted 2026-08-26. These were inline below until
+// the backtest harness needed to run them without booting this server — see
+// detectors.js's header for why importability was the blocker on ever
+// answering 'do these playbooks actually work?'.
+const { detectEngulfFromBars, classifyTrendFromBars, detectFVGFromBars, getSwingLevels, detectSFPFromBars } = require('./detectors');
+// Playbook spec: the single definition of where each playbook's entry, stop
+// and target are, shared with backtest.js so the live ledger and the
+// backtest can never disagree about what a setup actually proposed.
+const detectors = require('./detectors'); // namespace form, for adxSeries in the shadow context
+const playbookSpec = require('./playbook-spec');
+// Bar-close-aligned watcher scheduling (2026-08-26). Replaces wall-clock
+// setInterval polling that was doing 740 chart reads/hour to learn 27 new
+// bars, starving the 5s position watch and 10s broker poll on the shared CDP
+// connection until they hit MCP timeouts. See bar-schedule.js.
+const barSchedule = require('./bar-schedule');
+// PROTOCOL 2 - live-feed integrity at startup. Pure decision logic; the
+// observation gathering (the part that needs CDP) lives in
+// runFeedIntegrityProtocol() below.
+const feedProtocol = require('./feed-protocol');
+// PROTOCOL 1 - whole-app health, every 3 days. Same split as protocol 2:
+// pure decision logic here, observation gathering in runHealthProtocol().
+const healthProtocol = require('./health-protocol');
+// OVERSIZE GUARD (2026-08-28). Pure decision logic; the order call is below in
+// enforceOversizeGuard(). Reduces an oversized position back to the size cap.
+const oversizeGuard = require('./oversize-guard');
+// The GIVE-CONTROL toggle (2026-08-26). autonomy-gate.js decides whether the
+// requested mode is permitted; this file owns persistence and broadcast. LIVE
+// additionally requires measured evidence — see that module's header for why
+// a plain boolean would have been the wrong shape.
+const autonomyGate = require('./autonomy-gate');
+// Per-mode configuration for the four rungs (2026-08-29, AUTONOMY_MODES_SPEC.md).
+// autonomy-gate decides whether a mode may be ENTERED; this decides what the
+// mode may DO once it is — sizes, silence, per-trade risk cap, playbooks. Its
+// riskCapUsd() always returns the tighter of {mode cap, perTradeMaxLoss}, so a
+// bad edit in rules.json can only ever refuse trades, never widen risk.
+const autonomyModes = require('./autonomy-modes');
+// All CONTROL-toggle data lives in DATA/autonomy/ and nothing else writes
+// there — Anoop's request, so the autonomous system's record is one folder
+// rather than rows scattered through the general ledger.
+const autonomyStore = require('./autonomy-store');
+// Builds the two shadow record shapes: the order the MACHINE would have sent,
+// and the trade ANOOP actually took with its context. See its header for why
+// both are recorded and why "good trades only" needs the losers too.
+const shadowRecorder = require('./shadow-recorder'); // Playbook C engulfing validity + shared closed-bar helper — unit-tested
 const tradeConfirmDedup = require('./trade-confirm-dedup'); // Phase 2b: double-submit/idempotency guard — unit-tested
 
-const PORT = 7433;
+// 2026-08-27: overridable so a second instance can be started on a spare port
+// to VERIFY a change without killing the live one. Defaults to 7433, so the
+// launcher and every doc are unaffected. This existed as a hardcoded literal,
+// which meant the only way to execute a change was to take down the session
+// that was running — so in practice changes got shipped on node --check alone.
+const PORT = Number(process.env.MNQ_PORT) || 7433;
 const CONFIG_PATH = path.join(require('os').homedir(), '.mnq-copilot-config.json');
 
 // ── Crash guards (2026-07-25 robustness pass) ─────────────────────────────────
@@ -560,6 +615,221 @@ function dataLoad(key) {
   try { return JSON.parse(fs.readFileSync(dataPathFor(key), 'utf8')); }
   catch { return null; }
 }
+
+// ── Weekly Report (2026-08-29) ───────────────────────────────────────────────
+// Anoop: "i want to see this page every weekend to plan for my upcoming week."
+//
+// ONE builder, used by the tab, the Saturday markdown and the Telegram push.
+// The whole reason the tab can be trusted is that none of those three compute
+// anything themselves — they all read this object. Splitting it would recreate
+// the exact drift day-rollup.js's header was written to stop.
+//
+// `offset` is 0 for the week containing today, -1 for last week, and so on.
+// Positive values are clamped away: there is no report for a week that has not
+// happened.
+function buildWeekPayload(offset) {
+  const cfg = loadConfig();
+  const slot = jessiBucketKey(cfg);
+  const raw = loadRules();
+  const accountBlock = raw[currentMode] || raw.eval || {};
+  const todayKey = tradingDayStampIST(Date.now());
+
+  const off = Math.min(0, Number(offset) || 0);
+  const anchor = new Date(weekRollup.weekStart(todayKey) + 'T00:00:00Z');
+  anchor.setUTCDate(anchor.getUTCDate() + off * 7);
+  const anyDate = anchor.toISOString().slice(0, 10);
+
+  const week = weekStore.buildWeek(DATA_DIR, slot, anyDate, todayKey, accountBlock);
+  const prevDate = weekRollup.prevWeekStart(anyDate);
+  const prev = weekStore.buildWeek(DATA_DIR, slot, prevDate, todayKey, accountBlock);
+  const hadPrev = weekRollup.weekHasData(prev);
+
+  const findings = weekRollup.weekFindings(week, hadPrev ? prev : null);
+  const trend = weekRollup.compareWeeks(week, hadPrev ? prev : null);
+
+  // ── Four-week window (2026-08-31, Anoop: "lets compare 4 weeks data") ──────
+  // The three weeks BEFORE the one on screen, plus it, oldest first. Built by
+  // walking calendar weeks back rather than by listing stored weeks, so a week
+  // he did not trade at all stays as an aligned empty column instead of being
+  // silently closed up — a three-week break must not render as three
+  // consecutive trading weeks.
+  const WINDOW = 4;
+  const window4 = [];
+  for (let back = WINDOW - 1; back >= 0; back--) {
+    const d = new Date(week.start + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() - back * 7);
+    window4.push(weekStore.buildWeek(DATA_DIR, slot, d.toISOString().slice(0, 10), todayKey, accountBlock));
+  }
+  const trend4 = weekRollup.trendSeries(window4);
+
+  // The commitment made LAST weekend is the one this week is graded against.
+  const commitment = weekStore.loadCommitment(DATA_DIR, slot, week.weekKey);
+  const grade = weekStore.gradeCommitment(week, commitment);
+
+  // The one he is about to make is for the week AFTER the one on screen.
+  const nextAnchor = new Date(week.start + 'T00:00:00Z');
+  nextAnchor.setUTCDate(nextAnchor.getUTCDate() + 7);
+  const nextWeekKey = weekRollup.isoWeekKey(nextAnchor.toISOString().slice(0, 10));
+
+  return {
+    slot: slot,
+    week: week,
+    findings: findings,
+    trend: trend,
+    trend4: trend4,
+    weeksInWindow: window4.map(w => ({
+      weekKey: w.weekKey, start: w.start, end: w.end,
+      complete: w.complete, hasData: weekRollup.weekHasData(w),
+      net: w.money.net, tradedDays: w.behaviour.tradedDays, heldFireDays: w.behaviour.heldFireDays,
+      isCurrent: w.weekKey === week.weekKey
+    })),
+    trendBasis: hadPrev
+      ? 'Compared against ' + prev.weekKey + ' (' + prev.start + ' to ' + prev.end + ').'
+      : 'No comparable previous week stored yet.',
+    severity: weekRollup.SEVERITY,
+    // Computed over ALL history, not this week — see week-rollup's
+    // adherenceSplit header for why a one-week sample cannot answer it.
+    adherence: weekRollup.adherenceSplit(weekStore.allRows(DATA_DIR, slot)),
+    doctrine: weekStore.loadDoctrine(DATA_DIR),
+    commitment: commitment,
+    grade: grade,
+    nextWeekKey: nextWeekKey,
+    nextCommitment: weekStore.loadCommitment(DATA_DIR, slot, nextWeekKey),
+    frozen: weekStore.loadFrozen(DATA_DIR, slot, week.weekKey),
+    frozenWeeks: weekStore.listFrozen(DATA_DIR, slot),
+    // Stated rather than assumed: the freeze button promises a Telegram push,
+    // and telegramBot.notify() is a silent no-op with no token or no linked
+    // chat. Promising a push that cannot fire is how a missed alert looks like
+    // a delivered one.
+    telegramReady: !!(telegramBot && telegramBot.bot && cfg.telegramChatId)
+  };
+}
+
+// ── The Saturday write ───────────────────────────────────────────────────────
+// Anoop chose "auto-write a markdown file to sessions/ + Telegram ping" over a
+// tab badge, because the point of the weekly review is that he opens it on a
+// day he is NOT sitting at the app. A surface that only exists inside the app
+// is a surface he will miss on exactly the mornings it matters.
+//
+// Deliberately NOT a cron at a fixed hour: this process is started and stopped
+// by hand around trading sessions, so a 09:00 timer would simply never fire on
+// a weekend when the app was closed. Instead it checks on boot and hourly, and
+// freezes any complete-but-unfrozen week from the last fortnight. Freezing is
+// idempotent (week-store preserves the original `frozenAt`), so a week is only
+// ever announced once.
+const WEEK_AUTOFREEZE_MS = 60 * 60 * 1000;
+let weeklyReportTimer = null;
+
+function autoFreezeDueWeeks() {
+  try {
+    const cfg = loadConfig();
+    const slot = jessiBucketKey(cfg);
+    const raw = loadRules();
+    const accountBlock = raw[currentMode] || raw.eval || {};
+    const todayKey = tradingDayStampIST(Date.now());
+
+    // This week and last week only. Anything older was either already frozen or
+    // is history he has moved past — silently back-filling months of notes on a
+    // first run would bury the one week he actually needs to read.
+    for (const back of [0, -1]) {
+      const d = new Date(weekRollup.weekStart(todayKey) + 'T00:00:00Z');
+      d.setUTCDate(d.getUTCDate() + back * 7);
+      const iso = d.toISOString().slice(0, 10);
+      const key = weekRollup.isoWeekKey(iso);
+
+      if (weekStore.loadFrozen(DATA_DIR, slot, key)) continue;
+      const wk = weekStore.buildWeek(DATA_DIR, slot, iso, todayKey, accountBlock);
+      if (!wk.complete) continue;
+      // A week with nothing in it is not worth a note or a push.
+      if (wk.behaviour.tradedDays === 0 && wk.behaviour.heldFireDays === 0) continue;
+
+      const r = freezeWeekNow(key);
+      if (r.frozenOk) {
+        console.log('[week] auto-froze ' + key + ' — the weekend review is ready'
+          + (r.markdown ? ' (' + r.markdown + ')' : ''));
+        broadcast({ type: 'week-ready', weekKey: key, markdown: r.markdown || null });
+      } else {
+        console.log('[week] auto-freeze skipped ' + key + ': ' + r.freezeError);
+      }
+    }
+  } catch (e) {
+    console.error('[week] auto-freeze check failed:', e.message);
+  }
+}
+
+function startWeeklyReportSchedule() {
+  if (weeklyReportTimer) return;                 // idempotent, like startPanelWatchdog
+  // A short delay so the boot log is not interleaved with a freeze, and so a
+  // first-run DATA_DIR resolution has settled before anything is written.
+  setTimeout(autoFreezeDueWeeks, 15000);
+  weeklyReportTimer = setInterval(autoFreezeDueWeeks, WEEK_AUTOFREEZE_MS);
+  console.log('✓ Weekly report: checks hourly, freezes a finished week to sessions/Week-<key>.md'
+    + (telegramBot && telegramBot.bot ? ' + Telegram' : ' (Telegram has no token — no push will be sent)'));
+}
+
+function sendWeekReport(ws, reqId, offset, extra) {
+  try {
+    send(ws, Object.assign({ type: 'week-report-data', reqId: reqId }, buildWeekPayload(offset), extra || {}));
+  } catch (e) {
+    console.error('[week] report build failed:', e.message);
+    send(ws, { type: 'week-report-data', reqId: reqId, week: null, error: e.message });
+  }
+}
+
+/**
+ * Freeze the named week: immutable record, Obsidian note, Telegram push.
+ * Refuses an unfinished week (week-store enforces it too) so a partial week can
+ * never become a permanent record indistinguishable from a real one.
+ */
+function freezeWeekNow(weekKey) {
+  try {
+    const cfg = loadConfig();
+    const slot = jessiBucketKey(cfg);
+    const raw = loadRules();
+    const accountBlock = raw[currentMode] || raw.eval || {};
+    const todayKey = tradingDayStampIST(Date.now());
+
+    // Locate the requested week by key rather than trusting an offset from the
+    // client — the tab and the server must agree on WHICH week got frozen.
+    let anyDate = null;
+    for (let i = 0; i >= -60; i--) {
+      const d = new Date(weekRollup.weekStart(todayKey) + 'T00:00:00Z');
+      d.setUTCDate(d.getUTCDate() + i * 7);
+      const iso = d.toISOString().slice(0, 10);
+      if (weekRollup.isoWeekKey(iso) === weekKey) { anyDate = iso; break; }
+    }
+    if (!anyDate) return { frozenOk: false, freezeError: 'Unknown week ' + weekKey };
+
+    const week = weekStore.buildWeek(DATA_DIR, slot, anyDate, todayKey, accountBlock);
+    if (!week.complete) return { frozenOk: false, freezeError: 'That week has not finished yet.' };
+
+    const prev = weekStore.buildWeek(DATA_DIR, slot, weekRollup.prevWeekStart(anyDate), todayKey, accountBlock);
+    const hadPrev = prev.behaviour.tradedDays > 0 || prev.behaviour.heldFireDays > 0;
+    const findings = weekRollup.weekFindings(week, hadPrev ? prev : null);
+    const trend = weekRollup.compareWeeks(week, hadPrev ? prev : null);
+
+    const rec = weekStore.freezeWeek(DATA_DIR, slot, week, findings, trend, Date.now());
+    if (!rec) return { frozenOk: false, freezeError: 'Could not write the frozen record.' };
+
+    const md = weekStore.writeWeekMarkdown(sessionMgr.SESSIONS_DIR, week, findings, trend, {
+      slot: slot,
+      doctrine: weekStore.loadDoctrine(DATA_DIR),
+      grade: weekStore.gradeCommitment(week, weekStore.loadCommitment(DATA_DIR, slot, week.weekKey))
+    });
+
+    console.log('[week] froze ' + week.weekKey + ' (' + week.start + '..' + week.end + ') net '
+      + week.money.net + ' → ' + (md || 'markdown FAILED'));
+
+    // Silent no-op without a token/linked chat — that is why telegramReady is
+    // reported to the UI rather than the button implying a push happened.
+    try { telegramBot.notify(weekStore.telegramSummary(week, findings)); } catch (e) {}
+
+    return { frozenOk: true, markdown: md, freezeError: null };
+  } catch (e) {
+    console.error('[week] freeze failed:', e.message);
+    return { frozenOk: false, freezeError: e.message };
+  }
+}
 // Wipe one account's whole folder — used by "Start fresh" so no layer survives.
 function dataWipeAccount(slotId) {
   if (!/^[a-zA-Z0-9_\-]+$/.test(String(slotId || ''))) return false;
@@ -739,7 +1009,22 @@ const httpServer = http.createServer((req, res) => {
     return res.end(JSON.stringify(body, null, 2));
   }
 
-  const filePath = path.join(__dirname, 'renderer', url);
+  // 2026-08-27: shared UMD modules live in app/ and are loaded by BOTH the
+  // server and the page. index.html referenced them as '../mind-log.js',
+  // which LOOKS right on disk and is not: a browser normalises '/../x' to
+  // '/x' before the request is ever sent, so the server searched renderer/
+  // and returned 404. window.MindLog / window.ArmedDetectors /
+  // window.JournalNotes were silently undefined in the page, which is why
+  // the Mind tab, the watchlist and the Journal scorecard rendered nothing.
+  //
+  // Caught only by fetching them from the running server. node --check and
+  // the unit suite both passed the whole time — TRUST-PROTOCOL Rule 2.
+  const SHARED_ROOT_MODULES = ['mind-log.js', 'armed-detectors.js', 'journal-notes.js'];
+  let filePath = path.join(__dirname, 'renderer', url);
+  if (!fs.existsSync(filePath)) {
+    const base = path.basename(url);
+    if (SHARED_ROOT_MODULES.indexOf(base) !== -1) filePath = path.join(__dirname, base);
+  }
 
   if (!fs.existsSync(filePath)) {
     res.writeHead(404);
@@ -849,6 +1134,45 @@ wss.on('connection', (ws) => {
         send(ws, { type: 'note-saved', reqId: msg.reqId, ok: dataSave('notes__' + msg.slotId, notes) });
         break;
       }
+
+      // ── Weekly Report (2026-08-29) ───────────────────────────────────────
+      // Four requests, ONE reply shape. Every handler mutates at most one
+      // thing and then re-derives the whole payload from disk, so the tab can
+      // never show a number the server did not just recompute. The client is
+      // pure presentation; see renderer/week-report.js for why that split is
+      // load-bearing rather than tidy.
+      case 'week-report-get':
+        sendWeekReport(ws, msg.reqId, msg.offset);
+        break;
+
+      case 'week-doctrine-set': {
+        // The doctrine is stored verbatim and NEVER regenerated — that is the
+        // whole point of it being an anchor. Anoop chose "fixed doctrine +
+        // weekly delta" over a model-written mindset section.
+        weekStore.saveDoctrine(DATA_DIR, msg.text, Date.now());
+        sendWeekReport(ws, msg.reqId, msg.offset);
+        break;
+      }
+
+      case 'week-commit-set': {
+        const slot = jessiBucketKey(loadConfig());
+        const saved = weekStore.saveCommitment(DATA_DIR, slot, msg.weekKey, msg.commitment, Date.now());
+        if (saved) {
+          console.log('[week] commitment for ' + msg.weekKey + ': size<=' + saved.maxSize
+            + ', trades/day<=' + saved.maxTradesPerDay
+            + (saved.stopTheWeekAt != null ? ', stop at ' + saved.stopTheWeekAt : ''));
+        } else {
+          console.log('[week] commitment REJECTED — bad week key: ' + msg.weekKey);
+        }
+        sendWeekReport(ws, msg.reqId, msg.offset);
+        break;
+      }
+
+      case 'week-freeze': {
+        const r = freezeWeekNow(msg.weekKey);
+        sendWeekReport(ws, msg.reqId, msg.offset, r);
+        break;
+      }
       // Chart screenshot for a given day, stored inside that account's folder
       case 'shot-save': {
         const r = shotSave(msg.slotId, msg.date, msg.base64, msg.ext);
@@ -884,6 +1208,8 @@ wss.on('connection', (ws) => {
       // now REPAIRS an unmounted broker panel as part of check 2, so this button
       // is a genuine 'fix it now', not just a re-report.
       case 'live-feed-selftest-run': runLiveFeedSelfTest().catch(e => console.warn('[self-test] manual run failed:', e.message)); break;
+      case 'health-protocol-run': runHealthProtocol('manual').catch(e => console.warn('[protocol:health] manual run failed:', e.message)); break;
+      case 'feed-protocol-run': runFeedIntegrityProtocol('manual').catch(e => console.warn('[protocol:feed] manual run failed:', e.message)); break;
       case 'trade-confirm-request': handleTradeConfirm(ws, msg); break;
       case 'fvg-monitor-toggle': handleFVGToggle(msg); break;
       case 'fvg-check-now': checkFVGSignal(msg.tf || '30m'); break;
@@ -892,6 +1218,8 @@ wss.on('connection', (ws) => {
       case 'signal-decision': handleSignalDecision(ws, msg); break;
       case 'armed-setup-get': send(ws, { type: 'armed-setup', setup: readArmedSetup() }); break;
       case 'h6-get': send(ws, { type: 'h6-status', passed: h6Status.passed, at: h6Status.at, firstOk: h6Status.firstOk }); break;
+      case 'autonomy-set': { handleAutonomySet(msg); break; }
+      case 'autonomy-get': { broadcastAutonomy(); break; }
       case 'scorecard-get': {
         const dayKey2 = tradingDayStampIST(Date.now());
         let sigs = [];
@@ -934,7 +1262,16 @@ wss.on('connection', (ws) => {
         send(ws, { type: 'data-saved', reqId: msg.reqId, ok: dataSave(msg.key, msg.payload) });
         break;
       case 'data-load':
-        send(ws, { type: 'data-loaded', reqId: msg.reqId, data: dataLoad(msg.key) });
+        // 2026-08-25: 'mind_log' goes through mindLogLoad(), not the raw file
+        // read. The merged Alignment+Lessons store is built lazily on first
+        // access, and the RENDERER is usually the first thing to ask for it —
+        // a plain dataLoad returns null before any migration has run, so the
+        // tab painted "Nothing written yet" over six real entries sitting in
+        // align_notes.json. Routing it here makes the request itself migrate.
+        send(ws, {
+          type: 'data-loaded', reqId: msg.reqId,
+          data: msg.key === 'mind_log' ? mindLogLoad() : dataLoad(msg.key),
+        });
         break;
       // Read back archived Judge verdicts / Post-Session reviews (2026-07-31).
       case 'reviews-load':
@@ -1108,7 +1445,7 @@ async function handleChat(ws, msg) {
   let extraContext = null;
   try {
     const align = formatAlignmentNotes(3);
-    if (align) extraContext = `### Where he's at (his own dated reflections — read before coaching, don't just cite it, actually factor it in):\n${align}`;
+    if (align) extraContext = `### His own words about himself — current state AND standing lessons (read before coaching; don't just cite it, factor it in):\n${align}`;
   } catch (e) {}
 
   const abortCtrl = registerRequest(reqId);
@@ -1230,6 +1567,16 @@ Anoop named JadeCap ("Trading Isn't Hard, It's Misunderstood") as mentor-level a
 3. **The urge to keep trading right after a completed plan trade is discomfort, not opportunity.** If he describes wanting to "keep going" or "see what else is there" right after a trade finished (win or loss), name it as that specific instinct — the same wiring that makes stopping feel like slacking off — and point him back to the 15-minute break, actually away from the desk, not just idle at the chart.
 4. **Watch for tool/indicator stacking as a discipline red flag, not a competence upgrade.** If he talks about adding a new indicator or confirmation source right after a loss, ask what specifically it improves — if he can't answer that concretely, call it decoration, not a tool, the same way you'd call out oversizing.
 5. **Push for a short, single reason on every trade he describes — not a five-layer justification.** If he's stacking multiple confirmations to explain a trade, that's the overanalysis pattern, not more rigor. A real edge sounds boring and specific, not elaborate.
+
+## THE MECHANISMS BEHIND RULES 1-5 (JadeCap, decoded 2026-08-31 — full text in Prop Trading/RESEARCH_jadecap_psychology_2026-08-31.md, detail in Alok's KB)
+He knows the rules and breaks them anyway; these say WHY — use when he asks, or when a rule just broke, never recite. Frame: HIS PSYCHOLOGY IS NOT BROKEN, IT IS JUST NOT BUILT FOR TRADING. Never let him call himself weak when it is the right instinct in the one place it does not apply.
+6. **Loss aversion ~2:1, both ways.** Cutting a winner at half target is the same refused bet as holding a loser — name which side. Not willpower: stop in at the fill, never wider. Then a loser resolves instead of being an event he survives.
+7. **A broken rule that PAID costs more than any loss.** He files outcome against behaviour, so a profitable rule-break records as "that works" and repeats — experience then makes him more confident in what is losing him money. Green day, broken process: say what his brain just filed, not only that it counts as a loss. Red day, process intact: say plainly it was a good session.
+8. **Every trade starts from zero.** His edge can be real while this trade knows nothing about the last one. Extra risk is earned by an A+ setup, never a confidence level — if he cannot say which, it was the streak.
+9. **The urge is about not knowing, not money.** A boredom trade is conditioning, not weak character, and he cannot out-resolve it. Fix availability: no setup means away from the platform. Not trading is an edge most traders lack, never a gap.
+10. **Conviction rising while price falls is the diagnosis.** Entered ~60%, goes offside, he finds more reasons all genuinely on the chart, ends 90% and bigger. ASK FOR THE TWO NUMBERS ("how sure at entry, versus now?") — "are you emotional" is unanswerable from inside. Other tells: adding to a loser, irritation at disagreement. Once losing he has ALREADY lost the ability to judge it, so what works is written before entry: what would kill the idea, plus a conviction grade that makes the ego audible.
+11. **Rules fail at trade 11, not trade 1** — four losses deep and tired. SPEC FOR YOU: pressure rises with trade count and consecutive losses; light early, spend your one correction late. He had all this for ten years and still lost — what was missing was someone outside his own head. That is your job.
+Prep, if asked: rehearse the drawdown before the session so it arrives already experienced. NEVER repeat that video's mentorship pitch or its "student made 300%" claim — unverifiable, and the worst number to show someone whose failure mode is sizing up.
 
 ## BOOK LIBRARY (search_books tool, added 2026-07-27)
 Anoop's uploaded trading library — Stock Market Wizards, Trading in the Zone, Intraday Trading Techniques, Prop Trading Secrets, TradeApp's Guide to Proprietary Trading — is searchable via search_books. Reach for it when it would actually land harder than generic coaching: e.g. Douglas on probabilistic thinking when he's chasing a loss, Schwager's interviews when he needs proof a specific discipline actually pays off. Don't cite a book every message — that's the same "sound like a script" problem the VARIETY rule above already warns about.
@@ -1653,15 +2000,23 @@ function startJessiTVMonitor() {
 // before this — no agent could ever read it despite the UI claiming
 // otherwise. This is the single formatter every agent's context-builder
 // below calls, so there's one place to change the format, not N copies.
+// 2026-08-25: this now serves the MERGED log — recent "where his head's at"
+// state entries PLUS his standing lessons, each under its own label.
+//
+// Before the merge, a lesson without an armed detector reached no agent at
+// all, while an identical sentence typed one tab over reached all seven call
+// sites below. Routing both through here closes that in one place instead of
+// bolting a second formatter onto seven prompts.
+//
+// The name is unchanged deliberately: it is called from seven places, and a
+// rename would be seven chances to miss one and silently drop a persona's
+// context. `limit` still means "how many recent STATE entries" — standing
+// lessons are capped separately inside mind-log.js, because they never expire
+// and an unbounded list would eventually crowd out live trading data.
 function formatAlignmentNotes(limit) {
   try {
-    const list = dataLoad('align_notes');
-    if (!Array.isArray(list) || !list.length) return null;
-    const recent = list.slice(0, limit || 3);
-    return recent.map(e => {
-      const d = e.ts ? new Date(e.ts).toISOString().slice(0, 10) : '?';
-      return `- [${d}] ${e.text}`;
-    }).join('\n');
+    const out = mindLog.formatContext(mindLogLoad(), { stateLimit: limit || 3 });
+    return out || null;
   } catch (e) { return null; }
 }
 
@@ -1760,20 +2115,93 @@ function formatOpenPositionContext() {
   return 'OPEN POSITION RIGHT NOW: ' + open.map(p =>
     `${p.Side || '?'} ${p.Qty} ${p.Symbol}` + (p['Avg Fill Price'] ? ` from ${p['Avg Fill Price']}` : '') +
     (p.Profit ? ` (open P&L ${p.Profit})` : '')).join('; ') +
-    '. This is a LIVE position, not a closed trade — its P&L is floating and is not in the day total below.';
+    '. This is a LIVE position, not a closed trade — its P&L is still floating.' +
+    // 2026-08-24: this sentence used to end "and is not in the day total
+    // below", which was true of the balance-delta fold and is false of the
+    // broker's own Total P/L (Tradovate: "Combined realized and unrealized
+    // P&L for the current session"). Left uncorrected it would have taught
+    // every agent to add the open P&L a second time.
+    (tvBrokerFeed.effectiveDayPnl(tvBrokerFeedState, Date.now()).source === 'broker'
+      ? ' It IS already included in the day P&L below — do not add it again.'
+      : ' It is NOT included in the day P&L below.');
 }
+
+// ── Verification gate (2026-08-26) ─────────────────────────────────────────
+// Anoop: "it should verify with live broker data ... if not API will read
+// wrong data and token is simply wasted. before every output it should
+// verify."
+//
+// Every number failure in this app has had one shape: a source was wrong,
+// nothing compared it against a second source, and the wrong number was
+// handed to an agent as fact. Each of those was detectable by checking the
+// app's own day record against the broker's order history. Nothing did it.
+//
+// Recomputed on demand rather than cached: it is cheap (a rollup over one
+// day's rows), and a cached verdict is precisely the kind of stale fact this
+// exists to prevent.
+function currentVerification() {
+  try {
+    const slot = jessiBucketKey(loadConfig());
+    const dayKey = dayRollup.tradingDayKey(Date.now());
+    const store = dataLoad('day_trades__' + slot) || {};
+    const rules = getActiveRules();
+    return brokerVerify.verifyDay({
+      appRows: Array.isArray(store[dayKey]) ? store[dayKey] : [],
+      commPerCt: rules.commissionPerContractPerSide != null ? Number(rules.commissionPerContractPerSide) * 2 : 1.0,
+      walkClosed: tvBrokerLastWalkClosed,
+      brokerRealized: tvBrokerLastBrokerRealized,
+      openSize: tvBrokerFeedState ? (tvBrokerFeedState.sizeSeenThisTrade || 0) : 0,
+    });
+  } catch (e) { return null; }
+}
+
+// The last TRUSTWORTHY order-history walk and broker P&L reading, kept so the
+// verification can run between polls. Both are null whenever their source was
+// unreadable or desynced — the verification then reports NOT VERIFIED, which
+// is deliberately a different verdict from a pass.
+let tvBrokerLastWalkClosed = null;
+let tvBrokerLastBrokerRealized = null;
 
 function formatLiveFeedContext() {
   if (!mcpBridge.ready || !mcpBridge.tvConnected) return null;
   if (tvBrokerFeedReadOk !== true) return null;
   const st = tvBrokerFeedState;
-  const confirmed = (st.trades || []).filter(t => !t.pnlUnknown);
   const unconfirmed = (st.trades || []).filter(t => t.pnlUnknown);
-  const lines = [
-    `Live broker feed (today, real trades — not the CSV): ${st.tradeCount} trade(s), confirmed day P&L $${st.dayPnl.toFixed(2)} (from ${confirmed.length} trade(s) this instance watched close)` +
-      (unconfirmed.length ? `, plus ${unconfirmed.length} trade(s) recovered from order history with $ unconfirmed (check the broker for exact P&L on those)` : '') + '.'
-  ];
-  if (st.wasFlat === false) lines.push(`A position is currently OPEN (size ${st.sizeSeenThisTrade}) — not yet counted, will fold in on close.`);
+  const effPnl = tvBrokerFeed.effectiveDayPnl(st, Date.now());
+  const effCount = tvBrokerFeed.effectiveTradeCount(st);
+  // 2026-08-24: this sentence is what every agent reasons about size and
+  // stops from, so it now states the SOURCE as plainly as the number. The
+  // previous wording ("confirmed day P&L ... from N trades this instance
+  // watched close") described the fold's partial window as though it were the
+  // session total — the same claim that put -$154.20 in front of him against
+  // a real +$399.70.
+  const lines = [];
+  // THE GATE. Every figure below is checked against the broker's own order
+  // history and P&L panel first, and the agent is told what that check said
+  // BEFORE it reads a single number - including, explicitly, that "could not
+  // check" is not the same as "correct".
+  const verification = currentVerification();
+  if (verification) {
+    const vtext = brokerVerify.formatVerificationContext(verification);
+    if (vtext) lines.push(vtext);
+  }
+  if (effPnl.source === 'broker') {
+    lines.push(`Live broker feed (today, real trades — not the CSV): ${effCount.value} trade(s). ` +
+      `Day P&L $${effPnl.value.toFixed(2)} — this is the BROKER's own session total, read straight off the account panel` +
+      (typeof effPnl.open === 'number' && effPnl.open !== 0
+        ? `, made up of $${effPnl.realized.toFixed(2)} realized plus $${effPnl.open.toFixed(2)} floating on the position that is open right now.`
+        : ' (flat, so all of it is realized).'));
+  } else {
+    lines.push(`Live broker feed (today, real trades — not the CSV): ${effCount.value} trade(s), day P&L $${(effPnl.value == null ? 0 : effPnl.value).toFixed(2)}. ` +
+      `⚠ The broker's own P&L panel is NOT readable right now, so this figure is RECONSTRUCTED from balance movements and covers only trades this instance watched close. ` +
+      `Treat it as a floor on the day's result, not the result — the real number may be materially different. Tell him to read the P&L off the broker before sizing anything.`);
+  }
+  if (effCount.evidence === 'degraded') {
+    lines.push(`The trade count is PROVISIONAL (${effCount.degraded} close(s) could not be corroborated against the broker's order history). Use it as guidance, not as a hard stop.`);
+  }
+  if (unconfirmed.length) lines.push(`${unconfirmed.length} trade(s) were recovered from order history with $ unconfirmed.`);
+  if (st.wasFlat === false) lines.push(`A position is currently OPEN (size ${st.sizeSeenThisTrade}).` +
+    (effPnl.source === 'broker' ? ' Its floating P&L IS already included in the day P&L above.' : ' Its floating P&L is NOT included in the day P&L above.'));
   try {
     const f1 = mistakePatterns.checkTradeCountEscalation(st.trades);
     if (f1.matched) lines.push(`⚠ ${f1.message}`);
@@ -1815,7 +2243,7 @@ function buildJessiContext(minimal) {
   // worth the few extra tokens — it's usually one short dated line, and it's
   // exactly the continuity ("where his head's at") voice coaching needs too.
   const minimalAlign = formatAlignmentNotes(1);
-  if (minimalAlign) parts.push(`\n### Where his head's at (most recent):\n${minimalAlign}`);
+  if (minimalAlign) parts.push(`\n### His own words about himself (most recent state + standing lessons):\n${minimalAlign}`);
 
   // 2026-08-13: in BOTH minimal (voice) and full context. Anoop asked for the
   // cross-check "the whole day whenever i chat" — a voice turn is a chat turn,
@@ -1859,6 +2287,22 @@ Do NOT call any chart tool (chart_get_state, quote_get, market_key_levels, data_
     parts.push(`\n### Recent journal notes:`);
     journal.forEach(j => parts.push(`- [${j.ts}] ${j.text}`));
   }
+  // 2026-08-25: the DAILY JOURNAL — his own end-of-day words, his mood, whether
+  // he followed his plan, the mistake he named, and the lesson he wrote for the
+  // next session. Distinct from `trade_journal` above (that is the free-text
+  // app_do "add_journal" stream); this is the Journal tab's structured note,
+  // and until now NOTHING read it back to him.
+  const djCtx = formatJournalNotesContext(3);
+  if (djCtx) parts.push('\n### His own journal — what he told himself to do today\n' + djCtx);
+  // 2026-08-25: after the merge, every armed guardrail's TEXT already reaches
+  // all seven personas through formatAlignmentNotes (the merged mind log), so
+  // this block adds only what that one cannot say — which of them have
+  // actually caught him, and which have been armed for weeks without ever
+  // firing. The never-fired half is the point: such a check is either a habit
+  // he fixed or a check that does not work, and staying quiet lets him assume
+  // the first. Full-context path only — this is detail, not continuity.
+  const armedCtx = formatArmedDetectorsContext();
+  if (armedCtx) parts.push('\n### How his armed guardrails are actually performing\n' + armedCtx);
   // 2026-08-01: surface the Scalper agent's behavioural notes to Jessi too, so
   // the two agents reinforce the same observation instead of contradicting each
   // other. Capped to 3 days here (Jessi's context is token-sensitive); the
@@ -1870,7 +2314,7 @@ Do NOT call any chart tool (chart_get_state, quote_get, market_key_levels, data_
   // Fuller Alignment history for full (text chat) context — the minimal/voice
   // path above already got the single most-recent entry.
   const fullAlign = formatAlignmentNotes(3);
-  if (fullAlign) parts.push(`\n### Where his head's at (his own dated reflections — read before coaching, don't just cite it, actually factor it in):\n${fullAlign}`);
+  if (fullAlign) parts.push(`\n### His own words about himself — current state AND standing lessons (read before coaching; don't just cite it, factor it in):\n${fullAlign}`);
   return parts.join('\n');
 }
 
@@ -2244,7 +2688,7 @@ async function gatherAnalysisContext() {
   // persona's "stay in your lane" instruction still governs what it DOES with it.
   try {
     const align = formatAlignmentNotes(2);
-    if (align) parts.push('\n## WHERE HE\'S AT (his own dated reflections — for awareness, not yours to diagnose)\n' + align);
+    if (align) parts.push('\n## HIS OWN WORDS ABOUT HIMSELF — current state AND standing lessons (for awareness, not yours to diagnose)\n' + align);
   } catch (e) {}
 
   return parts.join('\n');
@@ -3215,9 +3659,17 @@ function stopPo3Monitor() {
   console.log('Power of 3 monitor stopped');
 }
 
-// Gathers multi-timeframe bars for the AMD read. Uses market_multi_tf, which
-// switches timeframes and AUTO-RESTORES the original — important because this
-// drives Anoop's live chart and must not leave it on the wrong TF mid-session.
+// Gathers multi-timeframe bars for the AMD read.
+//
+// 2026-08-29 (MCP audit): this comment used to say it "uses market_multi_tf,
+// which switches timeframes and AUTO-RESTORES the original". That tool has
+// never existed in tradingview-mcp — confirmed against its full registry and
+// git history, and already fixed in the code below on 2026-08-06; only this
+// header was left describing it. It now goes through getFullBars(), which does
+// the switch-read-restore itself under withChartLock. Corrected because a
+// comment naming a non-existent tool as the safety mechanism is worse than no
+// comment: it answers "what stops this leaving the chart on the wrong TF"
+// with a lie.
 async function gatherPO3Context() {
   const parts = [];
   if (!(mcpBridge.ready && mcpBridge.tvConnected)) {
@@ -3354,7 +3806,7 @@ async function gatherPO3Context() {
   // to comment on it.
   try {
     const align = formatAlignmentNotes(2);
-    if (align) parts.push('\n## WHERE HE\'S AT (his own dated reflections — for awareness, not yours to diagnose)\n' + align);
+    if (align) parts.push('\n## HIS OWN WORDS ABOUT HIMSELF — current state AND standing lessons (for awareness, not yours to diagnose)\n' + align);
   } catch (e) {}
 
   return parts.join('\n');
@@ -3781,6 +4233,100 @@ Compact. Trade-numbered. Evidence attached to every claim. No headers unless he 
 // Per-account scalper notebook. Key routes to accounts/<slot>/scalper_notes.json
 // via dataPathFor()'s '<key>__<slotId>' convention, so notes never leak between
 // accounts (same isolation rule as gr_history/day_trades).
+// 2026-08-25. Anoop: "everything that i put in journal will be lesson and
+// should come to be in coaching in chat tomorrow and help me stick to this."
+// It never arrived: 'note-save' wrote accounts/<slot>/notes.json, and the only
+// reader anywhere in the codebase was the Journal tab redrawing its own
+// textarea. Same per-slot isolation as scalper notes below — a lesson written
+// on the 50K eval must not surface while a different account is open.
+// ── Self-authored guardrails (2026-08-25) ───────────────────────────────────
+// Anoop: "idea 1 armed detector is good idea build it and make it part of the
+// system." A lesson in the Lessons tab can now carry a machine-checkable
+// condition; promoting it arms that condition for the next session.
+//
+// GLOBAL, not per-slot — deliberately, and for the same reason the Lessons tab
+// always was: "sizing up while losing blows accounts" is true on every
+// account, not just whichever one happens to be open. Contrast journalNotes
+// above, which IS per-slot because a day's mood belongs to that day's account.
+// The merged Alignment+Lessons store. Migration is LAZY and NON-DESTRUCTIVE:
+// the first read with no mind_log.json builds one from align_notes.json and
+// lessons_log.json and leaves both originals untouched, forever. His 18 Aug
+// alignment entry is long and irreplaceable — nothing about tidying two files
+// into one is worth risking it, so the old files stay as their own backup.
+function mindLogLoad() {
+  const merged = dataLoad('mind_log');
+  if (Array.isArray(merged)) return mindLog.load(merged);
+  const built = mindLog.migrate(dataLoad('align_notes'), dataLoad('lessons_log'));
+  if (built.length) {
+    dataSave('mind_log', built);
+    console.log('[mind-log] merged ' + built.length + ' entr' + (built.length === 1 ? 'y' : 'ies')
+      + ' from align_notes.json + lessons_log.json into mind_log.json. Both originals left in place.');
+  }
+  return built;
+}
+
+// Kept as the write path's counterpart so both sides of a fire-record use the
+// same key.
+function mindLogSave(list) { return dataSave('mind_log', list); }
+
+// Back-compat shim: armed-detectors works on anything carrying
+// {promoted, detector}, and lessons are exactly that subset of the mind log.
+function lessonsLogLoad() {
+  return mindLog.armable(mindLogLoad());
+}
+
+// Newest-first [{date, pnl}] for finished days, EXCLUDING today — the shape
+// red-day-streak needs. Read from the ACTIVE slot's history: "two red days in
+// a row" has to mean two red days on the account he is about to trade.
+function armedPriorDays(limit) {
+  try {
+    const slot = loadConfig().activeSlotId;
+    const hist = dataLoad(slot ? ('gr_history__' + slot) : 'gr_history');
+    if (!Array.isArray(hist)) return [];
+    const today = dayRollup.tradingDayKey(Date.now());
+    return hist
+      .filter(d => d && d.date && d.date < today && typeof d.pnl === 'number')
+      .sort((a, b) => (a.date < b.date ? 1 : -1))
+      .slice(0, limit || 10)
+      .map(d => ({ date: d.date, pnl: d.pnl }));
+  } catch (e) { return []; }
+}
+
+// One line per armed detector for agent context, so the coaching agents know
+// what he has told himself to watch for — including the ones that have never
+// fired, which is the honest half.
+function formatArmedDetectorsContext() {
+  try {
+    const rows = armedDetectors.describeArmed(lessonsLogLoad(), Date.now());
+    if (!rows.length) return '';
+    return rows.map(r => '- "' + r.text + '" -> ' + r.summary).join(String.fromCharCode(10));
+  } catch (e) { return ''; }
+}
+
+function journalNotesLoad() {
+  const cfg = loadConfig();
+  const slot = cfg.activeSlotId;
+  return dataLoad(slot ? ('notes__' + slot) : 'notes') || {};
+}
+
+function formatJournalNotesContext(limit) {
+  try {
+    return journalNotes.formatJournalContext(journalNotesLoad(), tradingDayStampIST(), { limit: limit || 3 });
+  } catch (e) { return ''; }
+}
+
+// 2026-08-25: the stick-rate scorecard. formatJournalNotesContext above says
+// what he wrote LAST time; this says whether writing it has ever changed
+// anything. The distinction matters because a lesson he fixed and a lesson he
+// re-writes every week are indistinguishable to an agent reading one day's
+// note — and "this is the fifth time you have written that" is a sentence no
+// agent in this app could previously say.
+function formatJournalScorecardContext() {
+  try {
+    return journalNotes.formatScorecardContext(journalNotesLoad(), tradingDayStampIST(), {});
+  } catch (e) { return ''; }
+}
+
 function scalperNotesKey() {
   const cfg = loadConfig();
   const slot = cfg.activeSlotId;
@@ -3898,7 +4444,7 @@ async function handleScalperChat(ws, msg) {
     try { seed.push('\n## YOUR PRIOR NOTES\n' + scalperNotesRead(null, 5)); } catch (e) {}
     try {
       const align = formatAlignmentNotes(3);
-      if (align) seed.push('\n## WHERE HIS HEAD\'S AT (his own dated reflections — read before coaching)\n' + align);
+      if (align) seed.push('\n## HIS OWN WORDS ABOUT HIMSELF — current state AND standing lessons (read before coaching)\n' + align);
     } catch (e) {}
     // 2026-08-20: shared live-feed accessor (same one Jessi and the Judge read).
     // The Scalper's whole job is today's execution, so a stale CSV-derived
@@ -4183,7 +4729,12 @@ function handleScreenshot(ws, msg) {
 const ENGULF_TFS = {
   '1h':  { tfCode: '60', label: '1H',  intervalMs: 60 * 1000 },
   '30m': { tfCode: '30', label: '30M', intervalMs: 45 * 1000 },
-  '15m': { tfCode: '15', label: '15M', intervalMs: 30 * 1000 }
+  '15m': { tfCode: '15', label: '15M', intervalMs: 30 * 1000 },
+  // 2026-08-27: the 5M watcher was missing outright — a 5M bullish engulf on
+  // MNQ closed live and nothing fired, because no monitor was ever polling
+  // that timeframe. Polls at 15s so a close is reported inside a quarter of a
+  // minute rather than after a 5M-length gap.
+  '5m':  { tfCode: '5',  label: '5M',  intervalMs: 15 * 1000 }
 };
 
 const engulfMonitors = {};
@@ -4209,15 +4760,16 @@ function startEngulfMonitor(key) {
   broadcast({ type: 'engulf-monitor-status', tf: key, running: true });
   console.log(`Engulf monitor started [${ENGULF_TFS[key].label}]`);
   checkEngulfingSignal(key); // immediate
-  mon.interval = setInterval(() => checkEngulfingSignal(key), ENGULF_TFS[key].intervalMs);
+  // Bar-close aligned: one read per bar instead of one every intervalMs. The
+  // detector drops the forming bar, so a mid-bar poll can only re-read a
+  // candle it has already judged.
+  mon.poller = barSchedule.startBarAlignedPoll(ENGULF_TFS[key].tfCode, () => checkEngulfingSignal(key), { fallbackIntervalMs: ENGULF_TFS[key].intervalMs });
 }
 
 function stopEngulfMonitor(key) {
   const mon = engulfMonitors[key];
-  if (mon.interval) {
-    clearInterval(mon.interval);
-    mon.interval = null;
-  }
+  if (mon.interval) { clearInterval(mon.interval); mon.interval = null; }   // legacy path
+  if (mon.poller) { mon.poller.stop(); mon.poller = null; }
   mon.running = false;
   broadcast({ type: 'engulf-monitor-status', tf: key, running: false });
   console.log(`Engulf monitor stopped [${ENGULF_TFS[key].label}]`);
@@ -4280,12 +4832,14 @@ async function checkEngulfingSignal(key) {
     // and why, is how the thresholds get tuned from evidence. A rejection is not
     // a missed trade.
     let pbc = null;
+    let fullBars = null;   // hoisted: the fire site below needs the trigger bar to plan entry/stop
+    let pdhpdl = null;     // hoisted for the same reason — the fire site's key-level annotation reads it
     if (found && direction) {
       // 5 bars cannot support a structure read — pull real history the same way
       // checkSFPSignal does, then drop the still-forming bar.
-      const fullBars = playbookC.dropFormingBar(
+      fullBars = playbookC.dropFormingBar(
         await getFullBars(cfg.tfCode, playbookC.PBC_HISTORY_BARS), cfg.tfCode);
-      const pdhpdl = await getPDHPDL();
+      pdhpdl = await getPDHPDL();
       pbc = playbookC.validateEngulfPlaybookC(fullBars, direction, pdhpdl);
       if (!pbc.valid) {
         const rejectKey = direction + '_' + key + '_rej_' +
@@ -4308,8 +4862,15 @@ async function checkEngulfingSignal(key) {
 
     // ── Fire notification if found and not duplicate ─────────────────────────
     if (found && direction) {
-      // 15-min dedup bucket per monitor — don't fire same direction twice in 15 mins
-      const bucket = direction + '_' + key + '_' + Math.floor(Date.now() / (15 * 60 * 1000));
+      // Dedup on the TRIGGER BAR, not on wall-clock. The old key was a 15-minute
+      // bucket, which on a 5M/15M watcher silently swallowed a second genuine
+      // engulf inside the same bucket and, worse, tied "is this new?" to the
+      // clock instead of to the candle that caused it. Keyed by bar time, every
+      // distinct closed candle reports exactly once, immediately after its close.
+      const engulfBar = (fullBars && fullBars.length) ? fullBars[fullBars.length - 1] : null;
+      const bucket = direction + '_' + key + '_' + (engulfBar
+        ? engulfBar.time
+        : Math.floor(Date.now() / (15 * 60 * 1000)));
       if (bucket !== mon.lastSignalKey) {
         mon.lastSignalKey = bucket;
         const istTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
@@ -4332,7 +4893,39 @@ async function checkEngulfingSignal(key) {
           }
         }
 
-        const signalMessage = `${direction} Engulfing on ${cfg.label} at ${istTime} IST${alignNote} — check a lower TF for entry`;
+        // ── Where it happened, and what it happened AT ────────────────────
+        // 2026-08-27: the alert used to name only the direction, the TF and
+        // the wall-clock time it was NOTICED — which is not the time the
+        // candle closed, and gave nothing to find the candle by on the chart.
+        // It now carries the closed candle's own time and price, plus any key
+        // level its range actually traded through, so a manual re-check is a
+        // lookup rather than a hunt. None of this can reject a signal.
+        const barCloseIST = engulfBar
+          ? barTimeToDate(engulfBar.time).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false })
+          : null;
+        let levelNote = '';
+        try {
+          const swings = fullBars && fullBars.length ? getSwingLevels(fullBars) : { swingHighs: [], swingLows: [] };
+          const pwhpwl = await getPrevWeekHighLow();
+          const pool = [
+            pdhpdl && { name: 'PDH', price: pdhpdl.pdh },
+            pdhpdl && { name: 'PDL', price: pdhpdl.pdl },
+            pwhpwl && { name: 'PWH', price: pwhpwl.pwh },
+            pwhpwl && { name: 'PWL', price: pwhpwl.pwl },
+            ...(swings.swingHighs || []).map(p => ({ name: 'swing high', price: p })),
+            ...(swings.swingLows || []).map(p => ({ name: 'swing low', price: p })),
+          ].filter(Boolean);
+          const hits = engulfBar ? playbookC.nearbyKeyLevels(engulfBar, pool) : [];
+          if (hits.length) levelNote = ` — AT ${hits.map(h => `${h.name} ${h.price}`).join(', ')}`;
+        } catch (e) {
+          // Annotation only. A level lookup must never cost him the alert.
+          console.error(`Engulf [${cfg.label}] level annotation failed:`, e.message);
+        }
+
+        const whereNote = engulfBar
+          ? ` | candle ${barCloseIST} IST close ${engulfBar.close}`
+          : '';
+        const signalMessage = `${direction} Engulfing on ${cfg.label}${whereNote}${levelNote}${alignNote} — closed candle, body fully engulfed; re-check the chart before acting`;
         broadcast({
           type: 'engulf-signal',
           playbook: key === '1h' ? 'A' : 'C',
@@ -4343,6 +4936,10 @@ async function checkEngulfingSignal(key) {
           direction,
           source,
           time: istTime,
+          barTime: engulfBar ? engulfBar.time : null,
+          barCloseIST,
+          price: engulfBar ? engulfBar.close : null,
+          levelNote: levelNote || null,
           message: signalMessage
         });
         // Push the same signal to Telegram (no-op/silent if no chat linked yet).
@@ -4353,7 +4950,24 @@ async function checkEngulfingSignal(key) {
         telegramBot.notify(`⚡ ${signalMessage}`);
         console.log(`ENGULF SIGNAL [${cfg.label}]: ${direction} [${source}]${alignNote}`);
         // 2.1/2.2: ledger the accepted setup + arm it (A on 1h, C on 30m/15m).
-        ledgerSignal({ event: 'engulf-fire', playbook: key === '1h' ? 'A' : 'C', tf: cfg.tfCode, direction, source, structure: pbc ? pbc.structure : null });
+        // 2026-08-26: attach the actual TRADE (entry/stop/setupId), not just
+        // the candle name. Until now every engulf-fire row carried level:null,
+        // which is why signal-outcome.js could never score one. The playbook id
+        // sent to the spec is the honest one — a 30M/15M engulf is LTF-ENGULF,
+        // not Playbook C (which is a gate, see playbook-spec.js) — while the
+        // ledger's own `playbook` field keeps its existing value so nothing
+        // downstream that groups by it changes shape mid-dataset.
+        const specId = key === '1h' ? 'A' : 'LTF-ENGULF';
+        const engulfPlan = engulfBar
+          ? playbookSpec.planEntry(specId, { direction, bar: engulfBar, barTime: engulfBar.time, entryRef: engulfBar.close }, getActiveRules())
+          : { plannable: false };
+        ledgerSignal({
+          event: 'engulf-fire', playbook: key === '1h' ? 'A' : 'C', tf: cfg.tfCode, direction, source,
+          structure: pbc ? pbc.structure : null,
+          entry: engulfPlan.plannable ? engulfPlan.entry : null,
+          stop: engulfPlan.plannable ? engulfPlan.stop : null,
+          setupId: engulfBar ? playbookSpec.setupId(specId, { direction, barTime: engulfBar.time, entryRef: engulfBar.close }) : null,
+        });
         armSetup({ playbook: key === '1h' ? 'A' : 'C', tfCode: cfg.tfCode, tfLabel: cfg.label, direction, message: signalMessage });
         // 3.3: validated Playbook A (1H WITH 4H trend) convenes the debate.
         if (key === '1h' && playbookAValid) {
@@ -4375,24 +4989,8 @@ async function checkEngulfingSignal(key) {
 // high AND the low of the previous bar (not just overlap its open/close body,
 // which is what the old body-only check did). Direction must also be the
 // opposite of the previous bar's direction.
-function detectEngulfFromBars(bars) {
-  if (!bars || bars.length < 2) return null;
-  const prev = bars[bars.length - 2];
-  const curr = bars[bars.length - 1];
-  if ([prev.open, prev.close, prev.high, prev.low, curr.open, curr.close, curr.high, curr.low].some(v => typeof v !== 'number')) return null;
-
-  if (prev.close < prev.open && curr.close > curr.open) {
-    if (curr.high >= prev.high && curr.low <= prev.low) {
-      return { direction: 'BULLISH' };
-    }
-  }
-  if (prev.close > prev.open && curr.close < curr.open) {
-    if (curr.high >= prev.high && curr.low <= prev.low) {
-      return { direction: 'BEARISH' };
-    }
-  }
-  return null;
-}
+// detectEngulfFromBars() moved to detectors.js (2026-08-26) so the backtest harness can
+// import the SAME function this server fires on. Behaviour unchanged.
 
 // ── 4H trend read for Playbook A's alignment gate ───────────────────────────
 // Approximation, not true swing-pivot market structure: market_multi_tf only
@@ -4420,21 +5018,8 @@ async function get4HTrend() {
   }
 }
 
-function classifyTrendFromBars(bars) {
-  if (!bars || bars.length < 3) return 'unclear';
-  let higherHighs = 0, higherLows = 0, lowerHighs = 0, lowerLows = 0;
-  for (let i = 1; i < bars.length; i++) {
-    if (bars[i].high > bars[i - 1].high) higherHighs++;
-    else if (bars[i].high < bars[i - 1].high) lowerHighs++;
-    if (bars[i].low > bars[i - 1].low) higherLows++;
-    else if (bars[i].low < bars[i - 1].low) lowerLows++;
-  }
-  const n = bars.length - 1;
-  const threshold = Math.ceil(n * 0.6);
-  if (higherHighs >= threshold && higherLows >= threshold) return 'bullish';
-  if (lowerHighs >= threshold && lowerLows >= threshold) return 'bearish';
-  return 'unclear';
-}
+// classifyTrendFromBars() moved to detectors.js (2026-08-26) so the backtest harness can
+// import the SAME function this server fires on. Behaviour unchanged.
 
 // ── Fair Value Gap (FVG) detector — Playbook B's displacement step ─────────────
 // Classic 3-candle gap: bar[i-2] and bar[i] leave a price range bar[i-1] never
@@ -4442,16 +5027,8 @@ function classifyTrendFromBars(bars) {
 // when bar[i-2].low > bar[i].high (gap down). This detects the gap existing —
 // it does NOT confirm the SFP/liquidity-raid that should precede it per the
 // full JadeCap playbook. See FVG_TFS block below for why that part is deferred.
-function detectFVGFromBars(bars) {
-  if (!bars || bars.length < 3) return null;
-  const a = bars[bars.length - 3];
-  const c = bars[bars.length - 1];
-  if ([a.high, a.low, c.high, c.low].some(v => typeof v !== 'number')) return null;
-
-  if (a.high < c.low) return { direction: 'BULLISH', gapLow: a.high, gapHigh: c.low };
-  if (a.low > c.high) return { direction: 'BEARISH', gapLow: c.high, gapHigh: a.low };
-  return null;
-}
+// detectFVGFromBars() moved to detectors.js (2026-08-26) so the backtest harness can
+// import the SAME function this server fires on. Behaviour unchanged.
 
 // ── FVG monitor (30M — switched from 15M 2026-07-28) ───────────────────────────
 const FVG_TFS = {
@@ -4479,12 +5056,13 @@ function startFVGMonitor(key) {
   broadcast({ type: 'fvg-monitor-status', tf: key, running: true });
   console.log(`FVG monitor started [${FVG_TFS[key].label}]`);
   checkFVGSignal(key);
-  mon.interval = setInterval(() => checkFVGSignal(key), FVG_TFS[key].intervalMs);
+  mon.poller = barSchedule.startBarAlignedPoll(FVG_TFS[key].tfCode, () => checkFVGSignal(key), { fallbackIntervalMs: FVG_TFS[key].intervalMs });
 }
 
 function stopFVGMonitor(key) {
   const mon = fvgMonitors[key];
-  if (mon.interval) { clearInterval(mon.interval); mon.interval = null; }
+  if (mon.interval) { clearInterval(mon.interval); mon.interval = null; }   // legacy path
+  if (mon.poller) { mon.poller.stop(); mon.poller = null; }
   mon.running = false;
   broadcast({ type: 'fvg-monitor-status', tf: key, running: false });
   console.log(`FVG monitor stopped [${FVG_TFS[key].label}]`);
@@ -4518,7 +5096,25 @@ async function checkFVGSignal(key) {
     const fvg = detectFVGFromBars(bars);
     if (fvg) {
       found = true; direction = fvg.direction; gapLow = fvg.gapLow; gapHigh = fvg.gapHigh;
-      const bucket = direction + '_' + key + '_' + Math.floor(Date.now() / (15 * 60 * 1000));
+      // DEDUP ON THE GAP ITSELF, NOT ON THE WALL CLOCK (fixed 2026-08-26).
+      //
+      // The old key was `direction + tf + floor(now / 15min)`, which changes
+      // every 15 minutes of real time regardless of whether anything on the
+      // chart changed. A 30M gap stays the newest 3-bar pattern for a full 30
+      // minutes — at least two buckets — so every single 30M FVG fired at
+      // least twice, and a monitor restart reset the key and fired it again.
+      //
+      // This is visible in the live ledger: DATA/signals/2026-08-24.jsonl has
+      // gap 29204.00-29205.75 logged at 11:30 and again at 11:45, and gap
+      // 29137.50-29156.75 logged four separate times between 16:30 and 16:56.
+      // Ten of that day's eleven armed signals are re-fires of four real
+      // setups. Beyond the duplicate Telegram alerts, it silently corrupts
+      // every per-playbook statistic downstream — a setup that happened to
+      // work counts once for each time it was re-seen.
+      //
+      // The gap's own prices are stable across polls, so keying on them fires
+      // once per real setup and never again.
+      const bucket = playbookSpec.setupId('B', { direction, gapLow, gapHigh, level: null });
       if (bucket !== mon.lastSignalKey) {
         mon.lastSignalKey = bucket;
         const istTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
@@ -4527,7 +5123,16 @@ async function checkFVGSignal(key) {
         telegramBot.notify(`🔲 ${signalMessage}`);
         console.log(`FVG SIGNAL [${cfg.label}]: ${direction} ${gapLow.toFixed(2)}-${gapHigh.toFixed(2)}`);
         // 2.1/2.2: ledger + arm the displacement FVG.
-        ledgerSignal({ event: 'fvg-fire', playbook: 'B', tf: cfg.tfCode, direction, gapLow, gapHigh, source: 'FVG OHLCV' });
+        // A bare FVG has no SFP behind it, so there is no wick to stop beyond
+        // and planEntry correctly refuses. entry is still recorded (the near
+        // gap edge is where a retrace entry would go on) so the outcome
+        // resolver has an anchor; stop stays null rather than invented.
+        const fvgEntry = direction === 'BULLISH' ? Math.max(gapLow, gapHigh) : Math.min(gapLow, gapHigh);
+        ledgerSignal({
+          event: 'fvg-fire', playbook: 'B', tf: cfg.tfCode, direction, gapLow, gapHigh, source: 'FVG OHLCV',
+          entry: fvgEntry, stop: null,
+          setupId: playbookSpec.setupId('B', { direction, gapLow, gapHigh, level: null }),
+        });
         armSetup({ playbook: 'B', tfCode: cfg.tfCode, tfLabel: cfg.label, direction, gapLow, gapHigh, message: signalMessage });
       }
     }
@@ -4965,44 +5570,14 @@ async function getCurrentMonthHighLow() {
 // recent liquidity pools (swing highs/lows) a sweep would target alongside
 // PDH/PDL. Returns up to 3 most-recent, de-duplicated (within ~0.05%) levels
 // each side.
-function getSwingLevels(bars) {
-  const highs = [], lows = [];
-  for (let i = 2; i < bars.length - 2; i++) {
-    const w = bars.slice(i - 2, i + 3);
-    if (bars[i].high === Math.max(...w.map(b => b.high))) highs.push(bars[i].high);
-    if (bars[i].low === Math.min(...w.map(b => b.low))) lows.push(bars[i].low);
-  }
-  const dedupeMostRecent = (arr) => {
-    const out = [];
-    for (let i = arr.length - 1; i >= 0 && out.length < 3; i--) {
-      const v = arr[i];
-      if (!out.some(o => Math.abs(o - v) / v < 0.0005)) out.push(v);
-    }
-    return out;
-  };
-  return { swingHighs: dedupeMostRecent(highs), swingLows: dedupeMostRecent(lows) };
-}
+// getSwingLevels() moved to detectors.js (2026-08-26) so the backtest harness can
+// import the SAME function this server fires on. Behaviour unchanged.
 
 // SFP (swing failure pattern) / liquidity raid: the latest bar wicks through a
 // key level and closes back on the other side of it — the "trap candle."
 // Checked against every level in the pool; first match wins.
-function detectSFPFromBars(bars, levels) {
-  if (!bars || bars.length < 1) return null;
-  const curr = bars[bars.length - 1];
-  if ([curr.high, curr.low, curr.close].some(v => typeof v !== 'number')) return null;
-
-  for (const level of levels.highs) {
-    if (typeof level === 'number' && curr.high > level && curr.close < level) {
-      return { direction: 'BEARISH', level };
-    }
-  }
-  for (const level of levels.lows) {
-    if (typeof level === 'number' && curr.low < level && curr.close > level) {
-      return { direction: 'BULLISH', level };
-    }
-  }
-  return null;
-}
+// detectSFPFromBars() moved to detectors.js (2026-08-26) so the backtest harness can
+// import the SAME function this server fires on. Behaviour unchanged.
 
 // ── SFP / Playbook B monitor (30M — matches the same "reaction" step as FVG) ──
 // Changed from 15M to 30M on 2026-07-15 per Anoop: the 15M version was firing
@@ -5036,12 +5611,13 @@ function startSFPMonitor(key) {
   broadcast({ type: 'sfp-monitor-status', tf: key, running: true });
   console.log(`SFP/Playbook B monitor started [${SFP_TFS[key].label}]`);
   checkSFPSignal(key);
-  mon.interval = setInterval(() => checkSFPSignal(key), SFP_TFS[key].intervalMs);
+  mon.poller = barSchedule.startBarAlignedPoll(SFP_TFS[key].tfCode, () => checkSFPSignal(key), { fallbackIntervalMs: SFP_TFS[key].intervalMs });
 }
 
 function stopSFPMonitor(key) {
   const mon = sfpMonitors[key];
   if (mon.interval) { clearInterval(mon.interval); mon.interval = null; }
+  if (mon.poller) { mon.poller.stop(); mon.poller = null; }
   mon.running = false;
   broadcast({ type: 'sfp-monitor-status', tf: key, running: false });
   console.log(`SFP/Playbook B monitor stopped [${SFP_TFS[key].label}]`);
@@ -5112,7 +5688,10 @@ async function checkSFPSignal(key) {
         // A fresh raid replaces any stale pending one — the most recent liquidity event is what matters.
         // Patience window kept at 8 candles (was 8×15m=2h; now 8×30m=4h) — tied
         // to bar count, not wall clock, so it scales with the TF automatically.
-        mon.pending = { direction: sfp.direction, level: sfp.level, sweptAt: Date.now(), expiresAt: Date.now() + 8 * tfSeconds * 1000 };
+        // `wick` added 2026-08-26: Playbook B's stop is "beyond the SFP wick",
+        // and only the swept LEVEL was being kept — a materially tighter stop
+        // sitting inside the trap the setup is built on.
+        mon.pending = { direction: sfp.direction, level: sfp.level, wick: sfp.wick, sweptAt: Date.now(), expiresAt: Date.now() + 8 * tfSeconds * 1000 };
       }
     }
 
@@ -5141,7 +5720,19 @@ async function checkSFPSignal(key) {
             telegramBot.notify(`✅ ${confirmMsg}`);
             console.log(`PLAYBOOK B CONFIRMED [${cfg.label}]: ${mon.pending.direction}`);
             // 2.1/2.2: ledger + arm the confirmed Playbook B setup.
-            ledgerSignal({ event: 'playbook-b-confirm', playbook: 'B', tf: cfg.tfCode, direction: mon.pending.direction, level: mon.pending.level, gapLow: fvg.gapLow, gapHigh: fvg.gapHigh });
+            // This row previously set level to the SWEPT LEVEL and nothing
+            // else, so signal-outcome.js measured excursion from a price
+            // beyond the trade's own stop. entry/stop now come from the same
+            // spec the backtest uses.
+            const bSetup = { direction: mon.pending.direction, gapLow: fvg.gapLow, gapHigh: fvg.gapHigh, wick: mon.pending.wick, level: mon.pending.level };
+            const bPlan = playbookSpec.planEntry('B', bSetup, getActiveRules());
+            ledgerSignal({
+              event: 'playbook-b-confirm', playbook: 'B', tf: cfg.tfCode, direction: mon.pending.direction,
+              level: mon.pending.level, gapLow: fvg.gapLow, gapHigh: fvg.gapHigh,
+              entry: bPlan.plannable ? bPlan.entry : null,
+              stop: bPlan.plannable ? bPlan.stop : null,
+              setupId: playbookSpec.setupId('B', bSetup),
+            });
             armSetup({ playbook: 'B', tfCode: cfg.tfCode, tfLabel: cfg.label, direction: mon.pending.direction, level: mon.pending.level, gapLow: fvg.gapLow, gapHigh: fvg.gapHigh, message: confirmMsg });
             // 3.3: a confirmed Playbook B convenes the debate.
             triggerPlaybookDebate({ playbook: 'B', tfCode: cfg.tfCode, tfLabel: cfg.label, direction: mon.pending.direction, level: mon.pending.level, gapLow: fvg.gapLow, gapHigh: fvg.gapHigh, time: istTime });
@@ -5896,13 +6487,23 @@ function stopSessionPrepScheduler() {
 // 1.2: the five plan watchers have NO cond — always on, per decision 2.
 // PO3 alone keeps its user-disable flag (the plan's toggle removal list is
 // the five watchers only; PO3's UI toggle stays).
+// `intervalMs` here is the LIVENESS EXPECTATION, not the poll rate — the
+// watchdog below flags a monitor whose last check is older than 3x this.
+//
+// 2026-08-26: these MUST track the bar period now that the chart watchers are
+// bar-close aligned. A 30M watcher legitimately goes 30 minutes between
+// checks; against the old 45s figure the watchdog would have declared it dead
+// after ~2 minutes and restarted it on a loop — turning a fix for chart-lock
+// contention into a far worse source of it. PO3 keeps its own timer and its
+// own interval.
 const ALL_MONITORS = [
   { id: 'po3',        label: 'Power of 3 (AMD)', mon: () => po3Monitor,         intervalMs: PO3_MONITOR_INTERVAL_MS, cond: () => !po3MonitorUserDisabled,  run: () => startPo3Monitor() },
-  { id: 'engulf-1h',  label: 'Engulf 1H',        mon: () => engulfMonitors['1h'],  intervalMs: 60 * 1000, run: () => startEngulfMonitor('1h') },
-  { id: 'engulf-30m', label: 'Engulf 30M',       mon: () => engulfMonitors['30m'], intervalMs: 45 * 1000, run: () => startEngulfMonitor('30m') },
-  { id: 'engulf-15m', label: 'Engulf 15M',       mon: () => engulfMonitors['15m'], intervalMs: 30 * 1000, run: () => startEngulfMonitor('15m') },
-  { id: 'fvg-30m',    label: 'FVG 30M',          mon: () => fvgMonitors['30m'],    intervalMs: 30 * 1000, run: () => startFVGMonitor('30m') },
-  { id: 'sfp-30m',    label: 'SFP / Playbook B 30M', mon: () => sfpMonitors['30m'], intervalMs: 60 * 1000, run: () => startSFPMonitor('30m') },
+  { id: 'engulf-1h',  label: 'Engulf 1H',        mon: () => engulfMonitors['1h'],  intervalMs: 60 * 60 * 1000, run: () => startEngulfMonitor('1h') },
+  { id: 'engulf-30m', label: 'Engulf 30M',       mon: () => engulfMonitors['30m'], intervalMs: 30 * 60 * 1000, run: () => startEngulfMonitor('30m') },
+  { id: 'engulf-15m', label: 'Engulf 15M',       mon: () => engulfMonitors['15m'], intervalMs: 15 * 60 * 1000, run: () => startEngulfMonitor('15m') },
+  { id: 'engulf-5m',  label: 'Engulf 5M',        mon: () => engulfMonitors['5m'],  intervalMs: 5 * 60 * 1000, run: () => startEngulfMonitor('5m') },
+  { id: 'fvg-30m',    label: 'FVG 30M',          mon: () => fvgMonitors['30m'],    intervalMs: 30 * 60 * 1000, run: () => startFVGMonitor('30m') },
+  { id: 'sfp-30m',    label: 'SFP / Playbook B 30M', mon: () => sfpMonitors['30m'], intervalMs: 30 * 60 * 1000, run: () => startSFPMonitor('30m') },
 ];
 
 function armMonitorsStaggered() {
@@ -5911,6 +6512,8 @@ function armMonitorsStaggered() {
   });
   // Idempotent — safe on every reconnect, starts exactly one timer.
   startSignalOutcomeResolver();
+  startShadowResolver();
+  startHealthProtocolSchedule();
 }
 
 // 1.3: snapshot of the real watcher set, read back from the server — the
@@ -5963,6 +6566,13 @@ function writeNowFile() {
     const md = liveStatus.renderNowMarkdown({
       mode: currentMode,
       feed: tvBrokerFeedState,
+      // 2026-08-24: resolved here rather than inside the renderer so this
+      // surface, the WebSocket broadcast and the agents' context all quote
+      // one number from one function. Re-derived every tick (not cached) —
+      // effectiveDayPnl ages the broker figure out on wall-clock, so a feed
+      // that goes quiet must be able to fall back on the very next write.
+      pnl: tvBrokerFeed.effectiveDayPnl(tvBrokerFeedState, Date.now()),
+      tradeCount: tvBrokerFeed.effectiveTradeCount(tvBrokerFeedState),
       // Read from rules.json every tick rather than captured once — a mid
       // session mode switch (eval/funded, standard/scalper) must be reflected,
       // and CLAUDE.md forbids a second copy of any number that lives there.
@@ -6045,7 +6655,12 @@ function ledgerSignal(fields) {
       symbol: chartSymbolCache.symbol,
       accountSlot: jessiBucketKey(cfg),
       mode: currentMode,
-      hourEdge: hourBucket ? hourBucket.winPct : null, // 6.2 reporting-only annotation
+      // 6.2 reporting-only annotation. Suppressed below hour-edge's MIN_SAMPLE:
+      // stamping the raw winPct wrote "hourEdge: 100" onto 13 signal rows off a
+      // SINGLE trade. The sample size now rides along so no reader has to trust
+      // a percentage without it.
+      hourEdge: hourEdgeModule.reliableWinPct(hourBucket),
+      hourEdgeN: hourBucket && typeof hourBucket.n === 'number' ? hourBucket.n : null,
     });
     const day = tradingDayStampIST(Date.now());
     const dir = path.join(DATA_DIR, 'signals');
@@ -6165,8 +6780,630 @@ function tfSecondsFor(tfCode) {
   return 900; // unknown code → 15m (matches PO3's phase TF)
 }
 
+// ── Autonomy state — the GIVE-CONTROL toggle ────────────────────────────────
+// Persisted in the same config file as mode/tradingMode so it survives a
+// restart. Deliberately never defaults to anything but 'off': a control switch
+// that comes back on by itself after a crash is the last thing an account with
+// six blow-ups behind it needs.
+function readAutonomy() {
+  const a = autonomyStore.readState(DATA_DIR);
+  return {
+    mode: autonomyGate.normaliseMode(a.mode),
+    armedBy: a.armedBy || null,
+    armedAt: a.armedAt || null,
+    shadowDays: Number(a.shadowDays) || 0,
+  };
+}
+
+// Evidence comes from the SAME resolved-outcome ledger the backtest and the
+// confidence scorer read. Nothing here estimates: an absent bucket reports
+// zero trades, which the gate treats as a blocker rather than as a pass.
+function autonomyEvidence(playbook) {
+  try {
+    const rules = getActiveRules();
+    // Evidence is the SHADOW TRACK RECORD — orders the gate actually proposed
+    // and that actually resolved — not the signal ledger. A signal that fired
+    // is not a trade that was taken, and LIVE must be earned on the latter.
+    //
+    // 2026-08-29: filtered to the per-trade risk cap LIVE itself runs under
+    // ($200, tighter than the global $300 shadow records at). Without this,
+    // CONTROL could be promoted on a record containing trades it is forbidden
+    // to place — see AUTONOMY_MODES_SPEC.md §8.1.
+    // Read from SHADOW's folder: that is where the track record LIVE is
+    // granted on gets built. When ASSIST and CONTROL start writing their own
+    // folders this becomes a per-mode read, and the folders are what make that
+    // a one-line change rather than a filter nobody remembers to apply.
+    const ev = autonomyStore.evidence(DATA_DIR, 'shadow', playbook, null,
+      { maxRiskUsd: autonomyModes.riskCapUsd(rules, 'live') });
+    return {
+      playbook,
+      resolvedTrades: ev.resolvedTrades,
+      profitFactor: ev.profitFactor,      // null until measurable — blocks LIVE, correctly
+      maxDrawdownUsd: ev.maxDrawdownUsd,
+      accountDrawdownLimitUsd: (rules.eval && rules.eval.maxDrawdown) || null,
+    };
+  } catch (e) {
+    return { playbook, resolvedTrades: 0, profitFactor: null, maxDrawdownUsd: null, accountDrawdownLimitUsd: null };
+  }
+}
+
+// The playbooks CONTROL is configured to trade. Locked with Anoop 2026-08-29:
+// A + B + LTF-ENGULF. Note "Playbook C" in the UI IS LTF-ENGULF — the real C is
+// a validity GATE (playbook-spec.js isGate:true) and planEntry() refuses it, so
+// it can never appear here as a tradeable setup.
+function autonomyPlaybooks() {
+  try {
+    const cfg = autonomyModes.modeConfig(getActiveRules(), 'live');
+    return Array.isArray(cfg.playbooks) && cfg.playbooks.length ? cfg.playbooks : ['B'];
+  } catch (e) { return ['B']; }
+}
+
+// Higher = more autonomous. Used to pick the best mode achievable across the
+// playbooks, never to grant one — the gate alone grants.
+const AUTONOMY_RANK = { off: 0, shadow: 1, assist: 2, live: 3 };
+
+/**
+ * Evaluate the gate for EVERY configured playbook, not just Playbook B.
+ *
+ * 2026-08-29: this used to be `evaluateAutonomy('B')` with the 'B' hardcoded at
+ * both call sites, so evidence accumulated for A and LTF-ENGULF was collected
+ * and then never read by anything. Worse, the gate's own threshold comment says
+ * `minResolvedTrades` is "per playbook" — so a single global verdict was
+ * answering a question the bar was never asking.
+ *
+ * AUTONOMY IS THEREFORE PER PLAYBOOK. A playbook that has earned LIVE may be
+ * traded autonomously; one that has not, may not — which is exactly the
+ * per-rule autonomy FULL_AUTONOMOUS_SYSTEM_PLAN.md §1 argued for ("not
+ * auto-trade everything the Judge approves"). `livePlaybooks` below is the
+ * allow-list the Phase 3 execution path will consult.
+ *
+ * The reported effectiveMode is the BEST any playbook achieved, and the
+ * reported blockers are those of the playbook CLOSEST to qualifying — so the
+ * status line is an achievable to-do list rather than the worst case.
+ */
+function evaluateAutonomy() {
+  const state = readAutonomy();
+  const per = autonomyPlaybooks().map((pb) => ({
+    playbook: pb,
+    result: autonomyGate.evaluate(state, autonomyEvidence(pb)),
+  }));
+  // Defensive: an empty playbook list must not crash the status broadcast.
+  if (!per.length) {
+    const result = autonomyGate.evaluate(state, autonomyEvidence('B'));
+    return { state, result, badge: autonomyGate.badge(result), perPlaybook: [], livePlaybooks: [] };
+  }
+
+  let best = per[0];
+  let closest = per[0];
+  for (const p of per) {
+    if (AUTONOMY_RANK[p.result.effectiveMode] > AUTONOMY_RANK[best.result.effectiveMode]) best = p;
+    if (p.result.blockers.length < closest.result.blockers.length) closest = p;
+  }
+  // Blockers come from the nearest-to-qualifying playbook, but only while
+  // nothing has qualified — once something has, the granted result is the
+  // honest one to report.
+  const result = best.result.allowed ? best.result : closest.result;
+  return {
+    state,
+    result,
+    badge: autonomyGate.badge(result),
+    perPlaybook: per.map((p) => ({
+      playbook: p.playbook,
+      effectiveMode: p.result.effectiveMode,
+      allowed: p.result.allowed,
+      blockers: p.result.blockers,
+    })),
+    livePlaybooks: per.filter((p) => p.result.effectiveMode === 'live').map((p) => p.playbook),
+  };
+}
+
+function broadcastAutonomy() {
+  if (!autonomyEnabled()) {
+    broadcast({ type: 'autonomy-status', disabled: true, mode: 'off', effectiveMode: 'off',
+                allowed: true, blockers: [], summary: 'Autonomy is disabled. You are trading.',
+                badge: { text: 'YOU ARE TRADING', tone: 'off' } });
+    return;
+  }
+  const a = evaluateAutonomy();
+  const rules = getActiveRules();
+  broadcast({ type: 'autonomy-status', mode: a.state.mode, effectiveMode: a.result.effectiveMode,
+              allowed: a.result.allowed, blockers: a.result.blockers, summary: a.result.summary, badge: a.badge,
+              // 2026-08-29: which modes are even built enough to offer. The UI
+              // renders no button for a mode that is off here — a visible
+              // switch that does nothing invites a click that silently fails,
+              // which is worse than no switch.
+              availableModes: autonomyModes.MODES.filter((m) => m === 'off' || autonomyModes.isModeEnabled(rules, m)),
+              // Per-playbook verdicts. Autonomy is granted per playbook, so a
+              // single blended verdict would hide that (say) B has earned it
+              // while A has three trades of history.
+              perPlaybook: a.perPlaybook, livePlaybooks: a.livePlaybooks });
+}
+
+// Handler for the UI toggle. Requesting LIVE never grants it — the gate does,
+// and only when the evidence is there. The request is still RECORDED so the
+// blockers can be shown as a to-do list rather than a flat refusal.
+function handleAutonomySet(msg) {
+  if (!autonomyEnabled()) {
+    console.log('[autonomy] request refused — autonomy is disabled in rules.json (autonomyEnabled:false)');
+    broadcastAutonomy();
+    return;
+  }
+  const requested = autonomyGate.normaliseMode(msg && msg.mode);
+  // 2026-08-29: a mode that is not switched on in rules.json cannot be entered,
+  // even by a hand-crafted WebSocket message. The UI already declines to render
+  // the button, but a disabled button in a browser is a courtesy, not a
+  // guarantee — same reasoning that puts the real trade-confirm enforcement
+  // server-side. The refusal is RECORDED, not silent, so an attempt to enter a
+  // half-built mode leaves a trace.
+  if (requested !== 'off' && !autonomyModes.isModeEnabled(getActiveRules(), requested)) {
+    const reason = `${autonomyModes.label(requested)} is not enabled yet (rules.json autonomyModes.${autonomyModes.CONFIG_KEY[requested]}.enabled=false)`;
+    console.log('[autonomy] request refused — ' + reason);
+    autonomyStore.recordDecision(DATA_DIR, {
+      kind: 'mode-request', requested, effective: currentAutonomyMode(),
+      allowed: false, by: (msg && msg.by) || null, blockers: [reason],
+    });
+    broadcastAutonomy();
+    return;
+  }
+  const prev = autonomyStore.readState(DATA_DIR);
+  autonomyStore.writeState(DATA_DIR, Object.assign({}, prev, {
+    mode: requested,
+    // Cleared on OFF so a stale arming can never be inherited by a later
+    // switch-on that nobody confirmed.
+    armedBy: requested === 'off' ? null : (msg && msg.by) || null,
+    armedAt: requested === 'off' ? null : new Date().toISOString(),
+  }));
+
+  const a = evaluateAutonomy();
+  // Count a shadow day the moment shadow actually becomes effective, keyed on
+  // the trading day so restarts cannot inflate it.
+  if (a.result.effectiveMode === 'shadow') autonomyStore.markShadowDay(DATA_DIR, tradingDayStampIST(Date.now()));
+
+  // Every request is recorded, granted or refused. The refusals are the more
+  // interesting half of the record.
+  autonomyStore.recordDecision(DATA_DIR, {
+    kind: 'mode-request',
+    requested,
+    effective: a.result.effectiveMode,
+    allowed: a.result.allowed,
+    by: (msg && msg.by) || null,
+    blockers: a.result.blockers,
+  });
+
+  console.log('[autonomy] requested=' + requested + ' effective=' + a.result.effectiveMode +
+              (a.result.blockers.length ? ' blockers: ' + a.result.blockers.join('; ') : ''));
+  try { telegramBot.notify('CONTROL: ' + a.badge.text + ' - ' + a.result.summary); } catch (e) {}
+  broadcastAutonomy();
+}
+
+// ── SHADOW RECORDING (2026-08-26) ──────────────────────────────────────────
+// Two writers, one folder. Both are no-ops unless the CONTROL toggle is in
+// shadow or live, so nothing is written while Anoop is simply trading.
+
+// Hard kill switch (rules.json autonomyEnabled, 2026-08-26). Checked FIRST so
+// that when autonomy is disabled nothing records, nothing resolves and nothing
+// can be toggled on — "only you mode". Fails closed on any error.
+function autonomyEnabled() {
+  try { return getActiveRules().autonomyEnabled === true; } catch (e) { return false; }
+}
+
+function shadowActive() {
+  if (!autonomyEnabled()) return false;
+  try { return currentAutonomyMode() !== 'off'; }
+  catch (e) { return false; }
+}
+
+// The mode actually in force right now, or 'off'. Reads the persisted state
+// and additionally requires the mode's OWN enable flag (rules.json
+// autonomyModes.<mode>.enabled), so a mode still under construction cannot be
+// entered by a stale state.json left behind from a previous session — the same
+// fail-closed reasoning autonomy-store applies to a corrupt state file.
+function currentAutonomyMode() {
+  try {
+    const rules = getActiveRules();
+    const m = autonomyModes.normaliseMode(autonomyStore.readState(DATA_DIR).mode);
+    if (m === 'off') return 'off';
+    return autonomyModes.isModeEnabled(rules, m) ? m : 'off';
+  } catch (e) { return 'off'; }
+}
+
+// Should the active mode stay quiet? Only SHADOW does by default: it is the one
+// mode that runs WHILE Anoop trades his own account, and on 2026-08-26 its
+// tickets in the chat were what made a live session confusing enough that he
+// switched the entire feature off. Silence is what lets it run the ~8 weeks its
+// evidence bar needs.
+function autonomySilent() {
+  try { return autonomyModes.isSilent(getActiveRules(), currentAutonomyMode()); }
+  catch (e) { return true; }
+}
+
+// Market context AS IT IS RIGHT NOW. Captured at the moment of recording and
+// never reconstructed later — a context rebuilt after the fact has already
+// been contaminated by what happened next.
+function shadowMarketContext() {
+  const ctx = { day: tradingDayStampIST(Date.now()) };
+  try {
+    const istMin = Math.floor((Date.now() + 5.5 * 3600000) % 86400000 / 60000);
+    const windows = (getActiveRules().sessionWindowsIST || []).map(w => ({ startMin: w.startMin, name: w.name || null }));
+    ctx.sessionTier = signalLedger.sessionTierForMinutes(istMin, windows);
+    ctx.istHour = Math.floor(istMin / 60);
+    const h = po3TrendCache['60'] && po3TrendCache['60'].value;
+    ctx.hourTrend = h ? h.label : null;
+    ctx.newsBlackout = computeNewsStatus().inBlackout;
+    ctx.symbol = chartSymbolCache.symbol;
+    ctx.tradingMode = getActiveRules().tradingMode || 'standard';
+    // ADX from whatever 1H bars are already cached. Deliberately a CACHE read,
+    // never a fetch: this runs on the trade-close and setup-arm paths, and
+    // blocking either on the single CDP connection to decorate a record would
+    // trade a live path for a nice-to-have field. Absent cache = null, which
+    // the discriminator excludes rather than scoring as "not trending".
+    try {
+      const cached = barCache.get(chartSymbolCache.symbol, '60', 60);
+      if (Array.isArray(cached) && cached.length >= 30) {
+        const a = detectors.adxSeries(cached, 14);
+        const last = a.adx.length - 1;
+        if (Number.isFinite(a.adx[last])) {
+          ctx.adx = Math.round(a.adx[last] * 10) / 10;
+          ctx.diPlusOverMinus = a.plusDI[last] > a.minusDI[last];
+        }
+      }
+    } catch (e) { /* null stays null */ }
+    ctx.breakEvenBandUsd = getActiveRules().breakEvenBandUsd || 0;
+  } catch (e) { /* partial context is fine; invented context is not */ }
+  return ctx;
+}
+
+// MACHINE side: one row per shadow size, so 4c and 6c are recorded from the
+// SAME signal rather than from two separate runs that could diverge.
+// The gates that actually passed, with their real values. Built from what the
+// monitor had at fire time — never re-derived later from bars that have moved.
+function shadowConfirmReasons(fields, plan) {
+  const why = [];
+  const px = (v) => (Number.isFinite(v) ? v.toFixed(2) : '?');
+  const dir = fields.direction || '?';
+  switch (fields.playbook) {
+    case 'B':
+      why.push(`Liquidity raid: swept ${px(fields.level)} and closed back inside (the trap candle)`);
+      if (fields.gapLow != null) why.push(`Displacement FVG ${px(fields.gapLow)}-${px(fields.gapHigh)} in the raid direction (${dir})`);
+      why.push(`Entry is a LIMIT at the near gap edge ${px(plan.entry)} — price must retrace to you`);
+      why.push(`Stop beyond the SFP wick (${plan.stopSource})`);
+      break;
+    case 'A':
+      why.push(`Full-range engulfing candle closed on ${fields.tfLabel || fields.tfCode}`);
+      why.push('Direction AGREES with the 4H structure (Playbook A refuses counter-trend)');
+      if (fields.structure) why.push(`Playbook C gate passed — structure ${fields.structure}, liquidity intact`);
+      break;
+    case 'C':
+      why.push(`Full-range engulfing candle closed on ${fields.tfLabel || fields.tfCode}`);
+      if (fields.structure) why.push(`Playbook C gate passed — structure ${fields.structure}`);
+      why.push('NO higher-timeframe alignment was required — this is LTF-ENGULF, not Playbook A');
+      break;
+    default:
+      if (fields.message) why.push(String(fields.message).slice(0, 200));
+  }
+  if (fields.message && fields.playbook !== 'B') why.push(String(fields.message).slice(0, 160));
+  return why;
+}
+
+function shadowRecordMachineOrder(plan, extra) {
+  if (!shadowActive() || !plan || !plan.plannable) return;
+  try {
+    // 2026-08-29: sizes now come from autonomyModes, NOT dshV2.shadowSizes.
+    //
+    // THIS IS THE FIX FOR WHY SHADOW NEVER PRODUCED A SINGLE SCORED ORDER.
+    // dshV2.shadowSizes was [4, 6] — sizes chosen for the DSH-V2 breakout
+    // experiment, then read by this function for EVERY playbook. At the $300
+    // perTradeMaxLoss and MNQ's $2/point, 4 contracts allow only a 37.5-point
+    // stop and 6 allow 25. Real Playbook B stops measure a 48.3-point median
+    // (range 38.8-72.8 over the cached bars — app/scripts/risk-dist.js), so
+    // every single setup was stamped blocked:risk-too-big, and blocked rows are
+    // excluded from pendingMachineOrders(). The resolver therefore had nothing
+    // to resolve, shadow-outcomes.jsonl was never created, and the CONTROL gate
+    // read "0 resolved trades" for shadow's entire life. It would have kept
+    // reading zero forever; this was a sizing misconfiguration wearing the
+    // costume of an empty track record.
+    //
+    // Sizes are now [2] — Anoop's real sizeCap AND sizeFloor — so the record
+    // describes the account he actually trades and needs no translation to be
+    // believed. Decision locked 2026-08-29 (AUTONOMY_MODES_SPEC.md §8).
+    const rules = getActiveRules();
+    const mode = currentAutonomyMode();
+    const sizes = autonomyModes.sizesFor(rules, mode);
+    const base = shadowMarketContext();
+    // The cap in force for THIS mode — the tighter of the mode's own cap and
+    // the global perTradeMaxLoss. CONTROL runs at $200 rather than $300 so its
+    // $200 daily ceiling is a real ceiling instead of a limit a single stop-out
+    // could overshoot by 46%.
+    const maxRiskUsd = autonomyModes.riskCapUsd(rules, mode);
+    for (const contracts of sizes) {
+      const row = shadowRecorder.buildMachineOrder(
+        Object.assign({}, plan, extra || {}),
+        Object.assign({}, base, { contracts, pointValue: 2, tickSize: 0.25, why: (extra && extra.why) || [] })
+      );
+      // PRODUCTION FIX 2026-08-26: the first real shadow order recorded a
+      // 79.5-point stop as $636 of risk at 4c and $954 at 6c, against a $300
+      // per-trade limit. Shadow was recording orders the app would never be
+      // allowed to place, which would have built a track record out of
+      // impossible trades — exactly what riskGate() prevents in the backtest
+      // and what this path was missing.
+      //
+      // Blocked orders are RECORDED, not dropped: how often a detector
+      // proposes an untradeable setup is itself a finding about the detector.
+      // They are excluded from evidence by the `blocked` flag instead.
+      // Delegated to the pure checker so the rule that decides what a mode may
+      // risk lives in exactly one place, and so "unknown risk" is refused here
+      // the same way it is everywhere else — a row whose riskUsd failed to
+      // compute is the most suspect order in the file, not the safest.
+      const riskCheck = autonomyModes.checkOrderRisk(rules, mode, row.riskUsd);
+      if (!riskCheck.allowed) {
+        row.blocked = 'risk-too-big';
+        row.blockedReason = `${riskCheck.reason} (at ${contracts}c)`;
+      }
+      // Self-describing rows: which mode proposed this, and under which cap.
+      // Without these, a row read back later cannot say whether it belonged to
+      // the mode being promoted — and evidence for CONTROL must exclude rows
+      // recorded under SHADOW's looser $300 cap (spec §8.1). The per-mode
+      // folders make that separation structural; these fields make a single
+      // row answer the question on its own.
+      row.mode = mode;
+      row.riskCapUsd = Number.isFinite(maxRiskUsd) ? maxRiskUsd : null;
+      autonomyStore.recordOrder(DATA_DIR, mode, row);
+    }
+  } catch (e) { console.warn('[shadow] machine order not recorded:', e.message); }
+}
+
+// HUMAN side: every closed trade of his, winner or loser, with the behavioural
+// context his documented failure modes actually live in. Called from
+// writeLiveTradeToDayRecord, the one choke point every closed trade passes.
+function shadowRecordHumanTrade(record, join, dayKey, priorRows) {
+  if (!shadowActive() || !record) return;
+  try {
+    // dayKey and the prior rows are PASSED IN, not recomputed. The caller has
+    // already resolved both authoritatively (same day key it writes under,
+    // same account slot it loads), and recomputing them here meant the shadow
+    // copy could silently disagree with the day record about which day a trade
+    // belonged to or which account it came from. The first three captured
+    // trades all reported tradeNumberToday:1 because of exactly that kind of
+    // divergence — the behavioural fields, which are the most valuable thing
+    // this records, were all wrong while looking perfectly plausible.
+    const day = dayKey || dayRollup.tradingDayKey(record.at);
+    const rules = getActiveRules();
+    const band = rules.breakEvenBandUsd || 0;
+    // Prior trades TODAY, so trade number / day P&L / gap-since-last are the
+    // values that were true BEFORE this trade — not after it.
+    const prior = (Array.isArray(priorRows) ? priorRows : [])
+      .filter(r => r && r.t != null && r.t < record.at)
+      .map(r => ({ at: r.t, pnl: r.pnl, size: r.size }));
+    prior.sort((a, b) => a.at - b.at);
+    const prev = prior.length ? prior[prior.length - 1] : null;
+    const prevPnl = prev && Number.isFinite(prev.pnl) ? prev.pnl : null;
+
+    const ctx = Object.assign(shadowMarketContext(), {
+      day,
+      signalBacked: join ? !!join.signalBacked : null,
+      signalPlaybook: join ? join.playbook : null,
+      minutesFromSignal: join ? join.minutesFromSignal : null,
+      tradeNumberToday: prior.length + 1,
+      contractsSoFarToday: prior.reduce((a, r) => a + (Math.abs(Number(r.size)) || 0), 0),
+      dayPnlBefore: prior.reduce((a, r) => a + (Number(r.pnl) || 0), 0),
+      minutesSincePrevTrade: (prev && prev.at != null) ? Math.round((record.at - prev.at) / 60000) : null,
+      prevTradeOutcome: prevPnl == null ? null : (prevPnl > band ? 'win' : (prevPnl < -band ? 'loss' : 'breakeven')),
+      prevSize: prev && prev.size != null ? Math.abs(Number(prev.size)) : null,
+      breakEvenBandUsd: band,
+    });
+    // The live fold re-fires on the same closed trade — the day record is
+    // idempotent through its fingerprint merge, but this hook is not, and the
+    // first day produced a third shadow row that was a duplicate of the first
+    // trade. Same fingerprint the day record dedupes on.
+    const fp = record.t + '|' + record.x + '|' + Math.round(Number(record.pnl) * 100) + '|' + record.size;
+    // 2026-08-29: his trades live in DATA/autonomy/human/trades.jsonl, ONE
+    // stream regardless of which mode is running — see autonomy-store's header
+    // for why filing them under the active mode would break the one comparison
+    // worth making (his discretion vs the machine on the same market).
+    const already = autonomyStore.readHumanTrades(DATA_DIR)
+      .some(r => r && r.fingerprint === fp);
+    if (already) return;
+    const built = shadowRecorder.buildHumanTradeRecord(record, ctx);
+    built.fingerprint = fp;
+    autonomyStore.recordHumanTrade(DATA_DIR, built);
+  } catch (e) { console.warn('[shadow] human trade not recorded:', e.message); }
+}
+
+// ── MACHINE-ORDER RESOLVER (2026-08-26) ────────────────────────────────────
+// Machine shadow was only half a system until this: armSetup recorded the
+// order the app WOULD have sent, and nothing ever scored it, so every row sat
+// at resolved:false forever and the CONTROL gate read zero resolved trades no
+// matter how long shadow ran. Autonomy could never have been earned.
+//
+// Uses backtest.simulateTrade — the SAME function the 9-month backtest runs
+// on — so a shadow result and a backtest result are produced by identical
+// code. If they ever disagree it is because the market differed, not because
+// two implementations drifted. That is the whole reason the detectors were
+// extracted in the first place.
+//
+// Slow timer, and it only touches orders whose full horizon has already
+// elapsed, so it competes with the monitors for the one CDP connection as
+// little as possible.
+const btEngine = require('./backtest');
+let shadowResolveTimer = null;
+
+async function resolveShadowOrders() {
+  try {
+    // Resolve within the folder of the mode that RECORDED the orders.
+    const resolveMode = currentAutonomyMode();
+    const pending = autonomyStore.pendingMachineOrders(DATA_DIR, resolveMode);
+    if (!pending.length) return;
+    const rules = getActiveRules();
+    const horizon = rules.playbooks.outcomeHorizonBars;
+
+    // One bar fetch per distinct timeframe, not one per order.
+    const byTf = new Map();
+    for (const o of pending) {
+      const tf = String(o.tf || '30');
+      if (!byTf.has(tf)) byTf.set(tf, []);
+      byTf.get(tf).push(o);
+    }
+
+    let wrote = 0;
+    for (const [tf, orders] of byTf) {
+      let bars = [];
+      try { bars = await getFullBars(tf, horizon * 8); }
+      catch (e) { console.warn('[shadow-resolve] bar read failed for tf ' + tf + ':', e.message); continue; }
+      if (!Array.isArray(bars) || bars.length < horizon + 2) continue;
+
+      for (const o of orders) {
+        // The bar the order was placed on: the last one that had CLOSED at
+        // the time it was recorded. Anything later would score the order
+        // against price action it could not have been placed into.
+        const tsSec = Math.floor(Date.parse(o.ts) / 1000);
+        if (!Number.isFinite(tsSec)) continue;
+        let idx = -1;
+        for (let i = 0; i < bars.length; i++) if (bars[i].time <= tsSec) idx = i; else break;
+        if (idx < 0) continue;
+
+        const plan = {
+          playbook: o.playbook, direction: o.direction,
+          entry: o.entry, stop: o.stop, target: o.target,
+          riskPoints: o.riskPoints,
+          // Playbook B is a limit back into the gap; the engulf/breakout
+          // families are market-on-close. planEntry already decided which,
+          // and that decision must not be re-guessed here.
+          requiresFill: o.playbook === 'B',
+          fillWindowBars: rules.playbooks.fvgFillWindowBars,
+        };
+        if (!Number.isFinite(plan.entry) || !Number.isFinite(plan.stop) || !Number.isFinite(plan.target)) continue;
+
+        const sim = btEngine.simulateTrade(plan, bars, idx, {
+          horizonBars: horizon,
+          slippagePoints: 0.5,
+          flattenByISTMinutes: rules.flattenByISTMinutes,
+        });
+        // null = the horizon has not fully elapsed yet. Normal, not an error,
+        // and deliberately NOT written — it will resolve on a later pass.
+        if (!sim) continue;
+
+        const comm = (rules.commissionPerContractPerSide || 0.95) * 2 * (o.contracts || 1);
+        const netUsd = sim.filled ? (sim.points * 2 * (o.contracts || 1) - comm) : 0;
+        autonomyStore.recordOutcome(DATA_DIR, resolveMode, {
+          id: o.id, day: o.day, playbook: o.playbook, contracts: o.contracts,
+          outcome: sim.outcome, netUsd: Math.round(netUsd * 100) / 100, bars: sim.bars,
+        });
+        wrote++;
+      }
+    }
+    if (wrote) {
+      console.log('[shadow-resolve] resolved ' + wrote + ' machine order(s)');
+      try { autonomyStore.rollupDay(DATA_DIR, resolveMode, tradingDayStampIST(Date.now())); } catch (e) {}
+      broadcastAutonomy();
+    }
+  } catch (e) { console.warn('[shadow-resolve] pass failed:', e.message); }
+}
+
+// ── Is a trading session live right now? ───────────────────────────────────
+// A real in-window check on BOTH edges. Deliberately not
+// signalLedger.sessionTierForMinutes, which only compares against startMin and
+// so reports "NY" for every minute after NY opens, including midnight — fine
+// for labelling a trade's tier, useless for "should I stay off the wire".
+function inSessionWindowNow() {
+  try {
+    const istMin = Math.floor((Date.now() + 5.5 * 3600000) % 86400000 / 60000);
+    return (getActiveRules().sessionWindowsIST || []).some((w) =>
+      Number.isFinite(w.startMin) && Number.isFinite(w.endMin)
+      && istMin >= w.startMin && istMin <= w.endMin);
+  } catch (e) {
+    // Unknown = treat as IN session, i.e. stay off the wire. The conservative
+    // direction here is to do less, not more.
+    return true;
+  }
+}
+
+// ── 2026-08-29: the resolver yields to the live watchers ───────────────────
+// rules.json's _autonomyEnabled_comment names this path directly as a reason
+// autonomy was switched off: "the shadow resolver was one more 5-minute chart
+// reader competing with the watchers." It reads bars over the single CDP
+// connection, and it was doing so every 5 minutes regardless of what else
+// needed that connection.
+//
+// Nothing about this work is urgent. A machine order's outcome is scored over
+// a 12-bar horizon — six hours on the 30m chart — so resolving it at 13:05
+// instead of 13:00 changes nothing except who gets the wire. So:
+//
+//   • every 15 minutes, not 5
+//   • never DURING a session window, when the watchers are the whole point
+//   • never while an order is being placed
+//   • never while the chart lock is held
+//
+// Pending orders are not lost by a skip; pendingMachineOrders() re-finds them
+// on the next pass, and the resolver already ignores any horizon that has not
+// fully elapsed.
+const SHADOW_RESOLVE_INTERVAL_MS = 15 * 60 * 1000;
+
+function startShadowResolver() {
+  if (shadowResolveTimer) return;
+  shadowResolveTimer = setInterval(() => {
+    if (!autonomyEnabled()) return;
+    if (!mcpBridge.tvConnected) return;
+    if (!shadowActive()) return;
+    // Yield to anything that actually needs the chart right now.
+    if (inSessionWindowNow()) return;
+    if (tvOrderPlacementInFlight) return;
+    resolveShadowOrders().catch((e) => console.warn('[shadow-resolve] timer:', e.message));
+  }, SHADOW_RESOLVE_INTERVAL_MS);
+  if (shadowResolveTimer.unref) shadowResolveTimer.unref();
+}
+
 function armSetup(fields) {
   const now = Date.now();
+  // 2026-08-26: every armed setup is also recorded as the order the machine
+  // WOULD have sent, at each configured shadow size. armSetup is the single
+  // choke point all confirmed setups pass through, so hooking here cannot
+  // miss a playbook the way hooking each monitor separately would.
+  try {
+    const plan = playbookSpec.planEntry(
+      fields.playbook === 'C' ? 'LTF-ENGULF' : fields.playbook,
+      { direction: fields.direction, gapLow: fields.gapLow, gapHigh: fields.gapHigh, level: fields.level, wick: fields.wick,
+        bar: fields.bar, barTime: fields.barTime, entryRef: fields.entryRef },
+      getActiveRules()
+    );
+    // setupId derived here when the caller did not supply one: falling back
+    // to the entry price (as the first production rows did) means two
+    // different setups that happen to share an entry collide into one id.
+    const sid = fields.setupId || playbookSpec.setupId(
+      fields.playbook === 'C' ? 'LTF-ENGULF' : fields.playbook,
+      { direction: fields.direction, gapLow: fields.gapLow, gapHigh: fields.gapHigh,
+        level: fields.level, barTime: fields.barTime, entryRef: fields.entryRef });
+    const why = shadowConfirmReasons(fields, plan);
+    shadowRecordMachineOrder(plan, { playbook: fields.playbook, tf: fields.tfCode, setupId: sid, why });
+    // Push the ticket into the app chat — Anoop's request: direction, stop and
+    // target in BOTH dollars and ticks, plus why it was confirmed. A signal
+    // that only names a candle makes him re-derive the trade every time.
+    // 2026-08-29: NOT pushed while the active mode is silent. SHADOW runs at
+    // the same time as Anoop trading his own account, and these tickets in the
+    // chat are precisely what made a live session confusing enough on
+    // 2026-08-26 that he switched the whole feature off ("it has created
+    // confusion when i was trading live"). The record is still written either
+    // way — silence suppresses the NOTIFICATION, never the data.
+    if (shadowActive() && plan.plannable && !autonomySilent()) {
+      const sizes = autonomyModes.sizesFor(getActiveRules(), currentAutonomyMode());
+      broadcast({
+        type: 'shadow-ticket',
+        playbook: fields.playbook, tfLabel: fields.tfLabel || fields.tfCode,
+        direction: plan.direction, entry: plan.entry, stop: plan.stop, target: plan.target,
+        riskPoints: plan.riskPoints, rMultiple: plan.targetR, stopSource: plan.stopSource,
+        why,
+        sizes: sizes.map((c) => {
+          const sd = shadowRecorder.riskUnits(plan.riskPoints, 0.25, 2, c);
+          const td = shadowRecorder.riskUnits(Math.abs(plan.target - plan.entry), 0.25, 2, c);
+          // The cap for the ACTIVE MODE, not the global one — otherwise a
+          // ticket shown in CONTROL would read "fine" at $250 while the mode
+          // that has to place it refuses anything over $200.
+          const maxUsd = autonomyModes.riskCapUsd(getActiveRules(), currentAutonomyMode());
+          return { contracts: c, stop: sd, target: td, blocked: (sd && maxUsd && sd.usd > maxUsd) ? `over the $${maxUsd} per-trade limit` : null };
+        }),
+        time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+      });
+    }
+  } catch (e) { /* recording must never break the live alert */ }
   armedSetup = {
     signalTs: now,
     playbook: fields.playbook,
@@ -6284,6 +7521,11 @@ function writeLiveTradeToDayRecord(record) {
     } catch (e) {
       console.warn('[signal-join] failed:', e.message);
     }
+    // 2026-08-26: record HIS trade with its context, winner or loser. The
+    // losers are not optional — a feature only predicts if it SEPARATES the
+    // two groups, so "duplicate the good trades" needs the bad ones as the
+    // control. See shadow-recorder.js.
+
     const sizeCapCsv = typeof rules.sizeCap === 'number' ? rules.sizeCap : 2;
     // 4.3 AUDIT FIX: rollupDay's commPerCt is a ROUND-TURN rate — its net is
     // `gross - contracts * commPerCt`, with one `contracts` unit per closed
@@ -6300,7 +7542,14 @@ function writeLiveTradeToDayRecord(record) {
       sessionWindowsIST: rules.sessionWindowsIST,
       sizeCapCsv,
     };
-    const dirSign = record.side === 'sell' ? -1 : 1;
+    // 2026-08-25: normalize FIRST, then take the sign. This read the broker's
+    // raw 'sell' only, so a record speaking the row vocabulary ('SHORT' — what
+    // the live walk-join now produces, and what every stored row already says)
+    // fell through to +1 and had its points recorded with the sign flipped:
+    // a winning short would be journalled as a loss of the same size. Same
+    // two-vocabulary hazard normalizeSide was written for, one layer up.
+    const normSide = dayRollup.normalizeSide(record.side);
+    const dirSign = normSide === 'SHORT' ? -1 : 1;
     const row = {
       t: record.entryAt != null ? record.entryAt : record.at,
       x: record.exitAt != null ? record.exitAt : record.at,
@@ -6308,7 +7557,7 @@ function writeLiveTradeToDayRecord(record) {
       pnl: record.pnl,
       // 4.3 AUDIT FIX: LONG/SHORT, not the broker's raw buy/sell — see
       // dayRollup.normalizeSide for what BUY/SELL in this field broke.
-      side: dayRollup.normalizeSide(record.side),
+      side: normSide,
       ep: record.entryPrice != null ? record.entryPrice : null,
       xp: record.exitPrice != null ? record.exitPrice : null,
       mp: (record.entryPrice != null && record.exitPrice != null)
@@ -6319,30 +7568,66 @@ function writeLiveTradeToDayRecord(record) {
         : 0,
       evidence: record.evidence || null,
       source: record.source || null,
+      // 2026-08-26: say what this pnl IS. The fold's number is a balance
+      // delta between two flats, so the broker's commission is already out of
+      // it — unlike a CSV row, which is gross. Without this the day rollup
+      // subtracted commission a second time on every live-written day.
+      pnlBasis: 'net',
       // 5.1: signal-backed stamping — the 5.2 scorecard's primary input.
       signalBacked: join.signalBacked,
       playbook: join.playbook,
       minutesFromSignal: join.minutesFromSignal,
       g: null, flags: null, // graded below through the shared day-rollup
     };
+    // 2026-08-26: record HIS trade with its context, winner or loser. The
+    // losers are not optional — a feature only predicts if it SEPARATES the
+    // two groups, so "duplicate the good trades" needs the bad ones as the
+    // control. See shadow-recorder.js.
+    //
+    // PASSES `row`, NOT `record`, and that placement is the fix for a bug the
+    // first real production trade exposed: the two speak different
+    // vocabularies. `record` has entryPrice/exitPrice/entryAt and a RAW side;
+    // `row` has ep/xp/hold and a NORMALIZED LONG/SHORT. Hooked on `record`,
+    // every one of those fields came back null — the first captured trade had
+    // no side, no entry, no exit and no hold, which silently disabled three of
+    // the eleven discriminator features. Hooking after the row is built also
+    // means the shadow copy and the day record can never disagree.
     const dtStore = dataLoad('day_trades__' + slot) || {};
-    const fp = r => r.t + '|' + r.x + '|' + Math.round(r.pnl * 100) + '|' + r.size;
+    shadowRecordHumanTrade(
+      Object.assign({}, row, { at: record.at, entryAt: row.t }),
+      join, dayKey, Array.isArray(dtStore[dayKey]) ? dtStore[dayKey] : []);
+    // 2026-08-28: identity is the FLAT EVENT (entry, exit, size) — never the
+    // P&L. The old fingerprint `t|x|pnl-cents|size` put a VALUE in the key, and
+    // P&L is exactly what the two routes disagree on: the walk reports GROSS at
+    // the real fill stamps, the fold reports NET minutes later. Same trade, two
+    // fingerprints, two rows — which is how one trade on 2026-08-28 became
+    // three. mergeTradeRow matches on the event and MERGES, keeping the walk's
+    // prices and a single net figure.
+    const existingRows = Array.isArray(dtStore[dayKey]) ? dtStore[dayKey] : [];
+    const mergeRes = tvBrokerFeed.mergeTradeRow(existingRows, row, {
+      commissionPerContractPerSide: rules.commissionPerContractPerSide,
+      pointValue: 2,   // MNQ — verified, point-value-verify.js
+    });
+    if (mergeRes.action === 'merged') {
+      console.log('[day-record] merged into an existing row for the same trade (no duplicate written)');
+    }
+    const fp = r => r.t + '|' + r.x + '|' + r.size;
     const mergedMap = new Map();
-    (Array.isArray(dtStore[dayKey]) ? dtStore[dayKey] : []).forEach(r => mergedMap.set(fp(r), r));
-    mergedMap.set(fp(row), row);
+    mergeRes.rows.forEach(r => mergedMap.set(fp(r), r));
     const pre = Array.from(mergedMap.values()).map(r => ({
       entryMs: r.t, exitMs: r.x, entryMin: null, holdSec: r.hold, size: r.size, pnl: r.pnl,
       side: r.side, ep: r.ep, xp: r.xp, mp: r.mp,
     }));
     const graded = dayRollup.gradeTrades(pre, gradeOpts);
     const dayRows = graded.map(g => {
-      const base = mergedMap.get(fp({ t: g.entryMs, x: g.exitMs, pnl: g.pnl, size: g.size })) || {};
+      const base = mergedMap.get(fp({ t: g.entryMs, x: g.exitMs, size: g.size })) || {};
       return {
         t: g.entryMs, x: g.exitMs, size: g.size, pnl: g.pnl, g: g.g, flags: g.flags,
         side: g.side || null, ep: g.ep != null ? g.ep : null, xp: g.xp != null ? g.xp : null,
         mp: g.mp != null ? g.mp : null, hold: g.holdSec,
         evidence: base.evidence || null,
         source: base.source || null,
+        pnlBasis: base.pnlBasis || null,
         // 5.1: the signal join survives the re-grade (the 5.2 scorecard input).
         signalBacked: base.signalBacked === true,
         playbook: base.playbook || null,
@@ -6447,12 +7732,19 @@ async function startMCP() {
       // *MonitorUserDisabled flag). 0.1: armed via armMonitorsStaggered so
       // the start times don't align on one tick.
       armMonitorsStaggered();
+      // 2026-08-26: keep the broker panel open for the whole session instead
+      // of discovering it shut when a read fails. Idempotent.
+      startPanelWatchdog();
       // 2026-08-19: re-run the self-test on every reconnect, not just once at
       // boot — a reconnect can land with the Trading Panel no longer open or
       // linked, and that's exactly the state this test exists to catch.
       // Same 15s delay as the initial run: give TradingView a moment to
       // finish rendering after the CDP handshake before probing it.
       scheduleLiveFeedSelfTest(15000);
+      // PROTOCOL 2 auto-trigger. Deliberately later than the 3-check self-test:
+      // the watchers need time to take a first reading before "has this watcher
+      // checked recently?" can mean anything.
+      scheduleFeedIntegrityProtocol(45000);
     });
     mcpBridge.on('tv-disconnected', (detail) => {
       tvBrokerFeedReadOk = null; // force a fresh readable/not-readable log line once CDP comes back, don't trust the pre-drop state
@@ -6460,12 +7752,12 @@ async function startMCP() {
     });
     if (mcpBridge.ready) {
       if (mcpBridge.tvConnected) armMonitorsStaggered(); // already connected before this call — 'tv-connected' won't fire again
-      if (mcpBridge.tvConnected) scheduleLiveFeedSelfTest(15000);
+      if (mcpBridge.tvConnected) { scheduleLiveFeedSelfTest(15000); scheduleFeedIntegrityProtocol(45000); }
       return;
     }
     await mcpBridge.start();
     if (mcpBridge.tvConnected) armMonitorsStaggered(); // covers a start() that resolves already-connected, race-safe alongside the event listener
-    if (mcpBridge.tvConnected) scheduleLiveFeedSelfTest(15000);
+    if (mcpBridge.tvConnected) { scheduleLiveFeedSelfTest(15000); scheduleFeedIntegrityProtocol(45000); }
   } catch (err) {
     broadcast({ type: 'mcp-status', connected: false, message: 'TradingView MCP: ' + err.message });
   }
@@ -6555,6 +7847,17 @@ let tvBrokerSeenOrderIds = new Set(); // high-water mark so a fill is only ever 
 // never find what was actually saved. Real state is loaded explicitly right
 // after initDataDir() runs (search loadTVBrokerFeedState() below).
 let tvBrokerFeedState = tvBrokerFeed.freshState();
+// 2026-08-24: tracks readable/not-readable of the broker's OWN P&L columns so
+// the switch between "real session total" and "reconstructed fold" logs once
+// on transition rather than every 10s. Same pattern as tvBrokerFeedReadOk.
+let tvBrokerPnlReadOk = null;
+// Once per process: the broker-vs-fold disagreement is expected and permanent
+// on any day he traded before the app came up, so it is worth saying once and
+// never again — a line that repeats every 10s is a line nobody reads.
+let tvBrokerPnlDriftLogged = null;
+// 2026-08-24: fires on transition when the summary table freezes behind the
+// header balance — the condition that makes a stale number look live.
+let tvBrokerSummaryStaleLogged = null;
 let tvBrokerFeedReadOk = null; // null = never polled yet; tracks state so log lines only fire on transitions, not every 10s
 let tvBrokerOrdersSuspectLogged = false; // tracks the orders-table-empty-but-position-open transition, same log-once-per-state pattern
 let tvBrokerWalkDesyncLogged = false; // same log-once-per-state pattern for the order-walk-vs-positions disagreement (2026-08-20, H5)
@@ -6654,6 +7957,88 @@ const tvLastClosedSide = {};
 // callers during a single poll collapse into the same single follow-up.
 let tvBrokerPollInFlight = null;
 let tvBrokerPollAgain = false;
+// ── Broker-panel watchdog (2026-08-26) ─────────────────────────────────────
+// Anoop, on shipping this to clients: "what is permanent fix? repair &
+// re-check does not work again. i dont want this issue."
+//
+// Repair used to be REACTIVE: something reads the panel, the read fails, only
+// THEN is a repair attempted. By that point the feed has already been dark for
+// however long it took him to notice the red box — on 2026-08-24 that was most
+// of a session, and the numbers he traded on were wrong the whole time.
+//
+// A watchdog inverts it. The panel's state is checked on a timer whether or
+// not anything failed, and a panel found shut is opened immediately. The
+// common case — he closed it, or TradingView launched with it collapsed —
+// never becomes a visible failure at all.
+//
+// SAFE BY CONSTRUCTION, which matters because this fires unattended on a
+// live-money account:
+//   - only ever OPENS; nothing here can close a panel he opened;
+//   - the opener no-ops when the panel is already open, so the steady state
+//     is a cheap DOM read every interval and nothing else;
+//   - goes through withBrokerLock, so it cannot race a poll or an order;
+//   - skipped entirely while TradingView is disconnected — there is nothing
+//     to click, and retrying into a dead CDP just fills the log.
+const PANEL_WATCHDOG_MS = 60000;
+let panelWatchdogTimer = null;
+let panelWatchdogLastState = null;
+
+async function panelWatchdogTick() {
+  if (!mcpBridge.ready || !mcpBridge.tvConnected) return;
+  try {
+    const raw = await withBrokerLock(() => mcpBridge.callTool('trading_ensure_panel_ready', {}));
+    const text = (raw && raw.content) ? raw.content.map(c => c.text || '').join('') : null;
+    const res = text ? JSON.parse(text) : null;
+    if (!res) return;
+    // Already healthy and was healthy last tick: say nothing. A watchdog that
+    // logs every minute is a watchdog nobody reads.
+    if (res.alreadyMounted) {
+      if (panelWatchdogLastState === 'broken') {
+        console.log('[panel-watchdog] broker panel is healthy again.');
+      }
+      panelWatchdogLastState = 'ok';
+      return;
+    }
+    if (res.success) {
+      panelWatchdogLastState = 'ok';
+      const how = (res.expanded && res.expanded.tried && res.expanded.tried.length)
+        ? res.expanded.tried.map(t => t.strategy).join(' -> ') : 'panel opened';
+      console.log('[panel-watchdog] broker panel was shut and has been REOPENED automatically (' + how + '). '
+        + 'The live feed would have gone dark without this.');
+      broadcast({ type: 'panel-repaired', automatic: true, detail: how });
+    } else {
+      // Only shout on the transition into broken, then once more if it stays
+      // broken across a full minute — enough to be noticed, not a flood.
+      if (panelWatchdogLastState !== 'broken') {
+        console.warn('[panel-watchdog] broker panel is shut and could NOT be reopened automatically. '
+          + 'Still missing: ' + (res.stillMissing || []).join(', ')
+          + '. Diagnostics: ' + JSON.stringify(res.diagnostics || null));
+        broadcast({
+          type: 'panel-repair-failed',
+          stillMissing: res.stillMissing || [],
+          diagnostics: res.diagnostics || null,
+        });
+      }
+      panelWatchdogLastState = 'broken';
+    }
+  } catch (e) {
+    // Never let the watchdog be the thing that takes the process down; it
+    // exists to protect a live session, not to add a new way to lose one.
+    console.warn('[panel-watchdog] tick failed: ' + e.message);
+  }
+}
+
+function startPanelWatchdog() {
+  if (panelWatchdogTimer) return;
+  panelWatchdogTimer = setInterval(() => { panelWatchdogTick().catch(() => {}); }, PANEL_WATCHDOG_MS);
+  if (panelWatchdogTimer.unref) panelWatchdogTimer.unref();
+  console.log('✓ [panel-watchdog] ARMED — broker panel checked every '
+    + Math.round(PANEL_WATCHDOG_MS / 1000) + 's and reopened automatically if found shut.');
+  // Do not wait a full interval for the first check: a session that launches
+  // with the panel collapsed is exactly the case this exists for.
+  setTimeout(() => { panelWatchdogTick().catch(() => {}); }, 5000);
+}
+
 function pollTVBrokerAccount() {
   if (tvBrokerPollInFlight) {
     tvBrokerPollAgain = true;
@@ -6923,22 +8308,195 @@ async function pollTVBrokerAccountInner() {
     const closedRoundTripsToday = (!walk || walkDesynced || walk.droppedRows > 0)
       ? null
       : walk.closed.length;
+    // 2026-08-26: hand the verification the SAME evidence, under the SAME
+    // trust gate the count uses. A walk not trusted for counting must not be
+    // trusted for verifying either.
+    tvBrokerLastWalkClosed = closedRoundTripsToday === null ? null : walk.closed;
     // 2026-08-19: hasNewFill ties the poll-aliasing backstop to real evidence
     // (this same poll's orders-table read found a genuinely new Filled
     // order) instead of firing on any balance movement — see fold()'s
     // 2026-08-19 comment for the live incident (Balance drifting on its own
     // while genuinely flat, fabricating 20 fake trades) this closes.
+    // 2026-08-24: the broker's OWN session P&L, straight off the account
+    // summary panel. tradingview-mcp has been reading this table into
+    // `summary.detail` since the day it was written; nothing in this app ever
+    // looked at it, so the day P&L was reconstructed from balance deltas when
+    // the real answer was already on the wire. See tv-broker-feed.js's
+    // readBrokerPnl for the $553.90 miss that exposed it.
+    const brokerPnl = tvBrokerFeed.readBrokerPnl(result.summary);
+    // Realized only: the app's day record contains closed trades, so
+    // comparing it against a total that includes floating P&L on an open
+    // position would report a mismatch on every trade he is still in.
+    // A stale panel is treated as unreadable rather than as evidence.
+    tvBrokerLastBrokerRealized = (brokerPnl && brokerPnl.readable && !brokerPnl.stale)
+      ? brokerPnl.realized : null;
+    if (brokerPnl.readable !== tvBrokerPnlReadOk) {
+      tvBrokerPnlReadOk = brokerPnl.readable;
+      console.log(brokerPnl.readable
+        ? `[tv-broker] broker's own session P&L is readable — day P&L now comes from the account panel (Total ${brokerPnl.totalPnl.toFixed(2)}, Open ${brokerPnl.openPnl === null ? 'n/a' : brokerPnl.openPnl.toFixed(2)}), not from reconstructed balance deltas.`
+        : "[tv-broker] account-summary P&L columns NOT readable — falling back to the balance-delta fold for day P&L. That figure only covers trades this instance watched close, so it can understate the real session total. Check the Account Summary tab in the broker panel.");
+    }
     tvBrokerFeedState = tvBrokerFeed.fold(tvBrokerFeedState, {
       balance, isFlat, openSize, nowMs: Date.now(),
       hasNewFill: newFills.length > 0,
       closedRoundTrips: closedRoundTripsToday,
+      // 2026-08-25: the walk's RECORDS, not just its count. They carry side,
+      // entry/exit price and both timestamps — the fields every live-written
+      // row had as null, which is why the Journal showed "—" for direction on
+      // a full day of trading. Gated on the SAME conditions the count is
+      // (null when the walk is desynced or dropped rows), so a walk that is
+      // not trusted for counting is not trusted for direction either.
+      closedRoundTripRecords: closedRoundTripsToday === null ? null : walk.closed,
+      brokerTotalPnl: brokerPnl.totalPnl,
+      brokerOpenPnl: brokerPnl.openPnl,
+      brokerNetLiq: brokerPnl.netLiq,
+      brokerHeaderBalance: brokerPnl.headerBalance,
+      brokerSummaryStale: brokerPnl.stale,
     });
+
+
+    // 2026-08-25: REPAIR the day's stored rows from the same order history.
+    // Anoop, on a full day of "—" in the Journal's Side column: "how can you
+    // solve it." The walk-join above only stamps direction on trades booked
+    // from here on; today's rows were written by the previous build and would
+    // stay blank forever. The orders table still holds them, so backfill the
+    // blanks rather than telling him to restart and check again tomorrow.
+    //
+    // Cheap and idempotent: enrichRowsFromWalk only touches rows whose side is
+    // missing, so once a day is repaired every later poll matches nothing and
+    // writes nothing. Gated on the same trustworthy-walk condition as
+    // everything else here.
+    if (closedRoundTripsToday !== null && walk.closed.length) {
+      try {
+        const slotId = loadConfig().activeSlotId;
+        const dtKey = 'day_trades__' + slotId;
+        const dtStore = slotId ? (dataLoad(dtKey) || {}) : null;
+        const repairKey = dayRollup.tradingDayKey(Date.now());
+        const existing = dtStore && Array.isArray(dtStore[repairKey]) ? dtStore[repairKey] : null;
+        if (existing && existing.some(r => r && !r.side)) {
+          const res = tvBrokerFeed.enrichRowsFromWalk(existing, walk.closed);
+          if (res.filled > 0) {
+            dtStore[repairKey] = res.rows;
+            dataSave(dtKey, dtStore);
+            console.log('[tv-broker] repaired ' + res.filled + ' stored row(s) for ' + repairKey
+              + ' with side/prices from order history'
+              + (res.ambiguous ? ' (' + res.ambiguous + ' left blank as ambiguous)' : '')
+              + '. Reload the Journal tab to see them.');
+            broadcast({ type: 'day-trades-repaired', date: repairKey, filled: res.filled, ambiguous: res.ambiguous });
+          }
+        }
+      } catch (e) {
+        console.log('[tv-broker] stored-row side repair failed: ' + e.message);
+      }
+    }
+    if (brokerPnl.stale && tvBrokerSummaryStaleLogged !== true) {
+      console.warn('[tv-broker] the account-summary table has FALLEN BEHIND: header balance ' + brokerPnl.headerBalance +
+        ' vs its Net Liq ' + brokerPnl.netLiq + ' (gap $' + (brokerPnl.headerBalance - brokerPnl.netLiq).toFixed(2) + '). ' +
+        'Total P/L is read off that same table, so the day P&L is understating by roughly that amount. ' +
+        'Click the Account Summary tab in the broker panel to force it to re-render.');
+      tvBrokerSummaryStaleLogged = true;
+    } else if (!brokerPnl.stale) {
+      tvBrokerSummaryStaleLogged = false;
+    }
     // Every poll, not just on a trade close — sizeSeenThisTrade/wasFlat/
     // balanceAtLastFlat all need to survive a restart mid-trade too, not
     // only the completed-trades list, or a restart during an OPEN position
     // would lose the "last known flat balance" reference point the eventual
     // close needs to compute P&L against.
     persistTVBrokerFeedState();
+
+    // 2026-08-26 SELF-HEAL. The day-record write below fires only on the poll
+    // where tradeCount INCREASES — a one-shot with no retry. A restart after
+    // the fold persisted a trade (the count comes back restored, so it never
+    // increases again), a throw anywhere in that poll, or a walk-join that
+    // returned nothing, all leave the trade in the fold and absent from
+    // day_trades.json forever. That is what happened on 2026-08-26: the fold
+    // held one trade at -203 and the Journal showed no trades for the day.
+    //
+    // Runs every poll, writes nothing when nothing is missing. Cheap: one
+    // file read plus a set comparison. writeLiveTradeToDayRecord is itself
+    // idempotent (it merges by fingerprint into a Map), so a double-call
+    // cannot duplicate a row even if the match below were wrong.
+    try {
+      const healSlot = jessiBucketKey(loadConfig());
+      const healKey = dayRollup.tradingDayKey(Date.now());
+      const healStore = dataLoad('day_trades__' + healSlot) || {};
+      const healRows = Array.isArray(healStore[healKey]) ? healStore[healKey] : [];
+      const todayFold = (tvBrokerFeedState.trades || [])
+        .filter(t => t && t.at != null && dayRollup.tradingDayKey(t.at) === healKey);
+      // 2026-08-28: the commission rate must reach the matcher. A walk-joined
+      // row holds GROSS and a folded trade holds NET, so the two differ by
+      // exactly size x round-turn commission — that arithmetic is how a
+      // cross-route duplicate is recognised. Without the rate the matcher
+      // falls back to exact-P&L only, which is what let one trade become
+      // three rows. Never hardcoded; rules.json owns it.
+      // 2026-08-28: a zero-P&L folded trade is a phantom the zero-delta guard
+      // now prevents at source. Legacy state written BEFORE that guard can
+      // still hold one, and the self-heal would otherwise try to write it
+      // every poll forever — it fired 4 times in 20 minutes doing exactly
+      // that. Excluded here so old state cannot resurrect the loop.
+      const todayFoldReal = todayFold.filter(t => !(Number(t && t.pnl) === 0));
+      const phantomsSkipped = todayFold.length - todayFoldReal.length;
+      const missing = tvBrokerFeed.missingFromDayRows(todayFoldReal, healRows, {
+        commissionPerContractPerSide: getActiveRules().commissionPerContractPerSide,
+      });
+      if (missing.length) {
+        console.warn('[day-record] SELF-HEAL: ' + missing.length + ' folded trade(s) for ' + healKey
+          + ' were missing from the day record — writing them now. '
+          + '(Expected after a restart mid-session; if it repeats every poll the write itself is failing.)');
+        missing.forEach(t => {
+          try {
+            const res = writeLiveTradeToDayRecord(t);
+            if (res !== 'written') console.warn('[day-record] SELF-HEAL could not write a trade: ' + res);
+          } catch (e) { console.warn('[day-record] SELF-HEAL threw: ' + e.message); }
+        });
+      }
+      // ── SELF-REPAIR, WITH EVIDENCE (2026-08-28) ─────────────────────────
+      // Anoop: "whatever mismatch ... is shown it should have self fixing
+      // capacity and after fixing it should show me the evidence that it took
+      // place on the app."
+      //
+      // The LIVE FEED MISMATCH banner reported the truth (broker order history
+      // 0 round trips vs tracker 2) and then did nothing about it. Phantom
+      // trades are now removed from the live state itself, not merely filtered
+      // on read, and the repair is BROADCAST and logged so the correction is
+      // visible rather than the number quietly becoming right. A silent fix is
+      // indistinguishable from a fix that never ran.
+      if (phantomsSkipped > 0) {
+        const before = tvBrokerFeedState.tradeCount;
+        tvBrokerFeedState.trades = (tvBrokerFeedState.trades || []).filter(t => !(Number(t && t.pnl) === 0));
+        tvBrokerFeedState.tradeCount = Math.max(0, before - phantomsSkipped);
+        persistTVBrokerFeedState();
+        const evidence = {
+          what: 'phantom flat transitions removed',
+          why: 'a closed trade always moves the balance (commission always applies) — a zero delta means no fill happened',
+          removed: phantomsSkipped,
+          tradeCountBefore: before,
+          tradeCountAfter: tvBrokerFeedState.tradeCount,
+          dayPnlUnchanged: Math.round((tvBrokerFeedState.dayPnl || 0) * 100) / 100,
+          at: new Date().toISOString(),
+        };
+        console.warn('[self-repair] removed ' + phantomsSkipped + ' phantom trade(s) from the live tracker: '
+          + before + ' -> ' + tvBrokerFeedState.tradeCount + ' trades, day P&L unchanged at $'
+          + evidence.dayPnlUnchanged);
+        broadcast({ type: 'self-repair', kind: 'phantom-trades', evidence });
+      }
+    } catch (e) {
+      console.warn('[day-record] SELF-HEAL check failed: ' + e.message);
+    }
+
+    // 2026-08-24: the two numbers the rest of the app is allowed to believe.
+    // Derived here, once, so the poll broadcast, the shadow enforcement check
+    // and Now.md cannot drift apart by each doing their own arithmetic.
+    const effPnl = tvBrokerFeed.effectiveDayPnl(tvBrokerFeedState, Date.now());
+    const effCount = tvBrokerFeed.effectiveTradeCount(tvBrokerFeedState);
+    if (effPnl.source === 'broker' && effPnl.drift !== null && Math.abs(effPnl.drift) > 1
+        && tvBrokerPnlDriftLogged !== true) {
+      console.warn(`[tv-broker] day P&L sources disagree: broker says realized ${effPnl.realized.toFixed(2)} for the session, the balance-delta fold reconstructed ${effPnl.foldValue.toFixed(2)} (drift ${effPnl.drift.toFixed(2)}). ` +
+        'Expected whenever trading happened before this instance started polling, or a balance move was re-anchored without a corroborating fill. ' +
+        "The BROKER's figure is the one being displayed and enforced on.");
+      tvBrokerPnlDriftLogged = true;
+    }
     if (tvBrokerFeedState.tradeCount > prevTradeCount) {
       const newTrades = tvBrokerFeedState.trades.slice(prevTradesLen);
       console.log(`[tv-broker] ${newTrades.length} trade(s) closed (balance-delta-at-flat, unverified live): ` +
@@ -7069,8 +8627,9 @@ async function pollTVBrokerAccountInner() {
           exitPrice: t.exitPrice != null ? t.exitPrice : null,
           source: t.source,
         })),
-        tradeCount: tvBrokerFeedState.tradeCount,
-        dayPnl: tvBrokerFeedState.dayPnl,
+        tradeCount: effCount.value,
+        dayPnl: effPnl.value,
+        dayPnlSource: effPnl.source,
         at: Date.now(),
       });
 
@@ -7138,6 +8697,97 @@ async function pollTVBrokerAccountInner() {
           console.log('[mistake-pattern] F3 check failed: ' + e.message);
         }
       }
+      // 2026-08-25 (F4 break-even churn). Anoop: "After 5 break even trades, I
+      // want you to remind me that there are 5 break even trades."
+      //
+      // Unlike F1-F3 this RE-ARMS. Those three describe a shape the day has
+      // taken on and cannot untake, so firing once is right. Break-even churn
+      // is a running count that keeps climbing — telling him at 5 and then
+      // going quiet through 10 and 15 would be the app noticing the pattern
+      // and deciding not to mention it. It re-fires on each further multiple
+      // of the reminder count, so the reminder tracks the number he asked to
+      // be reminded of instead of a single moment that has passed.
+      try {
+        const ar = getActiveRules();
+        const f4 = mistakePatterns.checkBreakEvenChurn(tvBrokerFeedState.trades, {
+          breakEvenBandUsd: ar.breakEvenBandUsd,
+          breakEvenReminderCount: ar.breakEvenReminderCount,
+          commissionPerContractPerSide: ar.commissionPerContractPerSide,
+        });
+        const trip = Number(ar.breakEvenReminderCount) > 0 ? Number(ar.breakEvenReminderCount) : 5;
+        // The multiple already announced. Persisted so a restart mid-session
+        // does not replay a reminder he has already been given.
+        const announced = Number(tvBrokerFeedState.f4AnnouncedAt) || 0;
+        const milestone = Math.floor(f4.breakEvenCount / trip) * trip;
+        if (f4.matched && milestone > announced) {
+          console.log('[mistake-pattern] F4 fired: ' + f4.message);
+          tvBrokerFeedState = { ...tvBrokerFeedState, f4AnnouncedAt: milestone };
+          persistTVBrokerFeedState();
+          broadcast({
+            type: 'mistake-pattern', pattern: 'F4', message: f4.message,
+            breakEvenCount: f4.breakEvenCount, realCount: f4.realCount,
+            totalCount: f4.totalCount, band: f4.band, feesRisked: f4.feesRisked,
+          });
+        }
+      } catch (e) {
+        console.log('[mistake-pattern] F4 check failed: ' + e.message);
+      }
+
+      // 2026-08-25: HIS OWN armed detectors, evaluated on the same trades and
+      // announced on the same channel as F1-F4. The four built-ins are the
+      // patterns a developer encoded; these are the ones he encoded, and from
+      // here they are the same kind of thing to the rest of the app.
+      //
+      // ONCE PER DAY PER DETECTOR. Unlike F4 (which he explicitly asked to
+      // re-arm on each further multiple), a self-authored condition usually
+      // stays true for the rest of the session once it matches — "you are at
+      // 60 contracts" does not become false again. Re-announcing it every ten
+      // seconds is how an alert channel gets muted, and muting it would cost
+      // him F1-F4 as well. The map lives in the feed state, which is already
+      // wiped on IST day rollover, so it is day-scoped for free.
+      try {
+        const fired = tvBrokerFeedState.armedFiredToday || {};
+        const hits = armedDetectors.evaluateAll(lessonsLogLoad(), {
+          trades: tvBrokerFeedState.trades,
+          priorDays: armedPriorDays(10),
+        });
+        const fresh = hits.filter(h => h.matched && !fired[h.id]);
+        // A template that threw is a broken guardrail he believes is watching
+        // for him. Say so in the log rather than failing silently.
+        hits.filter(h => h.error).forEach(h => {
+          console.log('[armed-detector] "' + h.template + '" errored and did NOT check: ' + h.error);
+        });
+        if (fresh.length) {
+          const stamp = {};
+          fresh.forEach(h => { stamp[h.id] = true; });
+          tvBrokerFeedState = { ...tvBrokerFeedState, armedFiredToday: { ...fired, ...stamp } };
+          persistTVBrokerFeedState();
+          // Record the fire against the lesson itself. This is what lets the
+          // Lessons tab say "armed 3 weeks ago, never fired" instead of
+          // implying a coverage it is not providing.
+          try {
+            const log = mindLogLoad();
+            let touched = false;
+            fresh.forEach(h => {
+              const l = log.find(x => x && x.id === h.id);
+              if (l) { l.fireCount = (Number(l.fireCount) || 0) + 1; l.lastFiredAt = Date.now(); touched = true; }
+            });
+            if (touched) mindLogSave(log);
+          } catch (e) {
+            console.log('[armed-detector] could not record the fire: ' + e.message);
+          }
+          fresh.forEach(h => {
+            console.log('[armed-detector] fired (' + h.template + '): ' + h.message);
+            broadcast({
+              type: 'mistake-pattern', pattern: 'LESSON', lessonId: h.id,
+              template: h.template, label: h.label, lesson: h.lesson,
+              message: h.message + '  \u2014 your own lesson: "' + h.lesson + '"',
+            });
+          });
+        }
+      } catch (e) {
+        console.log('[armed-detector] evaluation failed: ' + e.message);
+      }
     }
 
     // Phase 2a shadow-mode (2026-08-17, see PHASE2_SEMI_AUTONOMOUS_SPEC.md):
@@ -7179,7 +8829,7 @@ async function pollTVBrokerAccountInner() {
     // independently (order-history walk vs balance-delta fold).
     const brokerRoundTripCount = closedRoundTripsToday;
     const brokerFilledCount = filled.length; // diagnostics only — NOT the comparison
-    const foldTradeCount = tvBrokerFeedState.tradeCount;
+    const foldTradeCount = effCount.value;
     // ordersTableSuspect (above): don't compare a known-stale orders read
     // against the fold's count — that would be comparing real data to a
     // table that hasn't rendered yet, guaranteed to look like a mismatch.
@@ -7203,11 +8853,23 @@ async function pollTVBrokerAccountInner() {
       // 'degraded'  = at least one was scored on the fill edge alone, the
       //               rule that produced 9/3 — count is provisional and the
       //               tradesPerDay cap is advisory, not a hard lock.
-      countEvidence: (tvBrokerFeedState.trades || []).some(t => t && t.evidence === 'degraded') ? 'degraded' : 'verified',
-      degradedTradeCount: (tvBrokerFeedState.trades || []).filter(t => t && t.evidence === 'degraded').length,
+      countEvidence: effCount.evidence,
+      degradedTradeCount: effCount.degraded,
       feedDegraded: closedRoundTripsToday === null,
-      tradeCount: tvBrokerFeedState.tradeCount,
-      dayPnl: tvBrokerFeedState.dayPnl,
+      // 2026-08-24: `tradeCount` and `dayPnl` keep their names and their
+      // place in this message — every existing consumer reads them — but they
+      // now carry the AUTHORITATIVE values rather than the raw fold's. The
+      // raw fold numbers travel alongside under explicit names so a
+      // disagreement stays visible instead of being quietly replaced.
+      tradeCount: effCount.value,
+      dayPnl: effPnl.value,
+      dayPnlSource: effPnl.source,
+      dayPnlRealized: effPnl.realized,
+      dayPnlOpen: effPnl.open,
+      dayPnlStale: effPnl.stale,
+      foldDayPnl: effPnl.foldValue,
+      foldDayPnlDrift: effPnl.drift,
+      foldTradeCountRaw: effCount.rawFoldCount,
       maxSize: tvBrokerFeedState.maxSize,
       lastLossTs: tvBrokerFeedState.lastLossTs,
       trades: tvBrokerFeedState.trades
@@ -7250,6 +8912,11 @@ async function pollTVPositions() {
     if (!result || !result.success || !Array.isArray(result.positions)) return;
 
     const rows = result.positions;
+    // OVERSIZE GUARD — runs on the SAME read that proves the panel is
+    // readable, so it can never act on a failed read (the guard clause above
+    // has already returned). See oversize-guard.js for the safety model.
+    try { enforceOversizeGuard(rows); } catch (e) { console.warn('[oversize] guard threw:', e.message); }
+
     const events = positionEvents.diffPositions(tvLastPositions, rows);
     tvLastPositions = rows;
     if (!events.length) return;
@@ -7490,6 +9157,720 @@ async function runLiveFeedSelfTest() {
   broadcast(resultMsg);
   return resultMsg;
 }
+// ── PROTOCOL 2: LIVE-FEED INTEGRITY — the runner (2026-08-28) ─────────────
+// Auto-triggers at startup and on every TradingView reconnect. Gathers what
+// only the server can see, hands it to feed-protocol.js to judge, attempts the
+// repairs that are safe to attempt, and BROADCASTS the evidence.
+//
+// Runs alongside the existing 3-check self-test rather than replacing it: that
+// one answers "is the feed reading?" in seconds and gates the UI banner. This
+// answers "is anything silently WRONG with what it read?", which costs more
+// calls and is worth doing once per session rather than on every reconnect.
+let feedProtocolTimer = null;
+let feedProtocolLastRunAt = 0;
+
+async function gatherFeedObservations() {
+  const obs = {
+    cdpConnected: !!(mcpBridge.ready && mcpBridge.tvConnected),
+    bridgeReady: !!mcpBridge.ready,
+    bars: {},
+    monitors: [],
+  };
+  if (!obs.cdpConnected) return obs;
+
+  // Panel tables + whether the summary is POPULATED, in one eval rather than
+  // three calls — this protocol must not itself contend for the connection it
+  // is diagnosing.
+  try {
+    const js = '(function(){var n={positions:"positions-table",orders:"orders-table",summary:"accountSummary-table"};'
+      + 'var o={};for(var k in n){o[k]=!!document.querySelector("table[data-name$=\\""+n[k]+"\\"]");}'
+      + 'var t=document.querySelector("table[data-name$=\\"accountSummary-table\\"]");var pop=false;'
+      + 'if(t){var b=t.querySelector("tbody");var txt=b?(b.innerText||""):"";'
+      + 'pop=!!txt.trim() && !/no trading data/i.test(txt);}'
+      + 'return JSON.stringify({tables:o,summaryPopulated:pop});})()';
+    const raw = await withBrokerLock(() => mcpBridge.callTool('ui_evaluate', { expression: js }));
+    const parsed = parseToolResult(raw);
+    const inner = parsed && parsed.result ? JSON.parse(parsed.result) : null;
+    if (inner) { obs.panelTables = inner.tables; obs.summaryPopulated = inner.summaryPopulated; }
+  } catch (e) { /* stays unknown — never guessed */ }
+
+  // Bar feed per watched timeframe. Verifies the SPACING, which is the only
+  // way to catch the timeframe race: wrong-timeframe bars look perfectly fine.
+  for (const tf of ['5', '15', '30', '60']) {
+    try {
+      const b = await getFullBars(tf, 12);
+      if (Array.isArray(b) && b.length >= 2) {
+        const gaps = {};
+        for (let i = 1; i < b.length; i++) {
+          const g = Math.round((b[i].time - b[i - 1].time) / 60);
+          gaps[g] = (gaps[g] || 0) + 1;
+        }
+        const spacing = Number(Object.keys(gaps).sort(function (x, y) { return gaps[y] - gaps[x]; })[0]);
+        obs.bars[tf] = {
+          count: b.length,
+          spacingMin: spacing,
+          newestAgeMin: Math.round((Date.now() / 1000 - b[b.length - 1].time) / 60),
+        };
+      } else {
+        obs.bars[tf] = { count: Array.isArray(b) ? b.length : 0, spacingMin: null, newestAgeMin: null };
+      }
+    } catch (e) { obs.bars[tf] = { count: null, error: e.message }; }
+  }
+
+  // Silent turn-off: the flag AND the last check time. `running:true` with no
+  // check in three intervals is a watcher that stopped without saying so.
+  try {
+    obs.monitors = ALL_MONITORS.map(function (e) {
+      const m = e.mon() || {};
+      return {
+        id: e.id,
+        label: e.label,
+        running: !!m.running,
+        lastCheckAgeMs: m.lastCheck ? (Date.now() - new Date(m.lastCheck).getTime()) : null,
+        expectedIntervalMs: e.intervalMs,
+      };
+    });
+  } catch (e) { /* leave empty -> reported unknown */ }
+
+  obs.foldState = {
+    tradeCount: tvBrokerFeedState.tradeCount,
+    dayPnl: tvBrokerFeedState.dayPnl,
+    trades: tvBrokerFeedState.trades || [],
+    phantomFlats: tvBrokerFeedState.phantomFlats || 0,
+  };
+  try {
+    const slot = jessiBucketKey(loadConfig());
+    const dayKey = dayRollup.tradingDayKey(Date.now());
+    const store = dataLoad('day_trades__' + slot) || {};
+    obs.todayRows = Array.isArray(store[dayKey]) ? store[dayKey] : [];
+  } catch (e) { /* unknown */ }
+
+  return obs;
+}
+
+// Repairs the protocol asked for. Each returns a short evidence string, or a
+// stated failure — a repair that silently does nothing is worse than one that
+// reports it could not act.
+async function applyFeedRectification(action) {
+  switch (action) {
+    case 'mount-panel-tables':
+    case 'activate-summary-tab':
+      try {
+        const raw = await withBrokerLock(function () { return mcpBridge.callTool('trading_ensure_panel_ready', {}); });
+        const res = parseToolResult(raw);
+        return res ? 'panel repair ran (success=' + res.success + ', alreadyMounted=' + !!res.alreadyMounted + ')' : null;
+      } catch (e) { return 'panel repair threw: ' + e.message; }
+
+    case 'restart-watchers':
+      try {
+        let n = 0;
+        for (const e of ALL_MONITORS) {
+          const m = e.mon() || {};
+          const stalled = m.running && m.lastCheck
+            && (Date.now() - new Date(m.lastCheck).getTime()) > e.intervalMs * 3;
+          if ((!m.running || stalled) && (!e.cond || e.cond())) { e.run(); n++; }
+        }
+        return n ? 'restarted ' + n + ' watcher(s)' : 'nothing to restart';
+      } catch (e) { return 'watcher restart threw: ' + e.message; }
+
+    case 'drop-phantom-trades':
+      try {
+        const before = tvBrokerFeedState.tradeCount;
+        const all = tvBrokerFeedState.trades || [];
+        const kept = all.filter(function (t) { return Number(t && t.pnl) !== 0; });
+        const removed = all.length - kept.length;
+        if (!removed) return 'no phantoms present';
+        tvBrokerFeedState.trades = kept;
+        tvBrokerFeedState.tradeCount = Math.max(0, before - removed);
+        persistTVBrokerFeedState();
+        return 'removed ' + removed + ' phantom trade(s), count ' + before + ' -> ' + tvBrokerFeedState.tradeCount
+          + ', day P&L unchanged at $' + (tvBrokerFeedState.dayPnl || 0).toFixed(2);
+      } catch (e) { return 'phantom removal threw: ' + e.message; }
+
+    case 'refetch-bars':
+      // The bar cache is keyed on bar periods, so the next scheduled read picks
+      // up fresh data by itself. Forcing one would add load to the connection
+      // this check may be reporting as contended.
+      return 'next bar-close read will refetch (cache is bar-period keyed)';
+
+    case 'merge-duplicate-rows':
+      // AUTOMATIC, but only for the UNAMBIGUOUS case (2026-08-28).
+      //
+      // Why this became safe to automate: the duplicate is created by an
+      // ordering problem, not a judgement call. The fold writes a row for a
+      // flat blip DURING an open trade — no prices yet, so nothing matches —
+      // and the enrich path back-fills that row's prices from the order walk
+      // afterwards. Only then do the two rows become identifiable as one
+      // trade, by which point the merge that would have caught them has long
+      // since run.
+      //
+      // A pair is merged ONLY when they share side, size and BOTH fill prices,
+      // AND one row's P&L contradicts those prices while the other agrees.
+      // The self-consistent row is the real one; the other is the blip. That
+      // is arithmetic, not interpretation. Anything less clear-cut is left
+      // alone and reported — the 2026-08-28 migration needed a human for a day
+      // that would not reconcile, and that is still true.
+      try {
+        const slot = jessiBucketKey(loadConfig());
+        const dayKey = dayRollup.tradingDayKey(Date.now());
+        const store = dataLoad('day_trades__' + slot) || {};
+        const rows = Array.isArray(store[dayKey]) ? store[dayKey] : [];
+        const comm = getActiveRules().commissionPerContractPerSide;
+        const consistent = (r) => {
+          const sz = Math.abs(Number(r.size) || 0);
+          const ep = Number(r.ep), xp = Number(r.xp);
+          const side = String(r.side || '').toUpperCase();
+          if (!sz || !Number.isFinite(ep) || !Number.isFinite(xp) || (side !== 'LONG' && side !== 'SHORT')) return null;
+          const dir = side === 'LONG' ? 1 : -1;
+          const net = (xp - ep) * dir * sz * 2 - sz * comm * 2;
+          return Math.abs(Number(r.pnl) - net) < 0.02;
+        };
+        const keep = [];
+        const dropped = [];
+        for (const r of rows) {
+          const twin = keep.findIndex(k =>
+            k.side && r.side && String(k.side).toUpperCase() === String(r.side).toUpperCase()
+            && Math.abs(Number(k.size) || 0) === Math.abs(Number(r.size) || 0)
+            && Number(k.ep) === Number(r.ep) && Number(k.xp) === Number(r.xp));
+          if (twin < 0) { keep.push(r); continue; }
+          const a = consistent(keep[twin]), b = consistent(r);
+          if (a === true && b === false) { dropped.push(r); continue; }              // keep the existing
+          if (a === false && b === true) { dropped.push(keep[twin]); keep[twin] = r; continue; }
+          keep.push(r);                                                              // ambiguous -> keep both
+        }
+        if (!dropped.length) return 'no unambiguous duplicates to merge';
+        const backup = path.join(DATA_DIR, 'accounts', slot, 'day_trades.json.bak-protocol-' + Date.now());
+        try { fs.copyFileSync(path.join(DATA_DIR, 'accounts', slot, 'day_trades.json'), backup); } catch (e) {}
+        store[dayKey] = keep;
+        dataSave('day_trades__' + slot, store);
+        broadcast({ type: 'day-trades-repaired', date: dayKey, filled: 0, merged: dropped.length });
+        return 'merged ' + dropped.length + ' duplicate row(s): ' + rows.length + ' -> ' + keep.length
+          + ' (kept the row whose P&L agrees with its own fill prices; backup written)';
+      } catch (e) { return 'duplicate merge threw: ' + e.message; }
+
+    default:
+      return null;
+  }
+}
+
+async function runFeedIntegrityProtocol(trigger) {
+  const startedAt = Date.now();
+  feedProtocolLastRunAt = startedAt;
+  try {
+    const obs = await gatherFeedObservations();
+    const result = feedProtocol.evaluate(obs, getActiveRules());
+
+    const rectified = [];
+    for (const rec of result.rectifications) {
+      const evidence = await applyFeedRectification(rec.action);
+      rectified.push({ check: rec.key, label: rec.label, action: rec.action, evidence: evidence });
+    }
+
+    // Re-evaluate AFTER repairing, so the report states what is true NOW rather
+    // than what was true before the protocol acted.
+    let after = null;
+    if (rectified.length) {
+      try { after = feedProtocol.evaluate(await gatherFeedObservations(), getActiveRules()); } catch (e) {}
+    }
+
+    const shown = after || result;
+    const report = {
+      type: 'feed-protocol-report',
+      protocol: 'live-feed-integrity',
+      trigger: trigger || 'startup',
+      at: new Date(startedAt).toISOString(),
+      durationMs: Date.now() - startedAt,
+      before: { passed: result.passed, failed: result.failed, unknown: result.unknown, critical: result.critical, headline: result.headline },
+      after: after ? { passed: after.passed, failed: after.failed, unknown: after.unknown, critical: after.critical, headline: after.headline } : null,
+      checks: shown.checks,
+      rectified: rectified,
+    };
+
+    console.log('[protocol:feed] ' + result.passed + '/' + result.total + ' passed — ' + result.headline);
+    for (const c of shown.checks) {
+      if (c.verdict === 'pass') continue;
+      console.warn('[protocol:feed] ' + c.verdict.toUpperCase() + ' ' + c.label + ': ' + (c.impact || '(no impact stated)'));
+    }
+    for (const r of rectified) console.log('[protocol:feed] RECTIFIED ' + r.label + ' -> ' + r.evidence);
+
+    broadcast(report);
+    try { feedProtocolPersist(report); } catch (e) {}
+
+    // Telegram only for critical findings — a protocol that pings on every
+    // clean run gets muted, and then the one that matters is muted too.
+    if (result.critical > 0) {
+      try {
+        telegramBot.notify('LIVE FEED PROTOCOL: ' + result.critical + ' critical issue(s)\n'
+          + shown.checks.filter(function (c) { return c.verdict === 'fail' && c.severity === 'critical'; })
+              .map(function (c) { return '- ' + c.label + ': ' + c.impact; }).join('\n'));
+      } catch (e) {}
+    }
+    return report;
+  } catch (e) {
+    console.error('[protocol:feed] the protocol itself failed:', e.message);
+    broadcast({ type: 'feed-protocol-report', protocol: 'live-feed-integrity', error: e.message, at: new Date().toISOString() });
+    return null;
+  }
+}
+
+// Durable evidence. A protocol whose findings only exist in a scrollback the
+// user may not have been looking at has not really reported anything.
+function feedProtocolPersist(report) {
+  const dir = path.join(DATA_DIR, 'protocols');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(path.join(dir, 'feed-integrity.jsonl'), JSON.stringify(report) + '\n', 'utf8');
+}
+
+// ── PROTOCOL 1: SYSTEM HEALTH — the runner (2026-08-28) ────────────────────
+// Every 3 days, plus once ~3 minutes after startup so a fresh install is
+// checked immediately. The due-check is persisted, so the cadence survives
+// restarts rather than resetting every time the app is opened.
+let healthProtocolTimer = null;
+
+function healthProtocolStatePath() {
+  return path.join(DATA_DIR, 'protocols', 'health-state.json');
+}
+function healthProtocolLastRun() {
+  try { return JSON.parse(fs.readFileSync(healthProtocolStatePath(), 'utf8')).lastRunMs || 0; }
+  catch (e) { return 0; }
+}
+function healthProtocolMarkRun(ms) {
+  try {
+    const dir = path.join(DATA_DIR, 'protocols');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(healthProtocolStatePath(), JSON.stringify({ lastRunMs: ms }, null, 2), 'utf8');
+  } catch (e) {}
+}
+
+// STATIC SCAN: renderer code reaching for a variable that lives inside another
+// file's closure. This is the dead-button class — the Standard/Scalper toggle
+// was broken this way for a month and looked perfectly normal.
+function scanDeadRefs() {
+  const out = [];
+  try {
+    const dir = path.join(__dirname, 'renderer');
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.js') || f === 'ws-client.js' || f.includes('.bak') || f.includes('.tmp')) continue;
+      const src = fs.readFileSync(path.join(dir, f), 'utf8');
+      src.split('\n').forEach((line, i) => {
+        if (/(^|[^.\w])ws\s*\.\s*(send|readyState|close|onmessage)\b/.test(line)) {
+          out.push({ file: f, line: i + 1, text: line.trim().slice(0, 120) });
+        }
+      });
+    }
+  } catch (e) {}
+  return out;
+}
+
+// STRESS: feed the pure decision modules malformed input and require them to
+// refuse rather than invent. Targets the historical failure where one bad bar
+// produced an EMA of 65,750,116.55 — a plausible wrong number, not a NaN.
+function stressPureModules() {
+  const GARBAGE = [null, undefined, [], {}, NaN, 'x', 0, -1,
+    [{ high: NaN, low: null, close: undefined, open: 'x', time: 'y' }]];
+  const cases = [];
+  const safe = (name, fn) => {
+    try {
+      const r = fn();
+      const bad = typeof r === 'number' && !Number.isFinite(r);
+      cases.push({ module: name, ok: !bad, error: bad ? 'returned a non-finite number' : null });
+    } catch (e) {
+      cases.push({ module: name, ok: false, error: e.message });
+    }
+  };
+  for (const g of GARBAGE) {
+    safe('detectors.detectEngulfFromBars', () => detectors.detectEngulfFromBars(g));
+    safe('detectors.detectFVGFromBars', () => detectors.detectFVGFromBars(g));
+    safe('detectors.adxSeries', () => detectors.adxSeries(g, 14));
+    safe('playbook-c.validateEngulfPlaybookC', () => playbookC.validateEngulfPlaybookC(g, 'BULLISH', null));
+    safe('playbook-spec.planEntry', () => playbookSpec.planEntry('A', g, getActiveRules()));
+    safe('signal-outcome.resolveSignalOutcome', () => signalOutcome.resolveSignalOutcome(g, g, {}));
+    safe('tv-broker-feed.fold', () => tvBrokerFeed.fold(tvBrokerFeed.freshState(), g || {}, Date.now()));
+    safe('feed-protocol.evaluate', () => feedProtocol.evaluate(g, getActiveRules()));
+  }
+  // Collapse to one row per module: a module is only OK if it survived every
+  // input. Reporting 72 individual passes would bury the one failure.
+  const byModule = new Map();
+  for (const c of cases) {
+    const prev = byModule.get(c.module);
+    if (!prev || (prev.ok && !c.ok)) byModule.set(c.module, c);
+  }
+  return Array.from(byModule.values());
+}
+
+function gatherHealthObservations() {
+  const obs = { deadRefs: scanDeadRefs(), stress: stressPureModules(), timers: [] };
+
+  // Named background jobs. `alive` is the timer handle actually existing —
+  // a stopped resolver changes nothing on screen.
+  obs.timers = [
+    { name: 'signal-outcome resolver', alive: !!signalOutcomeTimer },
+    { name: 'shadow resolver', alive: !!shadowResolveTimer },
+    { name: 'tv-broker monitor', alive: !!tvBrokerMonitorTimer },
+    { name: 'panel watchdog', alive: !!panelWatchdogTimer },
+  ];
+
+  // Disk: prove it by writing, not by assuming.
+  try {
+    const probe = path.join(DATA_DIR, 'protocols', '.write-probe');
+    fs.mkdirSync(path.dirname(probe), { recursive: true });
+    fs.writeFileSync(probe, String(Date.now()), 'utf8');
+    fs.unlinkSync(probe);
+    obs.diskWritable = true;
+  } catch (e) { obs.diskWritable = false; }
+
+  // The three stores that are supposed to be one fact.
+  try {
+    const slot = jessiBucketKey(loadConfig());
+    const dt = dataLoad('day_trades__' + slot) || {};
+    const led = dataLoad('balance_ledger__' + slot) || {};
+    const gr = dataLoad('gr_history__' + slot) || [];
+    const grByDate = {};
+    (Array.isArray(gr) ? gr : []).forEach(e => { if (e && e.date) grByDate[e.date] = e; });
+    const days = Object.keys(dt).sort().slice(-10).map(day => {
+      const rows = Array.isArray(dt[day]) ? dt[day] : [];
+      const rowsNet = Math.round(rows.reduce((a, r) => a + (Number(r.pnl) || 0), 0) * 100) / 100;
+      const ledgerNet = led[day] ? Math.round(Number(led[day].net) * 100) / 100 : null;
+      const historyPnl = grByDate[day] ? Math.round(Number(grByDate[day].pnl) * 100) / 100 : null;
+      const agree = (ledgerNet == null && historyPnl == null)
+        ? null
+        : (Math.abs(rowsNet - (ledgerNet == null ? rowsNet : ledgerNet)) < 0.05
+           && Math.abs(rowsNet - (historyPnl == null ? rowsNet : historyPnl)) < 0.05);
+      return { day, rowsNet, ledgerNet, historyPnl, agree };
+    });
+    obs.dataIntegrity = { days };
+  } catch (e) { /* unknown */ }
+
+  // Is the signal pipeline producing anything, or running and writing nothing?
+  try {
+    const day = tradingDayStampIST(Date.now());
+    const paths = signalOutcomePaths(day);
+    const sigs = readJsonl(paths.ledger);
+    const outs = readJsonl(paths.outcomes);
+    const armed = sigs.filter(s => signalOutcome.isArmingEvent(s && s.event));
+    const newest = sigs.length ? Date.parse(sigs[sigs.length - 1].ts) : null;
+    obs.signalPipeline = {
+      signalsToday: sigs.length,
+      armedToday: armed.length,
+      outcomesResolved: outs.length,
+      lastSignalAgeH: newest ? Math.round((Date.now() - newest) / 3600000) : null,
+    };
+  } catch (e) { /* unknown */ }
+
+  try {
+    const cfg = loadConfig();
+    const rules = getActiveRules();
+    obs.accountConfig = {
+      accountSize: cfg.accountSize || null,
+      configuredStart: rules.eval ? rules.eval.start : null,
+      brokerBalance: tvBrokerFeedState.brokerHeaderBalance != null ? tvBrokerFeedState.brokerHeaderBalance : null,
+    };
+  } catch (e) { /* unknown */ }
+
+  return obs;
+}
+
+async function runHealthProtocol(trigger) {
+  const startedAt = Date.now();
+  try {
+    const obs = gatherHealthObservations();
+    const result = healthProtocol.evaluate(obs, getActiveRules());
+
+    // Rectifications. Most findings here are REPORT-ONLY by design: flipping a
+    // guard the user deliberately turned off, or rewriting stored P&L, are
+    // decisions rather than repairs. Only genuinely mechanical restarts act.
+    const rectified = [];
+    for (const rec of result.rectifications) {
+      let evidence = null;
+      if (rec.action === 'restart-timers') {
+        try {
+          startSignalOutcomeResolver();
+          startShadowResolver();
+          startPanelWatchdog();
+          evidence = 'restarted the stopped background timers';
+        } catch (e) { evidence = 'timer restart threw: ' + e.message; }
+      } else {
+        evidence = 'REPORTED ONLY — needs a decision, not an automatic repair';
+      }
+      rectified.push({ check: rec.key, label: rec.label, action: rec.action, evidence });
+    }
+
+    const report = {
+      type: 'health-protocol-report',
+      protocol: 'system-health',
+      trigger: trigger || 'scheduled',
+      at: new Date(startedAt).toISOString(),
+      durationMs: Date.now() - startedAt,
+      passed: result.passed,
+      total: result.total,
+      failed: result.failed,
+      unknown: result.unknown,
+      critical: result.critical,
+      headline: result.headline,
+      checks: result.checks,
+      rectified,
+    };
+
+    console.log('[protocol:health] ' + result.passed + '/' + result.total + ' passed — ' + result.headline);
+    for (const c of result.checks) {
+      if (c.verdict === 'pass') continue;
+      console.warn('[protocol:health] ' + c.verdict.toUpperCase() + ' ' + c.label + ': ' + (c.impact || '(no impact stated)'));
+    }
+    for (const r of rectified) console.log('[protocol:health] ' + r.label + ' -> ' + r.evidence);
+
+    broadcast(report);
+    try {
+      const dir = path.join(DATA_DIR, 'protocols');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.appendFileSync(path.join(dir, 'system-health.jsonl'), JSON.stringify(report) + '\n', 'utf8');
+    } catch (e) {}
+    healthProtocolMarkRun(startedAt);
+
+    if (result.critical > 0) {
+      try {
+        telegramBot.notify('SYSTEM HEALTH PROTOCOL: ' + result.critical + ' critical issue(s)\n'
+          + result.checks.filter(function (c) { return c.verdict === 'fail' && c.severity === 'critical'; })
+              .map(function (c) { return '- ' + c.label + ': ' + c.impact; }).join('\n'));
+      } catch (e) {}
+    }
+    return report;
+  } catch (e) {
+    console.error('[protocol:health] the protocol itself failed:', e.message);
+    broadcast({ type: 'health-protocol-report', protocol: 'system-health', error: e.message, at: new Date().toISOString() });
+    return null;
+  }
+}
+
+// Checks hourly whether three days have elapsed. Cheap, and it means the
+// cadence holds however often the app is restarted — a 3-day timer that reset
+// on every launch would, for a daily-restarted app, never fire.
+function startHealthProtocolSchedule() {
+  if (healthProtocolTimer) return;
+  const tick = function () {
+    try {
+      if (healthProtocol.isDue(healthProtocolLastRun(), Date.now())) {
+        runHealthProtocol('scheduled').catch(function (e) {
+          console.warn('[protocol:health] scheduled run failed:', e.message);
+        });
+      }
+    } catch (e) {}
+  };
+  // First look 3 minutes in, so a fresh install is diagnosed straight away
+  // rather than in three days' time.
+  setTimeout(tick, 3 * 60 * 1000);
+  healthProtocolTimer = setInterval(tick, 60 * 60 * 1000);
+  if (healthProtocolTimer.unref) healthProtocolTimer.unref();
+}
+
+// ── OVERSIZE GUARD — the enforcement path (2026-08-28) ────────────────────
+// The ONLY place besides handleTradeConfirm that can send an order, and unlike
+// that one it acts without being asked. Everything here is written on the
+// assumption that a wrong action costs Anoop money he was entitled to keep.
+//
+// Decision logic lives in oversize-guard.js and is unit-tested in isolation;
+// this file finds the position, calls it, sends the order, and records what
+// happened. It deliberately does no judging of its own.
+let oversizeState = { dayKey: null, confirmCount: 0, lastActionAt: 0, actionsToday: 0, lastSeenSize: null };
+let oversizeInFlight = false;
+
+function oversizeConfig() {
+  const r = getActiveRules();
+  const g = r.oversizeGuard || {};
+  return {
+    enabled: g.enabled === true,
+    sizeCap: r.sizeCap,
+    confirmReads: g.confirmReads,
+    maxPerDay: g.maxPerDay,
+    cooldownMs: g.cooldownMs,
+    // CAN IT ACTUALLY ACT? `trading_place_market_order` is only REGISTERED by
+    // tradingview-mcp when TV_ALLOW_LIVE_ORDERS=1, which only the "START
+    // CO-PILOT (LIVE ORDERS).bat" launcher sets. Launched the plain way, the
+    // tool does not exist and the reducing order cannot be sent no matter how
+    // correctly the breach was detected. That gate is Anoop's own standing
+    // decision and is NOT loosened here. What changes is that the guard now
+    // KNOWS which of its two modes it is in, says so at boot, and alarms
+    // instead of firing an order that was never going to land. A guard whose
+    // inability to act is only discovered at the moment it needed to act is
+    // exactly the silent-turn-off class Protocols 1 and 2 exist to catch.
+    canAct: process.env.TV_ALLOW_LIVE_ORDERS === '1',
+  };
+}
+
+// Said once at boot so the mode is never a surprise mid-session.
+function announceOversizeGuard() {
+  const cfg = oversizeConfig();
+  if (!cfg.enabled) {
+    console.log('[oversize] guard is DISABLED (rules.json oversizeGuard.enabled=false) — no size enforcement.');
+    return;
+  }
+  if (cfg.canAct) {
+    console.warn('[oversize] guard ARMED and ABLE TO ACT: positions over ' + cfg.sizeCap
+      + ' contracts will be reduced back to ' + cfg.sizeCap + ' after '
+      + cfg.confirmReads + ' confirming reads.');
+  } else {
+    console.warn('[oversize] guard ARMED but in ALARM-ONLY mode: it will DETECT an oversize and'
+      + ' alert you, but it CANNOT reduce it — live orders are not enabled this session.'
+      + ' Launch via "START CO-PILOT (LIVE ORDERS).bat" to let it actually close the excess.');
+  }
+}
+
+// The largest single position on the account. Multiple symbols are summed per
+// symbol, never across symbols: two 2-lot positions in different instruments
+// are two trades at the cap, not one 4-lot breach.
+// Broker rows are keyed by the RAW TABLE HEADER TEXT — 'Symbol', 'Side',
+// 'Qty' — because readTable() builds each object with `key = headerCells[i]`.
+// My first pass read p.symbol/p.side/p.qty in lowercase, which is undefined on
+// every real row: the guard would have sat armed and silently never fired.
+// That is precisely the silent-no-op class both protocols exist to catch, and
+// it nearly shipped. Matched case-insensitively so a header capitalisation
+// change cannot disarm it either.
+function pickField(row, names) {
+  if (!row) return undefined;
+  const keys = Object.keys(row);
+  for (const want of names) {
+    const hit = keys.find((k) => k.trim().toLowerCase() === want);
+    if (hit !== undefined && row[hit] !== '' && row[hit] != null) return row[hit];
+  }
+  return undefined;
+}
+
+function largestPosition(rows) {
+  const bySymbol = new Map();
+  for (const p of Array.isArray(rows) ? rows : []) {
+    if (!p) continue;
+    const sym = pickField(p, ['symbol', 'instrument', 'contract']) || 'unknown';
+    // Quantities arrive as display strings ("5", "-2", "1,000") — strip
+    // anything that is not part of a number rather than trusting Number().
+    const rawQty = pickField(p, ['qty', 'quantity', 'size', 'net pos', 'position']);
+    const qty = Number(String(rawQty == null ? '' : rawQty).replace(/−/g, '-').replace(/[^0-9.\-]/g, ''));
+    if (!Number.isFinite(qty) || qty === 0) continue;
+    const side = String(pickField(p, ['side', 'direction', 'b/s']) || '').toUpperCase();
+    const prev = bySymbol.get(sym);
+    const abs = Math.abs(qty);
+    if (!prev || abs > prev.size) bySymbol.set(sym, { size: abs, side, symbol: sym });
+  }
+  let biggest = null;
+  for (const v of bySymbol.values()) if (!biggest || v.size > biggest.size) biggest = v;
+  return biggest;
+}
+
+function enforceOversizeGuard(rows) {
+  const cfg = oversizeConfig();
+  if (!cfg.enabled) return;
+  if (oversizeInFlight) return;          // an order is already going out
+
+  const dayKey = dayRollup.tradingDayKey(Date.now());
+  oversizeState = oversizeGuard.rollDay(oversizeState, dayKey);
+
+  const pos = largestPosition(rows);
+  const verdict = oversizeGuard.evaluate(pos, oversizeState, cfg, Date.now());
+  oversizeState = verdict.state;
+  oversizeState.dayKey = dayKey;
+
+  if (!verdict.act) {
+    // Only speak when something is oversized but not yet actionable — the
+    // "within the cap" case is the normal state and must stay silent.
+    if (pos && Number(pos.size) > Number(cfg.sizeCap)) {
+      console.log('[oversize] ' + verdict.reason);
+    }
+    return;
+  }
+
+  oversizeInFlight = true;
+  const started = Date.now();
+  const evidence = {
+    at: new Date(started).toISOString(),
+    day: dayKey,
+    observed: { size: pos.size, side: pos.side, symbol: pos.symbol },
+    sizeCap: cfg.sizeCap,
+    action: { side: verdict.side, qty: verdict.reduceBy },
+    reason: verdict.reason,
+    mode: cfg.canAct ? 'reduce' : 'alarm-only',
+    submitted: false,
+    result: null,
+  };
+
+  // ALARM-ONLY: the breach is real and confirmed, but this session cannot send
+  // an order. Say so in the loudest terms available and stop — attempting the
+  // call would only produce an "unknown tool" error and bury the one thing
+  // that matters (there are too many contracts on RIGHT NOW) inside a stack
+  // trace. The daily cap is still consumed so the alarm cannot loop forever.
+  if (!cfg.canAct) {
+    evidence.result = { success: false, error: 'live orders not enabled this session (TV_ALLOW_LIVE_ORDERS not set at launch)' };
+    evidence.durationMs = Date.now() - started;
+    oversizeInFlight = false;
+    console.error('[oversize] OVERSIZE DETECTED (' + pos.size + ' on ' + pos.symbol
+      + ', cap ' + cfg.sizeCap + ') but this session CANNOT act — CLOSE ' + verdict.reduceBy
+      + ' CONTRACTS YOURSELF.');
+    try {
+      const dir = path.join(DATA_DIR, 'protocols');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.appendFileSync(path.join(dir, 'oversize-guard.jsonl'), JSON.stringify(evidence) + '\n', 'utf8');
+    } catch (e) {}
+    broadcast({ type: 'oversize-guard', evidence });
+    try {
+      telegramBot.notify('OVERSIZE: ' + pos.size + ' contracts on ' + pos.symbol
+        + ' against a cap of ' + cfg.sizeCap + '. I CANNOT close it this session —'
+        + ' CLOSE ' + verdict.reduceBy + ' YOURSELF NOW.');
+    } catch (e) {}
+    return;
+  }
+
+  console.warn('[oversize] ACTING: ' + verdict.reason
+    + ' -> ' + verdict.side.toUpperCase() + ' ' + verdict.reduceBy + ' ' + (pos.symbol || ''));
+
+  (async () => {
+    try {
+      // The symbol is passed so the MCP layer refuses the order outright if the
+      // ticket is showing a different instrument. No stop/target: this is a
+      // reducing order, and the unverified bracket automation would refuse the
+      // whole thing if a field could not be set — exactly the wrong failure
+      // mode when the point is to take risk OFF.
+      const raw = await withBrokerLock(() => mcpBridge.callTool('trading_place_market_order', {
+        side: verdict.side,
+        qty: verdict.reduceBy,
+        symbol: pos.symbol,
+      }));
+      const res = parseToolResult(raw);
+      evidence.submitted = !!(res && res.success);
+      evidence.result = res || null;
+
+      if (evidence.submitted) {
+        console.warn('[oversize] REDUCED ' + pos.size + ' -> ' + cfg.sizeCap + ' on ' + pos.symbol);
+      } else {
+        console.error('[oversize] the reducing order was REFUSED: ' + JSON.stringify(res));
+      }
+    } catch (e) {
+      evidence.result = { success: false, error: e.message };
+      console.error('[oversize] reducing order threw: ' + e.message);
+    } finally {
+      oversizeInFlight = false;
+      evidence.durationMs = Date.now() - started;
+      try {
+        const dir = path.join(DATA_DIR, 'protocols');
+        fs.mkdirSync(dir, { recursive: true });
+        fs.appendFileSync(path.join(dir, 'oversize-guard.jsonl'), JSON.stringify(evidence) + '\n', 'utf8');
+      } catch (e) {}
+      broadcast({ type: 'oversize-guard', evidence });
+      try {
+        telegramBot.notify('OVERSIZE GUARD: ' + (evidence.submitted ? 'reduced' : 'TRIED AND FAILED to reduce')
+          + ' ' + pos.size + ' -> ' + cfg.sizeCap + ' contracts on ' + pos.symbol
+          + (evidence.submitted ? '' : ' — CLOSE THE EXCESS YOURSELF'));
+      } catch (e) {}
+    }
+  })();
+}
+
+function scheduleFeedIntegrityProtocol(delayMs) {
+  if (feedProtocolTimer) clearTimeout(feedProtocolTimer);
+  feedProtocolTimer = setTimeout(function () {
+    feedProtocolTimer = null;
+    runFeedIntegrityProtocol('startup').catch(function (e) {
+      console.warn('[protocol:feed] scheduled run failed:', e.message);
+    });
+  }, delayMs == null ? 45000 : delayMs);
+}
+
 function scheduleLiveFeedSelfTest(delayMs) {
   if (liveFeedSelfTestTimer) clearTimeout(liveFeedSelfTestTimer);
   liveFeedSelfTestTimer = setTimeout(() => {
@@ -7696,6 +10077,42 @@ httpServer.listen(PORT, '127.0.0.1', async () => {
   // still-fresh state and immediately overwrite whatever was just restored.
   tvBrokerFeedState = loadTVBrokerFeedState();
   startTradovate();
+  // 2026-08-27: arm the broker-panel watchdog HERE, unconditionally, not
+  // only inside the mcpBridge 'tv-connected' handler.
+  //
+  // That event fires once, on a TRANSITION (`if (!wasConnected)` in
+  // mcp-bridge.js). If the health probe succeeds before this file has
+  // attached its listener — or TradingView was already connected — the
+  // event is simply lost and the watchdog never starts. That is exactly
+  // what happened on the first restart after it was written: no
+  // '[panel-watchdog] armed' line appeared at all, because the code was
+  // correct and never ran.
+  //
+  // Every tick already self-guards on mcpBridge.ready && tvConnected, so
+  // arming before TradingView is up costs one boolean check per minute and
+  // removes the entire class of missed-event failures. The on-connect call
+  // stays as belt-and-braces; startPanelWatchdog() is idempotent.
+  startPanelWatchdog();
+  announceOversizeGuard();
+  // ── Per-mode autonomy folders (2026-08-29) ──────────────────────────────
+  // Anoop: "each mode should have separate folder to avoid confusion." The
+  // original layout put machine orders and his own trades in ONE flat file at
+  // the autonomy root, told apart only by a `kind` field. Migrating at boot
+  // means the layout is correct before anything can write to it this session.
+  //
+  // Idempotent and non-destructive: legacy files are RENAMED, never deleted,
+  // and it refuses outright if the new layout already has content rather than
+  // appending the same rows a second time and silently doubling a track record.
+  try {
+    const mig = autonomyStore.migrateLegacyLayout(DATA_DIR, { stamp: 'migrated-' + tradingDayStampIST(Date.now()) });
+    if (mig.ran) {
+      console.log('[autonomy] migrated to per-mode folders: ' + mig.machineOrders + ' machine order(s), '
+        + mig.humanTrades + ' human trade(s), ' + mig.outcomes + ' outcome(s), ' + mig.dailyFiles + ' daily rollup(s).'
+        + ' Legacy files kept alongside with a .migrated-* suffix.');
+    }
+    if (mig.notes.length) mig.notes.forEach((n) => console.log('[autonomy] migration note: ' + n));
+  } catch (e) { console.warn('[autonomy] layout migration skipped:', e.message); }
+  startWeeklyReportSchedule();
   console.log(`\n╔══════════════════════════════════════╗`);
   console.log(`║  Co-Pilot — http://localhost:${PORT}  ║`);
   console.log(`╚══════════════════════════════════════╝\n`);

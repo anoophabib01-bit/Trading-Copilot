@@ -1,0 +1,36 @@
+//@version=5
+strategy("Gold Asian Range Liquidity Sweep", overlay=true,
+     initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0.95,
+     slippage=2, calc_on_every_tick=false, max_bars_back=5000)
+
+// ── Inputs ─────────────────────────────────────────────────
+stop_buf = input.float(1.0, "Stop buffer beyond sweep", minval=0.0, maxval=10.0, step=0.5)
+
+// ── Asian session (00:00-07:59 UTC) high/low ───────────────
+isAsia = hour(time, "UTC") >= 0 and hour(time, "UTC") < 8
+
+var float asiaHigh = na
+var float asiaLow  = na
+if hour(time, "UTC") == 0
+    asiaHigh := high
+    asiaLow  := low
+else if isAsia
+    asiaHigh := math.max(asiaHigh, high)
+    asiaLow  := math.min(asiaLow, low)
+
+// ── Sweep + reversal (London / NY) ─────────────────────────
+sweepLong  = not isAsia and not na(asiaLow)  and low < asiaLow  and close > asiaLow  and strategy.position_size == 0
+sweepShort = not isAsia and not na(asiaHigh) and high > asiaHigh and close < asiaHigh and strategy.position_size == 0
+
+if sweepLong
+    strategy.entry("Long", strategy.long, comment="Asia sweep L")
+    strategy.exit("XL", stop=low - stop_buf, limit=asiaHigh)
+if sweepShort
+    strategy.entry("Short", strategy.short, comment="Asia sweep S")
+    strategy.exit("XS", stop=high + stop_buf, limit=asiaLow)
+
+plot(asiaHigh, "Asia High", color.new(color.orange, 0))
+plot(asiaLow,  "Asia Low",  color.new(color.blue, 0))
+plotshape(sweepLong,  "Sweep Long",  shape.triangleup,   location.belowbar, color.new(color.lime, 0), size=size.small)
+plotshape(sweepShort, "Sweep Short", shape.triangledown, location.abovebar, color.new(color.red, 0),  size=size.small)

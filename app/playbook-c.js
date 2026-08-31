@@ -124,6 +124,15 @@ function validateEngulfPlaybookC(bars, direction, pdhpdl) {
   if (!(engulf.high >= prev.high && engulf.low <= prev.low)) {
     return { valid: false, reason: 'does not take out BOTH the high and low of the previous candle', structure: 'n/a' };
   }
+  // 2026-08-27: body engulf, checked separately because range engulf does not
+  // imply it — a long-wicked indecision candle can straddle both extremes of
+  // the previous bar with its own body sitting inside that bar's body. See
+  // detectors.js's bodyEngulfs() note.
+  const pTop = Math.max(prev.open, prev.close), pBot = Math.min(prev.open, prev.close);
+  const eTop = Math.max(engulf.open, engulf.close), eBot = Math.min(engulf.open, engulf.close);
+  if (!(eTop >= pTop && eBot <= pBot)) {
+    return { valid: false, reason: 'body does not fully engulf the previous candle body (wicks only)', structure: 'n/a' };
+  }
 
   // Pivots computed on everything EXCEPT the engulfing candle and the one it
   // engulfed — those two are the event, not the structure that preceded it.
@@ -208,7 +217,43 @@ function validateEngulfPlaybookC(bars, direction, pdhpdl) {
   };
 }
 
+// ── Key levels the engulfing candle actually interacted with ────────────────
+// 2026-08-27. Purpose is Anoop's manual re-check, not an extra gate: the alert
+// should say WHERE the candle formed so he can pull the chart up and judge it
+// himself. Nothing here can reject a signal — it only annotates one.
+//
+// "Interacted with" is deliberately the candle's own RANGE, not a proximity
+// radius around its close. If price traded through the level during that
+// candle, the level is relevant; if it merely sits 20 points away untouched,
+// it is not, and saying otherwise would put a level in every single alert and
+// train him to ignore the line. A small tolerance band is added on top of the
+// range so a level the wick stopped one tick short of still counts.
+const PBC_NEAR_LEVEL_TOL = 0.0005;  // 0.05% — same band getSwingLevels dedupes on
+
+function nearbyKeyLevels(bar, levels, tolPct = PBC_NEAR_LEVEL_TOL) {
+  if (!bar || !Array.isArray(levels)) return [];
+  const out = [];
+  for (const lv of levels) {
+    if (!lv || typeof lv.price !== 'number' || !Number.isFinite(lv.price) || lv.price <= 0) continue;
+    const band = lv.price * tolPct;
+    if (bar.low - band <= lv.price && lv.price <= bar.high + band) {
+      out.push({ name: lv.name, price: lv.price, dist: Math.abs(lv.price - bar.close) });
+    }
+  }
+  // Nearest to the close first — that is the one the candle finished against.
+  out.sort((a, b) => a.dist - b.dist);
+  // Deduped by price: PDL and a swing low can be the same line to the tick, and
+  // naming it twice reads as two confluences when there is one.
+  const seen = [];
+  return out.filter(l => {
+    if (seen.some(p => Math.abs(p - l.price) / l.price < tolPct)) return false;
+    seen.push(l.price); return true;
+  }).slice(0, 3);
+}
+
 module.exports = {
+  nearbyKeyLevels,
+  PBC_NEAR_LEVEL_TOL,
   dropFormingBar,
   findPivots,
   validateEngulfPlaybookC,

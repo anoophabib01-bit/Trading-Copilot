@@ -12,6 +12,9 @@
        result kept landing as only partially matching. G5 is deliberately FLAT.
        Loads LAST so it wins the cascade. Remove this one line to fully revert. -->
   <link rel="stylesheet" href="g5-premium.css">
+  <!-- Weekly Report tab (2026-08-29). Own file, g5-premium.css precedent:
+       a bad rule here cannot reflow the live trading surface. -->
+  <link rel="stylesheet" href="week-report.css">
   <!-- Apply saved theme before paint to avoid a flash of the wrong theme -->
   <script>(function(){try{var t=localStorage.getItem('copilot-theme');if(t==='dark')document.documentElement.classList.add('theme-dark');else if(t==='graphite')document.documentElement.classList.add('theme-graphite');}catch(e){}})();</script>
 </head>
@@ -59,11 +62,36 @@
     <button class="acct-size-btn active" data-size="150k" onclick="switchAccount('150k', state.mode)">150K</button>
   </div>
 
-  <!-- Trading mode toggle: Standard vs Scalper (2026-08-01) -->
+  <!-- Trading mode toggle: Standard vs Scalper (2026-08-01)
+       NOT DEAD — checked 2026-08-26 when it was proposed for removal. This
+       switches rules.json's scalperRules overlay, which changes REAL limits:
+       tradesPerDay 5→10, maxHoldSeconds 1800→900, dailyLossTiers
+       -250/-350/-500 → -200/-300/-400 (tighter), scorerTradesPerDayLimit
+       10→15, plus cooldownAfterLossOnly. Read in 13 places in server.js
+       including the live hold-time guard and day grading. Removing it would
+       have silently loosened his daily loss limit by $100. -->
   <div class="trading-mode-toggle" id="trading-mode-toggle">
     <button class="tmode-btn active" id="tmode-standard-btn" onclick="switchTradingMode('standard')">STANDARD</button>
     <button class="tmode-btn" id="tmode-scalper-btn" onclick="switchTradingMode('scalper')">SCALPER</button>
   </div>
+
+  <!-- CONTROL toggle (2026-08-26) — who is placing the trades.
+       Deliberately its own control, visually separated from the mode toggles
+       above, because it answers a different and much larger question than
+       they do: not "under which rules" but "by whose hand". The badge always
+       states the EFFECTIVE mode, never the requested one — clicking CONTROL
+       requests LIVE, and the gate may grant only SHADOW. See autonomy-gate.js
+       for why that distinction is the whole point. -->
+  <div class="control-toggle" id="control-toggle" title="Who places the trades. LIVE requires a measured track record — click for details.">
+    <button class="ctrl-btn active" id="ctrl-off-btn"    onclick="switchControl('off')">YOU</button>
+    <button class="ctrl-btn"        id="ctrl-shadow-btn" onclick="switchControl('shadow')">SHADOW</button>
+    <!-- ASSIST (2026-08-29) — the rung between "records nothing real" and
+         "trades unattended". The app proposes, Anoop approves each ticket, the
+         app places it. Hidden unless the server says the mode is enabled. -->
+    <button class="ctrl-btn"        id="ctrl-assist-btn" onclick="switchControl('assist')">ASSIST</button>
+    <button class="ctrl-btn"        id="ctrl-live-btn"   onclick="switchControl('live')">CONTROL</button>
+  </div>
+  <div id="control-status" onclick="showControlDetail()" title="Click for the full requirement list"></div>
 
   <!-- Full-width kill bar, shown only when the chart feed is dead. The
        titlebar chip alone was missable with the window partly covered. -->
@@ -350,11 +378,12 @@
       <div class="rtab active" data-tab="analysis" onclick="switchTab('analysis')">Analysis</div>
       <div class="rtab" data-tab="journal"  onclick="switchTab('journal')">Journal</div>
       <div class="rtab" data-tab="rules"    onclick="switchTab('rules')">Rules</div>
-      <div class="rtab" data-tab="lessons"  onclick="switchTab('lessons')">Lessons</div>
+      <div class="rtab" data-tab="lessons"  onclick="switchTab('lessons')" title="Lessons you have armed as live checks — self-authored guardrails">Self-authored watchlist</div>
       <div class="rtab" data-tab="align"    onclick="switchTab('align')">Alignment</div>
       <div class="rtab" data-tab="ladder"   onclick="switchTab('ladder')">Ladder</div>
       <div class="rtab" data-tab="checklist" onclick="switchTab('checklist')">Checklist</div>
       <div class="rtab" data-tab="apprentice" onclick="switchTab('apprentice')">Roadmap</div>
+      <div class="rtab" data-tab="week" onclick="switchTab('week')" title="The whole week: calendar, where the money went, mistakes and positives, and next week's commitment">Week</div>
       <div class="rtab" data-tab="insights" onclick="switchTab('insights')">Insights</div>
       <div class="rtab" data-tab="cost" onclick="switchTab('cost')">Cost</div>
     </div>
@@ -409,6 +438,7 @@
             <button type="button" class="engulf-roller-tab active" id="engulf-roller-tab-1h" onclick="selectEngulfTF('1h')">1H<span class="engulf-roller-dot off" id="engulf-roller-dot-1h"></span></button>
             <button type="button" class="engulf-roller-tab" id="engulf-roller-tab-30m" onclick="selectEngulfTF('30m')">30M<span class="engulf-roller-dot off" id="engulf-roller-dot-30m"></span></button>
             <button type="button" class="engulf-roller-tab" id="engulf-roller-tab-15m" onclick="selectEngulfTF('15m')">15M<span class="engulf-roller-dot off" id="engulf-roller-dot-15m"></span></button>
+            <button type="button" class="engulf-roller-tab" id="engulf-roller-tab-5m" onclick="selectEngulfTF('5m')">5M<span class="engulf-roller-dot off" id="engulf-roller-dot-5m"></span></button>
           </div>
 
           <div class="engulf-tf-panel" data-tf-panel="1h">
@@ -454,6 +484,21 @@
               </div>
             </div>
             <div id="engulf-history-15m" class="engulf-history"></div>
+          </div>
+
+          <div class="engulf-tf-panel" data-tf-panel="5m" style="display:none;">
+            <div class="engulf-header" style="margin-top:8px;">
+              <span class="stat-label" style="font-size:10px;">Watching — always on</span>
+            </div>
+            <div id="engulf-status-5m" class="engulf-status off">Always on — no switches to forget.</div>
+            <div class="engulf-actions">
+              <button class="engulf-check-btn" onclick="checkEngulfNow('5m')" title="Run check now">↻ Check now</button>
+              <div class="engulf-indicator-row">
+                <span class="stat-label" style="font-size:10px;">Indicator</span>
+                <input id="engulf-indicator-5m" class="engulf-indicator-input" placeholder="auto-detect" title="Pine indicator name containing engulf signal (leave blank = auto-detect all)">
+              </div>
+            </div>
+            <div id="engulf-history-5m" class="engulf-history"></div>
           </div>
         </div>
 
@@ -506,18 +551,12 @@
            staging area; promoting a lesson into an actual enforced rule
            (rules.json + app logic + CLAUDE.md) is still a separate step,
            same as the existing "Pending Checklist Enhancements" pattern. -->
-      <div id="tab-lessons" style="display:none;padding:12px;">
-        <div class="rules-block" id="lessons-log-block">
-          <div class="rules-title">Lessons Log</div>
-          <div style="font-size:11px;opacity:.65;margin:-2px 0 8px;">Write down what you just learned, the moment you learn it. This does not change any rule by itself — flag it to promote it into an enforced rule.</div>
-          <textarea id="lesson-text" rows="2" placeholder="e.g. I sized up from 5 to 10 lots while already down on the day — that's what blew the account." style="width:100%;box-sizing:border-box;resize:vertical;background:var(--panel-2,#161b22);color:inherit;border:1px solid var(--border,#30363d);border-radius:6px;padding:6px 8px;font:inherit;"></textarea>
-          <div style="display:flex;gap:8px;align-items:center;margin-top:6px;">
-            <button class="engulf-check-btn" onclick="addLesson()">+ Log lesson</button>
-            <span id="lesson-saved" style="font-size:11px;opacity:.7;"></span>
-          </div>
-          <div id="lessons-list" style="margin-top:10px;"></div>
-        </div>
-      </div>
+      <!-- The Lessons tab was merged into this Alignment tab on
+           2026-08-25. Both held his own dated words about himself, but
+           Alignment reached seven agent call sites while Lessons reached one,
+           and only if the lesson carried an armed watch. Written lessons and
+           their optional watches are now the "A lesson" kind in the composer
+           below. See mind-log.js. -->
 
       <!-- Alignment tab (added 2026-07-28, Anoop) — closes the gap between
            "what Jessi/Claude currently thinks the rules and plan are" and
@@ -535,13 +574,30 @@
           <div id="align-live-rules" style="font-size:12px;"></div>
         </div>
         <div class="rules-block" style="margin-top:12px;">
-          <div class="rules-title">Where your head's at</div>
-          <div style="font-size:11px;opacity:.65;margin:-2px 0 8px;">Not a lesson, not an incident — just where you are today: what you're focused on, worried about, or planning to change. Dated automatically. Claude reads recent entries here before coaching you.</div>
-          <textarea id="align-text" rows="3" placeholder="e.g. Feeling pulled to oversize after two green days in a row — watching for that." style="width:100%;box-sizing:border-box;resize:vertical;background:var(--panel-2,#161b22);color:inherit;border:1px solid var(--border,#30363d);border-radius:6px;padding:6px 8px;font:inherit;"></textarea>
-          <div style="display:flex;gap:8px;align-items:center;margin-top:6px;">
-            <button class="engulf-check-btn" onclick="addAlignNote()">+ Add entry</button>
+          <!-- The title and help text are rewritten by mindSetKind() to match
+               whichever tab you came in through. The kind is NOT a toggle any
+               more: two buttons that both showed the whole log is exactly what
+               made Alignment and the watchlist indistinguishable. -->
+          <div class="rules-title" id="mind-title">Alignment — where your head's at</div>
+          <div id="mind-kind-help" style="font-size:11px;opacity:.6;margin-bottom:8px;"></div>
+
+          <textarea id="align-text" rows="3" style="width:100%;box-sizing:border-box;resize:vertical;background:var(--panel-2,#161b22);color:inherit;border:1px solid var(--border,#30363d);border-radius:6px;padding:6px 8px;font:inherit;"></textarea>
+
+          <!-- Only a lesson can be armed. A note about how today feels
+               describes a period, not a rule — arming one would mean the app
+               enforcing a mood. -->
+          <div id="mind-watch-wrap" style="margin-top:8px;display:none;">
+            <div style="font-size:11px;opacity:.65;margin-bottom:4px;">Watch for it automatically (optional)</div>
+            <select id="lesson-template" onchange="renderLessonParams()" style="width:100%;box-sizing:border-box;background:var(--panel-2,#161b22);color:inherit;border:1px solid var(--border,#30363d);border-radius:6px;padding:6px 8px;font:inherit;"></select>
+            <div id="lesson-template-help" style="font-size:11px;opacity:.6;margin-top:4px;"></div>
+            <div id="lesson-params" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;"></div>
+          </div>
+
+          <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+            <button class="engulf-check-btn" onclick="mindAdd()">+ Add entry</button>
             <span id="align-saved" style="font-size:11px;opacity:.7;"></span>
           </div>
+          <div id="lesson-errors" style="font-size:11px;color:var(--red,#f85149);margin-top:6px;"></div>
           <div id="align-notes-list" style="margin-top:10px;"></div>
         </div>
       </div>
@@ -966,6 +1022,15 @@
         <div id="journal-body"><div class="no-trades">Upload a CSV and the journal fills in.</div></div>
       </div>
 
+      <!-- Weekly Report (2026-08-29). Deliberately NOT in CK_GATED_TABS: a
+           weekend review must never be locked behind a pre-trade checklist —
+           the whole point is that he opens it on a day he is not trading.
+           Everything inside is painted by renderer/week-report.js from ONE
+           server payload; nothing here recomputes a number. -->
+      <div id="tab-week" style="display:none;padding:12px;">
+        <div id="week-body"><div class="no-trades">Open this on a weekend to review the week.</div></div>
+      </div>
+
       <div id="tab-insights" style="display:none;padding:12px;">
         <!-- Account breach/clear actions — added 2026-07-22. Static (outside
              #ins-body) so they survive every renderInsights() re-render. -->
@@ -1220,10 +1285,23 @@
 <script src="payout-pace.js"></script>
 <!-- signal-alert.js — decides whether a watcher detection is NEW and worth a
      chime. Must load BEFORE app.js, which reads window.SignalAlert. -->
+<!-- armed-detectors.js (UMD) — the self-authored guardrail templates. Loaded
+     in BOTH the renderer and server.js from this one file, so the numbers he
+     sees when he arms a lesson are the numbers that run in the session. -->
+<!-- mind-log.js (UMD) — the merged Alignment+Lessons store. Shared with
+     server.js so the tab and all seven agent call sites read one
+     definition of what a "state" entry vs a "lesson" is. -->
+<script src="../mind-log.js"></script>
+<script src="../armed-detectors.js"></script>
+<!-- journal-notes.js (UMD) — the stick-rate scorecard maths, shared with
+     server.js so the Journal panel and Jessi quote the same numbers. -->
+<script src="../journal-notes.js"></script>
 <script src="signal-alert.js"></script>
 <script src="app.js"></script>
 <!-- Loaded after app.js: reuses insCoachNotes/insMoney/edToday from it. -->
 <script src="day-recap.js"></script>
+<!-- Weekly Report tab. After app.js: uses addSystemMessage/switchTab from it. -->
+<script src="week-report.js"></script>
 <!-- Resilience layer — MUST load after app.js. Error traps, stall watchdog,
      and chat transcript persistence. See renderer/resilience.js. -->
 <script src="resilience.js"></script>

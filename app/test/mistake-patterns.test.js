@@ -291,3 +291,78 @@ test('F3: defaults apply when opts are missing (ratio 2, minWins 2)', () => {
   const r = checkInvertedRR([{ pnl: 10 }, { pnl: 10 }, { pnl: -40 }], null);
   assert.equal(r.matched, true);
 });
+
+// ── F4: break-even churn (2026-08-25) ───────────────────────────────────────
+// Anoop: "Consider anything below 100$ and above -100$ as not a trade... After
+// 5 break even trades, I want you to remind me."
+const { checkBreakEvenChurn } = require('../mistake-patterns.js');
+const F4OPTS = { breakEvenBandUsd: 100, breakEvenReminderCount: 5, commissionPerContractPerSide: 0.95 };
+
+test('F4: replays his real 2026-08-25 day — 8 of 11 landed inside the band', () => {
+  const rows = [
+    { size: 5, pnl: -280 }, { size: 2, pnl: -2.8 }, { size: 6, pnl: -291.4 },
+    { size: 2, pnl: -25.8 }, { size: 8, pnl: -15.6 }, { size: 6, pnl: -26.4 },
+    { size: 8, pnl: 20.3 }, { size: 12, pnl: 23.2 }, { size: 1, pnl: 5.6 },
+    { size: 2, pnl: -0.8 }, { size: 8, pnl: 907.8 },
+  ];
+  const r = checkBreakEvenChurn(rows, F4OPTS);
+  assert.strictEqual(r.matched, true);
+  assert.strictEqual(r.breakEvenCount, 8);
+  assert.strictEqual(r.realCount, 3);
+  assert.strictEqual(r.totalCount, 11);
+  assert.strictEqual(r.feesRisked, 77.9);
+  assert.ok(r.message.includes('8 of your 11'), r.message);
+});
+
+test('F4: does NOT fire below his stated count of 5', () => {
+  const rows = [{ size: 1, pnl: 5 }, { size: 1, pnl: -5 }, { size: 1, pnl: 5 }, { size: 1, pnl: -5 }];
+  const r = checkBreakEvenChurn(rows, F4OPTS);
+  assert.strictEqual(r.matched, false);
+  assert.strictEqual(r.breakEvenCount, 4);
+  assert.strictEqual(r.message, null);
+});
+
+test('F4: fires exactly AT 5', () => {
+  const rows = Array.from({ length: 5 }, () => ({ size: 1, pnl: 5 }));
+  assert.strictEqual(checkBreakEvenChurn(rows, F4OPTS).matched, true);
+});
+
+test('F4: the band is exclusive — exactly $100 is a REAL trade', () => {
+  const rows = Array.from({ length: 5 }, () => ({ size: 1, pnl: 100 }));
+  const r = checkBreakEvenChurn(rows, F4OPTS);
+  assert.strictEqual(r.breakEvenCount, 0);
+  assert.strictEqual(r.realCount, 5);
+});
+
+test('F4: a big LOSS is a real trade, not break-even', () => {
+  const rows = Array.from({ length: 5 }, () => ({ size: 1, pnl: -250 }));
+  assert.strictEqual(checkBreakEvenChurn(rows, F4OPTS).breakEvenCount, 0);
+});
+
+test('F4: reads the band from rules, not from a hardcoded 100', () => {
+  const rows = Array.from({ length: 5 }, () => ({ size: 1, pnl: 150 }));
+  const wide = checkBreakEvenChurn(rows, { breakEvenBandUsd: 200, breakEvenReminderCount: 5 });
+  assert.strictEqual(wide.breakEvenCount, 5);
+  assert.strictEqual(wide.band, 200);
+});
+
+test('F4: pnlUnknown rows are counted neither way', () => {
+  const rows = [].concat(Array.from({ length: 5 }, () => ({ size: 1, pnl: 5 })),
+                         [{ size: 1, pnl: 0, pnlUnknown: true }]);
+  const r = checkBreakEvenChurn(rows, F4OPTS);
+  assert.strictEqual(r.totalCount, 5);
+  assert.strictEqual(r.breakEvenCount, 5);
+});
+
+test('F4: fees stay null when any size was unobserved, never a partial sum', () => {
+  const rows = [].concat(Array.from({ length: 4 }, () => ({ size: 1, pnl: 5 })), [{ size: 0, pnl: 5 }]);
+  const r = checkBreakEvenChurn(rows, F4OPTS);
+  assert.strictEqual(r.matched, true);
+  assert.strictEqual(r.feesRisked, null);
+  assert.ok(!/commission/.test(r.message), 'must not claim a fee total it cannot compute');
+});
+
+test('F4: an empty day is not a match', () => {
+  assert.strictEqual(checkBreakEvenChurn([], F4OPTS).matched, false);
+  assert.strictEqual(checkBreakEvenChurn(null, F4OPTS).matched, false);
+});

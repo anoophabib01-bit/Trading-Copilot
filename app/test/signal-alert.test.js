@@ -106,3 +106,45 @@ test('pruneSeen keeps the map from growing all session', () => {
   assert.equal(Object.prototype.hasOwnProperty.call(seen, 'old'), false);
   assert.equal(Object.prototype.hasOwnProperty.call(seen, 'fresh'), true);
 });
+
+// ── 2026-08-27: engulf dedup keys on the CANDLE, not the poll clock ──────────
+// The old key used `time`, which server.js built from `new Date()` at the
+// moment the monitor noticed — so every re-poll of the same candle produced a
+// fresh key and chimed again. On a 5M watcher polling every 15s that is up to
+// twenty chimes for one candle.
+test('engulf: the same candle re-firing on a later poll chimes ONCE', () => {
+  const seen = Object.create(null);
+  const T = Date.parse('2026-08-27T07:00:00Z');
+  const bar = { tf: '5m', direction: 'BULLISH', barTime: 1756278000, time: '12:30:05' };
+  assert.strictEqual(shouldAnnounce(seen, 'engulf', bar, T).announce, true);
+  // Same candle, noticed 15s later — the poll clock moved, the candle did not.
+  const reFire = { ...bar, time: '12:30:20' };
+  assert.strictEqual(shouldAnnounce(seen, 'engulf', reFire, T + 15000).announce, false);
+});
+
+test('engulf: the NEXT candle is a new signal and chimes again', () => {
+  const seen = Object.create(null);
+  const T = Date.parse('2026-08-27T07:00:00Z');
+  const a = { tf: '5m', direction: 'BULLISH', barTime: 1756278000 };
+  const b = { tf: '5m', direction: 'BULLISH', barTime: 1756278300 };  // +5 min
+  assert.strictEqual(shouldAnnounce(seen, 'engulf', a, T).announce, true);
+  // Inside the 20-min repeat window — a wall-clock-keyed dedup would swallow
+  // this. Consecutive 5M engulfs are exactly the case that must not be lost.
+  assert.strictEqual(shouldAnnounce(seen, 'engulf', b, T + 5 * 60 * 1000).announce, true);
+});
+
+test('engulf: the chat line carries candle time, price and key level', () => {
+  const text = describeSignal('engulf', {
+    tfLabel: '5M', direction: 'BULLISH', barCloseIST: '12:30:00',
+    price: 29428.75, levelNote: ' — AT PDL 29402.25',
+  });
+  assert.match(text, /5M/);
+  assert.match(text, /12:30:00/);
+  assert.match(text, /29428\.75/);
+  assert.match(text, /PDL 29402\.25/);
+});
+
+test('engulf: an older server sending none of the annotations still describes cleanly', () => {
+  const text = describeSignal('engulf', { tfLabel: '1H', direction: 'BEARISH' });
+  assert.strictEqual(text, 'Engulfing 1H · BEARISH');
+});

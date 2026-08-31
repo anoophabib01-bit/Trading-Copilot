@@ -1,7 +1,8 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { fold, freshState, parseBalance, istDayStartMs } = require('../tv-broker-feed.js');
+const tvFeed = require('../tv-broker-feed.js');
+const { fold, freshState, parseBalance, istDayStartMs, readBrokerPnl, effectiveDayPnl, effectiveTradeCount, BROKER_PNL_MAX_AGE_MS } = require('../tv-broker-feed.js');
 
 test('parseBalance strips currency formatting and handles the U+2212 minus sign', () => {
   assert.equal(parseBalance('$50,123.45'), 50123.45);
@@ -22,6 +23,7 @@ test('open -> flat transition scores one trade via balance delta', () => {
   s = fold(s, { balance: 50000, isFlat: true, openSize: 0, nowMs: 1000 });   // baseline
   s = fold(s, { balance: 49990, isFlat: false, openSize: 2, nowMs: 2000 });  // position opens, floating loss
   s = fold(s, { balance: 50060, isFlat: true, openSize: 0, nowMs: 3000 });   // closes flat, up overall
+  s = fold(s, { balance: 50060, isFlat: true, openSize: 0, nowMs: 3001 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
   assert.equal(s.tradeCount, 1);
   assert.equal(s.dayPnl, 60);
   assert.equal(s.maxSize, 2);
@@ -36,6 +38,7 @@ test('a losing trade sets lastLossTs and accumulates a negative dayPnl', () => {
   s = fold(s, { balance: 50000, isFlat: true, openSize: 0, nowMs: 1000 });
   s = fold(s, { balance: 50000, isFlat: false, openSize: 1, nowMs: 2000 });
   s = fold(s, { balance: 49940, isFlat: true, openSize: 0, nowMs: 3000 });
+  s = fold(s, { balance: 49940, isFlat: true, openSize: 0, nowMs: 3001 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
   assert.equal(s.tradeCount, 1);
   assert.equal(s.dayPnl, -60);
   assert.equal(s.lastLossTs, 3000);
@@ -46,8 +49,10 @@ test('multiple trades in a day accumulate dayPnl/tradeCount/maxSize independentl
   s = fold(s, { balance: 50000, isFlat: true, openSize: 0, nowMs: 1000 });
   s = fold(s, { balance: 50000, isFlat: false, openSize: 1, nowMs: 2000 });
   s = fold(s, { balance: 49940, isFlat: true, openSize: 0, nowMs: 3000 }); // trade 1: -60, size 1
+  s = fold(s, { balance: 49940, isFlat: true, openSize: 0, nowMs: 3001 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
   s = fold(s, { balance: 49940, isFlat: false, openSize: 3, nowMs: 4000 });
   s = fold(s, { balance: 50100, isFlat: true, openSize: 0, nowMs: 5000 }); // trade 2: +160, size 3
+  s = fold(s, { balance: 50100, isFlat: true, openSize: 0, nowMs: 5001 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
   assert.equal(s.tradeCount, 2);
   assert.equal(s.dayPnl, 100);
   assert.equal(s.maxSize, 3);
@@ -69,6 +74,7 @@ test('an unreadable balance mid-trade still tracks max size and does not crash',
   assert.equal(s.sizeSeenThisTrade, 5);
   assert.equal(s.tradeCount, 0);
   s = fold(s, { balance: 50200, isFlat: true, openSize: 0, nowMs: 3000 });
+  s = fold(s, { balance: 50200, isFlat: true, openSize: 0, nowMs: 3001 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
   assert.equal(s.tradeCount, 1);
   assert.equal(s.trades[0].size, 5);
   assert.equal(s.trades[0].pnl, 200);
@@ -79,6 +85,7 @@ test('a new IST calendar day resets accumulators', () => {
   s = fold(s, { balance: 50000, isFlat: true, openSize: 0, nowMs: 1000 });
   s = fold(s, { balance: 50000, isFlat: false, openSize: 1, nowMs: 2000 });
   s = fold(s, { balance: 50100, isFlat: true, openSize: 0, nowMs: 3000 });
+  s = fold(s, { balance: 50100, isFlat: true, openSize: 0, nowMs: 3001 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
   assert.equal(s.tradeCount, 1);
 
   const nextDayMs = istDayStartMs(3000) + 24 * 3600000 + 1000; // well into the next IST day
@@ -169,6 +176,7 @@ test('the observed-transition path still wins and is NOT marked inferred', () =>
   s = fold(s, { balance: 50000, isFlat: true, openSize: 0, nowMs: 1000 });
   s = fold(s, { balance: 50000, isFlat: false, openSize: 4, nowMs: 2000 });
   s = fold(s, { balance: 50120, isFlat: true, openSize: 0, nowMs: 3000 });
+  s = fold(s, { balance: 50120, isFlat: true, openSize: 0, nowMs: 3001 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
   assert.equal(s.tradeCount, 1);
   assert.equal(s.trades[0].size, 4);
   assert.equal(s.trades[0].pnl, 120);
@@ -667,4 +675,856 @@ test('a reversal reports each leg at its own peak size, independently', () => {
   assert.equal(w.closed.length, 2);
   assert.equal(w.closed[0].size, 2, 'the long leg that closed on the reversal fill');
   assert.equal(w.closed[1].size, 3, 'the short leg peaked at 3, not 2 (the size of its final closing fill)');
+});
+
+// ── The broker's own P&L (2026-08-24 incident) ──────────────────────────────
+// Ground truth for every test below is Anoop's own screenshot: account flat,
+// DOLLAR OPEN P L $0.00, DOLLAR TOTAL P L +$399.70, equity $51,211.50 — while
+// sessions/Now.md, driven by the balance-delta fold, read -$154.20.
+
+test('readBrokerPnl reads the account panel and derives realized from total minus open', () => {
+  const r = readBrokerPnl({ detail: { 'Total P/L': '399.70', 'Open P/L': '0.00', 'Net Liq': '51,211.50' } });
+  assert.equal(r.totalPnl, 399.70);
+  assert.equal(r.openPnl, 0);
+  assert.equal(r.realizedPnl, 399.70);
+  assert.equal(r.readable, true);
+});
+
+test('readBrokerPnl handles the U+2212 minus sign and currency formatting', () => {
+  const r = readBrokerPnl({ detail: { 'Total P/L': '−$1,264.10', 'Open P/L': '−64.10' } });
+  assert.equal(r.totalPnl, -1264.10);
+  assert.equal(r.openPnl, -64.10);
+  assert.equal(r.realizedPnl, -1200);
+});
+
+test('readBrokerPnl accepts the "P&L" column wording as well as "P/L"', () => {
+  const r = readBrokerPnl({ detail: { 'Dollar Total P&L': '399.70', 'Dollar Open P&L': '0.00' } });
+  assert.equal(r.totalPnl, 399.70);
+  assert.equal(r.realizedPnl, 399.70);
+});
+
+test('readBrokerPnl reports unreadable rather than guessing when the panel is missing', () => {
+  for (const bad of [null, undefined, {}, { detail: null }, { detail: { 'Net Liq': '51,211.50' } }]) {
+    const r = readBrokerPnl(bad);
+    assert.equal(r.readable, false, JSON.stringify(bad));
+    assert.equal(r.totalPnl, null);
+    assert.equal(r.realizedPnl, null);
+  }
+});
+
+test('an open P&L column that will not parse still leaves total usable, realized unknown', () => {
+  const r = readBrokerPnl({ detail: { 'Total P/L': '399.70', 'Open P/L': '--' } });
+  assert.equal(r.totalPnl, 399.70);
+  assert.equal(r.openPnl, null);
+  assert.equal(r.realizedPnl, null, 'realized must not be invented from a half-read panel');
+  assert.equal(r.readable, true);
+});
+
+test('effectiveDayPnl prefers the broker figure and reports the fold as drift', () => {
+  // The incident, exactly: fold says -154.20, broker says +399.70, flat.
+  const r = effectiveDayPnl(
+    { dayPnl: -154.20, brokerTotalPnl: 399.70, brokerOpenPnl: 0, brokerPnlAt: 10000 }, 10000);
+  assert.equal(r.value, 399.70);
+  assert.equal(r.source, 'broker');
+  assert.equal(r.realized, 399.70);
+  assert.equal(r.foldValue, -154.20);
+  assert.ok(Math.abs(r.drift - (-553.90)) < 1e-9, 'drift is fold minus broker-realized');
+  assert.equal(r.stale, false);
+});
+
+test('effectiveDayPnl includes floating P&L on an open position — the reported "lag"', () => {
+  // fold() cannot move until the position returns to flat; the broker's total
+  // moves with it. A trade running -$300 must show as -$300, not as nothing.
+  const r = effectiveDayPnl(
+    { dayPnl: 0, brokerTotalPnl: -300, brokerOpenPnl: -300, brokerPnlAt: 500 }, 500);
+  assert.equal(r.value, -300);
+  assert.equal(r.realized, 0);
+  assert.equal(r.open, -300);
+});
+
+test('effectiveDayPnl falls back to the fold when the broker figure goes stale', () => {
+  const st = { dayPnl: -154.20, brokerTotalPnl: 399.70, brokerOpenPnl: 0, brokerPnlAt: 0 };
+  const fresh = effectiveDayPnl(st, BROKER_PNL_MAX_AGE_MS);
+  assert.equal(fresh.source, 'broker', 'exactly at the age limit is still fresh');
+  const stale = effectiveDayPnl(st, BROKER_PNL_MAX_AGE_MS + 1);
+  assert.equal(stale.source, 'fold');
+  assert.equal(stale.value, -154.20);
+  assert.equal(stale.stale, true, 'stale is distinguishable from never-had-one');
+});
+
+test('effectiveDayPnl falls back cleanly when the panel was never readable', () => {
+  const r = effectiveDayPnl({ dayPnl: -154.20 }, 10000);
+  assert.equal(r.source, 'fold');
+  assert.equal(r.value, -154.20);
+  assert.equal(r.stale, false, 'no broker figure ever seen is startup, not a fault');
+  assert.equal(r.drift, null);
+});
+
+test('effectiveTradeCount drops fill-edge phantoms and floors at the broker walk', () => {
+  const st = {
+    tradeCount: 15,
+    closedRoundTripsScored: 7,
+    trades: [
+      { size: 1, pnl: -1.9 },
+      ...Array.from({ length: 6 }, () => ({ size: 0, pnl: -1, inferred: true })),
+      ...Array.from({ length: 8 }, () => ({ size: 0, pnl: -1, inferred: true, evidence: 'degraded' })),
+    ],
+  };
+  const r = effectiveTradeCount(st);
+  assert.equal(r.value, 7, 'the 8 degraded phantoms are exactly the 15-vs-7 gap');
+  assert.equal(r.rawFoldCount, 15);
+  assert.equal(r.degraded, 8);
+  assert.equal(r.evidence, 'degraded');
+});
+
+test('effectiveTradeCount never under-counts when the walk went dark mid-day', () => {
+  // Walk stuck at 1, but two closes were corroborated by observed flat
+  // transitions — the higher number wins, so the cap cannot be walked past.
+  const r = effectiveTradeCount({
+    tradeCount: 3, closedRoundTripsScored: 1,
+    trades: [{ size: 1, pnl: 5 }, { size: 2, pnl: -5 }, { size: 0, pnl: 1, evidence: 'degraded' }],
+  });
+  assert.equal(r.value, 2);
+});
+
+test('effectiveTradeCount reports verified when nothing rests on the fill edge', () => {
+  const r = effectiveTradeCount({
+    tradeCount: 2, closedRoundTripsScored: 2,
+    trades: [{ size: 1, pnl: 5 }, { size: 2, pnl: -5 }],
+  });
+  assert.equal(r.value, 2);
+  assert.equal(r.degraded, 0);
+  assert.equal(r.evidence, 'verified');
+});
+
+test('fold records the broker P&L even on the first poll, which returns early', () => {
+  // On a restart mid-session this is the poll that matters most: it is the one
+  // that must replace a stale reconstructed figure with the real session total.
+  const s = fold(freshState(), {
+    balance: 51211.50, isFlat: true, openSize: 0, nowMs: 9000,
+    brokerTotalPnl: 399.70, brokerOpenPnl: 0,
+  });
+  assert.equal(s.tradeCount, 0, 'still scores nothing on the baseline poll');
+  assert.equal(s.brokerTotalPnl, 399.70);
+  assert.equal(s.brokerPnlAt, 9000);
+  assert.equal(effectiveDayPnl(s, 9000).value, 399.70);
+});
+
+test('an unreadable summary on one poll does not blank a good earlier reading', () => {
+  let s = fold(freshState(), { balance: 50000, isFlat: true, openSize: 0, nowMs: 1000, brokerTotalPnl: 120, brokerOpenPnl: 0 });
+  s = fold(s, { balance: 50000, isFlat: true, openSize: 0, nowMs: 2000, brokerTotalPnl: null, brokerOpenPnl: null });
+  assert.equal(s.brokerTotalPnl, 120, 'a flaky read degrades to slightly stale, not to no number');
+  assert.equal(s.brokerPnlAt, 1000, 'but its age is NOT refreshed — staleness must still be able to fire');
+});
+
+test('with broker P&L in hand, a fill edge while flat re-anchors WITHOUT inventing a trade', () => {
+  // The phantom generator: balance moved while flat with a new fill and no
+  // usable order walk. Pre-fix this scored a trade; that is where 8 of
+  // 2026-08-24's 15 came from, and why Now.md read "15 / 5".
+  let s = fold(freshState(), { balance: 50000, isFlat: true, openSize: 0, nowMs: 1000, brokerTotalPnl: 0, brokerOpenPnl: 0 });
+  s = fold(s, {
+    balance: 49990, isFlat: true, openSize: 0, nowMs: 2000,
+    hasNewFill: true, closedRoundTrips: null,
+    brokerTotalPnl: -10, brokerOpenPnl: 0,
+  });
+  assert.equal(s.tradeCount, 0, 'no phantom trade');
+  assert.equal(s.trades.length, 0);
+  assert.equal(s.balanceAtLastFlat, 49990, 'baseline still advances — no stale anchor left behind');
+  assert.equal(effectiveDayPnl(s, 2000).value, -10, 'and the P&L is not lost: the broker still reports it');
+});
+
+test('without broker P&L the degraded backstop still fires — under-counting stays the worse failure', () => {
+  let s = fold(freshState(), { balance: 50000, isFlat: true, openSize: 0, nowMs: 1000 });
+  s = fold(s, { balance: 49990, isFlat: true, openSize: 0, nowMs: 2000, hasNewFill: true, closedRoundTrips: null });
+  assert.equal(s.tradeCount, 1, 'unchanged fallback behaviour when the fold is the only P&L source');
+  assert.equal(s.trades[0].evidence, 'degraded');
+  assert.equal(s.dayPnl, -10);
+});
+
+test('a genuine observed round trip is still scored normally with broker P&L present', () => {
+  let s = fold(freshState(), { balance: 50000, isFlat: true, openSize: 0, nowMs: 1000, brokerTotalPnl: 0, brokerOpenPnl: 0 });
+  s = fold(s, { balance: 49980, isFlat: false, openSize: 2, nowMs: 2000, brokerTotalPnl: -20, brokerOpenPnl: -20 });
+  s = fold(s, { balance: 50060, isFlat: true, openSize: 0, nowMs: 3000, brokerTotalPnl: 60, brokerOpenPnl: 0 });
+  s = fold(s, { balance: 50060, isFlat: true, openSize: 0, nowMs: 3001, brokerTotalPnl: 60, brokerOpenPnl: 0 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
+  assert.equal(s.tradeCount, 1);
+  assert.equal(s.trades[0].size, 2, 'per-trade attribution is untouched by this change');
+  assert.equal(s.trades[0].pnl, 60);
+  assert.equal(effectiveTradeCount(s).evidence, 'verified');
+});
+
+test('REGRESSION 2026-08-24: the screenshot reconciles once the broker panel is read', () => {
+  // Rebuild the day the way it actually happened: the app starts polling at
+  // 17:30 with the account already +553.90 on the session, then gives some
+  // back. The fold can only ever see its own window; the broker sees the day.
+  let s = freshState();
+  s = fold(s, { balance: 51365.70, isFlat: true, openSize: 0, nowMs: 1000,
+                brokerTotalPnl: 553.90, brokerOpenPnl: 0 });
+  s = fold(s, { balance: 51365.70, isFlat: false, openSize: 1, nowMs: 2000,
+                brokerTotalPnl: 553.90, brokerOpenPnl: 0 });
+  s = fold(s, { balance: 51211.50, isFlat: true, openSize: 0, nowMs: 3000, closedRoundTrips: 1,
+                brokerTotalPnl: 399.70, brokerOpenPnl: 0 });
+
+  const pnl = effectiveDayPnl(s, 3000);
+  assert.equal(pnl.value, 399.70, "must equal the broker's DOLLAR TOTAL P L, not the fold's window");
+  assert.equal(pnl.source, 'broker');
+  // Float noise: the real state file carried -154.20000000000437 for the same
+  // reason — a sum of balance deltas, not a rounded figure.
+  assert.ok(Math.abs(pnl.foldValue - (-154.20)) < 1e-6, 'the old, wrong headline number is still visible as the fold value');
+  assert.ok(Math.abs(pnl.drift - (-553.90)) < 1e-9, 'and the gap is reported, not hidden');
+  assert.equal(effectiveTradeCount(s).value, 1);
+});
+
+test('readBrokerPnl reads Net Liq — the header strip Balance drifts, this does not', () => {
+  // The exact live payload read 2026-08-24 while flat: header strip said
+  // 51,219.30, this table said 51,211.50, the broker's EQUITY column said
+  // 51,211.50. Net Liq is the one that agreed with the statement.
+  const r = readBrokerPnl({ detail: {
+    'Total P/L': '399.70', 'Open P/L': '0.00', 'Net Liq': '51211.50',
+    'Available Margin': '51211.50', 'Day Margin': '0.00',
+  } });
+  assert.equal(r.netLiq, 51211.50);
+  assert.equal(r.totalPnl, 399.70);
+});
+
+test('fold stores Net Liq even on a poll where the P&L columns are unreadable', () => {
+  let s = fold(freshState(), { balance: 50000, isFlat: true, openSize: 0, nowMs: 1000, brokerNetLiq: 51211.50 });
+  assert.equal(s.brokerNetLiq, 51211.50);
+  assert.equal(s.brokerTotalPnl, null, 'the two are read independently');
+});
+
+// ── Side / prices on a folded trade (2026-08-25) ────────────────────────────
+// Anoop: "also the side has not been mentioned check with it too! was the
+// trade long or short?" Every live row wrote side/ep/xp/mp as null while the
+// order walk already had all four.
+const RT = (o) => Object.assign({
+  symbol: 'MNQZ2026', side: 'buy', size: 2,
+  entryPrice: 29100, exitPrice: 29110,
+  entryAt: 1787641000000, exitAt: 1787641120000, at: 1787641120000,
+  pnl: 0, pnlUnknown: true, source: 'backfilled-from-orders',
+}, o || {});
+
+test('walkDetailFor: translates buy/sell into the row vocabulary LONG/SHORT', () => {
+  const buy = tvFeed.walkDetailFor({ closedRoundTripRecords: [RT()] }, 0, 1);
+  assert.strictEqual(buy.side, 'LONG');
+  const sell = tvFeed.walkDetailFor({ closedRoundTripRecords: [RT({ side: 'sell' })] }, 0, 1);
+  assert.strictEqual(sell.side, 'SHORT');
+});
+
+test('walkDetailFor: carries prices, timestamps, hold and the walk size', () => {
+  const d = tvFeed.walkDetailFor({ closedRoundTripRecords: [RT()] }, 0, 1);
+  assert.strictEqual(d.entryPrice, 29100);
+  assert.strictEqual(d.exitPrice, 29110);
+  assert.strictEqual(d.entryAt, 1787641000000);
+  assert.strictEqual(d.exitAt, 1787641120000);
+  assert.strictEqual(d.holdSec, 120);
+  assert.strictEqual(d.walkSize, 2);
+});
+
+test('walkDetailFor: REFUSES when two round trips closed in one poll', () => {
+  // One balance delta spans both closes, so neither side describes that P&L.
+  // Missing must stay missing rather than become a plausible guess.
+  const snap = { closedRoundTripRecords: [RT(), RT({ side: 'sell' })] };
+  assert.strictEqual(tvFeed.walkDetailFor(snap, 0, 2), null);
+});
+
+test('walkDetailFor: null when the walk was not trusted this poll', () => {
+  assert.strictEqual(tvFeed.walkDetailFor({ closedRoundTripRecords: null }, 0, 1), null);
+  assert.strictEqual(tvFeed.walkDetailFor({ closedRoundTripRecords: [RT()] }, 0, null), null);
+});
+
+test('walkDetailFor: null on an unreadable side rather than defaulting to long', () => {
+  const snap = { closedRoundTripRecords: [RT({ side: '' })] };
+  assert.strictEqual(tvFeed.walkDetailFor(snap, 0, 1), null);
+});
+
+test('applyWalkDetail: never overwrites the fold’s own P&L or observed size', () => {
+  const out = tvFeed.applyWalkDetail({ size: 5, pnl: -280, at: 1 }, { side: 'SHORT', walkSize: 2 });
+  assert.strictEqual(out.pnl, -280, 'the fold owns P&L');
+  assert.strictEqual(out.size, 5, 'an OBSERVED size must win over the walk peak');
+  assert.strictEqual(out.side, 'SHORT');
+  assert.strictEqual(out.walkSize, undefined, 'walkSize is not a row field');
+});
+
+test('applyWalkDetail: fills an UNOBSERVED size and clears the inferred sentinel', () => {
+  const out = tvFeed.applyWalkDetail({ size: 0, pnl: -50, at: 1, inferred: true },
+    { side: 'LONG', walkSize: 3 });
+  assert.strictEqual(out.size, 3);
+  assert.strictEqual(out.inferred, undefined, 'size is no longer unknown, so the sentinel must go');
+});
+
+test('applyWalkDetail: a null detail leaves the record byte-identical', () => {
+  const rec = { size: 0, pnl: -50, at: 1, inferred: true };
+  assert.deepStrictEqual(tvFeed.applyWalkDetail(rec, null), rec);
+});
+
+test('fold: a real flat-to-flat close now records its direction', () => {
+  const base = tvFeed.freshState();
+  const t0 = Date.UTC(2026, 7, 25, 8, 0, 0);
+  let st = tvFeed.fold(base, { balance: 50000, isFlat: true, openSize: 0, nowMs: t0, closedRoundTrips: 0 });
+  st = tvFeed.fold(st, { balance: 50000, isFlat: false, openSize: 2, nowMs: t0 + 10000, closedRoundTrips: 0 });
+  st = tvFeed.fold(st, {
+    balance: 50040, isFlat: true, openSize: 0, nowMs: t0 + 20000,
+    closedRoundTrips: 1,
+    closedRoundTripRecords: [RT({ side: 'sell', entryPrice: 29110, exitPrice: 29100 })],
+  });
+  assert.strictEqual(st.trades.length, 1);
+  const tr = st.trades[0];
+  assert.strictEqual(tr.side, 'SHORT');
+  assert.strictEqual(tr.entryPrice, 29110);
+  assert.strictEqual(tr.exitPrice, 29100);
+  assert.strictEqual(tr.pnl, 40, 'P&L still comes from the balance delta, not from prices');
+  assert.strictEqual(tr.size, 2);
+});
+
+test('fold: a poll-aliased scalp recovers BOTH its side and its true size', () => {
+  // Opened and closed inside one 10s poll interval, so the fold never saw the
+  // position open — size 0 "not observed". The walk saw the order rows.
+  const base = tvFeed.freshState();
+  const t0 = Date.UTC(2026, 7, 25, 8, 0, 0);
+  let st = tvFeed.fold(base, { balance: 50000, isFlat: true, openSize: 0, nowMs: t0, closedRoundTrips: 0 });
+  st = tvFeed.fold(st, {
+    balance: 49900, isFlat: true, openSize: 0, nowMs: t0 + 10000,
+    closedRoundTrips: 1, hasNewFill: true,
+    closedRoundTripRecords: [RT({ side: 'buy', size: 6 })],
+  });
+  assert.strictEqual(st.trades.length, 1);
+  assert.strictEqual(st.trades[0].side, 'LONG');
+  assert.strictEqual(st.trades[0].size, 6);
+  assert.strictEqual(st.trades[0].pnl, -100);
+  assert.strictEqual(st.trades[0].inferred, undefined);
+});
+
+test('fold: two closes in one interval still record P&L, but assert no direction', () => {
+  const base = tvFeed.freshState();
+  const t0 = Date.UTC(2026, 7, 25, 8, 0, 0);
+  let st = tvFeed.fold(base, { balance: 50000, isFlat: true, openSize: 0, nowMs: t0, closedRoundTrips: 0 });
+  st = tvFeed.fold(st, {
+    balance: 49900, isFlat: true, openSize: 0, nowMs: t0 + 10000,
+    closedRoundTrips: 2, hasNewFill: true,
+    closedRoundTripRecords: [RT({ side: 'buy' }), RT({ side: 'sell' })],
+  });
+  assert.strictEqual(st.trades.length, 1);
+  assert.strictEqual(st.trades[0].pnl, -100);
+  assert.strictEqual(st.trades[0].side, undefined, 'no side may be asserted for a combined delta');
+});
+
+// ── Repairing rows written before their direction was known (2026-08-25) ────
+// Anoop: "the side coloume is still empty... how can you solve it."
+const WRT = (o) => Object.assign({
+  symbol: 'MNQZ2026', side: 'buy', size: 2,
+  entryPrice: 29100, exitPrice: 29110,
+  entryAt: 1787641000000, exitAt: 1787641120000, at: 1787641120000,
+}, o || {});
+
+test('enrichRowsFromWalk: fills side, prices, signed move and hold on a blank row', () => {
+  const rows = [{ t: 1787641120000, x: 1787641120000, size: 2, pnl: -280, side: null, ep: null, xp: null, mp: null, hold: 0 }];
+  const r = tvFeed.enrichRowsFromWalk(rows, [WRT()]);
+  assert.strictEqual(r.filled, 1);
+  assert.strictEqual(r.rows[0].side, 'LONG');
+  assert.strictEqual(r.rows[0].ep, 29100);
+  assert.strictEqual(r.rows[0].xp, 29110);
+  assert.strictEqual(r.rows[0].mp, 10);
+  assert.strictEqual(r.rows[0].hold, 120);
+  assert.strictEqual(r.rows[0].pnl, -280, 'P&L belongs to the fold and must not be rewritten');
+});
+
+test('enrichRowsFromWalk: a SHORT move is signed entry - exit', () => {
+  const rows = [{ t: 1787641120000, x: 1787641120000, size: 2, pnl: 40, side: null, ep: null, xp: null, mp: null }];
+  const r = tvFeed.enrichRowsFromWalk(rows, [WRT({ side: 'sell', entryPrice: 29110, exitPrice: 29100 })]);
+  assert.strictEqual(r.rows[0].side, 'SHORT');
+  assert.strictEqual(r.rows[0].mp, 10, 'a short that fell 10 points made +10, not -10');
+});
+
+test('enrichRowsFromWalk: never second-guesses a row that already knows its side', () => {
+  const rows = [{ t: 1787641120000, x: 1787641120000, size: 2, pnl: -280, side: 'SHORT', ep: 1, xp: 2, mp: -1 }];
+  const r = tvFeed.enrichRowsFromWalk(rows, [WRT({ side: 'buy' })]);
+  assert.strictEqual(r.filled, 0);
+  assert.deepStrictEqual(r.rows[0], rows[0]);
+});
+
+test('enrichRowsFromWalk: a contradicting known size is a different trade', () => {
+  const rows = [{ t: 1787641120000, x: 1787641120000, size: 5, pnl: -280, side: null }];
+  const r = tvFeed.enrichRowsFromWalk(rows, [WRT({ size: 2 })]);
+  assert.strictEqual(r.filled, 0);
+  assert.strictEqual(r.rows[0].side, null);
+});
+
+test('enrichRowsFromWalk: size 0 means NOT OBSERVED, so it excludes nothing', () => {
+  const rows = [{ t: 1787641120000, x: 1787641120000, size: 0, pnl: -280, side: null }];
+  const r = tvFeed.enrichRowsFromWalk(rows, [WRT({ size: 6 })]);
+  assert.strictEqual(r.filled, 1);
+  assert.strictEqual(r.rows[0].size, 6, 'and the real size is recovered');
+});
+
+test('enrichRowsFromWalk: an exit too far away is not matched', () => {
+  const rows = [{ t: 1, x: 1787641120000 + 600000, size: 2, pnl: -280, side: null }];
+  assert.strictEqual(tvFeed.enrichRowsFromWalk(rows, [WRT()]).filled, 0);
+});
+
+test('enrichRowsFromWalk: a TIE is refused, not guessed', () => {
+  // A wrong LONG would corrupt the exact judgement he wants to make against
+  // his higher-timeframe plan. Blank is the safer answer.
+  const rows = [{ t: 0, x: 1787641120000, size: 2, pnl: -280, side: null }];
+  const walk = [WRT({ side: 'buy', exitAt: 1787641120000 - 5000 }),
+                WRT({ side: 'sell', exitAt: 1787641120000 + 5000 })];
+  const r = tvFeed.enrichRowsFromWalk(rows, walk);
+  assert.strictEqual(r.filled, 0);
+  assert.strictEqual(r.ambiguous, 1);
+  assert.strictEqual(r.rows[0].side, null);
+});
+
+test('enrichRowsFromWalk: one round trip cannot be claimed by two rows', () => {
+  const rows = [
+    { t: 0, x: 1787641120000, size: 2, pnl: -10, side: null },
+    { t: 0, x: 1787641121000, size: 2, pnl: -20, side: null },
+  ];
+  const r = tvFeed.enrichRowsFromWalk(rows, [WRT()]);
+  assert.strictEqual(r.filled, 1, 'exactly one row may take the single round trip');
+  assert.strictEqual(r.rows[0].side, 'LONG');
+  assert.strictEqual(r.rows[1].side, null);
+});
+
+test('enrichRowsFromWalk: idempotent — a second pass changes nothing', () => {
+  const rows = [{ t: 1787641120000, x: 1787641120000, size: 2, pnl: -280, side: null }];
+  const once = tvFeed.enrichRowsFromWalk(rows, [WRT()]);
+  const twice = tvFeed.enrichRowsFromWalk(once.rows, [WRT()]);
+  assert.strictEqual(twice.filled, 0);
+  assert.deepStrictEqual(twice.rows, once.rows);
+});
+
+test('enrichRowsFromWalk: never adds, drops or reorders rows', () => {
+  const rows = [
+    { t: 0, x: 1000, size: 2, pnl: -10, side: null },
+    { t: 0, x: 1787641120000, size: 2, pnl: -20, side: null },
+    { t: 0, x: 2000, size: 2, pnl: -30, side: null },
+  ];
+  const r = tvFeed.enrichRowsFromWalk(rows, [WRT()]);
+  assert.strictEqual(r.rows.length, 3);
+  assert.deepStrictEqual(r.rows.map(x => x.pnl), [-10, -20, -30]);
+});
+
+test('enrichRowsFromWalk: empty and missing inputs are safe', () => {
+  assert.deepStrictEqual(tvFeed.enrichRowsFromWalk([], [WRT()]).rows, []);
+  assert.deepStrictEqual(tvFeed.enrichRowsFromWalk(null, [WRT()]).rows, []);
+  assert.strictEqual(tvFeed.enrichRowsFromWalk([{ side: null, x: 1 }], []).filled, 0);
+});
+
+// ── Self-heal: folded trades that never reached the day record (2026-08-26) ─
+// Anoop: "it is not showing how is trades are done for the day." The fold held
+// today's trade (-$203); day_trades.json had no rows for the day at all.
+
+test('missingFromDayRows: an empty day record reports every folded trade', () => {
+  const fold = [{ size: 2, pnl: -203, at: 1787754092531 }];
+  assert.strictEqual(tvFeed.missingFromDayRows(fold, []).length, 1);
+  assert.strictEqual(tvFeed.missingFromDayRows(fold, null).length, 1);
+});
+
+test('missingFromDayRows: a trade already written is NOT reported again', () => {
+  const fold = [{ size: 2, pnl: -203, at: 1787754092531 }];
+  const rows = [{ t: 1787754092531, x: 1787754092531, size: 2, pnl: -203 }];
+  assert.strictEqual(tvFeed.missingFromDayRows(fold, rows).length, 0);
+});
+
+test('missingFromDayRows: a row whose t is the ENTRY time still matches', () => {
+  // Once the walk supplies an entry time, the row's `t` is entryAt while the
+  // fold record's `at` is still the close. Matching only on `at` would
+  // re-add the same trade as a second copy on every later poll.
+  const fold = [{ size: 2, pnl: -203, at: 9000, entryAt: 5000 }];
+  const rows = [{ t: 5000, x: 9000, size: 2, pnl: -203 }];
+  assert.strictEqual(tvFeed.missingFromDayRows(fold, rows).length, 0);
+});
+
+test('missingFromDayRows: same P&L at a DIFFERENT time is a different trade', () => {
+  const fold = [{ size: 2, pnl: -203, at: 1000 }, { size: 2, pnl: -203, at: 2000 }];
+  const rows = [{ t: 1000, x: 1000, size: 2, pnl: -203 }];
+  assert.strictEqual(tvFeed.missingFromDayRows(fold, rows).length, 1);
+  assert.strictEqual(tvFeed.missingFromDayRows(fold, rows)[0].at, 2000);
+});
+
+test('missingFromDayRows: never reports what the writer would refuse', () => {
+  // Reporting a trade as missing that writeLiveTradeToDayRecord then skips
+  // would log a self-heal warning on every single poll, forever.
+  assert.strictEqual(tvFeed.missingFromDayRows([{ pnl: 0, at: 1, pnlUnknown: true }], []).length, 0);
+  assert.strictEqual(tvFeed.missingFromDayRows([{ pnl: NaN, at: 1 }], []).length, 0);
+  assert.strictEqual(tvFeed.missingFromDayRows([{ pnl: -10, at: null }], []).length, 0);
+  assert.strictEqual(tvFeed.missingFromDayRows([null], []).length, 0);
+});
+
+test('missingFromDayRows: cent-level P&L difference is a different trade', () => {
+  const rows = [{ t: 1000, x: 1000, size: 1, pnl: -203.00 }];
+  assert.strictEqual(tvFeed.missingFromDayRows([{ pnl: -203.01, at: 1000 }], rows).length, 1);
+});
+
+test('missingFromDayRows: unreadable rows on disk do not hide a real trade', () => {
+  const rows = [{ t: 1000 }, { pnl: 'x', t: 1000 }, null];
+  assert.strictEqual(tvFeed.missingFromDayRows([{ pnl: -203, at: 1000 }], rows).length, 1);
+});
+
+// ── Cross-route duplicate detection (2026-08-28) ────────────────────────────
+// One closed trade reaches the day record twice: the walk-joined row carries
+// GROSS P&L at the real fill exit, the folded trade carries NET at the moment
+// the fold noticed flat. Matching on pnl@timestamp could never see they were
+// the same trade, so 2026-08-28's single trade became three stored rows.
+{
+  const OPTS = { commissionPerContractPerSide: 0.95 };   // $1.90 round turn
+  const walkRow = (o) => Object.assign({ t: 1787899868000, x: 1787899957000, size: 1, pnl: 3.00, side: 'SHORT' }, o);
+  const foldTrade = (o) => Object.assign({ at: 1787900393198, size: 1, pnl: 1.10 }, o);
+
+  test('a folded trade already stored as a GROSS walk row is not written again', () => {
+    assert.equal(tvFeed.missingFromDayRows([foldTrade()], [walkRow()], OPTS).length, 0);
+  });
+
+  test('without the commission rate it cannot tell — so the rate must be passed', () => {
+    // Documents WHY server.js must supply it: this is the old behaviour.
+    assert.equal(tvFeed.missingFromDayRows([foldTrade()], [walkRow()]).length, 1);
+  });
+
+  test('a GENUINELY missing trade is still reported — the safe direction', () => {
+    // Nothing stored at all.
+    assert.equal(tvFeed.missingFromDayRows([foldTrade()], [], OPTS).length, 1);
+    // A stored row from a different trade: different size.
+    assert.equal(tvFeed.missingFromDayRows([foldTrade()], [walkRow({ size: 4 })], OPTS).length, 1);
+    // Same size but hours away — a different flat event.
+    assert.equal(tvFeed.missingFromDayRows([foldTrade()], [walkRow({ t: 1787800000000, x: 1787800001000 })], OPTS).length, 1);
+  });
+
+  test('a P&L gap that is NOT the commission is a different trade', () => {
+    // Same size, same window, but the gap is not size x $1.90.
+    assert.equal(tvFeed.missingFromDayRows([foldTrade({ pnl: -50 })], [walkRow({ pnl: 3.00 })], OPTS).length, 1);
+  });
+
+  test('the commission arithmetic scales with size', () => {
+    // 4 contracts: gross - net must be 4 x $1.90 = $7.60
+    const w = walkRow({ size: 4, pnl: 100.00 });
+    assert.equal(tvFeed.missingFromDayRows([foldTrade({ size: 4, pnl: 92.40 })], [w], OPTS).length, 0, 'exactly commission apart');
+    assert.equal(tvFeed.missingFromDayRows([foldTrade({ size: 4, pnl: 98.10 })], [w], OPTS).length, 1, 'wrong gap = different trade');
+  });
+
+  test('one stored row cannot absorb two different folded trades', () => {
+    const two = [foldTrade(), foldTrade({ at: 1787900393198 + 1000 })];
+    // Only one can match the single stored row; the other is still missing.
+    assert.equal(tvFeed.missingFromDayRows(two, [walkRow()], OPTS).length, 1);
+  });
+
+  test('an exact P&L match at an exact timestamp still short-circuits', () => {
+    const r = { t: 1787900393198, x: 1787900393198, size: 1, pnl: 1.10 };
+    assert.equal(tvFeed.missingFromDayRows([foldTrade()], [r], OPTS).length, 0);
+  });
+
+  test('unknown-P&L folded trades are never reported missing', () => {
+    assert.equal(tvFeed.missingFromDayRows([foldTrade({ pnlUnknown: true })], [], OPTS).length, 0);
+    assert.equal(tvFeed.missingFromDayRows([foldTrade({ pnl: NaN })], [], OPTS).length, 0);
+  });
+}
+
+// ── mergeTradeRow: identity is the flat event, never the P&L (2026-08-28) ──
+{
+  const OPTS = { commissionPerContractPerSide: 0.95 };   // $1.90 round turn
+  const walk = (o) => Object.assign({ t: 1787899868000, x: 1787899957000, size: 1, pnl: 3.00, side: 'SHORT', ep: 29611, xp: 29609.5, hold: 89 }, o);
+  const foldRow = (o) => Object.assign({ t: 1787900393198, x: 1787900393198, size: 1, pnl: 1.10, side: null, ep: null, xp: null, hold: 0 }, o);
+
+  test('the SAME walk trade re-read with a stale P&L merges, it does not duplicate', () => {
+    // Exactly today's rows 1 and 2: identical stamps and prices, pnl 1.10 vs 0.
+    const r = tvFeed.mergeTradeRow([walk({ pnl: 1.10 })], walk({ pnl: 0 }), OPTS);
+    assert.strictEqual(r.action, 'merged');
+    assert.strictEqual(r.rows.length, 1);
+  });
+
+  test('the fold row for a trade the walk already wrote merges and keeps the prices', () => {
+    const r = tvFeed.mergeTradeRow([walk()], foldRow(), OPTS);
+    assert.strictEqual(r.action, 'merged');
+    assert.strictEqual(r.rows.length, 1);
+    assert.strictEqual(r.rows[0].ep, 29611, 'walk prices survive');
+    assert.strictEqual(r.rows[0].xp, 29609.5);
+    assert.strictEqual(r.rows[0].side, 'SHORT');
+    assert.strictEqual(r.rows[0].pnl, 1.10, 'the NET figure survives, not the gross');
+  });
+
+  test('order does not matter — fold first, then walk', () => {
+    const r = tvFeed.mergeTradeRow([foldRow()], walk(), OPTS);
+    assert.strictEqual(r.action, 'merged');
+    assert.strictEqual(r.rows.length, 1);
+    assert.strictEqual(r.rows[0].pnl, 1.10);
+    assert.strictEqual(r.rows[0].ep, 29611);
+  });
+
+  test('a genuinely different trade is INSERTED — the safe direction', () => {
+    assert.strictEqual(tvFeed.mergeTradeRow([walk()], walk({ size: 4, t: 1787899868000 }), OPTS).action, 'inserted');
+    // hours apart
+    assert.strictEqual(tvFeed.mergeTradeRow([walk()], walk({ t: 1787800000000, x: 1787800001000 }), OPTS).action, 'inserted');
+    // same size and window but a P&L gap that is not the commission
+    assert.strictEqual(tvFeed.mergeTradeRow([walk()], foldRow({ pnl: -50 }), OPTS).action, 'inserted');
+  });
+
+  test('two real scale-outs at the same size minutes apart both survive', () => {
+    // Same size, but P&Ls neither equal nor commission-apart => two trades.
+    // Different exits — identical size AND identical prices cannot produce
+    // different P&L, so the original fixture described an impossible pair.
+    const first = walk({ pnl: 20, xp: 29601 });
+    const second = walk({ t: 1787900100000, x: 1787900200000, pnl: -35, xp: 29628.5 });
+    const r = tvFeed.mergeTradeRow([first], second, OPTS);
+    assert.strictEqual(r.action, 'inserted');
+    assert.strictEqual(r.rows.length, 2);
+  });
+
+  test('an empty day inserts', () => {
+    assert.strictEqual(tvFeed.mergeTradeRow([], walk(), OPTS).action, 'inserted');
+    assert.strictEqual(tvFeed.mergeTradeRow(null, walk(), OPTS).rows.length, 1);
+  });
+
+  test('a null row is skipped rather than throwing', () => {
+    assert.strictEqual(tvFeed.mergeTradeRow([walk()], null, OPTS).action, 'skipped');
+  });
+}
+
+// ── Zero-delta guard: a flat transition with no balance change (2026-08-28) ─
+// Anoop took ONE trade and the fold held two: the real {size 1, pnl 1.10} and
+// a phantom {size 1, pnl 0} three minutes later. A closed trade always moves
+// the balance because commission always applies, so a zero delta means no fill
+// happened — the positions table read empty for a poll and repopulated.
+{
+  const poll = (st, o) => tvFeed.fold(st, Object.assign({
+    isFlat: false, balance: 1000, openSize: 1, brokerHeaderBalance: null,
+  }, o), o.nowMs || 1000);
+
+  test('a flat transition with a ZERO balance delta is not recorded as a trade', () => {
+    let st = tvFeed.freshState();
+    st = poll(st, { isFlat: true, balance: 1000, openSize: 0, nowMs: 1000 });   // baseline
+    st = poll(st, { isFlat: false, balance: 1000, openSize: 1, nowMs: 2000 });  // position opens
+    st = poll(st, { isFlat: true, balance: 1000, openSize: 0, nowMs: 3000 });   // flat, balance UNCHANGED
+    st = poll(st, { isFlat: true, balance: 1000, openSize: 0, nowMs: 3001 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
+    assert.strictEqual(st.tradeCount, 0, 'no money moved — not a trade');
+    assert.strictEqual(st.trades.length, 0);
+    assert.strictEqual(st.phantomFlats, 1, 'but it IS counted as evidence');
+  });
+
+  test('a real trade with a non-zero delta is still recorded', () => {
+    let st = tvFeed.freshState();
+    st = poll(st, { isFlat: true, balance: 1000, openSize: 0, nowMs: 1000 });
+    st = poll(st, { isFlat: false, balance: 1000, openSize: 1, nowMs: 2000 });
+    st = poll(st, { isFlat: true, balance: 1001.10, openSize: 0, nowMs: 3000 });
+    st = poll(st, { isFlat: true, balance: 1001.10, openSize: 0, nowMs: 3001 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
+    assert.strictEqual(st.tradeCount, 1);
+    assert.strictEqual(Math.round(st.trades[0].pnl * 100), 110);
+    assert.strictEqual(st.phantomFlats, 0);
+  });
+
+  test('a LOSING trade is recorded — the guard is on zero, not on sign', () => {
+    let st = tvFeed.freshState();
+    st = poll(st, { isFlat: true, balance: 1000, openSize: 0, nowMs: 1000 });
+    st = poll(st, { isFlat: false, balance: 1000, openSize: 2, nowMs: 2000 });
+    st = poll(st, { isFlat: true, balance: 797, openSize: 0, nowMs: 3000 });
+    st = poll(st, { isFlat: true, balance: 797, openSize: 0, nowMs: 3001 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
+    assert.strictEqual(st.tradeCount, 1);
+    assert.strictEqual(st.trades[0].pnl, -203);
+  });
+
+  test("the phantom does not corrupt the next real trade's baseline", () => {
+    let st = tvFeed.freshState();
+    st = poll(st, { isFlat: true, balance: 1000, openSize: 0, nowMs: 1000 });
+    st = poll(st, { isFlat: false, balance: 1000, openSize: 1, nowMs: 2000 });
+    st = poll(st, { isFlat: true, balance: 1000, openSize: 0, nowMs: 3000 });   // phantom
+    st = poll(st, { isFlat: false, balance: 1000, openSize: 1, nowMs: 4000 });
+    st = poll(st, { isFlat: true, balance: 1050, openSize: 0, nowMs: 5000 });   // real +50
+    st = poll(st, { isFlat: true, balance: 1050, openSize: 0, nowMs: 5001 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
+    assert.strictEqual(st.tradeCount, 1);
+    assert.strictEqual(st.trades[0].pnl, 50, 'baseline was carried through the phantom');
+    assert.strictEqual(st.dayPnl, 50);
+  });
+
+  test("today's real sequence: one trade + one phantom = ONE trade", () => {
+    let st = tvFeed.freshState();
+    st = poll(st, { isFlat: true, balance: 51178.80, openSize: 0, nowMs: 1000 });
+    st = poll(st, { isFlat: false, balance: 51178.80, openSize: 1, nowMs: 2000 });
+    st = poll(st, { isFlat: true, balance: 51179.90, openSize: 0, nowMs: 3000 });   // the real +$1.10
+    st = poll(st, { isFlat: true, balance: 51179.90, openSize: 0, nowMs: 3001 });   // confirmed
+    st = poll(st, { isFlat: false, balance: 51179.90, openSize: 1, nowMs: 4000 });  // table blinks
+    st = poll(st, { isFlat: true, balance: 51179.90, openSize: 0, nowMs: 5000 });   // phantom
+    st = poll(st, { isFlat: true, balance: 51179.90, openSize: 0, nowMs: 5001 });   // + confirming poll: a close now needs flat SEEN TWICE (or broker round-trip evidence)
+    assert.strictEqual(st.tradeCount, 1, 'was 2 before the guard');
+    assert.strictEqual(Math.round(st.dayPnl * 100), 110);
+    assert.strictEqual(st.phantomFlats, 1);
+  });
+}
+
+// ── Same fill prices = same trade (2026-08-28) ──────────────────────────────
+// After the zero-delta guard went in, the store STILL held two rows for one
+// trade: SHORT 29611 -> 29609.5 twice, stamped $0.00 and $1.10. The walk route
+// writes a stale P&L that is neither equal to nor commission-apart from the
+// real figure, so no P&L test could pair them. The prices can.
+{
+  const OPTS = { commissionPerContractPerSide: 0.95, pointValue: 2 };
+  const stale = { t: 1787899868000, x: 1787899957000, size: 1, pnl: 0.00, side: 'SHORT', ep: 29611, xp: 29609.5 };
+  const real  = { t: 1787900304000, x: 1787900304000, size: 1, pnl: 1.10, side: 'SHORT', ep: 29611, xp: 29609.5 };
+
+  test('identical side+entry+exit at the same size merges, whatever the P&L says', () => {
+    const r = tvFeed.mergeTradeRow([stale], real, OPTS);
+    assert.strictEqual(r.action, 'merged');
+    assert.strictEqual(r.rows.length, 1);
+  });
+
+  test('the surviving P&L is recomputed from the prices, not inherited', () => {
+    // SHORT 29611 -> 29609.5 = +1.5pt x 1 x $2 = $3.00 gross, - $1.90 = $1.10
+    assert.strictEqual(tvFeed.mergeTradeRow([stale], real, OPTS).rows[0].pnl, 1.10);
+    // and it is the same answer whichever order they arrive in
+    assert.strictEqual(tvFeed.mergeTradeRow([real], stale, OPTS).rows[0].pnl, 1.10);
+  });
+
+  test('a LONG is recomputed with the right sign', () => {
+    const a = { t: 1, x: 2, size: 2, pnl: 0, side: 'LONG', ep: 100, xp: 110 };
+    const b = Object.assign({}, a, { t: 3, x: 4, pnl: 999 });
+    // +10pt x 2 x $2 = $40 gross, - 2 x $1.90 = $36.20
+    assert.strictEqual(tvFeed.mergeTradeRow([a], b, OPTS).rows[0].pnl, 36.20);
+  });
+
+  test('DIFFERENT prices at the same size are still two trades', () => {
+    const other = Object.assign({}, real, { ep: 29650, xp: 29640 });
+    assert.strictEqual(tvFeed.mergeTradeRow([stale], other, OPTS).action, 'inserted');
+  });
+
+  test('opposite sides at the same prices are two trades', () => {
+    const flipped = Object.assign({}, real, { side: 'LONG' });
+    assert.strictEqual(tvFeed.mergeTradeRow([stale], flipped, OPTS).action, 'inserted');
+  });
+
+  test('a priceless fold row still merges by the commission arithmetic', () => {
+    const foldRow = { t: 1787900304000, x: 1787900304000, size: 1, pnl: 1.10, side: null, ep: null, xp: null };
+    const walkRow = { t: 1787899868000, x: 1787899957000, size: 1, pnl: 3.00, side: 'SHORT', ep: 29611, xp: 29609.5 };
+    const r = tvFeed.mergeTradeRow([walkRow], foldRow, OPTS);
+    assert.strictEqual(r.action, 'merged');
+    assert.strictEqual(r.rows[0].pnl, 1.10);
+    assert.strictEqual(r.rows[0].ep, 29611, 'prices survive');
+  });
+}
+
+test('two SELF-CONSISTENT rows with identical prices are NOT merged — they are two real trades', () => {
+  const OPTS = { commissionPerContractPerSide: 0.95, pointValue: 2 };
+  // SHORT 29611 -> 29609.5, size 1 => $3.00 gross - $1.90 = $1.10 net.
+  // Both rows agree with their own prices, so neither is the stale duplicate.
+  const a = { t: 1, x: 2, size: 1, pnl: 1.10, side: 'SHORT', ep: 29611, xp: 29609.5 };
+  const b = { t: 300000, x: 400000, size: 1, pnl: 1.10, side: 'SHORT', ep: 29611, xp: 29609.5 };
+  // They still merge on the samePnl rule (equal P&L in window) — which is the
+  // pre-existing behaviour — but NOT via the price shortcut on a stale row.
+  // What must never happen is a merge when the P&Ls genuinely differ:
+  const c = { t: 300000, x: 400000, size: 1, pnl: -8.90, side: 'SHORT', ep: 29611, xp: 29620 };
+  assert.strictEqual(tvFeed.mergeTradeRow([a], c, OPTS).action, 'inserted');
+});
+
+// ── One empty read is not a close (2026-08-28) ──────────────────────────────
+// A real LONG ran 19:10:04 -> 19:14:43 on 2026-08-28. The positions table
+// blinked empty at 19:12:49 and the fold booked a SECOND trade mid-flight. The
+// enrich path then back-filled that phantom's prices, so it only looked like a
+// duplicate AFTER the merge that would have caught it had run. The zero-delta
+// guard could not catch it: the balance HAD moved, so the delta was non-zero.
+{
+  const p = (st, o) => tvFeed.fold(st, Object.assign({ brokerHeaderBalance: null }, o), o.nowMs);
+
+  test('a one-poll flat BLINK mid-trade does not book a trade', () => {
+    let st = tvFeed.freshState();
+    st = p(st, { isFlat: true, balance: 1000, openSize: 0, nowMs: 1000 });     // baseline
+    st = p(st, { isFlat: false, balance: 1000, openSize: 3, nowMs: 2000 });    // open
+    st = p(st, { isFlat: true, balance: 1039, openSize: 0, nowMs: 3000 });     // BLINK
+    assert.strictEqual(st.tradeCount, 0, 'a single empty read is not a close');
+    st = p(st, { isFlat: false, balance: 1050, openSize: 3, nowMs: 4000 });    // still open
+    assert.strictEqual(st.tradeCount, 0);
+    st = p(st, { isFlat: true, balance: 1174, openSize: 0, nowMs: 5000 });     // real close
+    st = p(st, { isFlat: true, balance: 1174, openSize: 0, nowMs: 6000 });     // confirmed
+    assert.strictEqual(st.tradeCount, 1, 'the REAL close is booked, once');
+    assert.strictEqual(st.trades[0].pnl, 174, 'and for the whole move, not the blink');
+  });
+
+  test('flat confirmed on two consecutive polls books the trade', () => {
+    let st = tvFeed.freshState();
+    st = p(st, { isFlat: true, balance: 1000, openSize: 0, nowMs: 1000 });
+    st = p(st, { isFlat: false, balance: 1000, openSize: 2, nowMs: 2000 });
+    st = p(st, { isFlat: true, balance: 1100, openSize: 0, nowMs: 3000 });   // 1st flat — held
+    assert.strictEqual(st.tradeCount, 0);
+    st = p(st, { isFlat: true, balance: 1100, openSize: 0, nowMs: 4000 });   // 2nd — booked
+    assert.strictEqual(st.tradeCount, 1);
+    assert.strictEqual(st.trades[0].pnl, 100);
+  });
+
+  test("the broker's own round-trip count books it IMMEDIATELY — no waiting", () => {
+    // Evidence beats persistence: if the order history says a round trip
+    // completed, that is not an inference and needs no second opinion.
+    let st = tvFeed.freshState();
+    st = p(st, { isFlat: true, balance: 1000, openSize: 0, closedRoundTrips: 0, nowMs: 1000 });
+    st = p(st, { isFlat: false, balance: 1000, openSize: 2, closedRoundTrips: 0, nowMs: 2000 });
+    st = p(st, { isFlat: true, balance: 1100, openSize: 0, closedRoundTrips: 1, nowMs: 3000 });
+    assert.strictEqual(st.tradeCount, 1, 'booked on the first flat because the broker confirmed it');
+  });
+
+  test('a fast close-and-reopen is not lost', () => {
+    // The risk of requiring persistence: if he closes and re-opens inside one
+    // poll, flat is never seen twice. The round-trip count is what saves it.
+    let st = tvFeed.freshState();
+    st = p(st, { isFlat: true, balance: 1000, openSize: 0, closedRoundTrips: 0, nowMs: 1000 });
+    st = p(st, { isFlat: false, balance: 1000, openSize: 1, closedRoundTrips: 0, nowMs: 2000 });
+    st = p(st, { isFlat: true, balance: 1050, openSize: 0, closedRoundTrips: 1, nowMs: 3000 });
+    assert.strictEqual(st.tradeCount, 1, 'not lost');
+  });
+
+  test('the blink does not corrupt the eventual P&L baseline', () => {
+    let st = tvFeed.freshState();
+    st = p(st, { isFlat: true, balance: 1000, openSize: 0, nowMs: 1000 });
+    st = p(st, { isFlat: false, balance: 1000, openSize: 3, nowMs: 2000 });
+    st = p(st, { isFlat: true, balance: 1039, openSize: 0, nowMs: 3000 });   // blink
+    st = p(st, { isFlat: false, balance: 1050, openSize: 3, nowMs: 4000 });
+    st = p(st, { isFlat: true, balance: 1174, openSize: 0, nowMs: 5000 });
+    st = p(st, { isFlat: true, balance: 1174, openSize: 0, nowMs: 6000 });
+    assert.strictEqual(st.dayPnl, 174, 'measured from the ORIGINAL flat, not the blink');
+  });
+}
+
+// ── Size-0 fold entries are fragments, not trades (2026-08-28) ─────────────
+// `size` is sizeSeenThisTrade — the largest position the fold ever OBSERVED
+// open. Zero means it saw a balance move but never a position behind it. On
+// 2026-08-28 the fold held nine entries for ~five real trades and every
+// spurious one had size 0, while the real trades were already recorded from
+// the order walk with fill prices.
+{
+  const OPTS = { commissionPerContractPerSide: 0.95 };
+
+  test('a size-0 fold fragment is never written as a row', () => {
+    const frag = { at: 1787924409000, size: 0, pnl: -0.45 };
+    assert.strictEqual(tvFeed.missingFromDayRows([frag], [], OPTS).length, 0);
+  });
+
+  test("today's real fold state: only the entries with an observed size are written", () => {
+    const fold = [
+      { at: 1, size: 1, pnl: 1.10 },      // real
+      { at: 2, size: 0, pnl: -0.45 },     // fragment
+      { at: 3, size: 0, pnl: 39.10 },     // fragment
+      { at: 4, size: 3, pnl: 3.15 },      // real (observed 3 lots)
+      { at: 5, size: 0, pnl: -13.00 },    // fragment
+      { at: 6, size: 2, pnl: -95.90 },    // real
+      { at: 7, size: 0, pnl: -11.45 },    // fragment
+      { at: 8, size: 1, pnl: -25.95 },    // real
+    ];
+    const writable = tvFeed.missingFromDayRows(fold, [], OPTS);
+    assert.strictEqual(writable.length, 4, 'nine fold entries, four writable trades');
+    assert.deepEqual(writable.map(t => t.size), [1, 3, 2, 1]);
+  });
+
+  test('a real trade with an observed size is STILL written — the safe direction', () => {
+    const real = { at: 1787924409000, size: 2, pnl: -140.80 };
+    assert.strictEqual(tvFeed.missingFromDayRows([real], [], OPTS).length, 1);
+  });
+
+  test('suppressing a fragment cannot lose a walk-recorded trade', () => {
+    // A size-0 entry can never match a row by size, so it could only ever be
+    // inserted as a NEW row — never merged into the real one. Suppressing it
+    // is therefore incapable of removing a trade the walk already captured.
+    const walkRow = { t: 1, x: 2, size: 3, pnl: 174.30, side: 'LONG', ep: 29652.75, xp: 29682.75 };
+    const frag = { at: 3, size: 0, pnl: 39.10 };
+    assert.strictEqual(tvFeed.missingFromDayRows([frag], [walkRow], OPTS).length, 0);
+  });
+}
+
+test('a MISSING size is not the same as an observed zero — that trade is still written', () => {
+  // "size: 0" means the fold looked and saw no position. "size absent" means
+  // nobody recorded it. Conflating them would suppress real trades.
+  const OPTS = { commissionPerContractPerSide: 0.95 };
+  assert.strictEqual(tvFeed.missingFromDayRows([{ at: 1000, pnl: -203 }], [], OPTS).length, 1);
+  assert.strictEqual(tvFeed.missingFromDayRows([{ at: 1000, pnl: -203, size: 0 }], [], OPTS).length, 0);
 });

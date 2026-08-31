@@ -127,3 +127,88 @@ test('GUARD: renderer/points-tracker.js is byte-identical to app/points-tracker.
   const copy = fs.readFileSync(renderer, 'utf8');
   assert.strictEqual(copy, src, 'renderer/points-tracker.js has drifted from app/points-tracker.js — copy the source file over it, do not hand-edit the copy');
 });
+
+// ── Ticks + derived points (2026-08-25) ─────────────────────────────────────
+// Anoop: "i want to see how many ticks and points did i capture or loss in
+// these trades on this tab." Every trade of 2026-08-25 rendered '—' in the
+// Journal's Points column because live-fold rows carry no ep/xp/mp.
+
+test('DRIFT GUARD: app/points-tracker.js and renderer/points-tracker.js are identical', () => {
+  // The browser loads renderer/points-tracker.js; these tests load
+  // app/points-tracker.js. They are two copies of one module, so an edit to
+  // either alone means the Journal shows a number the tests never checked.
+  const a = fs.readFileSync(path.join(__dirname, '..', 'points-tracker.js'), 'utf8');
+  const b = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'points-tracker.js'), 'utf8');
+  assert.strictEqual(a, b, 'the two copies of points-tracker.js have drifted');
+});
+
+test('tradePointsResolved: a stored price move (mp) wins and is not marked derived', () => {
+  const r = pt.tradePointsResolved({ size: 2, pnl: 20, mp: 5 }, { commPerContract: 0.95 });
+  assert.strictEqual(r.pts, 5);
+  assert.strictEqual(r.derived, false);
+});
+
+test('tradePointsResolved: no mp falls back to the pnl identity, marked derived', () => {
+  const r = pt.tradePointsResolved({ size: 2, pnl: 20 }, {});
+  assert.strictEqual(r.pts, 5);
+  assert.strictEqual(r.derived, true);
+});
+
+test('tradePointsResolved: a CSV row is gross, so commission is NOT added back', () => {
+  const r = pt.tradePointsResolved({ size: 2, pnl: 20 }, { commPerContract: 0.95 });
+  assert.strictEqual(r.pts, 5);
+});
+
+test('tradePointsResolved: a live-fold row is net, so commission IS added back', () => {
+  // 2026-08-25 trade 2, the case that proves this matters: -$2.80 on 2 lots.
+  // Straight division gives -0.70 pts — a losing trade. It was a 1-tick
+  // WINNER (+$1.00 gross) that commission turned red.
+  const r = pt.tradePointsResolved(
+    { size: 2, pnl: -2.8, evidence: 'fold' }, { commPerContract: 0.95 });
+  assert.ok(Math.abs(r.pts - 0.25) < 1e-9, 'expected +0.25 pts, got ' + r.pts);
+  assert.strictEqual(r.derived, true);
+});
+
+test('isNetOfCommission: recognises both live-feed stamps, rejects a CSV row', () => {
+  assert.strictEqual(pt.isNetOfCommission({ evidence: 'fold' }), true);
+  assert.strictEqual(pt.isNetOfCommission({ source: 'live-fold-only' }), true);
+  assert.strictEqual(pt.isNetOfCommission({ size: 2, pnl: 20 }), false);
+});
+
+test('tradeTicksResolved: MNQ default is 0.25 pts per tick', () => {
+  const r = pt.tradeTicksResolved({ size: 1, pnl: 2 }, {});
+  assert.strictEqual(r.ticks, 4);        // $2 on 1 lot = 1 pt = 4 MNQ ticks
+});
+
+test('tradeTicksResolved: an explicit tickSize overrides the MNQ default', () => {
+  // MGC is 0.1 pts per tick at $10/pt — guessing MNQ here would misreport.
+  const r = pt.tradeTicksResolved({ size: 1, pnl: 10 }, { mult: 10, tickSize: 0.1 });
+  assert.strictEqual(r.ticks, 10);
+});
+
+test('tradePointsResolved / tradeTicksResolved: null on an unusable row', () => {
+  assert.strictEqual(pt.tradePointsResolved({ size: 0, pnl: 5 }, {}), null);
+  assert.strictEqual(pt.tradeTicksResolved({ size: 2, pnl: NaN }, {}), null);
+});
+
+test('totalPointsTicks: replays 2026-08-25 — 3 fold rows, none skipped', () => {
+  const rows = [
+    { size: 5, pnl: -280, evidence: 'fold' },
+    { size: 2, pnl: -2.8000000000029104, evidence: 'fold' },
+    { size: 6, pnl: -291.40000000000146, evidence: 'fold' }
+  ];
+  const tot = pt.totalPointsTicks(rows, { commPerContract: 0.95 });
+  assert.strictEqual(tot.n, 3);
+  assert.strictEqual(tot.derived, 3);
+  assert.strictEqual(tot.skipped, 0);
+  assert.ok(Math.abs(tot.netPts - -50.1333333333) < 1e-6, 'netPts ' + tot.netPts);
+  assert.ok(Math.abs(tot.wonPts - 0.25) < 1e-6, 'wonPts ' + tot.wonPts);
+  assert.strictEqual(Math.round(tot.netTicks), -201);
+  // won/lost must partition the net exactly — no row counted twice or dropped
+  assert.ok(Math.abs((tot.wonPts + tot.lostPts) - tot.netPts) < 1e-9);
+});
+
+test('totalPointsTicks: null when nothing is usable, never a confident zero', () => {
+  assert.strictEqual(pt.totalPointsTicks([], {}), null);
+  assert.strictEqual(pt.totalPointsTicks([{ size: 0, pnl: 1 }], {}), null);
+});

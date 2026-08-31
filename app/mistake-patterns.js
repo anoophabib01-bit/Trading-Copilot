@@ -219,4 +219,75 @@ function checkInvertedRR(trades, opts) {
   };
 }
 
-module.exports = { checkTradeCountEscalation, F1_WIN_THRESHOLD, checkRevengeCluster, F2_LOSS_STREAK, checkInvertedRR };
+
+// ── F4: break-even churn (2026-08-25) ───────────────────────────────────────
+// Anoop's own words, and his own threshold: "There are so many trades in a day
+// that I take break even. Consider anything below 100$ and above -100$ as not
+// a trade... After 5 break even trades, I want you to remind me that there are
+// 5 break even trades."
+//
+// On 2026-08-25 he took 11 trades. EIGHT of them landed inside +/-$100 — one at
+// -$0.80, one at +$5.60. That is a day of paying commission to hold a seat: the
+// FEES on those seven are real money out, while the P&L they were risked for
+// rounds to nothing. His framing is that they should not count as trades at
+// all; the count itself is the signal he wants handed back to him.
+//
+// The band is a RULE, so it lives in rules.json (breakEvenBandUsd) like every
+// other threshold in this app — never hardcoded here. Same for the count that
+// trips the reminder (breakEvenReminderCount).
+//
+// DELIBERATELY ADVISORY, and deliberately NOT wired into the trade-count
+// ceiling. "Not a trade" is the right lens for judging his own session
+// quality; it is the wrong lens for a safety cap, because excluding break-even
+// trades from rules.json's tradesPerDay would let an unlimited number of them
+// through — churn is exactly what this pattern exists to flag, so it must not
+// also become the loophole. Both numbers are reported side by side instead.
+const F4_BAND_USD = 100;      // fallback only; rules.json is the source of truth
+const F4_REMINDER_COUNT = 5;  // fallback only; his stated number
+
+/**
+ * @param {Array} trades  today's trades (tv-broker-feed.js fold() shape)
+ * @param {object} opts   { breakEvenBandUsd, breakEvenReminderCount }
+ * @returns {{matched:boolean, breakEvenCount:number, realCount:number,
+ *            totalCount:number, band:number, feesRisked:number|null,
+ *            message:string|null}}
+ */
+function checkBreakEvenChurn(trades, opts) {
+  const list = Array.isArray(trades) ? trades : [];
+  const o = opts || {};
+  const band = Number(o.breakEvenBandUsd) > 0 ? Number(o.breakEvenBandUsd) : F4_BAND_USD;
+  const trip = Number(o.breakEvenReminderCount) > 0 ? Number(o.breakEvenReminderCount) : F4_REMINDER_COUNT;
+  // pnlUnknown rows are backfilled-from-orders: their $ result genuinely is
+  // not known, so they can be neither confirmed nor denied as break-even.
+  // Counting them either way would invent the number this is meant to report.
+  const known = list.filter(t => t && !t.pnlUnknown && typeof t.pnl === 'number');
+  const be = known.filter(t => Math.abs(t.pnl) < band);
+  const realCount = known.length - be.length;
+  const matched = be.length >= trip;
+  // Commission actually paid to take the trades that returned nothing. Only
+  // computable when a rate is supplied AND size was observed (size 0 means
+  // "not observed", never zero contracts), so it stays null rather than
+  // under-reporting a partial sum as if it were the total.
+  let feesRisked = null;
+  const rate = Number(o.commissionPerContractPerSide);
+  if (rate > 0 && be.length && be.every(t => Number(t.size) > 0)) {
+    feesRisked = Math.round(be.reduce((a, t) => a + Number(t.size) * rate * 2, 0) * 100) / 100;
+  }
+  return {
+    matched,
+    breakEvenCount: be.length,
+    realCount,
+    totalCount: known.length,
+    band,
+    feesRisked,
+    message: matched
+      ? `BREAK-EVEN CHURN: ${be.length} of your ${known.length} trades today landed inside +/-$${band} ` +
+        `— by your own definition those are not trades. Only ${realCount} ` +
+        `${realCount === 1 ? 'was' : 'were'} a real trade.` +
+        (feesRisked !== null ? ` You paid about $${feesRisked.toFixed(2)} in commission for the ${be.length} that went nowhere.` : '') +
+        ` You asked to be told at ${trip}. Either the setup is worth $100+ or it is not worth clicking.`
+      : null,
+  };
+}
+
+module.exports = { checkTradeCountEscalation, F1_WIN_THRESHOLD, checkRevengeCluster, F2_LOSS_STREAK, checkInvertedRR, checkBreakEvenChurn, F4_BAND_USD, F4_REMINDER_COUNT };

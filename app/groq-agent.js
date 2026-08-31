@@ -357,7 +357,23 @@ class GroqAgent {
     } catch {
       this._omniRouteHealthy = false;
     }
-    if (!this._omniRouteHealthy) console.log('[OmniRoute] health probe failed — will skip to Gemini fallback');
+    // Log the TRANSITION, not every probe. This runs every 30s and, when
+    // OmniRoute is not running locally, fails every single time — which on
+    // 2026-08-26 accounted for 425 of 567 lines in the server log, 75% of the
+    // output. That is not a cosmetic problem: the live feed is diagnosed by
+    // reading this log, and the MCP timeouts and panel self-heal messages that
+    // actually mattered were buried in the noise. Same discipline the panel
+    // watchdog already states for itself — a check that logs every minute is a
+    // check nobody reads.
+    //
+    // Behaviour is unchanged: the fallback to Gemini already happens through
+    // _omniRouteHealthy regardless of what is printed.
+    if (this._omniRouteHealthy !== this._omniRouteLastLoggedHealth) {
+      console.log(this._omniRouteHealthy
+        ? '[OmniRoute] health probe recovered — available as primary again'
+        : '[OmniRoute] health probe failed — skipping to Gemini fallback (silenced until it changes)');
+      this._omniRouteLastLoggedHealth = this._omniRouteHealthy;
+    }
     return this._omniRouteHealthy;
   }
 

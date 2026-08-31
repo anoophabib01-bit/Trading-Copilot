@@ -131,7 +131,15 @@ function renderNowMarkdown(state, nowMs) {
   const watchers = s.watchers || {};
   const recent = Array.isArray(s.recent) ? s.recent : [];
 
-  const dayPnl = typeof feed.dayPnl === 'number' ? feed.dayPnl : null;
+  // 2026-08-24: `pnl` and `tradeCount` are now handed in pre-resolved by the
+  // caller (tv-broker-feed's effectiveDayPnl/effectiveTradeCount) rather than
+  // read raw off the feed state. This surface is what he actually had on
+  // screen when it read -$154.20 against the broker's real +$399.70, so it
+  // must not do its own arithmetic — it renders the one number the rest of
+  // the app enforces on, and says where that number came from.
+  const pnl = s.pnl || {};
+  const dayPnl = typeof pnl.value === 'number' ? pnl.value
+    : (typeof feed.dayPnl === 'number' ? feed.dayPnl : null);
   const tier = lossTierStatus(dayPnl, rules.dailyLossTiers);
 
   const tvUp = watchers.tvConnected === true;
@@ -149,10 +157,42 @@ function renderNowMarkdown(state, nowMs) {
   out.push('');
   out.push('| | |');
   out.push('|---|---|');
-  out.push('| Balance | ' + money(feed.balanceAtLastFlat) + ' |');
-  out.push('| Day P&L | **' + money(dayPnl) + '** |');
-  out.push('| Trades | ' + (feed.tradeCount != null ? feed.tradeCount : '—') +
-           (rules.tradesPerDay != null ? ' / ' + rules.tradesPerDay : '') + ' |');
+  // 2026-08-24: Net Liq (the broker's own account figure, matching the EQUITY
+  // column he reads) in preference to balanceAtLastFlat, which came from the
+  // header strip and drifts on its own between trades.
+  // 2026-08-24 CORRECTED same day: the header balance, not Net Liq. Net Liq
+  // comes from the summary table, which was observed frozen for 70 minutes
+  // while the header tracked the broker's own export exactly. See
+  // tv-broker-feed.js's readBrokerPnl correction note.
+  const bal = typeof feed.brokerHeaderBalance === 'number' ? feed.brokerHeaderBalance
+    : typeof feed.brokerNetLiq === 'number' ? feed.brokerNetLiq
+    : feed.balanceAtLastFlat;
+  out.push('| Balance | ' + money(bal) + ' |');
+  out.push('| Day P&L | **' + money(dayPnl) + '**' +
+           // Provenance inline, not in a footnote. "broker" means this is the
+           // account panel's own session total, open P&L included, and should
+           // tie out to what Tradovate shows. "estimated" means the summary
+           // panel was unreadable and this is the balance-delta fold, which
+           // only covers trades this instance watched close — a number to
+           // treat as a floor, not as the truth.
+           (pnl.source === 'fold' ? ' _(estimated — broker panel unreadable)_'
+            : pnl.stale ? ' _(⚠ panel is BEHIND by ~' + money(pnl.staleBy) + ' — click Account Summary in the broker panel)_'
+            : '') + ' |');
+  // Split realized vs open only when a position is actually running: on a
+  // flat account the two lines would say the same thing twice.
+  if (typeof pnl.open === 'number' && pnl.open !== 0) {
+    out.push('| ├ realized | ' + money(pnl.realized) + ' |');
+    out.push('| └ open | ' + money(pnl.open) + ' |');
+  }
+  const tradeCount = s.tradeCount || {};
+  const tc = tradeCount.value != null ? tradeCount.value
+    : (feed.tradeCount != null ? feed.tradeCount : null);
+  out.push('| Trades | ' + (tc != null ? tc : '—') +
+           (rules.tradesPerDay != null ? ' / ' + rules.tradesPerDay : '') +
+           // A count carrying fill-edge-only evidence is advisory, and saying
+           // so is the difference between him stopping and him wondering why
+           // the app thinks he has traded twice as much as he has.
+           (tradeCount.evidence === 'degraded' ? ' _(provisional)_' : '') + ' |');
   out.push('| Size cap | ' + (rules.sizeCap != null ? rules.sizeCap : '—') + ' |');
   out.push('');
 

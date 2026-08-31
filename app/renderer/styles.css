@@ -2798,3 +2798,32 @@ html.theme-dark .analysis-block { padding: 14px; margin-bottom: 14px; }
 }
 #live-feed-health button:hover { border-color: var(--red, #ff5c5c); }
 #live-feed-selftest { cursor: pointer; }
+
+/* ── CONTROL toggle (2026-08-26) — who is placing the trades ────────────────
+   Shares the geometry of .trading-mode-toggle so it reads as part of the same
+   header row, but each state carries its OWN colour rather than the shared
+   white "active" fill. That is deliberate: the other toggles pick a ruleset
+   and any of their states is equally normal, whereas here the three states
+   are not peers — one of them means an automated system is sending real
+   orders. Colour is the fastest possible answer to "who is in charge", which
+   is exactly what Anoop asked the toggle to make unmistakable. */
+.control-toggle { display: flex; background: var(--surface2); border: 1px solid var(--border2); border-radius: var(--radius-sm); overflow: hidden; margin-left: 14px; margin-top: 6px; }
+.ctrl-btn { background: none; border: none; color: var(--text-dim); font-size: 10px; font-weight: 700; letter-spacing: 0.06em; padding: 5px 10px; cursor: pointer; transition: all 0.15s; }
+.ctrl-btn:hover { color: var(--text); }
+.ctrl-btn.active { background: var(--white); color: #000; }
+/* SHADOW = amber: recording, nothing submitted. */
+#ctrl-shadow-btn.active { background: #d99a2b; color: #000; }
+/* LIVE = red, and only ever applied when the gate actually GRANTED live.
+   A requested-but-refused LIVE must never render in this colour. */
+#ctrl-live-btn.active { background: #c0392b; color: #fff; }
+
+#control-status { margin-left: 8px; margin-top: 6px; font-size: 10px; letter-spacing: 0.04em; color: var(--text-dim); cursor: pointer; align-self: center; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#control-status.shadow { color: #d99a2b; }
+/* ASSIST (2026-08-29) gets its OWN colour, deliberately not the live red.
+   Real orders can be placed in this mode, so it must not read as inert like
+   shadow's amber — but every one of them passes through Anoop's click, so it
+   must not read as "the app is trading on its own" either. A distinct blue is
+   the honest third state; reusing either neighbour's colour would misstate
+   who is in charge, which is the one thing this toggle exists to answer. */
+#control-status.assist { color: #4aa8d8; font-weight: 700; }
+#control-status.live { color: #ff6b5a; font-weight: 700; }

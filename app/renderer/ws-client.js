@@ -536,6 +536,11 @@
       case 'account-db-result':
       case 'journey-list':
       case 'journey-result':
+      // Weekly Report (2026-08-29). Every week-* request answers with this ONE
+      // message type carrying the whole tab state, so the client never has to
+      // merge a partial update into a stale view — and so the tab, the Saturday
+      // markdown and the Telegram push can never disagree about a number.
+      case 'week-report-data':
         resolvePending(msg.reqId, msg);
         break;
 
@@ -550,6 +555,35 @@
         }
         break;
 
+      // A finished week was auto-frozen and its note written. Pushed, not
+      // polled, so the nudge arrives even if the Week tab has never been opened.
+      case 'week-ready':
+        if (typeof wkOnWeekReady === 'function') wkOnWeekReady(msg);
+        break;
+
+      case 'health-protocol-report':
+        if (typeof renderHealthProtocol === 'function') renderHealthProtocol(msg);
+        break;
+      case 'feed-protocol-report':
+        if (typeof renderFeedProtocol === 'function') renderFeedProtocol(msg);
+        break;
+      case 'self-repair':
+        // A mismatch the app FIXED, with the evidence of what it did. Anoop
+        // asked for exactly this: not a number that quietly becomes right,
+        // but a visible record that the correction happened.
+        if (typeof renderSelfRepair === 'function') renderSelfRepair(msg);
+        break;
+      case 'shadow-ticket':
+        // The shadow trade ticket — direction, stop/target in dollars AND
+        // ticks, and why the setup was confirmed. Rendered into chat because
+        // that is the surface Anoop actually reads during a session.
+        if (typeof renderShadowTicket === 'function') renderShadowTicket(msg);
+        break;
+      case 'autonomy-status':
+        // Renders the EFFECTIVE mode, not the requested one — see
+        // applyControlUI in app.js for why that distinction is load-bearing.
+        if (typeof applyControlUI === 'function') applyControlUI(msg);
+        break;
       case 'trading-mode':
         if (typeof applyTradingModeUI === 'function') applyTradingModeUI(msg.mode || 'standard');
         if (msg.reqId) resolvePending(msg.reqId, msg);
@@ -587,6 +621,31 @@
 
   // ── Public window.api ────────────────────────────────────────────────────────
   window.api = {
+
+    // Fire-and-forget message to the server.
+    //
+    // ADDED 2026-08-26 to fix a bug that had been live since the Standard/
+    // Scalper toggle shipped on 2026-08-01: app.js's switchTradingMode() did
+    // `if (ws && ws.readyState === 1) ws.send(...)`, but `ws` is declared with
+    // `let` INSIDE this IIFE and was never exposed on window. So the reference
+    // threw ReferenceError, the send never happened, AND the line after it
+    // (applyTradingModeUI) never ran — which is why the button did not even
+    // move. The toggle was dead in both directions: it could not tell the
+    // server anything, and it could not show that it had failed.
+    //
+    // The scalper RULES were always real (rules.json scalperRules changes
+    // tradesPerDay, maxHoldSeconds and the daily loss tiers); only the button
+    // was broken. `applyTradingModeUI` is still called from the config
+    // handler above, so the button always rendered the server's actual mode —
+    // which is exactly why this looked like a working toggle that "did
+    // nothing" rather than an obviously broken one.
+    //
+    // Returns true if the message actually went out, so a caller can tell the
+    // difference between "sent" and "socket was down" instead of assuming.
+    send: (obj) => {
+      if (!ws || ws.readyState !== 1) return false;
+      try { ws.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
+    },
 
     // Config
     getConfig: () => {
@@ -837,6 +896,15 @@
     journeyAction: (action, args) => sendRequest(Object.assign({ type: 'journey-action', action }, args || {})).then(r => r),
 
     // Daily Journal: per-account notes + chart screenshots (2026-07-25)
+    // ── Weekly Report (2026-08-29) ──────────────────────────────────────────
+    // All four resolve with the same full 'week-report-data' payload, so a
+    // save re-renders from the server's own recomputation rather than from
+    // what the client hoped it wrote.
+    weekReport:   (offset)              => sendRequest({ type: 'week-report-get', offset: offset || 0 }, 20000),
+    weekCommit:   (weekKey, commitment) => sendRequest({ type: 'week-commit-set', weekKey, commitment }, 20000),
+    weekDoctrine: (text)                => sendRequest({ type: 'week-doctrine-set', text }, 20000),
+    weekFreeze:   (weekKey)             => sendRequest({ type: 'week-freeze', weekKey }, 20000),
+
     noteSave: (slotId, date, note) => sendRequest({ type: 'note-save', slotId, date, note }).then(r => r.ok),
     shotSave: (slotId, date, base64, ext) => sendRequest({ type: 'shot-save', slotId, date, base64, ext }).then(r => r.file),
     shotList: (slotId, date)        => sendRequest({ type: 'shot-list', slotId, date }).then(r => r.files || []),

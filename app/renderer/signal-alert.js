@@ -40,9 +40,17 @@ function signalKey(type, msg) {
 
   switch (type) {
     case 'engulf':
-      // An engulf is identified by its bar; `time` is the bar's own IST stamp
-      // from the server, not the poll clock, so it is stable across re-fires.
-      return 'engulf|' + tf + '|' + dir + '|' + (m.time || '?');
+      // An engulf is identified by the BAR THAT CAUSED IT.
+      //
+      // 2026-08-27 correction: the comment here used to claim `time` was "the
+      // bar's own IST stamp from the server, not the poll clock". It was the
+      // poll clock — server.js built it with `new Date()` at the moment the
+      // monitor noticed, so every re-fire produced a different key and the
+      // dedup this module exists for never engaged for engulfs at all. The
+      // server now sends `barTime` (the closed candle's own timestamp); prefer
+      // it, and fall back to `time` only for an older server, where the old
+      // wrong-but-harmless behaviour is still better than crashing.
+      return 'engulf|' + tf + '|' + dir + '|' + (m.barTime != null ? m.barTime : (m.time || '?'));
     case 'fvg':
       // The gap bounds ARE the setup. Same gap = same setup, however many
       // polls confirm it.
@@ -71,7 +79,13 @@ function describeSignal(type, msg) {
 
   switch (type) {
     case 'engulf':
-      return 'Engulfing ' + tf + (dir ? ' · ' + dir : '');
+      // The candle's own close time, its close price, and any key level it
+      // traded through — the three things needed to find it on the chart for a
+      // manual re-check. All optional; an older server sends none of them.
+      return 'Engulfing ' + tf + (dir ? ' · ' + dir : '') +
+        (m.barCloseIST ? ' · candle ' + m.barCloseIST : '') +
+        (m.price != null ? ' · ' + m.price : '') +
+        (m.levelNote ? ' ' + String(m.levelNote).replace(/^\s*—\s*/, '· ') : '');
     case 'fvg':
       return 'FVG ' + tf + (dir ? ' · ' + dir : '') +
         (m.gapLow != null && m.gapHigh != null ? ' · gap ' + m.gapLow + '–' + m.gapHigh : '');

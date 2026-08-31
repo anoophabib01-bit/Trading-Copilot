@@ -12,18 +12,58 @@ REM  remote-debugging flag the Co-Pilot needs. Ordering also mattered and was
 REM  easy to get wrong. This does both, in the right order, every time.
 REM
 REM    1. TradingView, always with --remote-debugging-port=9222
-REM    2. Wait for it to finish booting
-REM    3. The Co-Pilot server from G:
+REM    2. The Co-Pilot server from G:
 REM
 REM  Use THIS and nothing else to start your trading setup.
 REM ============================================================================
+REM
+REM  REWRITTEN 2026-08-29 after Anoop reported "it's taking so much time and
+REM  TradingView did not auto start". Three separate faults, all measured:
+REM
+REM    1. STALE PATH. TV_EXE was hardcoded to the 3.3.0.0 WindowsApps folder.
+REM       TradingView had auto-updated to 3.4.0.0 - a different folder - so the
+REM       path no longer existed and this script silently skipped launching it.
+REM       Now resolved at run time from the package registration, so a future
+REM       update cannot break it. (scripts\ensure-tradingview.ps1)
+REM
+REM    2. THE READINESS CHECK COULD NEVER PASS. It probed
+REM       http://localhost:9222 - and "localhost" resolves to the IPv6 loopback
+REM       ::1 first here, while TradingView's debug port is IPv4 only. .NET does
+REM       not fall back the way Node does, so every probe burned its full 2s
+REM       timeout. 45 attempts, each in a FRESH powershell process (~1s start-up
+REM       each) = over two minutes of waiting to reach the wrong answer. The
+REM       probe now uses 127.0.0.1 and runs in ONE process. Measured on this
+REM       machine: 135s -> 0.32s when TradingView is already up.
+REM
+REM    3. IT KILLED EVERY NODE PROCESS ON THE MACHINE. `taskkill /F /IM
+REM       node.exe` took out MCP servers and other Node tooling on every single
+REM       launch, silently. Now stops only the process holding port 7433 plus
+REM       any leaked tradingview-mcp child of this repo.
+REM       (scripts\stop-copilot-server.ps1)
+REM
+REM  If TradingView is ALREADY running with the debug port open, this now reuses
+REM  it instead of killing a working chart and paying the cold start again.
+REM ============================================================================
 
 set "ROOT=G:\MNQ-CoPilot"
-set "TV_EXE=C:\Program Files\WindowsApps\31178TradingViewInc.TradingView_3.3.0.0_x64__q4jpyh43s5mv6\TradingView.exe"
+set "PS=powershell -NoProfile -ExecutionPolicy Bypass -File"
 
 echo.
 echo  ============================================
 echo    MNQ CO-PILOT
+echo  ============================================
+
+REM Say out loud which mode this is. Which shortcut you double-click is the
+REM only thing that decides whether the oversize guard can actually close
+REM contracts, so it must never be a guess. See oversize-guard.js.
+if "%TV_ALLOW_LIVE_ORDERS%"=="1" (
+    echo    LIVE ORDERS: ENABLED
+    echo    The oversize guard can CLOSE contracts. Tickets can execute.
+) else (
+    echo    LIVE ORDERS: off  ^(alarm-only^)
+    echo    The oversize guard will WARN but cannot close anything.
+    echo    Use "START CO-PILOT ^(LIVE ORDERS^).bat" if you want it to act.
+)
 echo  ============================================
 echo.
 
@@ -34,72 +74,39 @@ if not exist "%ROOT%\app\server.js" (
 )
 
 REM ------------------------------------------------------------ TradingView ---
-echo  [1/3] Starting TradingView with the debug connection enabled...
-taskkill /IM TradingView.exe /F >nul 2>&1
-timeout /t 2 /nobreak >nul
-
-if not exist "%TV_EXE%" (
+echo  [1/2] Making sure TradingView is up with the debug connection...
+%PS% "%~dp0scripts\ensure-tradingview.ps1" -Port 9222 -TimeoutSec 90
+if errorlevel 1 (
     echo.
-    echo  [!] TradingView.exe not found at the expected path.
-    echo      It has probably auto-updated to a new version folder.
-    echo      Tell Claude and the path will be updated.
-    echo      Continuing without it - the chart features will not work.
-    timeout /t 4 >nul
+    echo       [!] TradingView is not answering on port 9222.
+    echo           Chart features will be down until it is. The server keeps
+    echo           retrying on its own heartbeat, so it may still recover.
 ) else (
-    start "" "%TV_EXE%" --remote-debugging-port=9222
-    echo       Launched.
+    echo       TradingView ready.
 )
-
-echo.
-echo  [2/3] Waiting for TradingView's debug port to actually respond...
-REM FIX 2026-08-06 (Anoop: "the app doesn't get connected to MCP on start
-REM up"): this used to be a blind 30-second sleep. TradingView cold-start
-REM boot time genuinely varies 20-60s+ depending on the machine/day, so a
-REM fixed 30s wait meant the Co-Pilot server sometimes started probing CDP
-REM before TradingView was actually ready — mcp-bridge.js's own heartbeat
-REM recovery logic would eventually catch it, but only after a slow first
-REM connect + a full recovery cycle (up to another ~2min), which read as
-REM "doesn't connect on startup." Poll the real CDP endpoint instead of
-REM guessing a fixed delay: proceed the moment it's actually up, wait
-REM longer (up to 90s) if it's genuinely still booting.
-set "TV_READY=0"
-for /l %%i in (1,1,45) do (
-    if "!TV_READY!"=="0" (
-        powershell -NoProfile -Command "try { (Invoke-WebRequest -Uri 'http://localhost:9222/json/version' -UseBasicParsing -TimeoutSec 2) | Out-Null; exit 0 } catch { exit 1 }" >nul 2>&1
-        if not errorlevel 1 (
-            set "TV_READY=1"
-        ) else (
-            timeout /t 2 /nobreak >nul
-        )
-    )
-)
-if "%TV_READY%"=="1" (
-    echo       TradingView's debug port is up.
-) else (
-    echo       [!] Still not responding after 90s - continuing anyway.
-    echo           mcp-bridge.js will keep retrying on its own heartbeat.
-)
-REM Give the page itself a moment to finish loading the chart even after
-REM the debug port answers - the port can come up before the UI is usable.
-timeout /t 5 /nobreak >nul
 
 REM --------------------------------------------------------------- Co-Pilot ---
 echo.
-echo  [3/3] Starting the Co-Pilot server...
-taskkill /F /IM node.exe >nul 2>&1
-timeout /t 1 /nobreak >nul
+echo  [2/2] Starting the Co-Pilot server...
+%PS% "%~dp0scripts\stop-copilot-server.ps1" -Port 7433 -RepoRoot "%ROOT%"
 cd /d "%ROOT%\app"
 start "Co-Pilot" cmd /k "node server.js"
 
 echo.
 echo  ============================================
-echo   Both are starting.
-echo.
 echo   Browser opens at http://localhost:7433
 echo   Data saves to  %ROOT%\DATA
+echo.
+echo   Watch the server window for this line:
+echo     [oversize] guard ARMED ...
+echo   It tells you whether the guard can act.
 echo.
 echo   If the red dot does not clear within a
 echo   minute, just run this launcher again.
 echo  ============================================
 echo.
-timeout /t 6 >nul
+REM `timeout` fails outright when stdin is redirected ("input redirection is
+REM not supported"), which is exactly what happens when this launcher is run
+REM from a script or a test harness rather than double-clicked. ping is the
+REM redirect-safe way to pause in batch.
+ping -n 7 127.0.0.1 >nul

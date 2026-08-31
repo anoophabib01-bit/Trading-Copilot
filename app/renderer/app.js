@@ -49,7 +49,8 @@ const state = {
   engulf: {
     '1h':  { running: false, history: [], lastBias: null },
     '30m': { running: false, history: [], lastBias: null },
-    '15m': { running: false, history: [], lastBias: null }
+    '15m': { running: false, history: [], lastBias: null },
+    '5m':  { running: false, history: [], lastBias: null }
   },
   fvg: {
     '30m': { running: false, history: [] }
@@ -108,6 +109,12 @@ window.state = state;
 const ACCOUNT_PROFILES = {
   '50k': {
     label: '$50K',
+    // CONFIRMED 2026-08-28 against Tradeify's help centre: 50K Select
+    // Evaluation is $3,000 target / $2,000 END-OF-DAY trailing drawdown.
+    // startBalance is the real 50000, NOT the 50378.60 I back-fitted from
+    // the broker balance earlier: that method silently absorbs whatever the
+    // ledger is missing (it only starts 2026-08-17), turning a visible gap
+    // into a hidden one. The broker balance wins for display anyway.
     eval:   { startBalance: 50000,  target: 3000,  maxLoss: 2000,  accountId: null, placeholder: false, notOpened: false },
     // 2026-08-12: `blown` is DATA, not a hardcoded size check. Two places below
     // read `state.accountSize === '50k' && mode === 'funded'` to decide the
@@ -408,12 +415,42 @@ function saveActiveBucket() {
 // Fire-and-forget mirror of the per-slot datasets to disk. Never blocks the
 // UI and never throws into a caller — a disk problem must not interrupt a
 // live trading session.
+// ── The lost-update race this used to cause (2026-08-26) ───────────────────
+// Anoop: "i do not want this to happen again."
+//
+// This runs on a 30-second autosave and blind-writes localStorage over the
+// account's disk files. For most keys that is fine — the renderer is their
+// only writer. For THREE of them it is a lost-update race, because the SERVER
+// writes them too, from a different process, whenever a trade closes:
+//
+//   day_trades, gr_history, balance_ledger
+//
+// The sequence is always the same: the server writes the truth, then within
+// 30s this overwrites it with whatever the tab happened to hold. It has now
+// destroyed real data three separate times —
+//
+//   2026-08-24  a cleanup of 19 phantom rows was reverted byte-identically
+//               73 seconds after it was made
+//   2026-08-26  a closed trade the server had written to the day record was
+//               erased, so the Journal showed no trades for the day
+//   2026-08-26  a repair that stamped pnlBasis and re-graded the day was
+//               reverted the same way, which is how it was finally caught
+//
+// The server already broadcasts day-record-updated and the renderer already
+// applies it to localStorage, so the tab stays current WITHOUT this write.
+// And every legitimate renderer-side change to these three — the CSV import
+// (csvApply) and the guardrail's day rollover (archive) — writes them
+// explicitly through dataSave. Nothing needs the blind periodic copy; it only
+// ever raced the server.
+//
+// So: the three server-owned keys are no longer mirrored. The rest still are,
+// because for those the tab genuinely is the only writer and the original
+// reason for this function — "nothing lives only in the browser" — still holds.
+const SERVER_OWNED_KEYS = ['day_trades', 'gr_history', 'balance_ledger'];
+
 function mirrorSlotDataToDisk() {
   if (!window.api || !window.api.dataSave || !activeSlotId) return;
   const pairs = [
-    ['gr_history', 'copilot_gr_history'],
-    ['balance_ledger', 'copilot_balance_ledger'],
-    ['day_trades', 'copilot_day_trades'],
     ['pb_tags', 'copilot_pb_tags'],
     ['maemfe', 'copilot_maemfe'],
     ['loop_state', 'copilot_loop'],
@@ -421,6 +458,9 @@ function mirrorSlotDataToDisk() {
     ['eval_milestones', 'copilot_eval_milestones'],
   ];
   pairs.forEach(([key, lsKey]) => {
+    // Belt and braces: even if someone adds one of these back to the list
+    // above, it must not be blind-written from here.
+    if (SERVER_OWNED_KEYS.indexOf(key) !== -1) return;
     try {
       const raw = localStorage.getItem(lsKey);
       if (!raw) return; // never overwrite a good disk file with nothing
@@ -580,12 +620,17 @@ function enforceAccountInvariant(size, stage) {
   // and a CSV upload for today always wins over it (checked first, below).
   const todayKey = csvDayKey();
   let liveTodayNet = null;
-  if (!ledger[todayKey]) {
-    try {
-      const gs = JSON.parse(localStorage.getItem('copilot_guardrail_v1') || 'null');
-      if (gs && gs.live && gs.live.connected) liveTodayNet = gs.live.dayPnl || 0;
-    } catch (e) {}
-  }
+  let brokerBalance = null;
+  let liveIsFlat = null;
+  try {
+    const gs = JSON.parse(localStorage.getItem('copilot_guardrail_v1') || 'null');
+    if (gs && gs.live && gs.live.connected) {
+      if (!ledger[todayKey]) liveTodayNet = gs.live.dayPnl || 0;
+      // The broker's own figure, read every poll. Authoritative when present.
+      if (Number.isFinite(gs.live.brokerBalance)) brokerBalance = gs.live.brokerBalance;
+      liveIsFlat = gs.live.isFlat;
+    }
+  } catch (e) {}
 
   // Recompute balance + EOD-trailing floor straight from the ledger (+ live today, if applicable).
   const lockFloorValue = start + 100;
@@ -601,10 +646,31 @@ function enforceAccountInvariant(size, stage) {
   }
   bal = Math.round(bal * 100) / 100;
 
+  // ── THE BROKER WINS (2026-08-28) ─────────────────────────────────────────
+  // The invariant above exists because the balance kept getting corrupted by
+  // one of four storage layers, and deriving it from the ledger made it
+  // self-healing. That reasoning still holds AGAINST STORAGE — but not
+  // against the broker itself. The broker's balance is not a fourth cached
+  // copy, it is the account, and on 2026-08-28 the derived figure was
+  // $378.60 below it because startBalance was wrong.
+  //
+  // So: broker wins when present, ledger derivation is the fallback when the
+  // feed is down, and any disagreement between them is SURFACED rather than
+  // silently resolved. A quiet override would have hidden the very drift this
+  // whole block was written to catch.
+  const derivedBal = bal;
+  let ledgerDrift = null;
+  if (brokerBalance != null) {
+    ledgerDrift = Math.round((brokerBalance - derivedBal) * 100) / 100;
+    bal = brokerBalance;
+  }
+
   const acc = state.account;
   const before = acc.balance;
   acc.balance = bal;
-  acc.balanceSource = usingLiveToday ? 'live' : 'csv'; // 2026-08-17: read by updateAccountUI for a source label
+  acc.derivedBalance = derivedBal;
+  acc.ledgerDrift = ledgerDrift;
+  acc.balanceSource = brokerBalance != null ? 'broker' : (usingLiveToday ? 'live' : 'csv'); // read by updateAccountUI for a source label
   if (isEval) acc.evalFloor = Math.round(floor); else acc.fundedFloor = Math.round(floor);
   // Deterministic-from-terms fields — never trusted from storage.
   const d = acctDefaults(size, stage);
@@ -618,7 +684,7 @@ function enforceAccountInvariant(size, stage) {
   // estimate, not a confirmed ledger fact, and should not survive a restart
   // as if it were; a fresh live update re-applies within ~10s anyway once
   // the feed reconnects.
-  if (!usingLiveToday) {
+  if (!usingLiveToday && brokerBalance == null) {
     try {
       window.api.setConfig('balance', bal);
       if (isEval) window.api.setConfig('evalFloor', Math.round(floor)); else window.api.setConfig('fundedFloor', Math.round(floor));
@@ -630,7 +696,36 @@ function enforceAccountInvariant(size, stage) {
   // difference (dayPnl legitimately moves every poll) — only warn when the
   // CSV-only computation itself disagreed with storage, the real
   // drift/corruption case this was built to catch.
-  if (!usingLiveToday && before != null && Math.abs(before - bal) > 0.01 && typeof addSystemMessage === 'function') {
+  // ── DRIFT WARNING: ONLY WHEN FLAT, AND ONLY ONCE ────────────────────────
+  // Two bugs in the first version, both visible live on 2026-08-28 while Anoop
+  // was IN a trade: it fired on every poll, and it fired mid-trade.
+  //
+  //  1. MID-TRADE IT CANNOT MATCH. An open position marks the balance to
+  //     market, so the broker figure moves every tick while the ledger holds
+  //     only CLOSED trades. Comparing them then compares two different
+  //     quantities and will always disagree. Anoop: "when live trade is on it
+  //     can never match — after closing the trade it should synch."
+  //  2. IT REPEATED. The dedup keyed on the rounded gap, and the gap changed
+  //     by a dollar or two every poll, so every poll produced a "new" value
+  //     and a fresh chat line. A dozen identical warnings is not information.
+  //
+  // So: only while FLAT, and only when the gap has moved materially since the
+  // last thing said. A null flat state (positions unreadable) is NOT treated
+  // as flat — unknown must never license a warning that needs certainty.
+  const DRIFT_MIN_USD = 1;
+  const DRIFT_RESAY_USD = 25;      // only speak again if it moves this much
+  if (liveIsFlat === true && ledgerDrift != null && Math.abs(ledgerDrift) > DRIFT_MIN_USD
+      && typeof addSystemMessage === 'function') {
+    const last = window.__lastLedgerDriftWarn;
+    if (last == null || Math.abs(ledgerDrift - last) >= DRIFT_RESAY_USD) {
+      window.__lastLedgerDriftWarn = ledgerDrift;
+      addSystemMessage(`Balance reconciled while flat: showing the BROKER's $${bal.toLocaleString(undefined, { minimumFractionDigits: 2 })}. `
+        + `The ledger derivation says $${derivedBal.toLocaleString(undefined, { minimumFractionDigits: 2 })} — a gap of `
+        + `$${Math.abs(ledgerDrift).toFixed(2)}. That gap is a missing/incorrect day in the ledger or a wrong start balance, not a broker error.`);
+    }
+  }
+
+  if (!usingLiveToday && brokerBalance == null && before != null && Math.abs(before - bal) > 0.01 && typeof addSystemMessage === 'function') {
     addSystemMessage(`Corrected balance from the ledger: $${Math.round(before).toLocaleString()} → $${Math.round(bal).toLocaleString()} (${days.length} day${days.length === 1 ? '' : 's'} logged). The ledger is the source of truth.`);
   }
 }
@@ -691,14 +786,264 @@ function switchMode(mode) { switchAccount(state.accountSize, mode); }
 
 // ── Trading mode (Standard / Scalper) ────────────────────────────────────────
 function switchTradingMode(mode) {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'trading-mode-set', mode: mode }));
-  applyTradingModeUI(mode);
+  // `ws` is not in scope here — it lives inside ws-client.js's IIFE. Referencing
+  // it threw ReferenceError on every click since 2026-08-01, which also killed
+  // the applyTradingModeUI() call below, so the button never moved and the
+  // server never heard. Goes through window.api.send now. See its comment.
+  const sent = window.api.send({ type: 'trading-mode-set', mode: mode });
+  if (sent) applyTradingModeUI(mode);
+  else console.warn('[trading-mode] not sent — socket down');
 }
 function applyTradingModeUI(mode) {
   const stdBtn = document.getElementById('tmode-standard-btn');
   const scBtn = document.getElementById('tmode-scalper-btn');
   if (stdBtn) stdBtn.classList.toggle('active', mode === 'standard');
   if (scBtn) scBtn.classList.toggle('active', mode === 'scalper');
+}
+
+// ── CONTROL toggle (2026-08-26) — who is placing the trades ────────────────
+// Anoop: "there should be a toggle that says give control so that i know you
+// are incharge on the trades."
+//
+// THE ONE RULE THIS UI FOLLOWS: it renders the mode the server says is
+// EFFECTIVE, never the one that was clicked. Clicking CONTROL sends a request
+// for LIVE; autonomy-gate.js may grant only SHADOW, and in that case the
+// SHADOW button lights and the status line says why. Optimistically lighting
+// the clicked button would tell him an automated system is trading when it is
+// not — the exact confusion the toggle exists to remove.
+//
+// So there is deliberately NO local state change on click. The button moves
+// when the server's autonomy-status arrives, and only then.
+let lastControlStatus = null;
+
+function switchControl(mode) {
+  // ASSIST places REAL orders — one per click, but real. It gets its own
+  // confirmation for that reason, worded to make the one thing that matters
+  // unmissable: the app never submits anything you did not approve.
+  if (mode === 'assist') {
+    const ok = confirm(
+      'ASSIST — let the app propose real trades?\n\n' +
+      'When a setup fires you get a ticket with entry, stop, target and size. ' +
+      'NOTHING is sent to the broker until you approve that specific ticket.\n\n' +
+      'Every approval and every refusal is recorded in DATA/autonomy/.'
+    );
+    if (!ok) return;
+  }
+  if (mode === 'live') {
+    // The only place in the app that can arm LIVE, and it must be a person
+    // doing it — autonomy-gate.js checks `armedBy` against an allow-list, so
+    // a scripted message cannot satisfy this on his behalf.
+    const ok = confirm(
+      'GIVE CONTROL — let the app place real orders?\n\n' +
+      'It will only actually go live if the strategy has a measured track record ' +
+      '(40+ resolved trades, profit factor 1.3+, 20 shadow days). Otherwise it stays ' +
+      'in SHADOW and shows you exactly what is still missing.\n\n' +
+      'Everything it does is recorded in DATA/autonomy/.'
+    );
+    if (!ok) return;
+  }
+  window.api.send({ type: 'autonomy-set', mode: mode, by: 'anoop' });
+}
+
+function applyControlUI(st) {
+  lastControlStatus = st || null;
+  // Autonomy disabled (rules.json autonomyEnabled:false) — hide the control
+  // entirely rather than showing a dead toggle. A visible switch that does
+  // nothing is worse than no switch: it invites a click that silently fails.
+  const box = document.getElementById('control-toggle');
+  const status = document.getElementById('control-status');
+  if (st && st.disabled) {
+    if (box) box.style.display = 'none';
+    if (status) { status.textContent = ''; status.className = ''; }
+    return;
+  }
+  if (box) box.style.display = '';
+  const eff = (st && st.effectiveMode) || 'off';
+  const btns = {
+    off: document.getElementById('ctrl-off-btn'),
+    shadow: document.getElementById('ctrl-shadow-btn'),
+    assist: document.getElementById('ctrl-assist-btn'),
+    live: document.getElementById('ctrl-live-btn'),
+  };
+  // 2026-08-29: a mode still under construction gets NO BUTTON, rather than a
+  // disabled one. Same reason the whole toggle vanishes when autonomy is off —
+  // a visible switch that does nothing invites a click that silently fails,
+  // and this toggle exists precisely so Anoop is never unsure who is trading.
+  // The server is the authority (autonomyModes.isModeEnabled); an older server
+  // that sends no availableModes falls back to showing everything, which is
+  // the previous behaviour rather than a blank toolbar.
+  const available = Array.isArray(st && st.availableModes) ? st.availableModes : null;
+  for (const k of Object.keys(btns)) {
+    if (!btns[k]) continue;
+    btns[k].style.display = (!available || available.indexOf(k) !== -1) ? '' : 'none';
+    btns[k].classList.toggle('active', k === eff);
+  }
+  const line = document.getElementById('control-status');
+  if (!line) return;
+  line.className = eff === 'live' ? 'live' : (eff === 'assist' ? 'assist' : (eff === 'shadow' ? 'shadow' : ''));
+  if (eff === 'off') {
+    line.textContent = '';
+  } else if (eff === 'live') {
+    // Name the playbooks it may actually trade. Autonomy is granted per
+    // playbook, so "CLAUDE IS TRADING" alone overstates the grant whenever
+    // only some of them have earned it.
+    const pbs = (st && st.livePlaybooks) || [];
+    line.textContent = pbs.length ? `CLAUDE IS TRADING — ${pbs.join(', ')}` : 'CLAUDE IS TRADING';
+  } else if (eff === 'assist') {
+    line.textContent = 'ASSIST — nothing is placed until you approve it';
+  } else {
+    // In shadow, the most useful thing on screen is what is still missing —
+    // the blockers double as a to-do list rather than a flat refusal.
+    const n = (st && st.blockers && st.blockers.length) || 0;
+    line.textContent = n ? `SHADOW — ${n} requirement${n > 1 ? 's' : ''} left before live` : 'SHADOW — recording, not trading';
+  }
+}
+
+// ── Shadow trade ticket in chat (2026-08-26) ───────────────────────────────
+// Anoop: "displace shadow analysis with direction of the trade and stoploss
+// and in dollars and tick with take profit with dollars and ticks. and why
+// the setup was confirmed" — on the app chat.
+//
+// Rendered as a plain chat line rather than a widget so it lands in the same
+// durable scrollback as every other signal, and survives being scrolled past.
+// SHADOW is stated on the first line, every time: a ticket that looks like a
+// live order is the one thing this display must never be mistaken for.
+// ── Self-repair evidence in chat (2026-08-28) ──────────────────────────────
+// Anoop: "whatever mismatch ... is shown it should have self fixing capacity
+// and after fixing it should show me the evidence that it took place."
+//
+// The LIVE FEED MISMATCH banner reported a discrepancy and left it there. Now
+// the discrepancy is repaired AND the repair is written into the chat
+// scrollback, with the before/after and the reason. A correction nobody can
+// see is indistinguishable from one that never ran.
+// ── PROTOCOL 2 report in chat (2026-08-28) ─────────────────────────────────
+// Anoop asked for: notify, state the impact, rectify, and SHOW THE EVIDENCE.
+// So a clean run is one quiet line, and a run that found something prints what
+// it found, what that means downstream, what it did about it, and the numbers
+// behind each verdict.
+//
+// Passing checks are not listed. A wall of green is how the one red line gets
+// missed — the count carries the good news.
+// PROTOCOL 1 report in chat. Same shape as the feed protocol: only the
+// non-passing checks are listed, each with its impact and the evidence
+// behind it. A wall of green is how the one red line gets missed.
+function renderHealthProtocol(rep) {
+  try {
+    if (!rep) return;
+    if (rep.error) { addSystemMessage('SYSTEM HEALTH PROTOCOL could not run: ' + rep.error); return; }
+    var L = [];
+    var clean = rep.failed === 0 && rep.unknown === 0;
+    L.push((clean ? '✅' : '⚠️') + ' SYSTEM HEALTH PROTOCOL (' + (rep.trigger || 'scheduled') + ') — '
+      + rep.passed + '/' + rep.total + ' checks passed');
+    var bad = (rep.checks || []).filter(function (c) { return c.verdict !== 'pass'; });
+    for (var i = 0; i < bad.length; i++) {
+      var c = bad[i];
+      L.push('   ' + (c.verdict === 'fail' ? 'FAIL' : 'UNVERIFIED') + ' — ' + c.label
+        + (c.severity === 'critical' ? '  [CRITICAL]' : ''));
+      if (c.impact) L.push('      impact: ' + c.impact);
+      if (c.evidence) L.push('      evidence: ' + JSON.stringify(c.evidence).slice(0, 400));
+    }
+    if (rep.rectified && rep.rectified.length) {
+      L.push('   ACTIONS:');
+      for (var j = 0; j < rep.rectified.length; j++) L.push('      • ' + rep.rectified[j].label + ' → ' + rep.rectified[j].evidence);
+    }
+    if (clean) L.push('   ' + rep.headline);
+    addSystemMessage(L.join('\n'));
+  } catch (e) { console.warn('[health-protocol]', e && e.message); }
+}
+
+function renderFeedProtocol(rep) {
+  try {
+    if (!rep) return;
+    if (rep.error) { addSystemMessage('LIVE FEED PROTOCOL could not run: ' + rep.error); return; }
+    const b = rep.before || {};
+    const a = rep.after;
+    const L = [];
+    const clean = (a || b).failed === 0 && (a || b).unknown === 0;
+    L.push((clean ? '✅' : '⚠️') + ' LIVE FEED PROTOCOL (' + (rep.trigger || 'startup') + ') — '
+      + (a || b).passed + '/' + (rep.checks ? rep.checks.length : '?') + ' checks passed');
+
+    const bad = (rep.checks || []).filter(function (c) { return c.verdict !== 'pass'; });
+    for (const c of bad) {
+      L.push('   ' + (c.verdict === 'fail' ? 'FAIL' : 'UNVERIFIED') + ' — ' + c.label
+        + (c.severity === 'critical' ? '  [CRITICAL]' : ''));
+      if (c.impact) L.push('      impact: ' + c.impact);
+      if (c.evidence) L.push('      evidence: ' + JSON.stringify(c.evidence));
+    }
+    if (rep.rectified && rep.rectified.length) {
+      L.push('   RECTIFIED:');
+      for (const r of rep.rectified) L.push('      • ' + r.label + ' → ' + r.evidence);
+      if (a) L.push('   after repair: ' + a.headline);
+    }
+    if (clean && !bad.length) L.push('   ' + b.headline);
+    addSystemMessage(L.join('\n'));
+  } catch (e) {
+    console.warn('[feed-protocol]', e && e.message);
+  }
+}
+
+function renderSelfRepair(msg) {
+  try {
+    const e = (msg && msg.evidence) || {};
+    const L = [];
+    L.push('🔧 SELF-REPAIR — ' + (e.what || msg.kind || 'mismatch corrected'));
+    if (e.removed != null) L.push('   removed: ' + e.removed);
+    if (e.tradeCountBefore != null && e.tradeCountAfter != null) {
+      L.push('   trade count: ' + e.tradeCountBefore + ' → ' + e.tradeCountAfter);
+    }
+    if (e.dayPnlUnchanged != null) L.push('   day P&L unchanged: $' + e.dayPnlUnchanged);
+    if (e.why) L.push('   why: ' + e.why);
+    addSystemMessage(L.join('\n'));
+  } catch (err) {
+    console.warn('[self-repair]', err && err.message);
+  }
+}
+
+function renderShadowTicket(t) {
+  try {
+    if (!t || !t.sizes) return;
+    const px = (v) => (typeof v === 'number' ? v.toFixed(2) : '?');
+    const L = [];
+    L.push(`📋 SHADOW TICKET — Playbook ${t.playbook} ${t.direction} on ${t.tfLabel} at ${t.time} IST (NOT placed)`);
+    L.push(`   Entry ${px(t.entry)}  ·  Stop ${px(t.stop)}  ·  Target ${px(t.target)}  ·  ${t.rMultiple}R`);
+    for (const s of t.sizes) {
+      // Dollars and ticks together — reading one and converting the other in
+      // your head mid-session is exactly when it gets done wrong.
+      const line = `   @${s.contracts}c   SL ${s.stop.ticks} ticks / $${s.stop.usd.toFixed(0)}` +
+                   `   TP ${s.target.ticks} ticks / $${s.target.usd.toFixed(0)}`;
+      L.push(s.blocked ? `${line}   ⛔ ${s.blocked}` : line);
+    }
+    if (t.stopSource) L.push(`   Stop placed: ${t.stopSource}`);
+    if (t.why && t.why.length) {
+      L.push('   Why it confirmed:');
+      t.why.forEach((w, i) => L.push(`     ${i + 1}. ${w}`));
+    }
+    addSystemMessage(L.join('\n'));
+  } catch (e) {
+    console.warn('[shadow-ticket]', e && e.message);
+  }
+}
+
+function showControlDetail() {
+  const st = lastControlStatus;
+  if (!st) return;
+  const lines = [st.summary || ''];
+  if (st.blockers && st.blockers.length) {
+    lines.push('', 'Still required before LIVE:');
+    st.blockers.forEach((b, i) => lines.push(`  ${i + 1}. ${b}`));
+  }
+  // Autonomy is granted PER PLAYBOOK, so show where each one actually stands.
+  // A single blended verdict hides the case that matters most: one playbook
+  // has earned it while another has three trades of history.
+  if (Array.isArray(st.perPlaybook) && st.perPlaybook.length > 1) {
+    lines.push('', 'Per playbook:');
+    st.perPlaybook.forEach((p) => {
+      const n = (p.blockers && p.blockers.length) || 0;
+      lines.push(`  ${p.playbook}: ${p.effectiveMode.toUpperCase()}${n ? ` — ${n} requirement${n > 1 ? 's' : ''} left` : ''}`);
+    });
+  }
+  lines.push('', 'Full record: DATA/autonomy/');
+  alert(lines.join('\n'));
 }
 
 // ── Account breach/clear archiving (2026-07-22) ─────────────────────────────
@@ -1455,6 +1800,23 @@ const tvAudio = {
     this.tone(720, 0.11, 0.09, 0.10);
   },
 
+  // 2026-08-27: engulfing candle closed — its OWN sound, distinct from the
+  // generic playSignal() double-tap, so Anoop can tell an engulf from an
+  // FVG/SFP without looking at the screen. Three taps, still NEUTRAL in pitch
+  // for the reason spelled out above playSignal(): a detection is information,
+  // not a verdict, and a rising chime would train the wrong reflex. The
+  // distinctness comes from RHYTHM and timbre, not from sounding like a
+  // reward — a lower body tone with a brighter tap on top, three beats where
+  // every other watcher gets two.
+  playEngulf() {
+    const ctx = this.ensureCtx();
+    if (!ctx || ctx.state === 'suspended') return;
+    this.tone(540, 0.00, 0.08, 0.11);
+    this.tone(540, 0.13, 0.08, 0.11);
+    this.tone(540, 0.26, 0.08, 0.11);
+    this.tone(900, 0.26, 0.14, 0.07);
+  },
+
   // PO3 phase change — same neutral character, one extra tap and slightly more
   // present, because this is the transition that can auto-trigger the debate.
   playPhase() {
@@ -1505,6 +1867,11 @@ function setupWsEvents() {
   window.api.onWsOpen(() => {
     // Server sends config on connect
     window.api.getConfig().then(applyConfig);
+    // Ask who is currently in charge of the trades. Without this the CONTROL
+    // toggle would render its default (YOU) after a refresh regardless of the
+    // real state — showing "you are trading" while an automated system is
+    // armed is the single worst thing this toggle could do.
+    window.api.send({ type: 'autonomy-get' });
   });
 
   window.api.onMcpConnected(() => {
@@ -1959,7 +2326,11 @@ function setupWsEvents() {
       // the written record of a detection because the room got noisy would be
       // the wrong trade.
       if (!state.signalMuted) {
-        try { kind === 'po3' ? tvAudio.playPhase() : tvAudio.playSignal(); } catch (_) {}
+        try {
+          if (kind === 'po3') tvAudio.playPhase();
+          else if (kind === 'engulf') tvAudio.playEngulf();
+          else tvAudio.playSignal();
+        } catch (_) {}
       }
       addSystemMessage((state.signalMuted ? '🔕 ' : '🔔 ') + r.text);
     } catch (e) {
@@ -2516,7 +2887,7 @@ const DEFAULT_RULES_FALLBACK = {
     { name: 'NY', startMin: 1140, endMin: 1260 }
   ],
   oneInstrumentPerDay: true,
-  commissionPerContractPerSide: 0.59,
+  commissionPerContractPerSide: 0.95, // 2026-08-24: matches rules.json — see its _commission_comment for the two-source evidence. This copy is the fallback used only when rules.json fails to load; a stale value here would quietly reinstate the $0.72/contract under-charge.
   giveback: { armAtProfit: 400, retracePct: 50 },
   perTradeMaxLoss: 200
 };
@@ -2703,7 +3074,7 @@ function computeCsvDisciplineReport(csvText) {
   }
 
   // 8. Net P&L after estimated commission (rules.json, per contract per side ×2)
-  const commPerSide = RULES.commissionPerContractPerSide || 0.59;
+  const commPerSide = RULES.commissionPerContractPerSide || 0.95;
   const grossPnl = trades.reduce((s, t) => s + t.pnl, 0);
   const totalContracts = trades.reduce((s, t) => s + (t.qty || 1), 0);
   const estCommission = totalContracts * commPerSide * 2;
@@ -2851,11 +3222,12 @@ async function applyConfig(cfg) {
   showAccountGate(size, stage);
 }
 
-// ── Engulfing monitors (1H / 30M / 15M) ─────────────────────────────────────────
+// ── Engulfing monitors (1H / 30M / 15M / 5M) ─────────────────────────────────────────
 const ENGULF_MONS = {
   '1h':  { label: '1H',  intervalSec: 60 },
   '30m': { label: '30M', intervalSec: 45 },
-  '15m': { label: '15M', intervalSec: 30 }
+  '15m': { label: '15M', intervalSec: 30 },
+  '5m':  { label: '5M',  intervalSec: 15 }
 };
 
 // Roller switcher — added 2026-07-22 alongside the 1H/30M/15M consolidation.
@@ -2924,6 +3296,13 @@ function updateEngulfStatus(tf, status, bias) {
 
 function handleEngulfSignal(signal) {
   const { direction, time, message, source } = signal;
+  // 2026-08-27: the candle's OWN close time/price and any key level it traded
+  // through — the three things a manual chart re-check needs. Optional, since
+  // an older server (or a bar the level lookup could not annotate) sends
+  // neither, and a missing annotation must not blank the alert.
+  const barCloseIST = signal.barCloseIST || null;
+  const price = (typeof signal.price === 'number') ? signal.price : null;
+  const levelNote = signal.levelNote || '';
   const tf = signal.tf && state.engulf[signal.tf] ? signal.tf : '1h';
   const label = signal.tfLabel || (ENGULF_MONS[tf] && ENGULF_MONS[tf].label) || tf;
   const isBull = direction === 'BULLISH';
@@ -2942,8 +3321,9 @@ function handleEngulfSignal(signal) {
     <div class="engulf-signal-badge ${isBull ? 'bull' : 'bear'}">
       ${isBull ? '▲' : '▼'} ${direction}
     </div>
-    <div style="font-size:11px;color:var(--text-dim);margin-top:4px;">${time} IST · ${label}${source ? ' · ' + source : ''}</div>
-    <div style="font-size:11px;color:var(--text-mid);margin-top:4px;">Check a lower TF for entry setup</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-top:4px;">${barCloseIST ? 'candle ' + barCloseIST : time} IST · ${label}${price !== null ? ' · close ' + price : ''}${source ? ' · ' + source : ''}</div>
+    ${levelNote ? `<div style="font-size:11px;color:var(--accent, var(--text-mid));margin-top:4px;font-weight:600;">${levelNote.replace(/^\s*—\s*/, '')}</div>` : ''}
+    <div style="font-size:11px;color:var(--text-mid);margin-top:4px;">Closed candle, body fully engulfed — re-check the chart before acting</div>
   `;
 
   // Show popup
@@ -3392,6 +3772,59 @@ const ALOK_KB = [
     id: 'kane_patience', tags: ['patience', 'wait for the model', 'base hit', 'small win', 'okay being wrong', 'trader kane patience'],
     title: 'Trader Kane on patience and the "base hit" mentality',
     body: "From the same interview: Kane says the single biggest thing he sees traders lack — including people who assume shorter-term trading needs less patience than swing trading — is patience: \"95% of people... open the chart as soon as they wake up.\" His own target per setup is deliberately small — he calls it needing to \"grab that base hit every single day and then I'm done, I move on\" — rather than chasing a bigger move once he's already got what the setup was for. He's explicit about being comfortable being wrong: \"if I'm wrong, I'm wrong, that's okay, I really tried to instill into everybody that all I need to do is wait for price\" to reach his zone, not force an entry before it does. That's the same discipline your own Core Rule #12 already states (no trade before the market shows its hand) and your trader-model file's \"grade process not P&L\" — Kane's framing adds the base-hit language: the goal is one clean, defined win per day, not maximizing every session."
+  },
+  // ── JadeCap, "I'll Fix Your Trading Psychology in 17 Minutes" (2026-08-29) ──
+  // Decoded 2026-08-31 — full breakdown in
+  // `Prop Trading/RESEARCH_jadecap_psychology_2026-08-31.md`. Anoop already
+  // named JadeCap mentor-level (the five HARD PSYCHOLOGY RULES in
+  // JESSI_PERSONA came from a different JadeCap source on 2026-07-26). These
+  // seven entries are the mechanisms that source did NOT cover — each one
+  // explains WHY a rule he already has keeps breaking, which is the half that
+  // was missing. The sales pitch at the end of that video (mentorship, the
+  // "student made 300%" testimonial, the Apex affiliate code) is deliberately
+  // excluded: unverifiable, and a 300% number is the last thing to put in
+  // front of someone whose documented failure mode is sizing up.
+  {
+    id: 'jc_stop_discipline',
+    tags: ['move my stop', 'moved my stop', 'moving my stop', 'moving the stop', 'widen', 'wider stop', 'stop placement', 'where do i put my stop', 'trailing my stop'],
+    title: 'Stops: in at the fill, and never widened',
+    body: "JadeCap's coin flip: heads he pays you $150, tails you pay him $100, one flip. Almost nobody takes it — and you feel yourself refuse before you finish the maths. It's a bet you should take every single time. Most people need roughly $200 against $100 before it starts to feel fair, and that ratio measures the thing exactly: a loss hurts about twice as much as the same-sized win feels good. On a chart it cuts both ways. Up $200, you close at half target and it feels like discipline — it's the same refused bet, this time with real money. Down $200 it inverts, because closing makes the loss real and a certain loss feels worse than a bigger loss that's still only a maybe. So you hold, you give it room, you go find a level on a different timeframe that agrees with you, and you move the stop. Broker books show exactly where that ends: most clients close MORE winners than losers — on win rate they look like good traders — but they hand back about two dollars on a loser for every one they make on a winner. Right more often than wrong, still down. The fix isn't willpower, it's timing: the stop goes into the market at the same second you get filled, and it never moves further away. Tighter to lock in profit is fine. What that actually buys you is that a trade going against you stops being an event you have to survive and simply resolves — you're not sat there negotiating with yourself, because there's nothing left to negotiate with."
+  },
+  {
+    id: 'jc_random_reinforcement',
+    tags: ['broke my rules and won', 'broke my rules', 'got away with it', 'it worked out', 'worked anyway', 'made money but', 'green day', 'why do i keep doing', 'bad habit'],
+    title: 'Why a broken rule that PAID is your most expensive day',
+    body: "You learned a hot stove is dangerous by touching one once as a child and never needed a refresher. One trial, permanent. That's how good your brain is: do a thing, get a result, file the result against the behaviour. Now make the stove hot only 40% of the time, at random. You'd learn nothing true — you'd invent a rule about touching it in the morning, or with your left hand, or only after checking twice, and you'd believe it because the last three times were fine. The market is the 40% stove. JadeCap's own admission is the sharpest version of this: his first really big payout came from a trade where he sized up and moved his stop repeatedly, and it paid — and he says that trade did more damage to him than any loss he's ever taken, because his brain filed it as \"moving the stop works,\" not as \"I got lucky.\" A long losing streak followed, because he'd been rewarded for bad behaviour and kept repeating it chasing the same result. So every rule you break that ends in profit gets reinforced, and every good decision that loses gets punished — which means the more screen time you get, the more confident you become in the habits that are costing you. Experience makes it worse. That's why traders ten years in are still moving stops. The counter is to stop scoring on money: at the end of the session you get four boxes — did I follow my plan, did I size properly, did the stop go where I said, did the exit go where I said. A losing day where all four are ticked is a genuinely good session. A day where you made money and broke all four is the worst day of the month, and it's the one that comes for the whole account eventually."
+  },
+  {
+    id: 'jc_hot_hand',
+    tags: ['hot streak', 'winning streak', 'on a roll', 'in rhythm', 'hot hand', 'size up', 'sizing up', 'three wins in a row', 'feeling confident', 'high conviction'],
+    title: 'The hot hand — why the trade after three wins is the dangerous one',
+    body: "Everyone believes in the hot hand, players most of all — they'll tell you there are nights the basket just looks massive. Psychologists took every shot the Philadelphia 76ers made across a season and a half and checked whether making one shot predicted making the next. It doesn't: no positive correlation at all, and slightly worse, a hit followed by a miss was marginally MORE likely than two hits. Runs of four and five turned up exactly as often as random data predicts. They repeated it on Boston's free throws and on controlled experiments with Cornell's varsity teams, expecting pushback. Same answer every time. Be precise about what that means, because this is where people get it wrong: it does NOT mean basketball is luck — some players are genuinely far better, and that shows up over a season. It means this shot is independent of the last shot. The players couldn't tell; making the last three genuinely changed how confident they felt, and that feeling had no relationship to what happened. That's you after three wins. Your edge may be completely real — same as the genuinely better shooter — but this trade doesn't know about the last one, and the market has no idea what happened to you on Tuesday. The reason the illusion survives is memory: a run of five is memorable, win-loss-win-loss-loss isn't, so the streaks stick and the noise doesn't. JadeCap's own version: 2020, oil went negative, he was heavily short CAD and up about 200% on the account in a week, got married to the idea that USDCAD had to run to the 2016 highs — it came within 27 pips and then broke down, and he gave all of it back. Two fixes he actually changed: size never gets so large on a win streak that it becomes unmanageable, and extra risk is something an A+ setup earns, never something your confidence level earns. And grade your conviction BEFORE you enter, as a number or a letter — the moment you have to say \"I'm 60% on this\" or \"this is a B setup\" instead of \"this one feels good,\" you can hear the difference between an honest read and your ego."
+  },
+  {
+    id: 'jc_variable_reward',
+    tags: ['bored', 'boredom', 'nothing happening', 'no setup', 'flat day', 'did nothing today', 'urge to trade', 'dopamine', 'slot machine', 'just want to trade'],
+    title: "Boredom trades — it's the not-knowing, not the money",
+    body: "It isn't the reward that grips you, it's the not knowing. Most people check their phone around 100 times a day, and more than they'd guess. You're not checking because there's always something there — you're checking because there's SOMETIMES something there. If it buzzed on a reliable schedule you'd check it on the hour; you wouldn't check it at a red light, or in bed at midnight, or halfway through a conversation. The randomness is the hook. Same with reels: you keep scrolling because you don't know what's next. And you already know intention doesn't beat it, because you've tried — \"I'll spend less time on my phone\" lasts a few hours. Unpredictable reward produces behaviour that is extraordinarily persistent, stronger than consistent reward, and almost impossible to tame. A boredom trade is that exact mechanism: you're taking it for the dopamine of an unpredictable outcome, which means you've stopped trading a strategy and started trading for action. You beat it the same way you beat the phone — not with resolve, but by making it unavailable. Phone in another room is the same act as locking yourself out of the platform when there's no setup, because if you sit at the desk long enough the chart WILL tell you to take a position. And the payoff is the part worth hearing: right now a session where you did nothing feels wasted, like a real trader would have found something. But sitting at a desk and not taking a trade is itself an edge, because most traders don't have it. A flat day isn't a gap in your record — it's the skill."
+  },
+  {
+    id: 'jc_conviction_inversion',
+    tags: ['added to', 'adding to a loser', 'averaging down', 'more sure', 'more confident now', 'doubling down', 'defending', 'irritated', 'annoyed', 'still think i am right', 'proved right'],
+    title: 'When conviction rises while price falls — the test, not the feeling',
+    body: "The anatomy, as JadeCap lays it out. 9:30, you go long — decent reason, nothing spectacular, you're about 60% sure, normal size. 9:45 it's offside; not badly, just red. So you look again, you change timeframes, and you find MORE reasons: higher timeframe still constructive, that drop was a liquidity grab, sellers drying up, look at the reaction. Every one of those is a real observation genuinely on the chart. By 11:00 it's still in drawdown and you add to it, because now you feel even more sure. Stop there, because the tell is a test rather than a feeling: you entered at 60% conviction, it has gone against you for 90 minutes, and your conviction is now 90% and your size is bigger. The evidence went one direction and your conviction went the other at the same exact time. That's measurable; \"am I being emotional\" is not. The reason you can't feel it is that once you click the button you're no longer holding a trade, you're defending an opinion — and nobody tells you the switch has flipped. Everything agreeing gets waved straight through, everything disagreeing gets filed as noise or a fakeout. The cleanest early-warning sign is social: someone says \"this market looks heavy to me\" and you get a small flash of irritation, maybe don't even reply. That was information arriving and it didn't land as information, it landed as a dig at your opinion. There's always a guy who's been short forever explaining every new high — from the outside it's instantly obvious, and he can't see it in himself at all, and neither can you. The fix isn't discipline, because once your trade is losing you have already lost the ability to assess it honestly and no amount of discipline hands that back. The fix is temporal: write the invalidation down BEFORE you're in the trade, while you're still neutral and there's no position to defend — what has to happen for you to say the idea is dead. Then when it shows up, you're not admitting you're an idiot, you're just accepting you can be wrong a lot and still make money."
+  },
+  {
+    id: 'jc_premeditation',
+    tags: ['before the session', 'pre-session', 'worst case', 'mental prep', 'how do i prepare', 'routine before', 'get ready for the session'],
+    title: 'Rehearse the loss before the session, not during it',
+    body: "JadeCap's pre-session habit is Stoic — praemeditatio malorum, the premeditation of evils, which he attributes to Marcus Aurelius. Before the session you deliberately imagine the things that could go wrong: the loss, being in drawdown, the day going against you. Not as pessimism, as a rehearsal. The point is that when it actually happens it arrives as something you have already experienced rather than something that blindsides you, and his claim is that this alone keeps the survival instinct from ever needing to fire. That matters because the survival instinct is what's behind every one of the other failures — cutting the winner at half target, holding the loser to avoid making it real, widening the stop. It's much cheaper to feel a $600 drawdown in your head at 6pm than to meet it for the first time at 8pm with the position on. Pair it with the risk side: to get the outsized reward you have to genuinely be comfortable with the risk, and you find out whether you are before the session, not during it."
+  },
+  {
+    id: 'jc_trade_eleven',
+    tags: ['late in the session', 'emotionally tired', 'why do rules fail', 'four losses', 'trade 11', 'accountability', 'doing this on my own', 'why do i break my rules'],
+    title: 'Rules do not fail at trade 1 — they fail at trade 11',
+    body: "You'll take the notes and write the rules, but you're also the only one enforcing them. Trade one, you're fine — nobody breaks a rule on trade one. Trade eleven you're four losses deep and emotionally tired, and that's when the notes and the rules don't mean anything, because the only person in the room at that moment is the one who wants to break them. And it isn't stupid. It's you. JadeCap says he had every piece of this information for ten years — that we don't like losing, that we learn from outcomes rather than behaviour, that the market is random, that we hate being wrong — and it still cost him money AND time, because what he never had was one person outside his own head keeping him accountable, and another year of doing it alone didn't fix it. Two things follow. First, discipline that depends on you being sharp is not discipline; the guardrails have to be set while you're calm and be automatic by the time you're tired — which is the entire design principle behind your own hard stops, the size freeze and the cooldown. Second, the pressure a coach applies should go UP as the session goes on, not stay flat. Trade 1 barely needs a comment. Trade 11 after four losses is the whole ballgame."
   }
 ];
 // Score by tag-substring overlap — plain local search, not semantic.
@@ -3415,6 +3848,23 @@ function alokKbLiveTieIn(id) {
   if (id === 'loss_aversion' && last.avgWin && last.avgLoss && Math.abs(last.avgLoss) > last.avgWin) return '\n\nYour data: avg loss $' + Math.abs(Math.round(last.avgLoss)) + ' > avg win $' + Math.round(last.avgWin) + ' on ' + fmtDMY(last.date) + ' — inverted right now.';
   if (id === 'gamblers_fallacy' && last.tradedPast3Losses) return '\n\nYour data: you traded past 3 consecutive losses on ' + fmtDMY(last.date) + '.';
   if (id === 'position_sizing' && last.maxSize > 2) return '\n\nYour data: max size ' + last.maxSize + 'c on ' + fmtDMY(last.date) + ' — over your own 2-contract cap.';
+  // ── JadeCap-mechanism tie-ins (2026-08-31) ───────────────────────────────
+  // Same contract as the entries above: only fire when the number actually
+  // exists on the row. `disc` is a 0-100 discipline score from rollupDay();
+  // older rows predate it, hence the typeof guard rather than a truthy check
+  // (disc === 0 is a real, and very loud, value).
+  if (id === 'jc_random_reinforcement' && typeof last.disc === 'number' && last.disc < 100 && last.pnl > 0) {
+    return '\n\nYour data: ' + fmtDMY(last.date) + ' closed GREEN at +$' + Math.round(last.pnl) + ' with discipline at ' + last.disc + '%. That is the exact day this describes — the one your brain files as "that worked."';
+  }
+  if (id === 'jc_random_reinforcement' && typeof last.disc === 'number' && last.disc === 100 && last.pnl < 0) {
+    return '\n\nYour data: ' + fmtDMY(last.date) + ' closed red at $' + Math.round(last.pnl) + ' with discipline at 100%. Four boxes ticked — that is a good session, and it counts as one.';
+  }
+  if (id === 'jc_hot_hand' && last.bigAfterWins) return '\n\nYour data: your biggest size on ' + fmtDMY(last.date) + ' came after 2+ wins in a row — that is the hot hand, not the setup.';
+  if (id === 'jc_conviction_inversion' && last.sizedUpIntoLoss) return '\n\nYour data: size went UP while the day was red on ' + fmtDMY(last.date) + ' — evidence one way, conviction the other.';
+  if (id === 'jc_stop_discipline' && last.avgWin && last.avgLoss && Math.abs(last.avgLoss) > last.avgWin) {
+    return '\n\nYour data: on ' + fmtDMY(last.date) + ' your avg loss ($' + Math.abs(Math.round(last.avgLoss)) + ') was ' + (Math.abs(last.avgLoss) / last.avgWin).toFixed(1) + 'x your avg win ($' + Math.round(last.avgWin) + '). The broker-book number in this entry is 2x — that is what it looks like in your own ledger.';
+  }
+  if (id === 'jc_trade_eleven' && last.n >= 5) return '\n\nYour data: ' + last.n + ' trades on ' + fmtDMY(last.date) + (last.maxConsecLoss >= 3 ? ', with a ' + last.maxConsecLoss + '-loss streak in there' : '') + '. The back half of that day is where the rules were actually tested.';
   return '';
 }
 
@@ -6044,10 +6494,29 @@ function switchTab(tabId) {
   if (tabId === 'checklist') ckLoadPlan();
   if (tabId === 'insights') renderInsights();
   if (tabId === 'apprentice') renderPlanStageBanner();
-  if (tabId === 'lessons') renderLessons();
-  if (tabId === 'align')   renderAlignment();
+  // 2026-08-25: Lessons and Alignment are now ONE panel over one store, but
+  // BOTH tab buttons still work — removing the Lessons button took away a
+  // landmark Anoop navigates by, and merging the data was never a reason to
+  // do that. 'lessons' opens the same panel with the lesson half preselected
+  // and scrolled to, so each button still lands where its name promises.
+  if (tabId === 'lessons') {
+    switchTab('align');
+    document.querySelectorAll('.rtab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'lessons'));
+    try {
+      if (typeof mindSetKind === 'function') mindSetKind('lesson');
+      const el = document.getElementById('mind-title');
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'start' });
+    } catch (e) {}
+    return;
+  }
+  if (tabId === 'align') { if (typeof mindSetKind === 'function') mindSetKind('state'); renderAlignment(); }
   if (tabId === 'cost') renderCost();
   if (tabId === 'journal') renderJournal();
+  // Weekly Report (2026-08-29). Guarded by typeof because week-report.js loads
+  // after app.js — a switchTab() fired during startup must not throw here and
+  // leave every panel hidden (the failure mode the ckGate try/catch above
+  // exists to prevent).
+  if (tabId === 'week' && typeof renderWeekReport === 'function') renderWeekReport();
 }
 
 // ── Cost tab: lifetime prop-account spend vs payouts -> breakeven ───────────
@@ -6597,46 +7066,293 @@ document.getElementById('settings-open-btn').addEventListener('click', openSetti
 // itself. Promoting one into an actual enforced rule (rules.json + app
 // logic + a dated CLAUDE.md changelog entry) is still a deliberate follow-up
 // step — same as the existing "Pending Checklist Enhancements" section.
+// ── The mind log: Alignment + Lessons, one surface (2026-08-25) ────────────
+// Anoop: "can we merger both and make it one ? close both gaps but keep both".
+//
+// Both gaps closed here:
+//   - a lesson with NO watch now reaches every agent, exactly like an
+//     alignment entry always did (it previously reached none);
+//   - an entry can be turned into a lesson and armed, which alignment could
+//     never do.
+// Both KINDS kept, because they differ by lifespan — see mind-log.js.
 (function(){
-  const LKEY = 'copilot_lessons_log';
-  function loadL(){ try{ return JSON.parse(localStorage.getItem(LKEY)) || []; }catch(e){ return []; } }
-  function saveL(list){ localStorage.setItem(LKEY, JSON.stringify(list)); }
-  window.addLesson = function(){
-    const el = document.getElementById('lesson-text');
+  // DATA/mind_log.json on the server is the source of truth; localStorage is
+  // the offline cache. The server performs the one-time, NON-DESTRUCTIVE
+  // migration from align_notes.json + lessons_log.json and leaves both
+  // originals in place — see mindLogLoad() in server.js.
+  const MKEY = 'copilot_mind_log';
+  let cache = null;
+  // Which half of the log this tab is showing. Set by switchTab, never by a
+  // stray click — the tab IS the filter.
+  let composeKind = 'state';
+
+  const ML = function(){ return window.MindLog; };
+  const AD = function(){ return window.ArmedDetectors; };
+
+  function loadM(){
+    if (cache) return cache;
+    try{ cache = JSON.parse(localStorage.getItem(MKEY)) || []; }catch(e){ cache = []; }
+    return cache;
+  }
+  function saveM(list){
+    cache = list;
+    localStorage.setItem(MKEY, JSON.stringify(list));
+    try { if (window.api && window.api.dataSave) window.api.dataSave('mind_log', list).catch(function(){}); } catch(e){}
+  }
+
+  // The server's copy wins: it performs the one-time migration from
+  // align_notes.json + lessons_log.json, and it writes fireCount/lastFiredAt
+  // when an armed watch fires mid-session. That history exists nowhere else,
+  // so a stale local cache would show "never fired" for a watch that caught
+  // him an hour ago — and, on a first run, would show nothing at all.
+  //
+  // Does NOT render. renderAlignment() awaits this and then paints; folding a
+  // render in here would make renderAlignment -> ensure -> renderAlignment
+  // recurse without end.
+  window.mindEnsure = async function(){
+    try {
+      if (window.api && window.api.dataLoad) {
+        const remote = await window.api.dataLoad('mind_log');
+        if (Array.isArray(remote)) {
+          cache = remote;
+          localStorage.setItem(MKEY, JSON.stringify(remote));
+        }
+      }
+    } catch(e){}
+    return loadM();
+  };
+  window.mindHydrate = async function(){
+    await window.mindEnsure();
+    if (typeof renderAlignment === 'function') renderAlignment();
+  };
+
+  window.mindEntries = function(){ return ML() ? ML().load(loadM()) : loadM(); };
+
+  // ── Composer ──────────────────────────────────────────────────────────────
+  window.mindSetKind = function(kind){
+    composeKind = (kind === 'lesson') ? 'lesson' : 'state';
+    const ta = document.getElementById('align-text');
+    const help = document.getElementById('mind-kind-help');
+    const watch = document.getElementById('mind-watch-wrap');
+    const title = document.getElementById('mind-title');
+    if (watch) watch.style.display = composeKind === 'lesson' ? '' : 'none';
+    if (title) {
+      title.textContent = composeKind === 'lesson'
+        ? 'Self-authored watchlist — lessons you can arm'
+        : "Alignment — where your head's at";
+    }
+    if (help) {
+      help.textContent = composeKind === 'lesson'
+        ? 'A law about yourself, meant to outlast today. Every agent keeps quoting it back regardless of age — and you can arm it so the app checks for it live, every session.'
+        : 'Where you are right now: focused on, worried about, planning to change. Agents read only the most recent few, because this expires. Not armable — a mood is not a rule.';
+    }
+    if (ta) {
+      ta.placeholder = composeKind === 'lesson'
+        ? 'e.g. Sizing up while already down is what blew every account.'
+        : 'e.g. Feeling pulled to oversize after two green days in a row — watching for that.';
+    }
+    if (composeKind === 'lesson') renderLessonTemplates();
+    const wrap = document.getElementById('align-notes-list');
+    if (wrap && typeof mindListHtml === 'function') wrap.innerHTML = mindListHtml();
+  };
+
+  window.renderLessonTemplates = function(){
+    const sel = document.getElementById('lesson-template');
+    if (!sel || !AD()) return;
+    if (sel.options.length) return;
+    sel.innerHTML = '<option value="">— no watch, just write it down —</option>'
+      + AD().TEMPLATES.map(function(t){ return '<option value="' + t.id + '">' + t.label + '</option>'; }).join('');
+    renderLessonParams();
+  };
+
+  window.renderLessonParams = function(){
+    const sel = document.getElementById('lesson-template');
+    const wrap = document.getElementById('lesson-params');
+    const help = document.getElementById('lesson-template-help');
+    if (!sel || !wrap || !AD()) return;
+    const tpl = AD().getTemplate(sel.value);
+    if (!tpl) { wrap.innerHTML = ''; if (help) help.textContent = ''; return; }
+    if (help) help.textContent = tpl.help;
+    // min/max come from the template itself, so the input cannot offer a value
+    // validate() will refuse — same object, one definition of the bounds.
+    wrap.innerHTML = tpl.params.map(function(p){
+      return '<label style="font-size:11px;opacity:.8;display:flex;flex-direction:column;gap:2px;">'
+        + '<span>' + p.label + '</span>'
+        + '<input type="number" id="lp-' + p.key + '" value="' + p.def + '" min="' + p.min + '" max="' + p.max + '"'
+        + ' style="width:120px;background:var(--panel-2,#161b22);color:inherit;border:1px solid var(--border,#30363d);border-radius:6px;padding:4px 6px;font:inherit;">'
+        + '</label>';
+    }).join('');
+  };
+
+  function readDetector(){
+    const sel = document.getElementById('lesson-template');
+    if (!sel || !sel.value || !AD()) return null;
+    const tpl = AD().getTemplate(sel.value);
+    if (!tpl) return null;
+    const params = {};
+    tpl.params.forEach(function(p){
+      const el = document.getElementById('lp-' + p.key);
+      params[p.key] = el ? Number(el.value) : p.def;
+    });
+    return { template: sel.value, params: params };
+  }
+
+  window.mindAdd = function(){
+    const el = document.getElementById('align-text');
     const text = el ? el.value.trim() : '';
+    const errEl = document.getElementById('lesson-errors');
+    if (errEl) errEl.textContent = '';
     if (!text) return;
-    const list = loadL();
-    list.unshift({ id: Date.now(), ts: new Date().toISOString(), text: text, promoted: false });
-    saveL(list.slice(0, 100));
+    const entry = { id: Date.now(), ts: new Date().toISOString(), text: text, kind: composeKind };
+    if (composeKind === 'lesson') {
+      entry.promoted = false; entry.fireCount = 0; entry.lastFiredAt = null;
+      const d = readDetector();
+      if (d) {
+        entry.detector = d;
+        // Validate BEFORE saving. A refused watch means a refused save, never
+        // an entry stored with a broken check he believes is running.
+        const v = AD().validate(entry);
+        if (!v.ok) { if (errEl) errEl.textContent = v.errors.join(' '); return; }
+      }
+    }
+    const list = loadM().slice();
+    list.unshift(entry);
+    saveM(list.slice(0, 250));
     if (el) el.value = '';
-    const saved = document.getElementById('lesson-saved');
-    if (saved) { saved.textContent = 'Saved ✓'; setTimeout(() => { saved.textContent = ''; }, 2000); }
-    renderLessons();
+    const saved = document.getElementById('align-saved');
+    if (saved) {
+      saved.textContent = entry.detector ? 'Saved — press Arm to start watching' : 'Saved \u2713';
+      setTimeout(function(){ saved.textContent = ''; }, 3000);
+    }
+    renderAlignment();
   };
-  window.togglePromoted = function(id){
-    const list = loadL();
-    const e = list.find(x => x.id === id);
-    if (e) { e.promoted = !e.promoted; saveL(list); renderLessons(); }
+
+  window.mindToggleArmed = function(id){
+    const list = loadM().slice();
+    const e = list.find(function(x){ return x.id === id; });
+    if (!e || !e.detector) return;
+    const errEl = document.getElementById('lesson-errors');
+    if (errEl) errEl.textContent = '';
+    if (!e.promoted) {
+      // Arming is the moment this becomes a live check on a money account, so
+      // the cap and the config are enforced HERE where he can see the refusal.
+      const already = AD().armed(list).length;
+      if (already >= AD().MAX_ARMED) {
+        if (errEl) errEl.textContent = 'Already watching ' + AD().MAX_ARMED + ' lessons — that is the cap. '
+          + 'Four built-in patterns fire on this same channel; past this the alerts stop registering as signal. Disarm one first.';
+        return;
+      }
+      const v = AD().validate(e);
+      if (!v.ok) { if (errEl) errEl.textContent = v.errors.join(' '); return; }
+      e.armedAt = Date.now();
+    }
+    e.promoted = !e.promoted;
+    saveM(list);
+    renderAlignment();
   };
-  window.deleteLesson = function(id){
-    if (!confirm('Delete this lesson?')) return;
-    saveL(loadL().filter(x => x.id !== id));
-    renderLessons();
+
+  // Promote a "where my head's at" note into a standing lesson. This is the
+  // second gap closed: an alignment entry could never become a rule, however
+  // clearly it described one.
+  window.mindMakeLesson = function(id){
+    const list = loadM().slice();
+    const e = list.find(function(x){ return x.id === id; });
+    if (!e) return;
+    e.kind = 'lesson';
+    if (e.promoted === undefined) e.promoted = false;
+    if (e.fireCount === undefined) e.fireCount = 0;
+    saveM(list);
+    renderAlignment();
   };
-  window.renderLessons = function(){
-    const wrap = document.getElementById('lessons-list'); if (!wrap) return;
-    const list = loadL();
-    if (!list.length) { wrap.innerHTML = '<div style="font-size:12px;opacity:.5;">No lessons logged yet.</div>'; return; }
-    wrap.innerHTML = list.map(function(e){
-      const d = new Date(e.ts).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
-      return '<div style="border:1px solid var(--border,#30363d);border-radius:6px;padding:6px 8px;margin-bottom:6px;font-size:12px;'
-        + (e.promoted ? 'border-left:3px solid var(--green,#3fb950);' : 'border-left:3px solid var(--amber,#d29922);') + '">'
-        + '<div style="opacity:.6;font-size:10px;margin-bottom:2px;">' + d + (e.promoted ? ' · promoted to rule' : ' · not yet a rule') + '</div>'
-        + '<div>' + e.text.replace(/</g, '&lt;') + '</div>'
-        + '<div style="margin-top:4px;">'
-        + '<button class="engulf-check-btn" style="font-size:10px;padding:2px 6px;" onclick="togglePromoted(' + e.id + ')">' + (e.promoted ? 'Mark not-yet-promoted' : 'Mark promoted') + '</button> '
-        + '<button class="engulf-check-btn" style="font-size:10px;padding:2px 6px;" onclick="deleteLesson(' + e.id + ')">Delete</button>'
-        + '</div></div>';
+
+  window.mindDelete = function(id){
+    if (!confirm('Delete this entry?')) return;
+    saveM(loadM().filter(function(x){ return x.id !== id; }));
+    renderAlignment();
+  };
+
+  // ── Timeline ──────────────────────────────────────────────────────────────
+  window.mindListHtml = function(){
+    const all = window.mindEntries();
+    // THE difference between the two tabs: each shows only its own kind.
+    // Showing the whole log in both is what made them look identical.
+    const list = all.filter(function(e){
+      return composeKind === 'lesson' ? e.kind === 'lesson' : e.kind !== 'lesson';
+    });
+    const armedCount = AD() ? AD().armed(all).length : 0;
+
+    let head;
+    if (composeKind === 'lesson') {
+      head = '<div style="font-size:11px;opacity:.7;margin-bottom:8px;">'
+        + list.length + ' standing lesson' + (list.length === 1 ? '' : 's')
+        + ' · ' + armedCount + ' of ' + (AD() ? AD().MAX_ARMED : 6) + ' armed as live watches</div>';
+      if (!list.length) {
+        return head + '<div style="font-size:12px;opacity:.5;">No lessons yet. A lesson is a rule about yourself that does not expire — '
+          + 'and if you give it a watch, the app checks for it live every session. '
+          + "Your day-to-day notes live on the Alignment tab.</div>";
+      }
+    } else {
+      head = '<div style="font-size:11px;opacity:.7;margin-bottom:8px;">'
+        + list.length + ' entr' + (list.length === 1 ? 'y' : 'ies')
+        + ' · agents read the most recent few, because these expire</div>';
+      if (!list.length) {
+        return head + '<div style="font-size:12px;opacity:.5;">Nothing written yet.</div>';
+      }
+    }
+
+    return head + list.map(function(e){
+      const d = new Date(e.ts || e.id).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+      const isLesson = e.kind === 'lesson';
+      const tpl = (e.detector && AD()) ? AD().getTemplate(e.detector.template) : null;
+      const valid = tpl ? AD().validate(e).ok : false;
+      const isArmed = !!(e.promoted && valid);
+      const fired = Number(e.fireCount) || 0;
+
+      // The tab already says which kind these are, so the row states its
+      // STATUS instead of repeating the kind at him.
+      let label, colour;
+      if (isArmed) { label = 'ARMED — checked live every session'; colour = 'var(--green,#3fb950)'; }
+      else if (e.detector && !valid) { label = 'watch misconfigured — NOT running'; colour = 'var(--red,#f85149)'; }
+      else if (e.detector) { label = 'has a watch — not armed yet'; colour = 'var(--amber,#d29922)'; }
+      else if (isLesson) { label = 'no watch — read by every agent, never expires'; colour = 'var(--amber,#d29922)'; }
+      else { label = 'read by every agent while recent'; colour = 'var(--border,#30363d)'; }
+
+      let detail = '';
+      if (tpl) {
+        const p = AD().withDefaults(e.detector.template, e.detector.params);
+        detail = '<div style="font-size:10px;opacity:.65;margin-top:3px;">'
+          + tpl.label + ' — ' + tpl.params.map(function(sp){ return sp.label + ': <b>' + p[sp.key] + '</b>'; }).join(', ')
+          + '</div>';
+      }
+
+      // Said out loud, because an armed watch that has never matched is either
+      // a habit he fixed or a check that does not work — and silence lets him
+      // assume the first.
+      let firedLine = '';
+      if (isArmed) {
+        firedLine = '<div style="font-size:10px;margin-top:3px;color:'
+          + (fired ? 'var(--amber,#d29922)' : 'var(--text-dim,#8b949e)') + ';">'
+          + (fired
+              ? 'Caught you ' + fired + ' time' + (fired === 1 ? '' : 's')
+                + (e.lastFiredAt ? ' — last ' + new Date(e.lastFiredAt).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }) : '')
+              : 'Never fired since it was armed — either you fixed this, or the numbers are set too loose to catch it.')
+          + '</div>';
+      }
+
+      let btns = '';
+      if (e.detector) {
+        btns += '<button class="engulf-check-btn" style="font-size:10px;padding:2px 6px;" onclick="mindToggleArmed(' + e.id + ')">'
+          + (e.promoted ? 'Disarm' : 'Arm this watch') + '</button> ';
+      } else if (!isLesson) {
+        btns += '<button class="engulf-check-btn" style="font-size:10px;padding:2px 6px;" title="Moves it to the Self-authored watchlist, where it stops expiring and can be armed" onclick="mindMakeLesson(' + e.id + ')">Promote to a lesson &rarr;</button> ';
+      }
+      btns += '<button class="engulf-check-btn" style="font-size:10px;padding:2px 6px;" onclick="mindDelete(' + e.id + ')">Delete</button>';
+
+      return '<div style="border:1px solid var(--border,#30363d);border-radius:6px;padding:6px 8px;margin-bottom:6px;font-size:12px;border-left:3px solid ' + colour + ';">'
+        + '<div style="opacity:.6;font-size:10px;margin-bottom:2px;">' + d + ' · ' + label + '</div>'
+        + '<div>' + String(e.text).replace(/</g, '&lt;') + '</div>'
+        + detail + firedLine
+        + '<div style="margin-top:4px;">' + btns + '</div></div>';
     }).join('');
   };
 })();
@@ -6697,7 +7413,21 @@ document.getElementById('settings-open-btn').addEventListener('click', openSetti
     try { if (window.api && window.api.dataSave) await window.api.dataSave('align_notes', list); }
     catch (e) { console.error('Alignment save failed (kept locally, will retry next save):', e.message); }
   }
+  // 2026-08-25: redirects into the merged store. Kept rather than deleted
+  // because a caller writing to align_notes.json now would write into a file
+  // no agent reads — silent, and indistinguishable from working.
   window.addAlignNote = async function(){
+    if (typeof mindAdd === 'function') {
+      if (typeof mindSetKind === 'function') mindSetKind('state');
+      return mindAdd();
+    }
+    return legacyAddAlignNote();
+  };
+  window.deleteAlignNote = async function(id){
+    if (typeof mindDelete === 'function') return mindDelete(id);
+    return legacyDeleteAlignNote(id);
+  };
+  async function legacyAddAlignNote(){
     const el = document.getElementById('align-text');
     const text = el ? el.value.trim() : '';
     if (!text) return;
@@ -6709,11 +7439,11 @@ document.getElementById('settings-open-btn').addEventListener('click', openSetti
     if (saved) { saved.textContent = 'Saved ✓'; setTimeout(() => { saved.textContent = ''; }, 2000); }
     renderAlignment();
   };
-  window.deleteAlignNote = async function(id){
+  async function legacyDeleteAlignNote(id){
     if (!confirm('Delete this entry?')) return;
     await saveA((await loadA()).filter(x => x.id !== id));
     renderAlignment();
-  };
+  }
   window.renderAlignment = async function(){
     const liveEl = document.getElementById('align-live-rules');
     if (liveEl) {
@@ -6738,18 +7468,17 @@ document.getElementById('settings-open-btn').addEventListener('click', openSetti
       h += row('Sized up while losing', 'Forced hard stop (added 2026-07-28)');
       liveEl.innerHTML = h;
     }
+    // 2026-08-25: the timeline is now the MERGED mind log (state entries AND
+    // standing lessons, with the armed ones marked). align_notes.json is no
+    // longer read here — the server migrated it into mind_log.json on first
+    // load and left the original file untouched as its own backup.
     const wrap = document.getElementById('align-notes-list'); if (!wrap) return;
     wrap.innerHTML = '<div style="font-size:12px;opacity:.5;">Loading…</div>';
-    const list = await loadA(true); // force a fresh server read on every tab-open, not just the cache
-    if (!list.length) { wrap.innerHTML = '<div style="font-size:12px;opacity:.5;">Nothing logged yet.</div>'; return; }
-    wrap.innerHTML = list.map(function(e){
-      const d = new Date(e.ts).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
-      return '<div style="border:1px solid var(--border,#30363d);border-radius:6px;padding:6px 8px;margin-bottom:6px;font-size:12px;">'
-        + '<div style="opacity:.6;font-size:10px;margin-bottom:2px;">' + d + '</div>'
-        + '<div>' + e.text.replace(/</g, '&lt;') + '</div>'
-        + '<div style="margin-top:4px;"><button class="engulf-check-btn" style="font-size:10px;padding:2px 6px;" onclick="deleteAlignNote(' + e.id + ')">Delete</button></div>'
-        + '</div>';
-    }).join('');
+    // Pull the server's copy FIRST. Without this the panel painted from an
+    // empty local cache and his existing entries looked deleted.
+    if (typeof mindEnsure === 'function') { try { await mindEnsure(); } catch (e) {} }
+    if (typeof mindListHtml === 'function') wrap.innerHTML = mindListHtml();
+    else wrap.innerHTML = '<div style="font-size:12px;opacity:.5;">Log unavailable — mind-log.js did not load.</div>';
   };
 })();
 
@@ -7569,13 +8298,55 @@ window.grInBlackout = false;
   const money = n => (n < 0 ? '-$' : '$') + Math.abs(Math.round(n)).toLocaleString();
   const mmss = ms => { const s = Math.max(0, Math.ceil(ms / 1000)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
   function today() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
-  function summarize(s) {
+  // 2026-08-25 FIX (Anoop: "the best trade and worst trades are zero and the
+  // P/L does not match broker P/L"). This is the ONLY writer of a gr_history
+  // entry on a LIVE day rollover, and it emitted a 7-field stub whose `pnl`
+  // was GROSS. Two visible consequences on the Day Recap card:
+  //   - P&L read $547 when the broker said $459.10 — the $87.40 of commission
+  //     on 46 contracts was never subtracted. day-recap.js literally renders
+  //     it as "net $..."; it was never net.
+  //   - BEST/WORST TRADE showed $0 because `best`/`worst` were never written
+  //     at all — and those two numbers are what the card uses to recommend
+  //     today's contract size, so a silent 0 there is a sizing decision made
+  //     on missing data, not a cosmetic gap.
+  // The CSV-import path has always produced the full field set through
+  // DayRollup.rollupDay. Delegating to the SAME function is the fix: a day's
+  // summary must not depend on whether the live feed or a CSV wrote it.
+  function summarizeFallback(s) {
     const n = s.trades.length, pnl = s.trades.reduce((a, t) => a + t.pnl, 0);
     const maxSize = s.trades.reduce((m, t) => Math.max(m, t.size), 0);
     const over = s.trades.filter(t => t.size > SIZE_CAP).length;
     const revenge = s.trades.filter(t => t.flags && t.flags.indexOf('revenge') >= 0).length;
     const disc = n ? Math.round(s.trades.reduce((a, t) => a + (t.pts || 0), 0) / (4 * n) * 100) : 0;
     return { date: s.date, n: n, pnl: pnl, maxSize: maxSize, over: over, revenge: revenge, disc: disc };
+  }
+  // The guardrail's own s.trades carry no exit time, hold or side, so the
+  // rich day_trades store is preferred; it is the same day, written by the
+  // live feed through the same rollup contract. Fall back to the old shape
+  // when that store has nothing for the day (rollupDay divides by
+  // day.length and would return NaN/-Infinity on an empty array).
+  function summarizeRows(dateStr) {
+    try {
+      const dt = JSON.parse(localStorage.getItem('copilot_day_trades') || '{}');
+      const rows = dt && dt[dateStr];
+      return (Array.isArray(rows) && rows.length) ? rows : null;
+    } catch (e) { return null; }
+  }
+  function summarize(s) {
+    if (!s || !s.trades || !s.trades.length) return summarizeFallback(s);
+    const rows = summarizeRows(s.date);
+    if (!rows || typeof DayRollup === 'undefined' || !DayRollup.rollupDay) return summarizeFallback(s);
+    try {
+      const r = (typeof getRules === 'function' ? getRules() : null) || {};
+      return DayRollup.rollupDay(s.date, rows, {
+        // Per-side in rules.json, doubled for the round turn rollupDay expects
+        // — identical to the CSV path, so net never depends on the writer.
+        commPerCt: r.commissionPerContractPerSide != null
+          ? Number(r.commissionPerContractPerSide) * 2 : COMM_PER_CT,
+        sizeCapCsv: SIZE_CAP_CSV,
+        tradingMode: r.tradingMode || 'standard',
+      });
+    } catch (e) { return summarizeFallback(s); }
   }
   function archive(sum) { try { let h = JSON.parse(localStorage.getItem(HKEY) || '[]'); h = h.filter(e => e.date !== sum.date); h.push(sum); localStorage.setItem(HKEY, JSON.stringify(h.slice(-60))); if (window.api && window.api.dataSave) window.api.dataSave(slotDataKey('gr_history'), h.slice(-60)).catch(() => {}); } catch (e) {} }
   function load() {
@@ -7771,7 +8542,32 @@ window.grInBlackout = false;
     } else if (data && data.connected) {
       s.brokerFeedDown = false;
     }
-    s.live = data && data.connected ? { connected: true, tradeCount: data.tradeCount || 0, dayPnl: data.dayPnl || 0, maxSize: data.maxSize || 0, at: Date.now() } : null;
+    // 2026-08-28: carry the BROKER'S OWN BALANCE through, not just dayPnl.
+    // The panel header ships it on every poll and the renderer was throwing it
+    // away, so the sidebar had no choice but to derive a balance from
+    // startBalance + ledger — which is exactly how it came to show $50,801.30
+    // against a broker reading $51,179.90. Parsed from the header's formatted
+    // string ("51,179.90"); anything unparseable stays null so the derivation
+    // below falls back rather than using a NaN.
+    const brokerBal = (function () {
+      try {
+        const h = data && data.summary && data.summary.header;
+        if (!h || h.balance == null) return null;
+        const n = parseFloat(String(h.balance).replace(/−/g, '-').replace(/[^0-9.\-]/g, ''));
+        return Number.isFinite(n) ? n : null;
+      } catch (e) { return null; }
+    })();
+    // Is the account FLAT right now? While a position is open the broker's
+    // balance is marked to market and moves every tick, so it can never agree
+    // with a ledger of CLOSED trades. Comparing the two mid-trade is comparing
+    // two different quantities.
+    const isFlatNow = (function () {
+      try {
+        if (!data || !Array.isArray(data.positions)) return null;   // unknown, not "flat"
+        return data.positions.length === 0;
+      } catch (e) { return null; }
+    })();
+    s.live = data && data.connected ? { connected: true, tradeCount: data.tradeCount || 0, dayPnl: data.dayPnl || 0, maxSize: data.maxSize || 0, brokerBalance: brokerBal, isFlat: isFlatNow, at: Date.now() } : null;
     if (s.live) {
       if (s.live.dayPnl <= -dayStop() && !s.stopped) { s.stopped = true; s.stoppedAt = Date.now(); banner('DAILY STOP HIT (' + money(s.live.dayPnl) + ') — flatten and close Tradovate now.', 'red'); }
       if (data.lastLossTs && data.lastLossTs > (s.lastLossSeen || 0)) { s.lastLossSeen = data.lastLossTs; s.cooldownUntil = data.lastLossTs + COOLDOWN_MS; banner('Live loss — 15-min cooldown started.', 'amber'); }
@@ -8247,7 +9043,15 @@ function insCoachNotes(r) {
   else if (r.dow === 1 || r.dow === 5) notes.push({ c: 'warn', t: DOW[r.dow] + ' is lower-volume — cut size and trade count; avoid Mon-AM / Fri-PM chop.' });
   if (r.n > 20) notes.push({ c: 'bad', t: r.n + ' trades — over your 20 cap. Machine-gunning; this is the flag.' });
   else if (r.n > 12) notes.push({ c: 'warn', t: r.n + ' trades — getting high; quality over quantity.' });
-  if (r.medHold < 300) notes.push({ c: 'warn', t: 'Median hold ' + fmtDur(r.medHold) + ' — faster than your 5-10min plan; you exit winners too early.' });
+  // 2026-08-31 AUDIT: the `else` here used to be reachable with NO hold data at
+  // all — `undefined < 300` is false, `undefined > 0` is false, so a day whose
+  // hold times were never captured got praised for "holds in your 5-15min
+  // band". Latent today (every gr_history row currently has medHold) but live
+  // rows do arrive with hold 0/absent from the fold, and insDeepCard already
+  // branches on `r.avgHold !== undefined`. Praise must be earned by data that
+  // exists, so the absence is now stated instead.
+  if (typeof r.medHold !== 'number') notes.push({ c: 'warn', t: 'No hold-time data for this day — cannot judge whether you held the 5-15min band.' });
+  else if (r.medHold < 300) notes.push({ c: 'warn', t: 'Median hold ' + fmtDur(r.medHold) + ' — faster than your 5-10min plan; you exit winners too early.' });
   else if (r.over15 > 0) notes.push({ c: 'warn', t: r.over15 + ' trade(s) held >15min — past your max.' });
   else notes.push({ c: 'good', t: 'Holds in your 5-15min band — good.' });
   if (r.firstThreeMax > 6) notes.push({ c: 'bad', t: 'Started big (' + r.firstThreeMax + 'c in first 3 trades) — start small, size up only after bias confirms.' });
@@ -8278,9 +9082,26 @@ function insDeepCard(r) {
   return '<div class="ins-day"><div class="ins-day-head ' + pnlCls + '">' + head + '</div>' + metrics + notes + '</div>';
 }
 function insPassMath(hist, acc) {
-  const mode = state.mode, start = mode === 'eval' ? 150000 : 50000;
+  // 2026-08-31 AUDIT FIX. This read `start = mode === 'eval' ? 150000 : 50000`
+  // and `target = acc.evalTarget || 159000` — both hardcoded to the 150K
+  // account. On Anoop's live 50K eval that rendered:
+  //     "To target      $109,405.34"   (truth: $3,405.34)
+  //     "Net (eval days) -$100,405.34" (truth: -$405.34)
+  // in the one panel that is supposed to say how close he is to passing.
+  //
+  // ACCOUNT_PROFILES is the same source enforceAccountInvariant() already
+  // trusts for start/buffer, and it is correct for all three sizes — so this
+  // is the existing single definition, not a fourth one. Never reintroduce a
+  // literal here: it silently follows whichever account was current when it
+  // was typed.
+  const mode = state.mode;
+  const prof = ACCOUNT_PROFILES[state.accountSize] && ACCOUNT_PROFILES[state.accountSize][mode];
+  if (!prof) return '';   // unknown size: show nothing rather than a wrong number
+  const start = prof.startBalance;
   const floor = mode === 'eval' ? acc.evalFloor : acc.fundedFloor;
-  const target = mode === 'eval' ? (acc.evalTarget || 159000) : start + 3000;
+  const target = mode === 'eval'
+    ? (acc.evalTarget || (start + prof.target))
+    : (acc.payoutTarget || prof.payoutTarget || (start + 3000));
   const cushion = acc.balance - floor, profit = acc.balance - start;
   const pos = hist.filter(d => d.pnl > 0).map(d => d.pnl);
   const largest = pos.length ? Math.max.apply(null, pos) : 0;
@@ -8995,7 +9816,14 @@ function csvApply(filename, parsed) {
     // mergeCsvIntoStored replaces a tolerance-identical stored row in place
     // (the same identity the reconciliation report already compares by) and
     // keeps live-only provenance on the merged row.
-    const day = TradeIdentity.mergeCsvIntoStored(dtStore[d] || [], incoming, fp);
+    // 2026-08-26: pass the commission rate. Without it isSameTrade cannot
+    // convert a live row's NET pnl to the CSV's GROSS, and a live-written
+    // trade never matches its own CSV row — which is how re-importing a day
+    // added a second copy of every trade the feed had already recorded.
+    const day = TradeIdentity.mergeCsvIntoStored(dtStore[d] || [], incoming, fp, {
+      commPerContract: (getRules() && getRules().commissionPerContractPerSide != null)
+        ? Number(getRules().commissionPerContractPerSide) : 0,
+    });
 
     // 4.2: the day rollup is day-rollup.js's rollupDay now — ONE definition
     // shared with the live-feed writer (4.3). Byte-identical to the old
@@ -9198,7 +10026,10 @@ function csvIngest(filename, csvText) {
       // rows carry coarser printed ones, and fp() would double every trade.
       const csvRows = (parsed.byDate[d] || []).map(t => ({ t: t.entryMs, x: t.exitMs, size: t.size, pnl: t.pnl, side: t.side }));
       const liveRows = Array.isArray(liveStore[d]) ? liveStore[d] : [];
-      const m = TradeIdentity.matchCsvToLive(csvRows, liveRows);
+      const m = TradeIdentity.matchCsvToLive(csvRows, liveRows, {
+        commPerContract: (getRules() && getRules().commissionPerContractPerSide != null)
+          ? Number(getRules().commissionPerContractPerSide) : 0,
+      });
       if (liveRows.length) anyLive = true;
       const bits = [];
       if (m.csvOnly.length) { bits.push(m.csvOnly.length + ' in the file only — the live feed MISSED these (server was down?)'); anyDiff = true; }
@@ -9761,8 +10592,40 @@ function jrScalpStatsHtml(tradesIn, opts) {
   // Cooldown breaches are the number that actually predicts blow-ups
   // (revenge clusters), so it gets a tile of its own in every mode.
   html += tile('Cooldown Breaks', cooldownBreaches + '/' + gaps.length, cooldownBreaches > 0 ? 'var(--red)' : 'var(--green)');
+  // 2026-08-25 (Anoop): points and ticks captured vs lost for this slice. Uses
+  // the SAME resolver as the trade table below, so the tile and the rows can
+  // never disagree. `~` when any row's move had to be derived from pnl/size
+  // rather than read from stored prices.
+  const PTt = window.PointsTracker;
+  if (PTt && PTt.totalPointsTicks) {
+    const tot = PTt.totalPointsTicks(trades, {
+      commPerContract: (rules && rules.commissionPerContractPerSide != null)
+        ? Number(rules.commissionPerContractPerSide) : 0
+    });
+    if (tot) {
+      const mk = tot.derived > 0 ? '~' : '';
+      const sgn = v => (v >= 0 ? '+' : '') + v.toFixed(1);
+      const col = tot.netPts >= 0 ? 'var(--green)' : 'var(--red)';
+      html += tile('Points', mk + sgn(tot.netPts), col);
+      html += tile('Ticks', mk + (tot.netTicks >= 0 ? '+' : '') + Math.round(tot.netTicks), col);
+    }
+  }
   if (mode === 'scalper') html += tile('Hold Exceeded', holdExceeded + '', holdExceeded > 0 ? 'var(--red)' : 'var(--green)');
   html += '</div>';
+  if (PTt && PTt.totalPointsTicks) {
+    const tt = PTt.totalPointsTicks(trades, {
+      commPerContract: (rules && rules.commissionPerContractPerSide != null)
+        ? Number(rules.commissionPerContractPerSide) : 0
+    });
+    if (tt) {
+      html += '<div style="font-size:10px;color:var(--text-dim);margin:-4px 0 8px">'
+        + 'Captured <span style="color:var(--green)">+' + tt.wonPts.toFixed(1) + ' pts / +' + Math.round(tt.wonTicks) + ' ticks</span>'
+        + ' &middot; gave back <span style="color:var(--red)">' + tt.lostPts.toFixed(1) + ' pts / ' + Math.round(tt.lostTicks) + ' ticks</span>'
+        + (tt.derived > 0 ? ' &middot; ~ = ' + tt.derived + ' of ' + tt.n + ' derived from P&L and size (no prices stored for those fills)' : '')
+        + (tt.skipped > 0 ? ' &middot; ' + tt.skipped + ' unusable' : '')
+        + '</div>';
+    }
+  }
   if (gaps.length && meanGap > medGap * 2) {
     html += '<div style="font-size:10px;color:var(--text-dim);margin:-4px 0 8px">'
       + 'Mean gap ' + fmt(meanGap) + ' is skewed by an outlier gap — median (' + fmt(medGap) + ') reflects your actual re-entry speed.</div>';
@@ -9838,6 +10701,91 @@ function jrTradeLogHtml() {
 }
 
 // ── Main render ────────────────────────────────────────────────────────────────
+// ── Stick-rate scorecard (2026-08-25) ───────────────────────────────────────
+// Anoop asked for this in the Journal tab, beside State of Mind / Followed the
+// Plan / Main Mistake. It answers the one question those fields cannot answer
+// on their own: did writing it down change anything?
+//
+// A lesson he FIXED and a lesson he keeps RE-LEARNING look identical in this
+// app — both are one line in one day's note. Nothing ever compared today's
+// against the ones before it, so "you have written this same sentence four
+// times" was invisible, and stayed invisible precisely because he kept
+// dutifully writing it down.
+//
+// All maths lives in journal-notes.js (pure, unit-tested, shared with the
+// server so Jessi says the same numbers this panel shows).
+function jrScorecardHtml() {
+  const JN = window.JournalNotes;
+  if (!JN || typeof djNotes !== 'object') return '';
+  let sc = null;
+  try { sc = JN.buildScorecard(djNotes, edToday(), {}); } catch (e) { return ''; }
+  if (!sc) return '';
+
+  const esc = t => String(t == null ? '' : t).replace(/</g, '&lt;');
+  let h = '<div class="analysis-block" style="margin-top:12px">'
+    + '<div class="block-title">Did it stick? — ' + sc.journalledDays + ' journalled day'
+    + (sc.journalledDays === 1 ? '' : 's') + '</div>';
+
+  // The headline: the sentence he has proven he cannot make stick alone.
+  // Every matched entry is shown VERBATIM with its date — the match is a blunt
+  // token overlap, so he has to be able to dismiss a bad cluster on sight
+  // rather than take the count on faith.
+  if (sc.headline) {
+    h += '<div style="border-left:3px solid var(--amber);padding:6px 10px;margin-bottom:10px;background:var(--surface);border-radius:0 6px 6px 0;">'
+      + '<div style="font-size:12px;font-weight:600;color:var(--amber);margin-bottom:4px;">'
+      + 'You have written this same lesson ' + sc.headline.count + ' times</div>'
+      + sc.headline.items.map(function (i) {
+          return '<div style="font-size:11px;opacity:.8;">' + i.date + ' — "' + esc(i.text) + '"</div>';
+        }).join('')
+      + '<div style="font-size:11px;margin-top:5px;opacity:.75;">Writing it again is not the fix. What makes this time different?</div>'
+      + '</div>';
+  }
+
+  const a = sc.adherence;
+  if (a) {
+    const col = a.pct >= 70 ? 'var(--green)' : a.pct >= 40 ? 'var(--amber)' : 'var(--red)';
+    h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">'
+      + '<div style="flex:1;min-width:110px;padding:6px 8px;background:var(--surface);border-radius:6px;border:1px solid var(--border)">'
+      + '<div style="font-size:10px;color:var(--text-dim)">FOLLOWED THE PLAN</div>'
+      + '<div style="font-size:15px;font-weight:600;color:' + col + '">' + a.pct + '%</div>'
+      + '<div style="font-size:10px;color:var(--text-dim)">' + a.yes + ' yes · ' + a.partly + ' partly · ' + a.no + ' no</div>'
+      + '</div>';
+    // The trend is the half that says whether it is CHANGING. It is null
+    // until both windows have a real sample — see planAdherence for why a
+    // single earlier day must never read as "improving".
+    if (a.trend) {
+      const tc = a.trend === 'improving' ? 'var(--green)' : a.trend === 'slipping' ? 'var(--red)' : 'var(--text-dim)';
+      h += '<div style="flex:1;min-width:110px;padding:6px 8px;background:var(--surface);border-radius:6px;border:1px solid var(--border)">'
+        + '<div style="font-size:10px;color:var(--text-dim)">TREND</div>'
+        + '<div style="font-size:15px;font-weight:600;color:' + tc + '">' + a.trend.toUpperCase() + '</div>'
+        + '<div style="font-size:10px;color:var(--text-dim)">last ' + a.recentN + ': ' + a.recentPct
+        + '% vs ' + a.earlierPct + '% before</div></div>';
+    } else {
+      h += '<div style="flex:1;min-width:110px;padding:6px 8px;background:var(--surface);border-radius:6px;border:1px solid var(--border)">'
+        + '<div style="font-size:10px;color:var(--text-dim)">TREND</div>'
+        + '<div style="font-size:13px;font-weight:600;color:var(--text-dim)">—</div>'
+        + '<div style="font-size:10px;color:var(--text-dim)">not enough journalled days yet</div></div>';
+    }
+    h += '</div>';
+  }
+
+  if (sc.repeatedMistakes.length) {
+    h += '<div style="font-size:10px;color:var(--text-dim);margin-bottom:4px;">MISTAKES THAT CAME BACK</div>';
+    sc.repeatedMistakes.slice(0, 4).forEach(function (m) {
+      h += '<div style="font-size:11px;margin-bottom:3px;">'
+        + '<b>' + esc(m.mistake) + '</b> — first named ' + m.first + ', back <b>' + m.recurred
+        + '</b> more time' + (m.recurred === 1 ? '' : 's')
+        + ' across the ' + m.sinceDays + ' journalled day' + (m.sinceDays === 1 ? '' : 's') + ' since.'
+        + '</div>';
+    });
+  }
+
+  h += '<div style="font-size:10px;color:var(--text-dim);margin-top:8px;">'
+    + 'Repeats are matched by word overlap, not by a model — the exact lines are shown above so you can judge the match yourself. '
+    + 'Days you did not journal are not counted as clean.</div>';
+  return h + '</div>';
+}
+
 async function renderJournal() {
   const body = document.getElementById('journal-body'); if (!body) return;
   await djLoad();   // per-account notes + screenshot index
@@ -9885,6 +10833,9 @@ async function renderJournal() {
   } catch (e) {}
 
   const s = jrStats();
+  // 2026-08-25: djLoad() ran at the top of renderJournal, so djNotes is
+  // populated by the time this is built.
+  const scorecardHtml = jrScorecardHtml();
   const tile = (k, v, cls) => '<div class="jr-tile ' + (cls || '') + '"><div class="jr-k">' + k + '</div><div class="jr-v">' + v + '</div></div>';
 
   // 2026-08-13: points + sizing tile, driven by window.PointsTracker — the
@@ -9931,6 +10882,9 @@ async function renderJournal() {
   const dtAll = jrLS('copilot_day_trades', {});
   const histByDate = {}; jrLS('copilot_gr_history', []).forEach(d => { histByDate[d.date] = d; });
   const djDates = Array.from(new Set(Object.keys(ledger).concat(Object.keys(dtAll)))).sort().reverse();
+  // The scorecard sits directly above the per-day notes it is derived from,
+  // so the count and the fields that produced it are read in one glance.
+  html += scorecardHtml;
   html += '<div class="analysis-block"><div class="block-title">Daily Journal — ' + djDates.length + ' day' + (djDates.length === 1 ? '' : 's') + ' · click a day to expand</div>'
         + djDates.map(d => djDayRow(d, histByDate[d] || (ledger[d] ? { pnl: ledger[d].net, gross: ledger[d].gross, disc: 0 } : null), (dtAll[d] || []))).join('')
         + '</div>';
@@ -10168,13 +11122,26 @@ window.djSaveNote = async function (date) {
   // says "Saved ✓") — re-expanding this day later re-populates the fields
   // from the saved note as before; this reset only affects the moment
   // right after you hit Save.
+  // 2026-08-25 BUG FIX (found while auditing this path for the scorecard).
+  // This used to blank all five inputs after a successful save. Clicking
+  // "Save note" a SECOND time on the same still-open card then read those now
+  // empty inputs and wrote {text:'', mood:'', ...} straight over the note he
+  // had just written — silent, total data loss on a double-click, with the
+  // badge still reading "Saved". Nothing re-populated the fields in between,
+  // because djSaveNote never re-renders.
+  //
+  // The original intent (2026-07-28) was a visibly clean form after saving.
+  // Re-showing what was saved achieves that without arming the overwrite, and
+  // it also lets him SEE that the save took, which blanking never did.
   if (ok) {
-    const set = (id, v) => { const e = document.getElementById(id); if (e) e.value = v; };
-    set('dj-mood-' + date, '');
-    set('dj-plan-' + date, '');
-    set('dj-mistake-' + date, '');
-    set('dj-text-' + date, '');
-    set('dj-lesson-' + date, '');
+    const set = (id, v) => { const e = document.getElementById(id); if (e) e.value = v == null ? '' : v; };
+    set('dj-mood-' + date, note.mood);
+    set('dj-plan-' + date, note.followedPlan);
+    set('dj-mistake-' + date, note.mistake);
+    set('dj-text-' + date, note.text);
+    set('dj-lesson-' + date, note.lesson);
+    // Refresh the scorecard — the note just saved may BE the repeat.
+    if (typeof renderJournal === 'function') { try { renderJournal(); } catch (e) {} }
   }
 };
 
@@ -10271,18 +11238,50 @@ function djDayRow(date, dayStats, trades) {
       // number shown here matches what the Scalper agent quotes back.
       // Also flags each row's violations inline (from t.flags set at ingest)
       // so a bad trade is visible without cross-referencing another panel.
+      const PTR = window.PointsTracker;
+      // 2026-08-25 (Anoop): "Consider anything below 100$ and above -100$ as
+      // not a trade... as break even". Band comes from rules.json, never a
+      // literal here — same discipline as every other threshold.
+      const beBand = (getRules() && Number(getRules().breakEvenBandUsd) > 0)
+        ? Number(getRules().breakEvenBandUsd) : 100;
+      const beTrip = (getRules() && Number(getRules().breakEvenReminderCount) > 0)
+        ? Number(getRules().breakEvenReminderCount) : 5;
+      const isBreakEven = t => Number.isFinite(Number(t.pnl)) && Math.abs(Number(t.pnl)) < beBand;
+      const beCount = trades.filter(isBreakEven).length;
+      const ptOpts = { commPerContract: (getRules() && getRules().commissionPerContractPerSide != null)
+        ? Number(getRules().commissionPerContractPerSide) : 0 };
       h += '<div class="jr-tbl-wrap" style="max-height:200px"><table class="jr-tbl"><thead><tr>'
-        + '<th style="width:28px">#</th><th>Open</th><th>Side</th><th>Size</th><th>Hold</th><th>Points</th><th>Net P&L</th><th>Flags</th></tr></thead><tbody>';
+        + '<th style="width:28px">#</th><th>Open</th><th>Side</th><th>Size</th><th>Hold</th><th>Points</th><th>Ticks</th><th>Net P&L</th><th>Flags</th></tr></thead><tbody>';
       trades.forEach((t, ti) => {
         const tm = t.t ? new Date(t.t).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) : '—';
         const hold = t.hold != null ? (t.hold >= 60 ? Math.round(t.hold / 60) + 'm' : t.hold + 's') : '—';
-        const pts = t.mp != null ? (t.mp >= 0 ? '+' : '') + t.mp.toFixed(2) : '—';
+        // 2026-08-25 (Anoop: "i want to see how many ticks and points did i
+        // capture or loss"). t.mp alone left every live-fold row showing '—'
+        // — those rows have no prices, but pnl/size resolves the same move.
+        // A derived value is marked with a leading ~ so an inferred number is
+        // never mistaken for a chart read.
+        const pr = PTR ? PTR.tradePointsResolved(t, ptOpts) : null;
+        const tk = PTR ? PTR.tradeTicksResolved(t, ptOpts) : null;
+        const ptv = pr ? pr.pts : null;
+        const mark = pr && pr.derived ? '~' : '';
+        const pts = pr ? mark + (pr.pts >= 0 ? '+' : '') + pr.pts.toFixed(2) : '—';
+        const tks = tk ? mark + (tk.ticks >= 0 ? '+' : '') + Math.round(tk.ticks) : '—';
         const fl = (t.flags || []);
-        const flHtml = fl.length
+        // BREAK-EVEN is rendered as a badge but deliberately NEVER pushed into
+        // t.flags: rollupDay scores discipline as (4 - flags.length), so a
+        // flag here would mark a clean small trade as a rule break and quietly
+        // drag the day's discipline % down.
+        const be = isBreakEven(t);
+        const beHtml = be
+          ? '<span class="dj-flag" style="border-color:var(--text-dim);color:var(--text-dim)" title="inside +/-$'
+            + beBand + ' — by your own definition, not a trade">break-even</span>'
+          : '';
+        const flHtml = (fl.length
           ? fl.map(f => '<span class="dj-flag" title="' + f + '">' + f + '</span>').join(' ')
-          : '<span style="opacity:.35">clean</span>';
+          : (be ? '' : '<span style="opacity:.35">clean</span>'))
+          + (be ? (fl.length ? ' ' : '') + beHtml : '');
         h += '<tr><td style="opacity:.55;font-variant-numeric:tabular-nums">' + (ti + 1) + '</td><td>' + tm + '</td><td class="' + (t.side === 'long' ? 'jr-g' : t.side === 'short' ? 'jr-r' : '') + '">' + (t.side || '—')
-           + '</td><td>' + (t.size || '—') + '</td><td>' + hold + '</td><td class="' + (t.mp > 0 ? 'jr-g' : t.mp < 0 ? 'jr-r' : '') + '">' + pts + '</td><td class="' + (t.pnl >= 0 ? 'jr-g' : 'jr-r') + '">' + money(t.pnl) + '</td><td style="font-size:10px">' + flHtml + '</td></tr>';
+           + '</td><td>' + (t.size || '—') + '</td><td>' + hold + '</td><td class="' + (ptv > 0 ? 'jr-g' : ptv < 0 ? 'jr-r' : '') + '">' + pts + '</td><td class="' + (ptv > 0 ? 'jr-g' : ptv < 0 ? 'jr-r' : '') + '">' + tks + '</td><td class="' + (t.pnl >= 0 ? 'jr-g' : 'jr-r') + '">' + money(t.pnl) + '</td><td style="font-size:10px">' + flHtml + '</td></tr>';
       });
       h += '</tbody></table></div>';
 
@@ -10290,6 +11289,20 @@ function djDayRow(date, dayStats, trades) {
       // trades (avgWin ÷ avgLoss within each consecutive pair) — this is a
       // REALIZED ratio from actual fills, not a planned R:R, since the CSV
       // never carries the stop/target price that was set on the order.
+      // The count he asked to be reminded of, on the day he is reading about.
+      // The live F4 reminder fires during the session; this is the same number
+      // after the fact, so the two can never tell him different things.
+      if (beCount) {
+        const real = trades.length - beCount;
+        h += '<div style="margin-top:6px;font-size:11px;color:'
+          + (beCount >= beTrip ? 'var(--amber)' : 'var(--text-dim)') + '">'
+          + (beCount >= beTrip ? '&#9888; ' : '')
+          + beCount + ' of ' + trades.length + ' trades landed inside &plusmn;$' + beBand
+          + ' — by your own definition, ' + real + ' real trade' + (real === 1 ? '' : 's') + ' today.'
+          + (beCount >= beTrip ? ' You asked to be told at ' + beTrip + '.' : '')
+          + '</div>';
+      }
+
       const pairs = [];
       for (let i = 0; i < trades.length; i += 2) pairs.push(trades.slice(i, i + 2));
       h += '<div class="jr-pairs" style="margin-top:6px;font-size:12px;opacity:.85">';

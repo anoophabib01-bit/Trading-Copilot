@@ -176,3 +176,60 @@ test('event rows keep seconds — they correlate against the trades table', () =
   });
   assert.match(renderNowMarkdown(withEvent, T), /22:58:14/);
 });
+
+// ── Provenance on the glance surface (2026-08-24) ───────────────────────────
+// This file is what he had on screen reading -$154.20 while the broker showed
+// +$399.70. It must render the authoritative number and say where it came from.
+test('Now.md renders the broker figure plainly, with no qualifier, when it is real', () => {
+  const md = renderNowMarkdown({
+    mode: 'eval',
+    feed: { balanceAtLastFlat: 51211.50, dayPnl: -154.20 },
+    pnl: { value: 399.70, source: 'broker', realized: 399.70, open: 0, foldValue: -154.20, stale: false },
+    tradeCount: { value: 7, evidence: 'verified', degraded: 0 },
+    rules: { sizeCap: 4, tradesPerDay: 5, dailyLossTiers: { hard: -500 } },
+    watchers: { tvConnected: true }, recent: [],
+  }, 1787587000000);
+  assert.match(md, /\| Day P&L \| \*\*\$399\.70\*\* \|/);
+  assert.ok(!md.includes('-$154.20'), 'the fold figure must not appear as the headline');
+  assert.match(md, /\| Trades \| 7 \/ 5 \|/);
+  assert.ok(!md.includes('provisional'));
+});
+
+test('Now.md splits realized and open while a position is running', () => {
+  const md = renderNowMarkdown({
+    mode: 'eval',
+    feed: { balanceAtLastFlat: 51211.50, dayPnl: 100 },
+    pnl: { value: -200, source: 'broker', realized: 100, open: -300, foldValue: 100, stale: false },
+    tradeCount: { value: 3, evidence: 'verified', degraded: 0 },
+    rules: { sizeCap: 4, tradesPerDay: 5, dailyLossTiers: { hard: -500, warn: -250 } },
+    watchers: { tvConnected: true }, recent: [],
+  }, 1787587000000);
+  assert.match(md, /\| Day P&L \| \*\*-\$200\.00\*\*/);
+  assert.match(md, /realized \| \$100\.00/);
+  assert.match(md, /open \| -\$300\.00/);
+});
+
+test('Now.md marks an estimated P&L and a provisional count rather than presenting them as fact', () => {
+  const md = renderNowMarkdown({
+    mode: 'eval',
+    feed: { balanceAtLastFlat: 51211.50, dayPnl: -154.20 },
+    pnl: { value: -154.20, source: 'fold', realized: -154.20, open: null, foldValue: -154.20, stale: false },
+    tradeCount: { value: 7, evidence: 'degraded', degraded: 8 },
+    rules: { sizeCap: 4, tradesPerDay: 5, dailyLossTiers: { hard: -500 } },
+    watchers: { tvConnected: true }, recent: [],
+  }, 1787587000000);
+  assert.match(md, /estimated — broker panel unreadable/);
+  assert.match(md, /\| Trades \| 7 \/ 5 _\(provisional\)_ \|/);
+});
+
+test('Now.md still renders from raw feed state if no resolved pnl is handed in', () => {
+  // Defensive: a caller that has not been updated must not blank the surface.
+  const md = renderNowMarkdown({
+    mode: 'eval',
+    feed: { balanceAtLastFlat: 50000, dayPnl: -42, tradeCount: 2 },
+    rules: { sizeCap: 4, tradesPerDay: 5, dailyLossTiers: { hard: -500 } },
+    watchers: { tvConnected: true }, recent: [],
+  }, 1787587000000);
+  assert.match(md, /\| Day P&L \| \*\*-\$42\.00\*\*/);
+  assert.match(md, /\| Trades \| 2 \/ 5 \|/);
+});

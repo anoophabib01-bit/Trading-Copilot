@@ -1,0 +1,47 @@
+//@version=5
+strategy("Gold VWAP Reversion 2-sigma", overlay=true,
+     initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0.95,
+     slippage=2, calc_on_every_tick=false, max_bars_back=5000)
+
+// ── Inputs ─────────────────────────────────────────────────
+src       = input.source(hlc3, "VWAP source")
+stdev_len = input.int(20, "Std-dev lookback", minval=5, maxval=100)
+sig       = input.float(2.0, "Entry sigma", minval=1.0, maxval=3.0, step=0.25)
+stop_sig  = input.float(3.0, "Stop sigma", minval=2.0, maxval=4.0, step=0.25)
+
+// ── Session-anchored VWAP (reset each new day) ─────────────
+var float cumPV = 0.0
+var float cumV  = 0.0
+newDay = ta.change(time("D")) != 0
+cumPV := newDay ? src * volume : cumPV + src * volume
+cumV  := newDay ? volume : cumV + volume
+vwap = cumPV / cumV
+
+// ── Deviation bands ────────────────────────────────────────
+stdev  = ta.stdev(src - vwap, stdev_len)
+upper  = vwap + sig * stdev
+lower  = vwap - sig * stdev
+stopUp = vwap + stop_sig * stdev
+stopDn = vwap - stop_sig * stdev
+
+// ── Entries: close crosses beyond band -> fade back to VWAP ─
+long_sig  = ta.crossunder(close, lower) and strategy.position_size == 0
+short_sig = ta.crossover(close, upper) and strategy.position_size == 0
+
+if long_sig
+    strategy.entry("Long", strategy.long, comment="VWAP reversion L")
+if short_sig
+    strategy.entry("Short", strategy.short, comment="VWAP reversion S")
+
+// ── Exits: target VWAP, stop beyond 3-sigma ────────────────
+if strategy.position_size > 0
+    strategy.exit("XL", limit=vwap, stop=stopDn)
+if strategy.position_size < 0
+    strategy.exit("XS", limit=vwap, stop=stopUp)
+
+plot(vwap, "VWAP", color.new(color.blue, 0), linewidth=2)
+plot(upper, "Upper 2s", color.new(color.red, 0))
+plot(lower, "Lower 2s", color.new(color.green, 0))
+plotshape(long_sig,  "Long",  shape.triangleup,   location.belowbar, color.new(color.lime, 0), size=size.small)
+plotshape(short_sig, "Short", shape.triangledown, location.abovebar, color.new(color.red, 0),  size=size.small)

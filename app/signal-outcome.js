@@ -61,7 +61,14 @@ function resolveSignalOutcome(signal, bars, opts) {
   // NOT plain Number(): Number(null) and Number('') are both 0, which is
   // finite — so a signal with no level would resolve AT ZERO and report a
   // nonsense MFE of the full price. Caught by this module's own tests.
-  const rawLevel = signal ? signal.level : undefined;
+  //
+  // ANCHOR ON `entry` WHEN IT IS PRESENT (2026-08-26). Excursion has to be
+  // measured from the price the trade would actually have gone on at.
+  // `level` means different things per playbook — for playbook-b-confirm it
+  // is the SWEPT LEVEL, i.e. beyond the stop — so scoring from it measured
+  // the wrong distance entirely. Falls back to `level` so every row written
+  // before this field existed still resolves exactly as it used to.
+  const rawLevel = signal ? (signal.entry != null ? signal.entry : signal.level) : undefined;
   const level = (rawLevel != null && rawLevel !== '') ? Number(rawLevel) : NaN;
   const signalSec = signal && signal.ts ? Math.floor(Date.parse(signal.ts) / 1000) : NaN;
 

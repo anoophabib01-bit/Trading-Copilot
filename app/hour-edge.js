@@ -28,4 +28,29 @@ function buildHourEdge(days) {
   return buckets;
 }
 
-module.exports = { buildHourEdge };
+// ── Minimum sample before an hour's win% may be QUOTED ───────────────────────
+// (2026-08-31 audit) buildHourEdge always recorded `n` correctly, but the
+// consumer in server.js stamped only `winPct` onto every signal row and threw
+// the sample size away. The result was 13 rows in DATA/signals carrying
+// "hourEdge: 100" — a 100% win rate derived from ONE trade at 12:00 IST — with
+// nothing on the row to say so. That is a confident number manufactured from an
+// absence of data, sitting in the ledger the scorecard and the agents read.
+//
+// 5 is a floor for being worth showing AT ALL, not a claim of significance —
+// even n=8 is thin for a win rate. Below it, `reliableWinPct` returns null so
+// the annotation is absent rather than wrong; `n` is always carried alongside
+// so a reader can judge the rest.
+const MIN_SAMPLE = 5;
+
+/**
+ * The hour's win% only when there is enough of a sample to quote it.
+ * Returns null below MIN_SAMPLE — never a number the caller might round-trip
+ * into looking authoritative.
+ */
+function reliableWinPct(bucket, minSample) {
+  const min = typeof minSample === 'number' ? minSample : MIN_SAMPLE;
+  if (!bucket || typeof bucket.n !== 'number' || bucket.n < min) return null;
+  return typeof bucket.winPct === 'number' ? bucket.winPct : null;
+}
+
+module.exports = { buildHourEdge, reliableWinPct, MIN_SAMPLE };

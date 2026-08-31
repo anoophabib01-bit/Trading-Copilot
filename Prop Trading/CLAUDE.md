@@ -258,6 +258,7 @@ All 6 prior blown accounts hit the Max Loss Limit. Root causes:
 4. **Holding losers 3+ hours** — if a trade isn't working in 5 minutes, the thesis is wrong.
 5. **Multi-instrument on bad days** — every blow-up shows both MNQ and MGC being traded.
 6. **Accounts were UP before they crashed** — account 6 built +$937 then gave back $2,637.
+8. **Break-even churn** (self-identified 2026-08-25) — Anoop: "There are so many trades in a day that I take break even. Consider anything below 100$ and above -100$ as not a trade... After 5 break even trades, I want you to remind me." On 2026-08-25, 8 of 11 trades landed inside ±$100 (one at −$0.80, one at +$5.60) — about $77.90 of commission paid for trades that returned nothing. Rule: a trade is only a trade if it clears +$100 or −$100; anything inside that band is BREAK-EVEN and does not count as one. Enforced advisory-only in the app as mistake-pattern F4, thresholds in `app/rules.json` (`breakEvenBandUsd` 100, `breakEvenReminderCount` 5). Break-even trades DO still count toward the tradesPerDay/contractsPerDay caps — excluding them from a safety ceiling would make churn the loophole that bypasses it.
 7. **Entering too fast on the 1Min chart** (self-identified, merged from Trade Healer 2026-07-02) — looking at only a 1Min candle distorts judgment. Fix: wait 5–15 minutes, or confirm 2–3 consecutive candle closes (or at minimum one full closing candle) in the direction of the trade before entering. Don't exit immediately after entry without waiting for that confirmation — hold through the close of 2–3 candles unless the stop is hit.
 
 ### Session Warning Triggers — Issue Hard Stop If Anoop Says Any of These
@@ -309,7 +310,7 @@ Start every session by asking Anoop to send his Performance CSV from Tradovate, 
 - Trade timestamps (check for window violations and 15-min break rule)
 - P&L sequence (identify revenge clusters)
 - Max intraday drawdown vs the $100 yellow / $150 red / $200 hard-cutoff tiers
-- Net P&L after estimated commission (~$0.59/contract/side on Tradovate)
+- Net P&L after commission ($0.95/contract/side on Tradovate - corrected 2026-08-24; the earlier ~$0.59 estimate under-charged by $0.72 per contract round turn and made the app's balance read high. Confirmed against Tradovate's own Performance export and Tradeify's P&L calendar; see `app/rules.json`'s `_commission_comment`.)
 - Whether session profit was broadly distributed or saved by 1–2 outlier trades
 - System verdict
 

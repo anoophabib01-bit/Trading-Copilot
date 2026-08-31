@@ -1,0 +1,40 @@
+//@version=5
+strategy("DSH ADX35 Breakout v3 (Long-only)", overlay=true,
+     initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0.95,
+     slippage=2, pyramiding=1, calc_on_every_tick=false, max_bars_back=5000)
+
+// ── Inputs ─────────────────────────────────────────────────
+lookback  = input.int(10,  "Breakout lookback (bars)", minval=3, maxval=40)
+adx_min   = input.float(35.0, "ADX minimum", minval=20, maxval=50, step=5)
+stop_buf  = input.float(3.0, "Stop buffer (pts)", minval=0, maxval=20, step=0.5)
+rr_ratio  = input.float(2.0, "Target R", minval=1.0, maxval=4.0, step=0.5)
+
+// ── ADX / Directional Index ────────────────────────────────
+[diplus, diminus, adx] = ta.dmi(14, 14)
+
+// ── Entry: LONG only, strong confirmed uptrend breakout ────
+brk_high = ta.highest(high, lookback)[1]
+long_sig = adx >= adx_min and diplus > diminus and close > brk_high and close > open and strategy.position_size == 0
+
+var float stop_px = na
+var float tgt_px  = na
+if long_sig
+    stop_px := low - stop_buf
+    tgt_px  := close + (close - stop_px) * rr_ratio
+    strategy.entry("Long", strategy.long, qty=1, comment="ADX35 brk")
+
+if strategy.position_size > 0
+    strategy.exit("XL", stop=stop_px, limit=tgt_px)
+if strategy.position_size == 0
+    stop_px := na
+    tgt_px  := na
+
+// ── 03:00 IST hard flatten (no overnight) ──────────────────
+ist_hour = hour(time, "Asia/Kolkata")
+flatten  = ist_hour == 3 and ist_hour[1] != 3
+if flatten and strategy.position_size != 0
+    strategy.close_all(comment="03:00 IST flatten")
+
+// ── Visuals ────────────────────────────────────────────────
+plotshape(long_sig, "Long", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.small)

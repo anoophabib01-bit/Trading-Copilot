@@ -1,0 +1,224 @@
+/* ── Weekly Report tab (2026-08-29) ─────────────────────────────────────────
+   Its own file rather than an append to styles.css, following the g5-premium.css
+   precedent: this tab is self-contained and a bad rule here cannot reflow the
+   live trading surface.
+
+   Built on the same tokens as the Journal calendar so the two read as one
+   family. Nothing hardcodes a colour a theme would need to override, except the
+   two blame shades set inline from JS (where the slice keys live) and the
+   held-fire blue — which has no existing token because nothing before this tab
+   needed to say "good, and not money". */
+
+.wk-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.wk-head-mid { flex: 1; text-align: center; }
+.wk-key { font-size: 15px; font-weight: 700; letter-spacing: 0.04em; }
+.wk-range { font-size: 10px; color: var(--text-dim); margin-top: 1px; }
+.wk-status { margin-left: 6px; padding: 1px 6px; border-radius: var(--radius-xs); background: var(--surface3); }
+.wk-status.wk-live { background: var(--amber-dim); color: var(--amber); }
+
+.wk-verdict {
+  font-size: 13px; line-height: 1.5; font-weight: 600; padding: 10px 12px; margin-bottom: 10px;
+  border-left: 3px solid var(--amber); background: var(--amber-dim);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+.wk-kpis { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin-bottom: 12px; }
+.wk-kpi { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 7px 8px; text-align: center; }
+.wk-kpi-l { font-size: 9px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+.wk-kpi-v { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+
+.wk-g { color: var(--green); }
+.wk-r { color: var(--red); }
+.wk-dim { color: var(--text-dim); font-size: 10px; }
+
+.wk-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; margin-bottom: 10px; box-shadow: var(--shadow-1); }
+.wk-card-h { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-mid); margin-bottom: 10px; }
+.wk-card-r { border-left: 3px solid var(--red); }
+.wk-card-g { border-left: 3px solid var(--green); }
+.wk-card-doc { border-left: 3px solid var(--accent); }
+.wk-card-commit { border-left: 3px solid var(--amber); }
+.wk-card-warn { border-left: 3px solid var(--amber); background: var(--amber-dim); }
+.wk-empty { font-size: 11px; color: var(--text-dim); line-height: 1.6; }
+.wk-two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.wk-grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+
+/* Drawdown bar — the week damage against the whole allowance */
+.wk-dd { margin-bottom: 12px; }
+.wk-dd-bar { position: relative; height: 22px; background: var(--surface3); border-radius: var(--radius-xs); overflow: hidden; }
+.wk-dd-fill { position: absolute; inset: 0 auto 0 0; background: var(--red); opacity: 0.55; }
+.wk-dd-worst { position: absolute; inset: 0 auto 0 0; background: #8a1220; opacity: 0.9; }
+.wk-dd-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 6px; font-size: 10px; color: var(--text-mid); }
+.wk-sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+
+.wk-stat { background: var(--surface2); border-radius: var(--radius-sm); padding: 8px; }
+.wk-stat-l { font-size: 9px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+.wk-stat-v { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 2px 0; }
+.wk-stat-s { font-size: 9px; color: var(--text-dim); line-height: 1.4; }
+
+/* Week calendar — seven tiles, Monday first */
+.wk-cal { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+.wk-day {
+  display: flex; flex-direction: column; gap: 1px; min-height: 92px; padding: 6px 5px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface2);
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+.wk-day:not(.wk-closed):not(.wk-future):hover { transform: translateY(-2px); box-shadow: var(--shadow-2); }
+.wk-day-dow { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-mid); }
+.wk-day-date { font-size: 8px; color: var(--text-dim); margin-bottom: 3px; }
+.wk-day-pnl { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.wk-day-meta { font-size: 8px; color: var(--text-dim); }
+.wk-day-br { font-size: 8px; margin-top: auto; color: var(--red); }
+.wk-day-br.wk-g { color: var(--green); }
+.wk-day-note { font-size: 10px; color: var(--text-dim); margin: auto 0; text-align: center; }
+.wk-day-ck { font-size: 7px; letter-spacing: 0.05em; padding: 1px 4px; border-radius: 3px; align-self: flex-start; margin-top: 2px; background: var(--surface3); color: var(--text-dim); }
+.wk-day-ck.wk-ck-go { background: var(--green-dim); color: var(--green); }
+.wk-day-ck.wk-ck-nogo { background: var(--red-dim); color: var(--red); }
+.wk-day.wk-green { background: var(--green-dim); border-color: rgba(38, 166, 154, 0.4); }
+.wk-day.wk-green .wk-day-pnl { color: var(--green); }
+.wk-day.wk-red { background: var(--red-dim); border-color: rgba(239, 83, 80, 0.4); }
+.wk-day.wk-red .wk-day-pnl { color: var(--red); }
+.wk-day.wk-flat { background: var(--surface3); }
+/* Held fire: its own identity. Not a blank, not a loss — the behaviour he is
+   trying to repeat, so it must not look like an absence. */
+.wk-day.wk-held { background: rgba(79, 141, 249, 0.13); border-color: rgba(79, 141, 249, 0.45); border-style: dashed; }
+.wk-day.wk-held .wk-day-pnl { color: var(--accent); font-size: 11px; letter-spacing: 0.08em; }
+.wk-day.wk-closed, .wk-day.wk-future { background: none; border-style: dashed; border-color: var(--border); opacity: 0.5; }
+.wk-day.wk-breached { box-shadow: inset 0 -3px 0 var(--red); }
+
+.wk-notes { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.wk-note { background: var(--surface2); border-radius: var(--radius-sm); padding: 7px 9px; font-size: 11px; line-height: 1.5; }
+.wk-note b { font-size: 10px; color: var(--text-mid); margin-right: 6px; }
+.wk-tag { font-size: 8px; text-transform: uppercase; letter-spacing: 0.05em; padding: 1px 5px; border-radius: 3px; background: var(--surface3); color: var(--text-dim); margin-right: 4px; }
+.wk-tag-r { background: var(--red-dim); color: var(--red); }
+.wk-note-t { color: var(--text-mid); margin-top: 3px; }
+.wk-note-l { color: var(--accent); font-size: 10px; margin-top: 3px; }
+
+/* Money x process quadrant */
+.wk-quad-note { font-size: 10px; color: var(--text-dim); line-height: 1.5; margin-bottom: 10px; }
+.wk-quads { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.wk-quad { padding: 9px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface2); }
+.wk-quad-t { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
+.wk-quad-n { font-size: 22px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.wk-quad-d { font-size: 9px; color: var(--text-mid); }
+.wk-quad-s { font-size: 9px; color: var(--text-dim); margin-top: 4px; line-height: 1.4; }
+.wk-quad-empty { opacity: 0.45; }
+.wk-q-earned { background: var(--green-dim); border-color: rgba(38, 166, 154, 0.4); }
+.wk-q-earned .wk-quad-t, .wk-q-earned .wk-quad-n { color: var(--green); }
+.wk-q-got { background: var(--amber-dim); border-color: rgba(255, 159, 10, 0.4); }
+.wk-q-got .wk-quad-t, .wk-q-got .wk-quad-n { color: var(--amber); }
+.wk-q-luck { background: var(--surface3); }
+.wk-q-self { background: var(--red-dim); border-color: rgba(239, 83, 80, 0.45); }
+.wk-q-self .wk-quad-t, .wk-q-self .wk-quad-n { color: var(--red); }
+
+/* Loss-attribution donut */
+.wk-pie-wrap { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.wk-pie { width: 180px; height: 180px; flex: none; }
+.wk-arc { transition: opacity 0.15s ease; }
+.wk-pie:hover .wk-arc { opacity: 0.45; }
+.wk-pie .wk-arc:hover { opacity: 1; }
+.wk-pie-c1 { fill: var(--text); font-size: 17px; font-weight: 700; text-anchor: middle; font-variant-numeric: tabular-nums; }
+.wk-pie-c2 { fill: var(--text-dim); font-size: 8px; text-anchor: middle; }
+.wk-legend { flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 5px; }
+.wk-leg { display: flex; align-items: center; gap: 7px; font-size: 11px; }
+.wk-leg-l { flex: 1; color: var(--text-mid); }
+.wk-leg-v { font-variant-numeric: tabular-nums; font-weight: 600; }
+.wk-leg-p { width: 44px; text-align: right; color: var(--text-dim); font-size: 10px; font-variant-numeric: tabular-nums; }
+.wk-pie-note { font-size: 10px; color: var(--text-dim); line-height: 1.55; margin-top: 10px; }
+
+/* Daily P&L bars */
+.wk-bars { display: flex; gap: 6px; align-items: stretch; }
+.wk-bar-col { flex: 1; display: flex; flex-direction: column; align-items: center; }
+.wk-bar-half { height: 43px; width: 100%; display: flex; justify-content: center; }
+.wk-bar-up { align-items: flex-end; }
+.wk-bar-dn { align-items: flex-start; }
+.wk-bar { width: 100%; max-width: 40px; border-radius: 3px; }
+.wk-bar-g { background: var(--green); }
+.wk-bar-r { background: var(--red); }
+.wk-bar-dirty { background-image: repeating-linear-gradient(45deg, rgba(0,0,0,0.28) 0 3px, transparent 3px 6px); }
+.wk-bar-zero { width: 100%; height: 1px; background: var(--border2); }
+.wk-bar-lbl { font-size: 9px; color: var(--text-mid); margin-top: 4px; font-weight: 600; }
+.wk-bar-val { font-size: 10px; font-variant-numeric: tabular-nums; }
+.wk-bar-br { font-size: 8px; color: var(--text-dim); }
+
+/* Findings */
+.wk-find { padding: 8px 0; border-bottom: 1px solid var(--border); }
+.wk-find:last-child { border-bottom: none; }
+.wk-find-t { font-size: 12px; font-weight: 600; line-height: 1.4; display: flex; gap: 7px; }
+.wk-find-n { flex: none; width: 17px; height: 17px; border-radius: 50%; background: var(--red-dim); color: var(--red); font-size: 10px; display: flex; align-items: center; justify-content: center; font-weight: 700; }
+.wk-find-ng { background: var(--green-dim); color: var(--green); }
+.wk-find-d { font-size: 10px; color: var(--text-dim); line-height: 1.55; margin-top: 3px; padding-left: 24px; }
+
+/* Tables */
+.wk-tbl { width: 100%; border-collapse: collapse; font-size: 11px; }
+.wk-tbl th { text-align: left; font-size: 9px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); padding: 4px 6px; border-bottom: 1px solid var(--border); font-weight: 600; }
+.wk-tbl td { padding: 5px 6px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+.wk-tbl tr:last-child td { border-bottom: none; }
+
+/* Commitment grading */
+.wk-check { display: grid; grid-template-columns: 62px 1fr; gap: 4px 9px; padding: 7px 0; border-bottom: 1px solid var(--border); align-items: baseline; }
+.wk-check:last-child { border-bottom: none; }
+.wk-check-b { font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-align: center; padding: 2px 0; border-radius: 3px; }
+.wk-check-ok .wk-check-b { background: var(--green-dim); color: var(--green); }
+.wk-check-no .wk-check-b { background: var(--red-dim); color: var(--red); }
+.wk-check-self .wk-check-b { background: var(--surface3); color: var(--text-dim); }
+.wk-check-l { font-size: 12px; font-weight: 600; }
+.wk-check-d { grid-column: 2; font-size: 10px; color: var(--text-dim); line-height: 1.5; }
+
+/* Doctrine */
+.wk-doc-ta { width: 100%; min-height: 150px; resize: vertical; font-size: 12px; line-height: 1.6; padding: 9px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface2); color: var(--text); font-family: inherit; }
+.wk-doc-actions { display: flex; align-items: center; gap: 10px; margin-top: 7px; flex-wrap: wrap; }
+.wk-drift { margin-top: 11px; padding: 9px 10px; background: var(--amber-dim); border-radius: var(--radius-sm); }
+.wk-drift-h { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--amber); margin-bottom: 4px; }
+.wk-drift-i { font-size: 11px; color: var(--text-mid); line-height: 1.5; }
+
+/* Commit next week */
+.wk-commit-note { font-size: 10px; color: var(--text-dim); line-height: 1.55; margin-bottom: 10px; }
+.wk-commit-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.wk-field { display: flex; flex-direction: column; gap: 3px; }
+.wk-field label, .wk-commit-focus label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); }
+.wk-field input, .wk-commit-focus input { padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface2); color: var(--text); font-size: 12px; font-family: inherit; }
+.wk-commit-focus { display: flex; flex-direction: column; gap: 3px; margin-top: 8px; }
+.wk-commit-actions { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.wk-commit-btn { font-weight: 700; }
+.wk-freeze { margin-top: 11px; padding-top: 10px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 10px; }
+
+@media (max-width: 780px) {
+  .wk-kpis { grid-template-columns: repeat(3, 1fr); }
+  .wk-two, .wk-quads, .wk-grid3 { grid-template-columns: 1fr; }
+  .wk-commit-grid { grid-template-columns: 1fr 1fr; }
+  .wk-cal { grid-template-columns: repeat(4, 1fr); }
+  .wk-bars { overflow-x: auto; }
+}
+
+/* The weekend nudge — set by wkOnWeekReady() when a finished week is frozen. */
+.rtab.wk-tab-ready { position: relative; color: var(--amber); font-weight: 700; }
+.rtab.wk-tab-ready::after {
+  content: ""; position: absolute; top: 4px; right: 3px;
+  width: 6px; height: 6px; border-radius: 50%; background: var(--amber);
+}
+
+/* Adherence — does discipline pay */
+.wk-card-prov { border-left: 3px solid var(--text-dim); }
+.wk-prov-badge { font-size: 8px; padding: 1px 5px; border-radius: 3px; background: var(--surface3); color: var(--text-dim); letter-spacing: 0.04em; margin-left: 4px; }
+.wk-adh th { white-space: nowrap; }
+.wk-adh .wk-strong { font-weight: 700; font-size: 12px; }
+/* Greyed on purpose: per-trade invites the wrong comparison, and hiding it
+   would leave the obvious objection unanswered. */
+.wk-adh .wk-muted-col, .wk-tbl th.wk-muted-col { color: var(--text-dim); opacity: 0.65; }
+.wk-adh-clean td:first-child { color: var(--green); }
+.wk-adh-dirty td:first-child { color: var(--red); }
+.wk-adh-verdict { margin-top: 10px; padding: 9px 11px; border-radius: var(--radius-sm); font-size: 12px; line-height: 1.5; }
+.wk-adh-yes { background: var(--green-dim); color: var(--green); }
+.wk-adh-no { background: var(--amber-dim); color: var(--amber); }
+
+/* Four-week comparison */
+.wk-scroll { overflow-x: auto; }
+.wk-trend4 { min-width: 620px; }
+.wk-trend4 th, .wk-trend4 td { text-align: right; white-space: nowrap; }
+.wk-trend4 th:first-child, .wk-trend4 td:first-child { text-align: left; }
+.wk-trend4 .wk-th-sub { display: block; font-weight: 400; font-size: 8px; color: var(--text-dim); letter-spacing: 0; text-transform: none; }
+.wk-trend4 th.wk-th-cur { color: var(--text); }
+.wk-trend4 th.wk-th-empty { opacity: 0.45; }
+.wk-trend4 .wk-td-cur { background: var(--surface2); font-weight: 600; }
+.wk-spark-cell { width: 80px; padding: 2px 6px !important; }
+.wk-spark { width: 72px; height: 20px; display: block; }

@@ -35,6 +35,27 @@ function buildSignalRow(fields, ctx) {
     tf: f.tf || null,
     direction: f.direction || null,
     level: f.level != null ? f.level : null,
+    // ── entry / stop / setupId — ADDED 2026-08-26 ───────────────────────────
+    // Without these the ledger recorded that something FIRED but never what
+    // the trade was, and signal-outcome.js anchors its MFE/MAE on a price.
+    // The consequence was total and silent: across 2026-08-24 and 08-25, 16
+    // of 17 armed signals carried level:null, so resolveSignalOutcome()
+    // returned 'signal lacks direction, level or timestamp' for every one and
+    // DATA/signals/*.outcomes.jsonl was never created. The entire measurement
+    // apparatus — the thing that answers "do my playbooks work" — had been
+    // running and producing nothing.
+    //
+    // `entry` is deliberately separate from `level`. The one signal that DID
+    // carry a level (playbook-b-confirm) set it to the SWEPT LEVEL, which is
+    // the stop reference, not the entry: measuring excursion from there would
+    // have scored the trade from beyond its own stop. entry is where the
+    // trade goes on, stop is where it comes off, level keeps its original
+    // meaning so nothing that already reads it changes behaviour.
+    entry: f.entry != null ? f.entry : null,
+    stop: f.stop != null ? f.stop : null,
+    // Stable per-setup identity so one gap is one signal. See playbook-spec.js
+    // setupId() for the wall-clock-bucket re-fire bug this replaces.
+    setupId: f.setupId || null,
     gapLow: f.gapLow != null ? f.gapLow : null,
     gapHigh: f.gapHigh != null ? f.gapHigh : null,
     source: f.source || null,
@@ -49,6 +70,9 @@ function buildSignalRow(fields, ctx) {
     accountSlot: c.accountSlot || null,
     mode: c.mode || null,
     hourEdge: c.hourEdge != null ? c.hourEdge : null, // 6.2 reporting-only
+    // Sample size behind hourEdge. A win% with no n beside it is not a fact,
+    // it is an anecdote — see hour-edge.js MIN_SAMPLE (2026-08-31 audit).
+    hourEdgeN: c.hourEdgeN != null ? c.hourEdgeN : null,
     decision: f.decision || null,
     decidedAt: f.decidedAt || null,
     signalTs: f.signalTs != null ? f.signalTs : null,

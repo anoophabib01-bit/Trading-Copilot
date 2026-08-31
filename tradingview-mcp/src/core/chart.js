@@ -179,6 +179,7 @@ export async function manageIndicator({ action, indicator, entity_id, inputs: in
 }
 
 export async function getVisibleRange() {
+  const { evaluate } = _resolve();
   const result = await evaluate(`
     (function() {
       var chart = ${CHART_API};
@@ -220,7 +221,8 @@ export async function setVisibleRange({ from, to, _deps }) {
   return { success: true, requested: { from, to }, actual: actual || { from: 0, to: 0 } };
 }
 
-export async function scrollToDate({ date }) {
+export async function scrollToDate({ date, _deps }) {
+  const { evaluate } = _resolve(_deps);
   let timestamp;
   if (/^\d+$/.test(date)) timestamp = Number(date);
   else timestamp = Math.floor(new Date(date).getTime() / 1000);

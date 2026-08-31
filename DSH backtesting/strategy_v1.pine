@@ -1,0 +1,110 @@
+//@version=5
+strategy("DSH 3TF Quality v1 (A/B/C) | 30M signal", overlay=true,
+     initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0.95,
+     slippage=2, pyramiding=1, calc_on_every_tick=false, max_bars_back=5000)
+
+grp_bias = "Bias (4H)"
+piv_left  = input.int(3, "Pivot left bars (4H)", minval=1, maxval=10, group=grp_bias)
+piv_right = input.int(3, "Pivot right bars (4H)", minval=1, maxval=10, group=grp_bias)
+
+grp_conf = "1H confirmation (key driver)"
+disp_mult = input.float(1.5, "Displacement body (x 1H ATR)", minval=0.5, maxval=3.0, step=0.1, group=grp_conf)
+
+grp_entry = "30M entry"
+engulf_body_atr = input.float(0.3, "Engulf body (x 30M ATR)", minval=0.1, maxval=2.0, step=0.1, group=grp_entry)
+sfp_lookback = input.int(5, "SFP pivot lookback (30M)", minval=2, maxval=20, group=grp_entry)
+
+grp_risk = "Risk / exit"
+rr_ratio  = input.float(1.5, "Target R", minval=1.0, maxval=2.0, step=0.5, group=grp_risk)
+stop_buf  = input.float(3.0, "Stop buffer (pts)", minval=0.0, maxval=20.0, step=0.5, group=grp_risk)
+
+f_swingStructure(leftB, rightB) =>
+    var float sh1 = na
+    var float sh2 = na
+    var float sl1 = na
+    var float sl2 = na
+    ph = ta.pivothigh(leftB, rightB)
+    pl = ta.pivotlow(leftB, rightB)
+    if not na(ph)
+        sh2 := sh1
+        sh1 := ph
+    if not na(pl)
+        sl2 := sl1
+        sl1 := pl
+    bull4h = not na(sh2) and not na(sl2) and sh1 > sh2 and sl1 > sl2
+    bear4h = not na(sh2) and not na(sl2) and sh1 < sh2 and sl1 < sl2
+    [bull4h, bear4h, sh1, sl1]
+
+[bull4h, bear4h, swingHigh4h, swingLow4h] = request.security(syminfo.tickerid, "240", f_swingStructure(piv_left, piv_right), lookahead=barmerge.lookahead_off)
+
+bull1h = request.security(syminfo.tickerid, "60", close > ta.sma(close, 20), lookahead=barmerge.lookahead_off)
+bear1h = request.security(syminfo.tickerid, "60", close < ta.sma(close, 20), lookahead=barmerge.lookahead_off)
+disp_bull1h = request.security(syminfo.tickerid, "60", (close - open) >= disp_mult * ta.atr(14), lookahead=barmerge.lookahead_off)
+disp_bear1h = request.security(syminfo.tickerid, "60", (open - close) >= disp_mult * ta.atr(14), lookahead=barmerge.lookahead_off)
+
+atr30 = ta.atr(14)
+min_body = atr30 * engulf_body_atr
+prev_bull = close[1] > open[1]
+prev_bear = close[1] < open[1]
+curr_body = math.abs(close - open)
+bull_engulf = close > open and prev_bear and open <= close[1] and close >= open[1] and curr_body >= min_body
+bear_engulf = close < open and prev_bull and open >= close[1] and close <= open[1] and curr_body >= min_body
+
+crossed_above_swingHigh = ta.crossover(close, swingHigh4h)
+bars_since_cross_above  = ta.barssince(crossed_above_swingHigh)
+buy_side_swept  = not na(bars_since_cross_above) and bars_since_cross_above >= 1 and bars_since_cross_above < 20
+crossed_below_swingLow = ta.crossunder(close, swingLow4h)
+bars_since_cross_below = ta.barssince(crossed_below_swingLow)
+sell_side_swept = not na(bars_since_cross_below) and bars_since_cross_below >= 1 and bars_since_cross_below < 20
+
+pl30 = ta.pivotlow(sfp_lookback, sfp_lookback)
+ph30 = ta.pivothigh(sfp_lookback, sfp_lookback)
+sfp_long  = not na(pl30[1]) and low < pl30[1] and close > pl30[1]
+sfp_short = not na(ph30[1]) and high > ph30[1] and close < ph30[1]
+disp_bull30 = curr_body >= 1.5 * atr30 and close > open
+disp_bear30 = curr_body >= 1.5 * atr30 and close < open
+
+long_a  = bull4h and bull1h and disp_bull1h and bull_engulf and not buy_side_swept and strategy.position_size == 0
+short_a = bear4h and bear1h and disp_bear1h and bear_engulf and not sell_side_swept and strategy.position_size == 0
+long_b  = bull4h and bull1h and disp_bull1h and sfp_long and disp_bull30 and not buy_side_swept and strategy.position_size == 0
+short_b = bear4h and bear1h and disp_bear1h and sfp_short and disp_bear30 and not sell_side_swept and strategy.position_size == 0
+
+long_signal  = long_a or long_b
+short_signal = short_a or short_b
+
+var float long_stop  = na
+var float long_tp    = na
+var float short_stop = na
+var float short_tp   = na
+
+if long_signal
+    long_stop  := low - stop_buf
+    long_risk = close - long_stop
+    long_tp    := close + long_risk * rr_ratio
+    strategy.entry("Long", strategy.long, qty=1, comment="L")
+if short_signal
+    short_stop := high + stop_buf
+    short_risk = short_stop - close
+    short_tp   := close - short_risk * rr_ratio
+    strategy.entry("Short", strategy.short, qty=1, comment="S")
+
+if strategy.position_size > 0
+    strategy.exit("XL", stop=long_stop, limit=long_tp)
+if strategy.position_size < 0
+    strategy.exit("XS", stop=short_stop, limit=short_tp)
+if strategy.position_size == 0
+    long_stop := na
+    long_tp := na
+    short_stop := na
+    short_tp := na
+
+ist_hour = hour(time, "Asia/Kolkata")
+flatten_now = ist_hour == 3 and ist_hour[1] != 3
+if flatten_now and strategy.position_size != 0
+    strategy.close_all(comment="03:00 IST flatten")
+
+plotshape(long_signal,  "Long",  shape.triangleup,   location.belowbar, color.new(color.lime, 0),   size=size.small)
+plotshape(short_signal, "Short", shape.triangledown, location.abovebar, color.new(color.red, 0),    size=size.small)
+plot(swingHigh4h, "4H SH", color.new(color.orange, 40))
+plot(swingLow4h,  "4H SL", color.new(color.blue, 40))
