@@ -1056,3 +1056,127 @@ export async function ensurePanelTablesMounted({ want, requireExpanded = true } 
     diagnostics,
   };
 }
+
+// ── Forcing ONE table to actually render its rows (2026-09-02) ──────────────
+//
+// A THIRD failure mode, distinct from the two above and invisible to both.
+//
+//   collapsed panel  -> the table is not in the DOM at all      (fixed 2026-08-23)
+//   tab never opened -> the table is not in the DOM at all      (fixed 2026-09-01, summary)
+//   tab not SHOWING  -> the table IS in the DOM, with ZERO ROWS  <- this
+//
+// ensurePanelTablesMounted answers "is `table[data-name$=orders-table]` in the
+// document", and for this fault the answer is YES. The <table> is mounted, its
+// <thead> is correct, and its <tbody> is empty because ka-table only renders
+// body rows for the visible tab. Every presence check passes while the read
+// returns nothing.
+//
+// WHAT IT COST. app/server.js flags `ordersTableSuspect` on exactly this shape
+// (orders empty while a position is open) and then degrades: the order-history
+// walk is dropped, `closedRoundTrips` goes null, and every close falls to the
+// balance-delta fold — which knows the money and nothing else. Those rows are
+// written with `xp: null`, so from 2026-09-01 the app had no exit price for any
+// trade, and the post-exit drift panel sat anchored on 2026-08-31's 29406.5 for
+// two days while reporting it as current.
+//
+// WHY IT CLICKS AND THEN CLICKS BACK. Only the showing tab renders rows, so all
+// three cannot be live at once — there is no arrangement of the panel that
+// makes this go away. The read therefore borrows the tab: select Orders, let it
+// render, read it, put his tab back. Restoration is NOT cosmetic here (unlike
+// ensurePanelTablesMounted's, which is): leaving Orders selected would silently
+// stop the positions table from updating, and a stale positions table reads as
+// FLAT — the exact corruption the 2026-08-23 note calls out as worse than a
+// visible failure. So the tab always goes back, including on the throw path.
+//
+// DELIBERATELY NOT CALLED ON EVERY POLL. The panel visibly flickers, and at the
+// 10s account cadence that is unusable. Callers fire it when the answer matters
+// and not otherwise (app/server.js: on the suspect shape, under panel-repair.js's
+// cooldown/ceiling/escalation budget). It never re-collapses the panel and it
+// never touches the order ticket — same safety contract as everything above.
+//
+// Returns the FRESH read plus what it did, so a caller that gets `ok: false`
+// can keep its existing refuse-to-trust behaviour rather than acting on a table
+// it has no evidence rendered.
+// 2026-09-02 (same day, second fault): POSITIONS has the identical problem and
+// it is the more dangerous of the two. The oversize guard sends a reducing
+// order, then re-reads the positions table to confirm the position shrank. With
+// that table not re-rendering, the confirmation read returns the PRE-ORDER size
+// forever — so a reduction that actually worked looks like one that did nothing,
+// the guard hits its "one outstanding reduction at a time" refusal, and reports
+// STUCK. That happened twice on 2026-09-02 (11:56 and 12:30) and ended with the
+// guard switched off for the session, leaving size unenforced against a broker
+// ceiling of 40 micros and a cap of 2.
+//
+// The guard's refusal is CORRECT and stays exactly as it is — a stale read is
+// precisely when it must not send more (six reductions on a stale read flipped a
+// long to a short on 2026-08-31). What was wrong is the EVIDENCE it refuses on.
+// This gives it a genuinely re-rendered read to judge, so STUCK means the
+// position really did not move rather than the DOM not repainting.
+const REFRESHABLE = {
+  orders: { dataName: 'TRADOVATE.orders-table', tabText: TAB_TEXT.orders },
+  positions: { dataName: 'TRADOVATE.positions-table', tabText: TAB_TEXT.positions },
+};
+
+export async function refreshPanelTable({ table = 'orders', settleMs = 700 } = {}) {
+  const spec = REFRESHABLE[table];
+  if (!spec) return { ok: false, error: 'unknown table: ' + table };
+  const before = await readTable(spec.dataName);
+  const mounted = await evaluate(mountedTablesJS());
+
+  // The panel must be open first — with it collapsed there is no tab to click
+  // and no rows to render. Reuses the proven opener rather than a second one.
+  const panel = await evaluate(bottomPanelStateJS());
+  let opened = null;
+  if (!panel || !panel.present || panel.collapsed !== false) {
+    opened = await evaluate(openBrokerPanelJS());
+    await new Promise((r) => setTimeout(r, 900));
+  }
+
+  let click = null;
+  let restored = null;
+  let after = before;
+  try {
+    click = await evaluate(clickPanelTabJS(spec.tabText));
+    if (click && click.ok) {
+      await new Promise((r) => setTimeout(r, settleMs));
+      after = await readTable(spec.dataName);
+    }
+  } finally {
+    // ALWAYS, even if the read above threw. A tab left on Orders freezes the
+    // positions table, and a frozen positions table reads as flat.
+    if (click && click.ok && click.prevActive) {
+      try {
+        const r = await evaluate(clickPanelTabJS([click.prevActive]));
+        restored = !!(r && r.ok);
+      } catch (e) { restored = false; }
+    }
+  }
+
+  const rows = after.rows.map((r) => r.row);
+  return {
+    // ok means: the tab was clicked AND the table now shows either real rows
+    // or TradingView's explicit "no data" placeholder. An empty table with no
+    // placeholder is the unrendered shape again — not evidence of zero orders.
+    ok: !!(click && click.ok) && (rows.length > 0 || !!after.emptyStateText),
+    table,
+    mountedBefore: mounted ? mounted[table] : null,
+    rowsBefore: before.rows.length,
+    rowsAfter: rows.length,
+    emptyStateText: after.emptyStateText,
+    opened,
+    click,
+    restoredTab: click && click.prevActive ? click.prevActive : null,
+    restored,
+    rows,
+    // Kept under its original name so the orders callers written earlier today
+    // keep working unchanged.
+    orders: table === 'orders' ? rows : undefined,
+    positions: table === 'positions' ? rows : undefined,
+  };
+}
+
+// The original orders-only entry point, now a thin wrapper. Callers added on
+// 2026-09-02 use this name and there is no reason to churn them.
+export async function refreshOrdersTable(opts = {}) {
+  return refreshPanelTable(Object.assign({}, opts, { table: 'orders' }));
+}

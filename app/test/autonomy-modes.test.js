@@ -172,14 +172,17 @@ test('shadow silence can be turned off explicitly', () => {
 
 // ── playbooks ──────────────────────────────────────────────────────────────
 
-test('CONTROL trades A, B and LTF-ENGULF but not an unlisted playbook', () => {
+test('CONTROL trades only the playbooks on its allowlist', () => {
   assert.equal(m.isPlaybookAllowed(rules(), 'live', 'A'), true);
   assert.equal(m.isPlaybookAllowed(rules(), 'live', 'B'), true);
   assert.equal(m.isPlaybookAllowed(rules(), 'live', 'LTF-ENGULF'), true);
-  assert.equal(m.isPlaybookAllowed(rules(), 'live', 'DSH-V2'), false);
+  assert.equal(m.isPlaybookAllowed(rules(), 'live', 'C-ADX'), false);
 });
 
-test("the UI's 'C' is the LTF-ENGULF spec and is allowed through the alias", () => {
+// 2026-09-01: a 'C' arriving at the gate is an engulf SETUP, never the
+// validity gate. It used to alias to LTF-ENGULF; every always-on engulf
+// watcher is Playbook A now, so both 'C' and the retired id resolve there.
+test("the UI's 'C' is an engulf setup and resolves to Playbook A through the alias", () => {
   // playbook-spec marks the real Playbook C isGate:true and planEntry refuses
   // it, so a 'C' arriving at an execution gate is always the engulf setup.
   assert.equal(m.isPlaybookAllowed(rules(), 'live', 'C'), true);
@@ -190,8 +193,8 @@ test('a missing playbook list does NOT silently mean "all playbooks"', () => {
   // own gates — a dropped config key must not widen the grant on its own.
   const r = rules();
   delete r.autonomyModes.control.playbooks;
-  // Falls back to the module defaults, which are the locked A/B/LTF-ENGULF set.
-  assert.equal(m.isPlaybookAllowed(r, 'live', 'DSH-V2'), false);
+  // Falls back to the module defaults.
+  assert.equal(m.isPlaybookAllowed(r, 'live', 'C-ADX'), false);
 });
 
 // ── labels ─────────────────────────────────────────────────────────────────

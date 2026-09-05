@@ -400,10 +400,24 @@ body{
 /* ── 12 · Right-panel tabs — G5 line 139-141 ──────────────────────────────
    G5 .rtab: 10.5px / 6px 9px / radius 7px / weight 700, wrapping strip.
    Active = solid accent pill with matching border. */
-#right-tabs{ display:flex !important; flex-wrap:wrap !important; gap:4px !important; }
+/* 2026-09-05 (Anoop: "make it one line"): was flex-wrap:wrap, which is why 11
+   pills sat on two rows. Now a single non-wrapping row that SHRINKS to fit —
+   .rtab gets min-width:0 and a shrinkable padding so the pills narrow instead
+   of spilling. overflow-x:auto is the escape hatch: on a very narrow right
+   panel the strip scrolls sideways rather than clipping a tab out of reach,
+   which is the one outcome worse than wrapping. scrollbar-width:none keeps
+   that from showing a permanent bar under the tabs. */
+#right-tabs{
+  display:flex !important; flex-wrap:nowrap !important; gap:3px !important;
+  overflow-x:auto; scrollbar-width:none; -ms-overflow-style:none;
+}
+#right-tabs::-webkit-scrollbar{ display:none; }
 #right-tabs .rtab, .rtab{
   font-size:10.5px !important;
-  padding:6px 9px !important;
+  padding:6px 7px !important;
+  min-width:0 !important;
+  flex:0 1 auto !important;
+  white-space:nowrap !important;
   border-radius:7px !important;
   background:var(--surface) !important;
   border:1px solid var(--border) !important;

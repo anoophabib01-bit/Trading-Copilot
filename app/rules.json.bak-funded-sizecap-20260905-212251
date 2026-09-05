@@ -1,0 +1,266 @@
+{
+  "sizeCap": 4,
+  "sizeFloor": 2,
+  "tradeLimit": {
+    "eval": 2,
+    "funded": 20
+  },
+  "tradesPerSession": 5,
+  "tradesPerDay": 5,
+  "maxHoldSeconds": 1800,
+  "qualifyingTradeMinAbsPnl": 100,
+  "scorerTradesPerDayLimit": 10,
+  "dailyLossTiers": {
+    "yellow": -250,
+    "red": -350,
+    "hard": -500
+  },
+  "dayStop": {
+    "eval": 1500,
+    "funded": 200
+  },
+  "cooldownMinutes": 15,
+  "sessionWindows": [
+    {
+      "name": "London",
+      "tz": "Europe/London",
+      "startLocal": "08:00",
+      "endLocal": "09:30"
+    },
+    {
+      "name": "NY",
+      "tz": "America/New_York",
+      "startLocal": "09:30",
+      "endLocal": "11:30"
+    }
+  ],
+  "oneInstrumentPerDay": true,
+  "commissionPerContractPerSide": 0.95,
+  "giveback": {
+    "armAtProfit": 400,
+    "retracePct": 50
+  },
+  "perTradeMaxLoss": 300,
+  "_sessionWindowsNote": "Declared in each exchange's OWN timezone and converted to IST at load time by session-windows.js (see its header). Fixed IST minutes were wrong for half of every year: India has no DST, London and New York both do, and they shift on different dates. Durations are unchanged from the old fixed values (London 90min, NY 120min) — this moves WHEN a window opens, not how long it runs. Do not add startMin/endMin back here; loadRules() computes sessionWindowsIST from this block.",
+  "_comment": "Single source of truth for all discipline rules. Edit here — scorer, guardrails and reports all read this file. Times are IST wall-clock minutes (e.g. 810 = 13:30).",
+  "_sizeCap_comment": "FIXED 2026-07-28 (Anoop): was 6, silently 3x looser than the documented hard rule (CLAUDE.md rule #2: max 2 contracts/entry). The 150K eval breach on 2026-07-21 was exactly this — sized 5 lots, doubled to 10, against a stated 2-cap the app was never actually enforcing at this number. 2026-08-15: these BASE numbers are now the FUNDED ruleset — stageRules.eval permits upward from here, stageRules.funded clamps. See stage-rules.js for why the safe numbers are the base ones.",
+  "_sizeFloor_comment": "ADDED 2026-08-15. One-contract trades lose money in BOTH stages — eval 25% win rate/-$361 over 12 trades, funded 54% win rate but still -$345 over 13 trades, because the wins are too small to pay for the losses. Sizing down to 1 is not caution, it is what hesitation looks like in the ledger. 2 contracts is the only size profitable in both stages (eval +$535, funded +$264), and it survives dropping its single best trade in both.",
+  "_tradeLimit_comment": "SUPERSEDED 2026-07-28 by tradesPerSession/tradesPerDay below — kept only so any code path still reading the old shape doesn't crash. Do not raise this back up as the active limit.",
+  "_tradesPerDay_comment": "CHANGED 2026-08-15: was 10. The base rules are NORMAL (non-scalper) mode, and Anoop's own note sets normal mode at under 5 trades/day. Scalper raises it to 10 via scalperRules; funded clamps it to 6 via stageRules. Trade COUNT is owned by the tradingMode axis — stageRules.eval deliberately does not set it, so switching to eval can never raise the count above what the mode allows.",
+  "_maxHoldSeconds_comment": "ADDED 2026-08-15. Normal-mode ceiling of 30 min; scalperRules tightens to 900 (15 min). Anoop's note put a 15-min MINIMUM on normal mode; the data says the opposite — trades held over 15 min are 40% win rate and -$646 net across 15 trades, while the 5-15 min window is 22% of his trades and 145% of his profit (+$1,975, robust to dropping its best trade). Caveat kept on record: hold time is an outcome, not a decision, and those long holds are most likely failed scalps he refused to cut rather than planned swing trades — so this is a ceiling on hanging on, not evidence that swing trading fails for him.",
+  "_qualifying_comment": "2026-07-28 (Anoop): only trades that closed with |P&L| >= $100 count toward the 5/session, 10/day cap. Anything that closed between -$100 and +$100 is a scratch/near-breakeven trade and doesn't count as one of the 5.",
+  "_dailyLossTiers_comment": "CHANGED 2026-07-28 (Anoop): was -100/-150/-200.",
+  "_commission_comment": "0.95/side ($1.90 round turn), corrected 2026-08-24. Was 0.59, which under-charged every day's net by $0.72 per contract and left the app's balance drifting ABOVE the broker's. Two independent confirmations of 0.95: (1) replaying Tradovate's own Performance export for 2026-08-17..21 (97 round trips, 193 contracts) at 0.95/side yields a 5-day total of 811.80, i.e. a base balance of $50,811.80, which equals the broker's own start-of-day net liq to the cent (51,211.50 minus its Total P/L 399.70); at 0.59 it yields 950.76, off by exactly 193 x $0.72 = $138.96. (2) the same replay puts 2026-08-20 at -264.10, which is exactly the figure on Tradeify's own P&L calendar already recorded in tv-broker-feed.js's header from a separate source. Do NOT change this back without new evidence of the same standard: it feeds csvApply, day-rollup and the live P&L cross-check.",
+  "challenge": {
+    "greenDays": 5,
+    "scoreTarget": 70
+  },
+  "eval": {
+    "start": 50000,
+    "startDate": "2026-07-08",
+    "maxDrawdown": 2000,
+    "profitTarget": 3000,
+    "drawdownType": "end-of-day-trailing",
+    "floorLocksAt": 50100,
+    "dailyLossLimit": null,
+    "maxContractsBroker": 40,
+    "minTradingDays": 3
+  },
+  "_payout_comment": "ADDED 2026-08-23. REPLACES eval.consistencyPctMax, which was 50 — a number matching NO published Tradeify tier, and which grep showed was read by no code anywhere in the repo. The consistency rule is the hard gate on the entire goal of this app (reach a payout), and it was both mis-specified and untracked. Figures below are from Tradeify's own help centre: https://help.tradeify.co/en/articles/10468320-rules-consistency-rule (limits) and /11083796 (Growth day counts). Read by payout-eligibility.js. Per this repo's convention, no consistency figure may be hardcoded in code or in a persona string — it lives here.",
+  "payout": {
+    "_accountFamily_comment": "⚠ UNCONFIRMED — inferred, needs Anoop to verify against his Tradeify dashboard. The live broker account reads TDFYSL50413184562; the TDFY+SL prefix reads as Tradeify SELECT. If that is wrong, change this one value — everything else follows from it. Do NOT let an inferred tier silently become fact; that is exactly how the wrong 50 got here.",
+    "accountFamily": "select",
+    "_profitField_comment": "The firm writes 'no single day's profit (commissions are not included in profit)', which reads as evaluating GROSS. Defaulting to net ('pnl') is deliberately conservative: net is smaller, so the computed ratio is HIGHER and the app calls him ineligible slightly BEFORE the firm does, never after. Switch to 'gross' only once a real payout request settles the ambiguity.",
+    "profitField": "pnl",
+    "tiers": {
+      "selectEval": {
+        "label": "Select Evaluation",
+        "consistencyPct": 40,
+        "minProfitableDays": 3,
+        "minDayProfit": 0,
+        "_comment": "40% during the evaluation phase. The 3-day minimum is a consequence of the rule, not a separate gate: no single day may exceed 40% of total, so it cannot be passed in 1-2 days."
+      },
+      "selectFunded": {
+        "label": "Select Funded",
+        "consistencyPct": null,
+        "minProfitableDays": 0,
+        "minDayProfit": 0,
+        "_comment": "Tradeify publishes NO consistency rule for Select once funded. null means 'no limit configured' — payout-eligibility.js treats that as not-computable rather than as automatically satisfied."
+      },
+      "growthFunded": {
+        "label": "Growth Sim Funded",
+        "consistencyPct": 35,
+        "minProfitableDays": 5,
+        "minDayProfit": 250,
+        "_comment": "35%, plus 5+ days each showing profit above a size-dependent floor ($100 on 25k, $150 on 50k, $200 on 100k, $250 on 150k). 250 matches eval.start of 150000 above — re-check this if the account size changes. The day count resets after each successful payout."
+      },
+      "lightningFunded": {
+        "label": "Lightning Funded",
+        "consistencyPct": 20,
+        "minProfitableDays": 0,
+        "minDayProfit": 0,
+        "_comment": "Accounts bought after 2025-09-12 08:00 EST scale 20% → 25% → 30% by payout number; earlier accounts stay at 20% flat. Only the first-payout figure is encoded here — if this family ever becomes active, the scaling must be implemented rather than left at 20."
+      }
+    }
+  },
+  "_tradingMode_comment": "PINNED 2026-09-05. The STANDARD/SCALPER toggle was removed from the titlebar at Anoop's request; this key is now the ONLY place the trading rulebook is chosen, and nothing in the UI can change it. Pinned to scalper because that is what every recorded day since 2026-08-31 actually ran on. Editing this line silently moves tradesPerDay (10 vs 5), maxHoldSeconds (900 vs 1800) and the daily loss tiers (-200/-300/-400 vs -250/-350/-500) with no on-screen indicator that it changed — so change it deliberately, and say so in Prop Trading/CLAUDE.md at the same time.",
+  "tradingMode": "scalper",
+  "scalperRules": {
+    "_comment": "Override rules when tradingMode === 'scalper'. Anything NOT listed here falls through to the standard rules above. 2026-08-15: sizeCap deliberately REMOVED from this block — contract size is now owned by stageRules (eval/funded), not by trading style. Leaving it here meant switching to scalper mode on a FUNDED account silently raised the size cap, which is the exact change his own data says destroys that account (funded: every size except 2 contracts loses money, -$1,717 across 31 trades).",
+    "tradesPerSession": 5,
+    "tradesPerDay": 10,
+    "_tradesPerDay_comment": "CHANGED 2026-08-15: was 15 (session 8). Anoop's note: scalper may exceed 5 trades, up to 10/day.",
+    "dailyLossTiers": {
+      "yellow": -200,
+      "red": -300,
+      "hard": -400
+    },
+    "cooldownAfterLossOnly": true,
+    "maxHoldSeconds": 900,
+    "_maxHoldSeconds_comment": "CHANGED 2026-08-15: was 1800 (30 min). Anoop's note says scalper hold time is under 15 min, and the data agrees — over 15 min is 40% win rate, -$646 across 15 trades.",
+    "scorerTradesPerDayLimit": 15
+  },
+  "stageRules": {
+    "_comment": "ADDED 2026-08-15. The eval/funded risk layer, applied AFTER scalperRules — see stage-rules.js for the full derivation and the fail-safe argument. Anoop's strategy, verbatim: 'I want to risk aggressively in evaluation and be very secure when I'm creating a funded account, safe in funded... Spend less time in evaluation, more time in funded.' eval PERMITS upward from the base; funded CLAMPS and can only ever tighten (same one-way-ratchet idea as lossRatchet.mode 'min'). Trade COUNT is intentionally absent from the eval block so that being in eval can never raise the count above what the trading mode allows.",
+    "eval": {
+      "sizeCap": 4,
+      "contractsPerDayMax": 36,
+      "_comment": "Size 2-4. His 3-4c bucket is +$2,007 over 14 trades and stays +$1,286 after dropping its best trade, median +$57 — a real edge. 5-6c is NOT kept: +$506 that collapses to +$24 once one +$482 trade is removed, i.e. one lucky trade rather than an edge. This is where I disagreed with his handwritten note, which said scalper size 4-6 max 6; he accepted the cap of 4 on 2026-08-15. contractsPerDayMax 36 is deliberately near-non-binding: all six of his eval days above 12 contracts were GREEN (+$2,865, 6/6), and an intraday daily-loss stop COSTS money in eval at every level tested. The eval constraint is meant to be the clock, not the size."
+    },
+    "funded": {
+      "sizeCap": 4,
+      "sizeFloor": 2,
+      "tradesPerDay": 6,
+      "contractsPerDayMax": 12,
+      "dailyLossCap": 200,
+      "clampMode": "min",
+      "_comment": "Fixed at 2 contracts — not a range. 2c is the largest funded sample (20 trades) and the only profitable one (+$264, still +$83 after dropping its best trade, median +$8). Every other size loses: 1c -$345, 3c -$437, 4c -$103, 5-6c -$384, 7c+ -$449, totalling -$1,717 over 31 trades. contractsPerDayMax 12 = 6 trades x 2c, confirmed by the day-level data: all three funded days above 12 contracts lost (-$1,763, 0/3 green) while the two profitable funded days ran 10 and 11 contracts. dailyLossCap 200 comes from an intraday simulation walking each day's trades in order and halting at the cap — every level helps in funded and tighter is monotonically better ($200 -> +$795, $300 -> +$583, $500 -> +$219). It matches the dayStop.funded of 200 already in this file, which was never actually enforced."
+    }
+  },
+  "lossRatchet": {
+    "enabled": true,
+    "mode": "min",
+    "floor": 100,
+    "warnAtPct": 50
+  },
+  "_lossRatchet_comment": "ADDED 2026-08-12 (Anoop's own rule): tomorrow's maximum loss may never exceed what he made today. Targets his stated failure mode - 'after a couple of profit days, one day eats all my profits'. mode 'min' = cap is min(normal dayStop, yesterday's profit) - it can only ever TIGHTEN. This matters: the rule as first described ('max loss = yesterday's profit') would set an $800 cap after an $800 green day, i.e. 4x the $200 rule, loosening risk exactly after the good days that historically precede a blow-up. mode 'raw' would allow that; do not use it. floor = the cap never drops below this, so a tiny green day ($20) doesn't make tomorrow untradeable. A red or flat yesterday leaves the normal dayStop in force. warnAtPct = show a caution banner at this percentage of the cap.",
+  "requireChecklist": true,
+  "_requireChecklist_comment": "ADDED 2026-08-12 (task #33). Until now the pre-trade checklist was advisory - nothing stopped a trade without it. On 2026-08-10 Anoop skipped it and lost $855.50, and named it himself afterwards as the thing he was supposed to do. It is now a HARD NO-GO reason, ranked with the daily stop, not a soft 'pending' one (soft renders as amber PENDING CHECK-IN, which is precisely the ignorable state that let this slide for months). Set false to disable - deliberately a config switch rather than something he has to delete code to bypass, because guards that cannot be turned off get ripped out instead.",
+  "contractsPerDay": {
+    "enabled": true,
+    "max": 12,
+    "warnAtPct": 75
+  },
+  "_contractsPerDay_comment": "ADDED 2026-08-12. Caps TOTAL contracts traded per day, which nothing did before: sizeCap limits each ENTRY to 2, and tradesPerDay limits COUNT to 10 - but ten legal 2-lot trades is twenty contracts, every one inside the rules, day already lost. max=12 comes from Anoop's own five logged days, which split on exactly this: 10c=+$440, 11c=+$157.50, 12c=-$142, 24c=-$879.50, 29c=-$572.50. Under ~12 he makes money or loses small; past 24 he loses a week. Same trader, same setups - only the size changed. 12 contracts = six 2-lot trades, which also lands near the 3-4 trades/day profile of evaluation PASSERS in his own research file (failures average 6.8; his logged average is 6.4).",
+  "biasAdherence": {
+    "enabled": true,
+    "targetPct": 75,
+    "warnPct": 60,
+    "minTradesToJudge": 2
+  },
+  "_biasAdherence_comment": "ADDED 2026-08-13 (Anoop, verbatim): 'I should follow the trade direction according to it. 70% to 80% should be in the same direction.' targetPct 75 is the midpoint of the range he named; warnPct 60 is where Jessi starts naming it rather than just reporting it. DIRECTION OF RECORD = the Daily Bias field from the pre-trade checklist (his call 2026-08-13); 4H and 1H are logged as CONTEXT and downgrade confidence when they disagree, they do not override or veto. This became computable only on 2026-08-13: before that the checklist record stored {date, score, tier} and threw the bias/h4/h1 away, so there was nothing to compare trades against. minTradesToJudge stops a 1-trade day reading as '0% adherence' - one counter-trend scratch is not a pattern. Set enabled:false to silence the whole feature.",
+  "autoPostSessionReview": false,
+  "breakEvenBandUsd": 100,
+  "breakEvenReminderCount": 5,
+  "_breakEven_comment": "ADDED 2026-08-25, in Anoop's own words and his own numbers: \"There are so many trades in a day that I take break even. Consider anything below 100$ and above -100$ as not a trade... After 5 break even trades, I want you to remind me.\" A trade landing inside +/-breakEvenBandUsd is flagged BREAK-EVEN and excluded from the real-trade count; at breakEvenReminderCount of them, mistake-patterns F4 fires. On 2026-08-25, 8 of his 11 trades landed inside the band - about $77.90 of commission paid for trades that returned nothing. DELIBERATELY ADVISORY: break-even trades STILL count toward tradesPerDay/contractsPerDay. Excluding them from a SAFETY cap would make churn - the exact thing F4 exists to flag - the loophole that bypasses the ceiling. It also does NOT enter the flags array: disc is computed as 4 minus the number of rule-break flags, so flagging BREAK-EVEN there would silently score a clean small trade as a rule break.",
+  "f3Ratio": 2,
+  "f3MinWins": 2,
+  "_f3_comment": "LIVE_FEED_LOOP_PLAN 5.3 (F3 inverted R:R): fire when realized avgLoss >= f3Ratio x avgWin with >= f3MinWins confirmed wins and >=1 confirmed loss today. His documented ratio is ~15.6:1; 2 is a deliberately early warning (MISTAKE_PATTERNS_PLAN.md F3). Advisory only.",
+  "signalJoinWindowMinutes": 15,
+  "_signalJoin_comment": "LIVE_FEED_LOOP_PLAN 5.1: a closed trade joins back to the nearest preceding armed signal on the same instrument and direction within this many minutes (measured to trade entry).",
+  "_autoPostSessionReview_comment": "ADDED 2026-08-12 (Anoop): the full Post-Session Analyst report used to auto-fire 5s after EVERY CSV upload, on top of the auto-debrief - two AI calls per upload. The report is ~5-7K tokens in and ~1.5K out (roughly $0.014 on Haiku), and Anoop's words: 'it is such a long list of details... I cannot read the whole post-session review every time I upload a CSV'. Generating something unread is 100% waste at any price. Now OFF by default: the short debrief still fires on upload, and the full report runs only when explicitly asked - 'End Day & Save', or typing 'post session review' in chat. Set true to restore the old auto-fire behaviour.",
+  "_playbooks_comment": "ADDED 2026-08-26. The numbers playbook-spec.js needs to turn a detected setup into an actual entry/stop/target. They were previously nowhere: the live monitors fired a candle name and no trade plan at all, so no signal the app has ever recorded had an entry price, a stop, or a risk figure attached. stopBufferPoints and targetR come from the two Pine backtests already in Prop Trading/ (Playbook_A_C_Backtest_v2.pine and Playbook_B_JadeCap_SFP_FVG_Backtest_v1.pine both default to 3.0 pts and 2.0 R) so the JS harness starts from the same assumptions the Pine ones did, and any divergence in results is attributable to the logic rather than to the risk model. targetR is a PROXY for the rulebook's real exit ('exit at marker levels'), which is a hand-drawn zone no code can read - read backtest results as 'does the entry+stop edge exist', not 'does my exit process work'. fvgFillWindowBars is how long a Playbook B limit entry stays live waiting for the retrace before the setup is abandoned unfired; it is deliberately SHORTER than the SFP monitor's 8-candle patience window measured from the raid, because the clock here starts at the gap. outcomeHorizonBars mirrors SIGNAL_OUTCOME_HORIZON_BARS in server.js - change both together or the live ledger and the backtest stop being comparable, which defeats the point of sharing the detectors. minRiskPoints ADDED 2026-08-26 from the first real backtest run: 5 of 15 detected Playbook B setups came back with a stop exactly equal to stopBufferPoints, meaning entry==SFP wick, meaning the raid candle and the third candle of the displacement FVG were the SAME BAR - no displacement leg, so not the playbook. All 5 lost. 8 points is a judgement call, not a measured optimum: it is comfortably above the 1.0pt round-trip slippage assumption and above the 3pt buffer, and it is the number to revisit once there are more than 8.5 days of bars behind it. Setups under it are counted and reported, never silently dropped.",
+  "playbooks": {
+    "stopBufferPoints": 3,
+    "minRiskPoints": 8,
+    "targetR": 2,
+    "fvgFillWindowBars": 8,
+    "sfpToFvgMaxBars": 3,
+    "outcomeHorizonBars": 12
+  },
+  "flattenByISTMinutes": 180,
+  "edgeWindow": {
+    "start": 1080,
+    "end": 1200
+  },
+  "drawdownGuard": {
+    "reduceAt": 500,
+    "standDownAt": 250
+  },
+  "_flattenBy_comment": "ADDED 2026-08-26 (Anoop, verbatim): \"all the trades should end by 3 am indian stand time. the trades should not be carryied over night.\" 180 = 03:00 IST in minutes past midnight, the same units as sessionWindowsIST. This is a HARD FLATTEN, not a preference: any position still open at the cutoff is closed at the market, whatever it is showing. It also silently constrains every playbook - the backtest horizon of 12 bars on 30M is 6 hours, so a setup arming after 21:00 IST cannot be given its full horizon, and backtest.js now closes those trades at the cutoff rather than letting them run past it and reporting a result that could never have happened. Overnight gap risk on a prop account is uncapped by the intraday drawdown rules that otherwise protect him, which is why this is a rule and not a habit.",
+  "playbookCAdx": {
+    "enabled": true,
+    "shadowOnly": true,
+    "liveSize": null,
+    "tfCode": "60",
+    "tfLabel": "1H",
+    "lookback": 5,
+    "adxMin": 35,
+    "dailyCapPer2Contracts": 1000
+  },
+  "_playbookCAdx_comment": "RENAMED 2026-09-01 from `dshV2` to `playbookCAdx` at Anoop's instruction (\"name it playbook C (ADX)\"). Config for the long-only ADX-gated breakout — see 'DSH backtesting/' and app/scripts/verify-dsh-strategy.js. The spec id is `C-ADX`, NOT `C`: `C` is the engulf validity gate and autonomy-modes.js aliases an incoming 'C' to 'LTF-ENGULF', so three things would answer to one key. See playbook-spec.js's header for the full reasoning. shadowOnly:true and liveSize:null remain the load-bearing values - this strategy has NEVER traded and nothing here may place an order. shadowSizes REMOVED: it was [4,6] and superseded on 2026-08-29 by autonomyModes.<mode>.sizes ([2]); leaving a dead sizing key in this file invites a future reader to change it and wonder why nothing happens. CHANGED 2026-09-04 (Anoop): 1H + lookback 5 — the dominant 2-contract cell. tfCode/tfLabel/lookback/adxMin all live in this block so he can change them without touching code. (Was kept as published lookback 10 / adxMin 35, even though a re-run at 2 contracts on 2026-09-01 shows they are the WORST of the consistency-safe cells: at 2c lookback10/ADX35 gives +$3,051, PF 1.95, consistency 40% - exactly ON the eval's 40% limit - while lookback5/ADX35 gives +$4,021, PF 2.17, consistency 30%, dominating it on all three axes at once. The dominated config is being forward-tested ANYWAY because re-tuning to the best cell of a grid before a single forward trade exists is precisely the curve-fit the research file warns against; the published claim gets tested as published, and lookback 5 is a candidate the forward data may promote, not a change to make on in-sample evidence. dailyCapPer2Contracts scales with size and enforces the 40% consistency rule.",
+  "autonomyEnabled": true,
+  "_autonomyEnabled_comment": "SET FALSE 2026-08-26 at Anoop's instruction (\"disable shadow mode and control mode until i start working on them and have a proper plan... i want only you mode from now on\"). RE-ENABLED 2026-09-01 at his instruction to forward-test Playbook C (ADX) - which is the proper plan that condition asked for, and it is the FIRST strategy here with out-of-sample evidence. What re-enabling does NOT change: shadowOnly still holds, liveSize is still null, and assist/control remain enabled:false, so the ONLY thing switched on is recording. Nothing here can place an order. The two objections that closed it in August are both answered: NOISE - autonomyModes.shadow.silent stays true, so no tickets reach the chat and the badge does not change mid-session, which was the actual complaint (\"it has created confusion when i was trading live\"); CHART CONTENTION - the new C-ADX monitor is cache-read only and issues ZERO CDP calls, and the shadow resolver still yields (15-min, never during a session window, never while the chart lock is held). Anoop keeps a live UI toggle: OFF and SHADOW both render, so he can drop to \"you are trading\" for his New York session and back afterwards without a restart - cadxCheckOnce() returns 'inactive' on the next tick, so OFF genuinely stops the work rather than hiding it. Set false to kill the whole thing again; DATA/autonomy/ keeps its record either way.",
+  "autonomyModes": {
+    "shadow": {
+      "enabled": true,
+      "silent": false,
+      "sizes": [
+        2
+      ],
+      "perTradeRiskCapUsd": null
+    },
+    "assist": {
+      "enabled": true,
+      "sizes": [
+        2
+      ],
+      "perTradeRiskCapUsd": null
+    },
+    "control": {
+      "enabled": false,
+      "sizes": [
+        2
+      ],
+      "perTradeRiskCapUsd": 200,
+      "dailyLossCeilingUsd": 200,
+      "autoResetDaily": false,
+      "playbooks": [
+        "A",
+        "B"
+      ]
+    }
+  },
+  "_autonomyModes_comment": "ADDED 2026-08-29 (AUTONOMY_MODES_SPEC.md). 2026-09-01: shadow.enabled flipped TRUE to forward-test Playbook C (ADX); assist and control stay false and therefore stay unrendered. Shadow is GLOBAL - it hooks armSetup, so A, B and LTF-ENGULF record alongside C-ADX. That is deliberate (Anoop, 2026-09-01: \"i do not have issue if same live feed is fed to both the modes\"): a record of the new rule with no record of the rules he already trades gives nothing to compare it against, and silent:true means the extra rows cost him no attention.  Per-mode flags UNDER the autonomyEnabled master switch, so the four modes can be finished and turned on one at a time. A mode with enabled:false is NOT RENDERED AT ALL - not a greyed-out button; a visible switch that does nothing invites a click that silently fails. sizes:[2] everywhere replaces the old dshV2.shadowSizes [4,6], which was the reason shadow had produced ZERO scored orders in its entire life: at $300 perTradeMaxLoss and $2/point, 4c allows only a 37.5-point stop and 6c only 25, while real Playbook B stops measure a 48.3-point median (range 38.8-72.8, see app/scripts/risk-dist.js), so EVERY setup was stamped blocked:risk-too-big and excluded from the resolver. 2 is Anoop's real sizeCap and sizeFloor, so the record needs no translation to be believed. shadow.silent was TRUE from 2026-08-29 and is now FALSE (2026-09-01, Anoop: \"All the data when goes to shadow should be from live feed so that actions and signals are give to me immediately\"). This REVERSES the August silence decision knowingly: silence was the fix for tickets confusing him mid-session on 2026-08-26, and un-silencing brings that risk back. What makes the trade acceptable is that he now has a live OFF switch he did not have then - OFF and SHADOW both render, so he drops to \"you are trading\" for his New York session and re-arms after, per-session, no restart. Silence hid the signals for ~8 weeks; a toggle he controls gets him the signals AND a way to stop them, which is what he actually asked for. If tickets start confusing live sessions again the fix is to use the toggle, or set this back to true - not to remove the feature. CONTROL's perTradeRiskCapUsd is 200, deliberately TIGHTER than the global perTradeMaxLoss of 300: its dailyLossCeilingUsd is also 200, and a daily limit is only a CEILING if per-trade risk divides into it - at the general $300 cap a single stop-out could lose $291 and overshoot the stated ceiling by 46% before anything could halt it. At $200/trade and $200/day CONTROL gets exactly ONE full loser per day and the ceiling is real (overshoot is slippage only). Cost: it skips the widest ~33% of Playbook B setups. autoResetDaily:false is Anoop's decision of 2026-08-29 - once tripped, CONTROL stays demoted to SHADOW until he personally re-arms it, because a breaker that resets on a timer lets a bad week run five unattended days. NOTE evidence read FOR CONTROL must filter shadow rows to riskUsd <= 200, since SHADOW records under the looser $300 cap. 2026-09-01: control.playbooks trimmed from [A,B,LTF-ENGULF] to [A,B]. Not a reduction in scope - every always-on engulf watcher (1H/30M/15M/5M) is now Playbook A, so LTF-ENGULF names nothing and listing a retired id in the allowlist of the one mode that can send real orders is exactly the kind of stale grant that gets overlooked. It also removes a real oddity: LTF-ENGULF was flagged unsanctioned in playbook-spec.js - present in no rulebook and no Pine script - while sitting on CONTROL's permitted list.",
+  "_eval_comment": "CONFIRMED 2026-08-28 from Tradeify's own help centre (help.tradeify.co/en/articles/12853921-select-evaluation-accounts). Anoop trades 50K SELECT Evaluation only; his account TDFYSL50413184562 carries the SL/Select prefix, matching the selectEval payout tier already configured below. Every figure here is quoted, not inferred - the previous 150K numbers (9000/4500) had been in force on a 50K account, and my own earlier back-fit of start=50378.60 is REPLACED by the real 50000: back-fitting the start from the broker balance minus the ledger silently absorbs whatever the ledger is missing, and the ledger only begins 2026-08-17. A visible gap is better than a hidden one - the drift warning now surfaces it honestly. drawdownType: END OF DAY trailing, not intraday - 'intraday swings do not move the limit', but 'the limit is still enforced in real time - touching it fails the account immediately'. floorLocksAt 50100 = start+100, where the trailing floor stops rising. dailyLossLimit: null is REAL and is the dangerous part - SELECT Evaluation has NO broker-side daily loss limit, so nothing outside this app stops a bad day until the 2000 drawdown is gone. maxContractsBroker 40 is the BROKER's micro ceiling (4 mini / 40 micro); rules.json sizeCap of 2 is Anoop's own and is 20x tighter - the broker will never enforce it for him. minTradingDays 3 follows from the 40% consistency rule, not a separate gate.",
+  "oversizeGuard": {
+    "enabled": true,
+    "confirmReads": 2,
+    "maxPerDay": 6,
+    "cooldownMs": 30000
+  },
+  "_oversizeGuard_comment": "ADDED 2026-08-28 and ARMED LIVE at Anoop's explicit instruction after oversize cost him 72% of his 50K drawdown in a single session: day net -1436.20, of which -1147.70 came from the two trades over the 2-lot cap, and -1322.00 from one size-5 short. He chose REDUCE-TO-CAP over flatten (the thesis survives, only the excess risk goes: that short becomes about -529 instead of -1322, and the size-3 long that MADE +174.30 keeps 2 lots instead of being closed), TWO confirming reads before acting, and live arming rather than a shadow period. This is the only thing in the app besides handleTradeConfirm that can send an order, and the only one that does so unasked. It can ONLY reduce: the order is always strictly smaller than the position and always in the closing direction, so it is arithmetically incapable of opening or flipping one. It refuses to act on an unreadable size or an unreadable side - the fold logged size:0 four times on 2026-08-28 while real positions were open, and this repo's rows carry UNSIGNED sizes with the direction in a separate field, so inferring direction from the sign would have doubled a short instead of closing it. maxPerDay and cooldownMs bound a runaway: selling three lots every five seconds would be far worse than the problem it fixes. sizeCap is NOT duplicated here - it is read from the top-level sizeCap, so there is one size rule in this file, not two. Set enabled:false to disarm; every action is logged to DATA/protocols/oversize-guard.jsonl with the size observed, the order sent and whether the broker accepted it.",
+  "sizeCapMin": 2,
+  "sizeCapMax": 6,
+  "_sizeCapBounds_comment": "ADDED 2026-09-04 (Anoop: \"make size changeable from 2 minimum to 6 as maximum size so that i always use it and not go beyond 6 size. i can handle 6 but yesterday i took 20 size which was unacceptable\"). sizeCap is now HIS to move from the app, between these bounds; these bounds are not. stage-rules.js caps them again at a hard 2..6 in code, and getActiveRules() applies the ceiling AFTER the stage and scalper layers, so no overlay, hand-edit or rules-set message can produce an effective cap above 6. This LOOSENS the cap of 2 that his own data supports (see _sizeCap_comment and stageRules.funded._comment: every funded size except 2 loses money, -$1,717 over 31 trades) and that trade is made knowingly — on 2026-09-03 he traded 20 lots against a cap of 2, so the cap was not being enforced by agreement at all. A ceiling he trades inside beats a lower one he ignores. sizeCap itself is left at his current value on purpose: raising a risk limit is his decision to make, not a side effect of adding the control.",
+  "sessionWindowsIST": [
+    {
+      "name": "London",
+      "startMin": 750,
+      "endMin": 840,
+      "tz": "Europe/London",
+      "startLocal": "08:00",
+      "endLocal": "09:30",
+      "crossesIstMidnight": false
+    },
+    {
+      "name": "NY",
+      "startMin": 1140,
+      "endMin": 1260,
+      "tz": "America/New_York",
+      "startLocal": "09:30",
+      "endLocal": "11:30",
+      "crossesIstMidnight": false
+    }
+  ]
+}

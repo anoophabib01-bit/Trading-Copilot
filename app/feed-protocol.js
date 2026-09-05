@@ -120,6 +120,129 @@ function evaluate(obs, rules) {
       }));
   }
 
+  // ── 3a. MOUNTED IS NOT RENDERED (2026-09-02) ─────────────────────────────
+  // Check 2 above asks whether the <table> is in the DOM. It was TRUE through
+  // the whole of 2026-09-01 and 2026-09-02 while the feed ran degraded, because
+  // ka-table mounts the table for every sub-tab but renders BODY ROWS only for
+  // the tab that is showing. A hidden Orders tab therefore returns a perfectly
+  // well-formed table with zero rows.
+  //
+  // This is the same shape of mistake as check 3 (mounted != populated) one
+  // block below, found on 2026-08-28 — and check 3 was only ever applied to the
+  // summary. The orders table had the identical fault and no check for it, so
+  // the live-feed self-test printed 3/3 PASSED while:
+  //   • the order-history walk was dropped on every poll,
+  //   • every close was written by the balance-delta fold with xp:null,
+  //   • the trade count came from balance moves rather than round trips,
+  //   • the post-exit drift panel anchored on a two-day-old exit price,
+  //   • the oversize guard reported STUCK against a positions table that was
+  //     not repainting, and was then switched off for the session.
+  // Four symptoms, one cause, and the detector said everything was fine.
+  //
+  // THE TEST. A position cannot exist without a filled order that created it.
+  // So "zero order rows while a position is open" is not a state the broker can
+  // be in; it is proof the table has not rendered. TradingView's own explicit
+  // "no trading data here yet" placeholder is the opposite — that IS a rendered
+  // empty table, and must not be flagged.
+  if (o.panelRows) {
+    const pr = o.panelRows;
+    const unrendered = pr.openPositions > 0 && pr.orderRows === 0 && !pr.ordersEmptyState;
+    const knowable = pr.openPositions != null && pr.orderRows != null;
+    checks.push(check('panel-rows', 'Broker panel tables RENDERING rows',
+      !knowable ? 'unknown' : (unrendered ? 'fail' : 'pass'), {
+        severity: SEV.CRITICAL,
+        impact: unrendered
+          ? 'The orders table is mounted but rendering NO rows while ' + pr.openPositions
+            + ' position(s) are open — a position cannot exist without a filled order, so the table has not repainted.'
+            + ' Everything derived from order history is therefore unavailable: the round-trip walk is dropped, so closes are'
+            + ' recorded by the balance-delta fold with NO entry price, NO exit price and NO side; the trade count becomes a'
+            + ' count of balance moves rather than trades; and the post-exit drift panel silently keeps anchoring on the last'
+            + ' exit it has a price for, which can be days old while looking current.'
+          : null,
+        rectify: unrendered ? 'render-orders-table' : null,
+        evidence: pr,
+      }));
+  }
+
+  // ── 3c. Did today's trades actually keep their prices? ───────────────────
+  // The consequence check for 3a, and the one that proves a fix rather than
+  // asserting it. 3a can pass at startup (flat account, nothing to render) and
+  // the fault still appear the moment he opens a position. This reads the
+  // outcome instead: rows written today that carry no exit price.
+  //
+  // Deliberately NOT a failure when there are no trades yet — an empty day is
+  // not a broken day, and a check that cries wolf every morning before the open
+  // is a check he learns to scroll past.
+  if (Array.isArray(o.todayRows) && o.todayRows.length) {
+    const total = o.todayRows.length;
+    const priced = o.todayRows.filter(t => t && t.xp != null).length;
+    const foldOnly = total - priced;
+    checks.push(check('trade-detail', "Today's trades kept their prices",
+      foldOnly === 0 ? 'pass' : 'fail', {
+        // Not CRITICAL: the NET P&L of a fold row is trustworthy and the money
+        // guardrails still work. What is lost is every per-trade fact, which is
+        // a coaching and analysis failure rather than a risk one.
+        severity: SEV.DEGRADED,
+        impact: foldOnly === 0 ? null
+          : foldOnly + ' of ' + total + " of today's recorded trades have NO exit price — they came from the balance-delta"
+            + ' fold, which knows the money and nothing else. Their net P&L is real; their entry, exit, side, hold and'
+            + ' count are not, and nothing may compute statistics or coach on them. This is the downstream signature of'
+            + ' the orders table not rendering (see panel-rows).',
+        rectify: foldOnly === 0 ? null : 'render-orders-table',
+        evidence: { total, priced, foldOnly },
+      }));
+  }
+
+  // ── 3b. The oversize guard is actually watching ──────────────────────────
+  // Added 2026-09-02, the day it was armed, able to send orders, and silent
+  // through a real 5-lot. Nothing in this protocol had ever asserted on the ONE
+  // guard that can act on the account unasked — it checked the feeds the guard
+  // reads, but never the guard itself. "The positions table is mounted" is not
+  // "the guard saw a position": on that session panel-tables passed all day.
+  //
+  // Three distinct failures, deliberately NOT collapsed into one verdict,
+  // because the right response to each is different:
+  //   off      — he turned it off (or rules.json has), so size is unenforced
+  //              BY CHOICE. Reported, not rectified: undoing a decision he made
+  //              is not this protocol's business.
+  //   blind    — the positions table is unreadable, so an oversize cannot be
+  //              seen at all. This is the one that looks like "flat".
+  //   stale    — reads are arriving but are older than the watch cadence, i.e.
+  //              the watch itself has stopped ticking.
+  // alarm-only is NOT a failure: it still shouts, it just cannot send the
+  // reducing order. Flagging it as broken would train him to ignore this line.
+  const og = o.oversizeGuard;
+  if (og) {
+    const stale = og.lastReadAgeMs != null && og.lastReadAgeMs > (og.expectedReadIntervalMs || 5000) * 6;
+    const neverRead = og.lastReadAt == null;
+    const bad = !og.armed || og.blind || stale || neverRead;
+    let impact = null;
+    if (!og.armed) {
+      impact = og.userDisabled
+        ? 'The oversize guard is switched OFF for this session. Contract size is not being enforced by anything — the broker ceiling is 40 micros against your cap of ' + (og.sizeCap != null ? og.sizeCap : '?') + '.'
+        : 'The oversize guard is disabled in rules.json. Nothing in the app enforces contract size.';
+    } else if (og.blind) {
+      impact = 'The guard is armed but the positions table is unreadable, so it cannot see an oversize at all — an unreadable table looks IDENTICAL to a flat account. Size is unenforced until reads recover.';
+    } else if (neverRead) {
+      impact = 'The guard has never completed a position read this session, so it has never been in a position to enforce anything.';
+    } else if (stale) {
+      impact = 'The guard last saw the account ' + Math.round(og.lastReadAgeMs / 1000) + 's ago against a ' + Math.round((og.expectedReadIntervalMs || 5000) / 1000) + 's watch cadence — the position watch has stopped ticking.';
+    }
+    checks.push(check('oversize-guard', 'Oversize guard watching', bad ? 'fail' : 'pass', {
+      severity: og.armed ? SEV.CRITICAL : SEV.DEGRADED,
+      impact,
+      // Blindness is a panel problem and the panel already has a repair.
+      // Being switched off is a decision, and decisions are not auto-reverted.
+      rectify: (og.armed && (og.blind || neverRead)) ? 'mount-panel-tables' : null,
+      evidence: {
+        mode: og.mode, armed: og.armed, canAct: og.canAct, sizeCap: og.sizeCap,
+        lastSeenSize: og.lastSeenSize, lastRowCount: og.lastRowCount,
+        lastReadAgeMs: og.lastReadAgeMs, blindReads: og.blindReads,
+        actionsToday: og.actionsToday, stuck: og.stuck,
+      },
+    }));
+  }
+
   // ── 4. Bar reads: right timeframe, and fresh ─────────────────────────────
   // The timeframe race is invisible — the bars look perfectly normal, they are
   // simply not the timeframe that was asked for.
@@ -223,6 +346,45 @@ function evaluate(obs, rules) {
       rectify: null,
       evidence: { mcpTimeoutsRecent: o.mcpTimeoutsRecent },
     }));
+  }
+
+  // ── 10b. THE POSITION READ'S ACTUAL CADENCE (2026-09-02) ─────────────────
+  // Check 10 catches contention only once it has become an outright MCP
+  // TIMEOUT. Everything short of that — a lock queue seven deep turning a 5s
+  // position watch into an effective 20-30s — was invisible, and it is the
+  // regime that actually did the damage: on 2026-09-02 he reached 16 contracts
+  // against a cap of 2 while the app recorded a peak of 4, with zero timeouts
+  // logged in that window. The reads were not failing. They were queued.
+  //
+  // The oversize guard is the only thing here that can act on the account
+  // unasked, and its safety model assumes its reads are CURRENT. So the queue
+  // that read waits in is a safety property and gets a check of its own.
+  if (o.lockDepth) {
+    const ld = o.lockDepth;
+    // Depth OR wait. Depth is the proxy; the WAIT is the fault, and the two can
+    // disagree — a queue two deep behind one slow call is worse for the guard
+    // than a queue five deep of fast ones. Whichever says "stale", counts.
+    const deepQueue = ld.brokerMax != null && ld.brokerMax >= (ld.warnAt || 4);
+    const longWait = ld.brokerMaxWaitMs != null && ld.brokerMaxWaitMs >= (ld.warnWaitMs || 8000);
+    const bad = deepQueue || longWait;
+    checks.push(check('lock-queue', 'Broker lock not saturated',
+      ld.brokerMax == null ? 'unknown' : (bad ? 'fail' : 'pass'), {
+        severity: SEV.DEGRADED,
+        impact: bad
+          ? 'The broker lock queued ' + ld.brokerMax + ' deep'
+            + (longWait ? ' and a call waited ' + Math.round(ld.brokerMaxWaitMs / 1000) + 's before running' : '')
+            + '. Every operation on it is serialised, so the 5s position watch — the read the oversize guard acts'
+            + ' on — has been waiting behind other calls. Its effective cadence is several times its configured'
+            + ' one, and the guard cannot see a size breach it is not being shown.'
+            + ' NOTHING TIMED OUT: every one of those calls succeeded, just late, which is why no error appears'
+            + ' anywhere else. Raising the timeout would make this WORSE — the timeout is what abandons a stuck'
+            + ' call and frees the lock, so a longer one means a longer wait for whoever is next.'
+          : null,
+        // No auto-repair: the fix is fewer or cheaper chart reads, which is a
+        // design decision, not something to attempt mid-session.
+        rectify: null,
+        evidence: ld,
+      }));
   }
 
   return summarise(checks);

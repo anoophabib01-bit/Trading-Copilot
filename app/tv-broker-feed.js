@@ -216,6 +216,10 @@ function fold(prevState, snap) {
   const balance = typeof snap.balance === 'number' && Number.isFinite(snap.balance) ? snap.balance : null;
   const openSize = Number(snap.openSize) || 0;
   const closedRoundTrips = Number.isFinite(snap.closedRoundTrips) ? snap.closedRoundTrips : null;
+  // 2026-09-02: carried on the state so effectiveTradeCount can tell a walk
+  // figure that is CURRENT from one that is merely the last it ever had. Left
+  // untouched (rather than defaulted to false) when the caller does not supply
+  // it, so an older caller cannot silently mark a healthy walk as stale.
   // Read the baseline ONCE, here, before any branch advances it — walkDetailFor
   // needs the count as it stood at the start of this poll to tell "one round
   // trip closed" from "two did".
@@ -228,6 +232,9 @@ function fold(prevState, snap) {
   if (!Number.isFinite(st.closedRoundTripsScored)) {
     st.closedRoundTripsScored = closedRoundTrips === null ? 0 : closedRoundTrips;
   }
+  // Recorded on EVERY poll, before any early return, so the flag can never
+  // describe an older poll than the number it qualifies.
+  if (snap.walkTrusted !== undefined) st.walkTrusted = !!snap.walkTrusted;
 
   // 2026-08-24: capture the broker's own session P&L FIRST, before any
   // branch below can return early. The first-poll branch returns without
@@ -976,9 +983,10 @@ function enrichRowsFromWalk(rows, walkClosed, opts) {
   return { rows: out, filled, ambiguous };
 }
 
-function analyzeOrderWalk(orders, dayKeyMs) {
+function analyzeOrderWalk(orders, dayKeyMs, openingBySymbol) {
   const empty = { closed: [], netBySymbol: {}, droppedRows: 0 };
   if (!Array.isArray(orders) || dayKeyMs == null) return empty;
+  const opening = openingBySymbol && typeof openingBySymbol === 'object' ? openingBySymbol : null;
   const parsed = orders
     .filter(isFilledOrderRow)
     .map(o => ({
@@ -999,9 +1007,23 @@ function analyzeOrderWalk(orders, dayKeyMs) {
   const bySymbol = {};
   const closed = [];
   for (const o of filled) {
-    const st = bySymbol[o.symbol] || (bySymbol[o.symbol] = { qty: 0, entry: null, peakQty: 0 });
+    // 2026-09-02: the walk starts each symbol at 0 because the window starts at
+    // midnight IST — which silently ASSERTS the account was flat at midnight.
+    // A position carried across that boundary makes the assertion false and the
+    // walk runs permanently offset, so it never returns to zero and every later
+    // round trip in that symbol is refused. See reconcileOpeningPositions.
+    const st = bySymbol[o.symbol]
+      || (bySymbol[o.symbol] = {
+        qty: (opening && Number.isFinite(opening[o.symbol])) ? opening[o.symbol] : 0,
+        entry: null, peakQty: 0,
+        // 2026-09-03: volume-weighted price accumulators. See the block above
+        // the closed.push below for why a single fill's price is not the
+        // trade's price.
+        entryQty: 0, entryNotional: 0, exitQty: 0, exitNotional: 0
+      });
     const before = st.qty;
-    const after = before + (o.side === 'buy' ? o.qty : -o.qty);
+    const delta = (o.side === 'buy' ? o.qty : -o.qty);
+    const after = before + delta;
     // A close is "returned to flat" OR "crossed through flat" — the latter is
     // a reversal, which closes the old position and opens a new one on the
     // same fill.
@@ -1027,16 +1049,63 @@ function analyzeOrderWalk(orders, dayKeyMs) {
     if (before === 0) {
       st.entry = o;
       st.peakQty = Math.abs(after);
+      st.entryQty = o.qty;
+      st.entryNotional = o.price * o.qty;
+      st.exitQty = 0;
+      st.exitNotional = 0;
     } else if (!crossed) {
       st.peakQty = Math.max(st.peakQty, Math.abs(after));
+      // A fill that moves the position further from flat is part of the ENTRY;
+      // one that moves it toward flat is part of the EXIT. Before 2026-09-03
+      // neither was accumulated and a partial exit simply vanished.
+      if (Math.sign(delta) === Math.sign(before)) {
+        st.entryQty += o.qty;
+        st.entryNotional += o.price * o.qty;
+      } else {
+        st.exitQty += o.qty;
+        st.exitNotional += o.price * o.qty;
+      }
     }
     if (crossed && st.entry) {
+      // ── VOLUME-WEIGHTED PRICES (2026-09-03) ──────────────────────────────
+      // This walk only emits on a return to (or through) flat, so a round trip
+      // can be built from many fills. entryPrice used to be the FIRST fill's
+      // price and exitPrice the LAST fill's price — each one fill out of
+      // however many, with the trade's full `size` attached to it.
+      //
+      // Caught live on 2026-09-03 against Anoop's own Tradovate statement.
+      // A 4-lot long entered at 29283 was exited in two 2-lot fills, 29280.75
+      // then 29283.75. The walk reported "4 lots, 29283 -> 29283.75", implying
+      // +$6.00 gross; the real gross was -$6.00. That row then fed
+      // mergeTradeRow, whose "a row must not contradict its own prices" repair
+      // recomputed P&L FROM those prices and overwrote the balance-derived
+      // -$13.60 with -$1.60 on every poll. missingFromDayRows compares P&L, saw
+      // a $12.00 gap where only a $7.60 commission gap is tolerated, and
+      // declared the trade missing again — 683 times in one afternoon, each
+      // one re-writing the wrong number. The day P&L stayed wrong the whole
+      // time and nothing could converge, because the price it was all derived
+      // from was never the trade's price.
+      //
+      // The size fix for exactly these shapes went in on 2026-08-21 (st.peakQty
+      // — see the note above); the PRICE half of the same bug was missed.
+      //
+      // On a reversal only the part of this fill that closes the old leg
+      // belongs to this exit; the residual opens the next leg and is credited
+      // to it below.
+      const closingQty = Math.min(o.qty, Math.abs(before));
+      const exitQty = st.exitQty + closingQty;
+      const exitNotional = st.exitNotional + o.price * closingQty;
+      // Round only to kill float noise. NOT to a tick: a genuine VWAP of an
+      // uneven split legitimately falls between ticks, and snapping it would
+      // put the error straight back.
+      const vwap = (notional, qty, fallback) =>
+        (qty > 0 ? Math.round((notional / qty) * 1e6) / 1e6 : fallback);
       closed.push({
         symbol: o.symbol,
         side: st.entry.side,
         size: st.peakQty,
-        entryPrice: st.entry.price,
-        exitPrice: o.price,
+        entryPrice: vwap(st.entryNotional, st.entryQty, st.entry.price),
+        exitPrice: vwap(exitNotional, exitQty, o.price),
         entryAt: st.entry.at,
         exitAt: o.at,
         // 2026-08-20 (found in review): `at` is the field every consumer of
@@ -1058,6 +1127,11 @@ function analyzeOrderWalk(orders, dayKeyMs) {
       // large the new position already is at the moment it was opened.
       st.entry = after === 0 ? null : o;
       st.peakQty = after === 0 ? 0 : Math.abs(after);
+      // The residual is the new leg's opening fill, at this fill's price.
+      st.entryQty = after === 0 ? 0 : Math.abs(after);
+      st.entryNotional = after === 0 ? 0 : o.price * Math.abs(after);
+      st.exitQty = 0;
+      st.exitNotional = 0;
     }
     st.qty = after;
   }
@@ -1067,6 +1141,83 @@ function analyzeOrderWalk(orders, dayKeyMs) {
     if (st.qty !== 0) netBySymbol[symbol] = st.qty;
   }
   return { closed, netBySymbol, droppedRows };
+}
+
+/**
+ * ── WHAT POSITION DID THE DAY OPEN WITH? (2026-09-02) ──────────────────────
+ *
+ * analyzeOrderWalk starts every symbol at zero because its window starts at
+ * midnight IST. That is not a neutral default — it ASSERTS the account was flat
+ * at midnight. When a position was carried across that boundary the assertion is
+ * false, the walk runs permanently offset, its net never returns to zero, and
+ * isWalkDesynced then correctly refuses it. Correctly, but expensively: ONE
+ * unmatched contract disables the walk for EVERY symbol, which is how a single
+ * stray lot took down trade counts, exit prices and trade direction for a whole
+ * session.
+ *
+ * Live on 2026-09-02: `WALK NET: MNQU6 -1 | PANEL: (panel shows flat)` — the walk
+ * booked one more sell than buy across 44 order rows and 11 round trips.
+ *
+ * THE INFERENCE. The positions panel is ground truth for what is open RIGHT NOW.
+ * The walk's residual is what it believes is open. The difference between them is
+ * exactly the position the walk never saw opened — i.e. what the day opened with.
+ * So: opening = panelNow - walkResidual, per symbol.
+ *
+ * ── WHY THIS IS NOT JUST PAPERING OVER A DATA GAP ──────────────────────────
+ * A residual has two possible causes and this only legitimately fixes one:
+ *   (a) a position carried across midnight IST — the opening offset is REAL and
+ *       recovering it is simply correct;
+ *   (b) a fill row that has scrolled out of the Orders table — the offset is a
+ *       missing row, and seeding it hides a genuine gap.
+ * They are indistinguishable from the table alone. So this deliberately does NOT
+ * claim verification: it returns the offsets AND `assumed: true`, the caller
+ * re-walks and must confirm the result actually reconciles, and the recovered
+ * count is reported as recovered rather than as walked-and-proven.
+ *
+ * BOUNDED ON PURPOSE. A large residual is far more likely to be a broken read
+ * than an overnight hold, and seeding a large offset would manufacture round
+ * trips wholesale. Above `maxOffset` it refuses and leaves the existing desync
+ * refusal in place — the safe direction, and the one this codebase already takes
+ * everywhere it cannot prove a number.
+ *
+ * PURE. Unit-tested in test/tv-broker-feed.test.js.
+ */
+function reconcileOpeningPositions(netBySymbol, positionRows, opts) {
+  const maxOffset = (opts && Number.isFinite(opts.maxOffset)) ? opts.maxOffset : 5;
+  const panel = {};
+  if (Array.isArray(positionRows)) {
+    for (const p of positionRows) {
+      if (!p || typeof p !== 'object') continue;
+      const sym = String(p.Symbol || '').trim();
+      if (!sym) continue;
+      const q = Number(String(p.Qty == null ? '' : p.Qty).replace(/[^0-9.\-]/g, ''));
+      if (!Number.isFinite(q) || q === 0) continue;
+      // The panel reports size and side separately; the walk speaks signed.
+      const short = /sell|short/i.test(String(p.Side || ''));
+      panel[sym] = short ? -Math.abs(q) : Math.abs(q);
+    }
+  }
+  const walk = netBySymbol || {};
+  const symbols = new Set([...Object.keys(walk), ...Object.keys(panel)]);
+  const offsets = {};
+  let any = false;
+  for (const sym of symbols) {
+    const w = Number.isFinite(walk[sym]) ? walk[sym] : 0;
+    const p = Number.isFinite(panel[sym]) ? panel[sym] : 0;
+    const off = p - w;
+    if (off === 0) continue;
+    if (Math.abs(off) > maxOffset) {
+      return { ok: false, offsets: null, assumed: true,
+        reason: 'residual of ' + off + ' on ' + sym + ' exceeds the ' + maxOffset
+          + '-lot ceiling — far likelier a broken order-table read than an overnight hold, so the walk stays refused.' };
+    }
+    offsets[sym] = off;
+    any = true;
+  }
+  if (!any) return { ok: false, offsets: null, assumed: false, reason: 'walk already agrees with the panel — nothing to reconcile.' };
+  return { ok: true, offsets, assumed: true,
+    reason: 'inferred the position each symbol opened the IST day with: '
+      + Object.entries(offsets).map(e => e[0] + ' ' + (e[1] > 0 ? '+' : '') + e[1]).join(', ') };
 }
 
 // Back-compat wrapper: the backfill only ever wanted the closed round trips.
@@ -1391,19 +1542,43 @@ function effectiveTradeCount(state) {
   const corroborated = trades.filter(t => !(t && t.evidence === 'degraded')).length;
   const walk = Number.isFinite(st.closedRoundTripsScored) ? st.closedRoundTripsScored : 0;
   const degraded = trades.length - corroborated;
+  // ── IS THE WALK HALF OF THIS max() STILL CURRENT? (2026-09-02) ───────────
+  // closedRoundTripsScored is NOT cleared when the walk goes dark — by design,
+  // because clearing it would make every round trip already completed today
+  // look new. The cost is that the last figure the walk ever produced keeps
+  // winning the max() indefinitely once the walk desyncs.
+  //
+  // Live today: walk 11, corroborated 5, and the UI hard-locked at "10 trades
+  // — cap 10. Done." while the SAME walk was being refused for round-trip
+  // counting, for trade direction, and for exit prices on every poll. The
+  // number the cap enforced on was the one piece of that walk nothing had
+  // marked as untrusted.
+  //
+  // The value is deliberately UNCHANGED — this does not quietly lower his
+  // count, which would fail in the permissive direction on a live-money
+  // account. It reports that the walk figure is stale so the caller can
+  // present the count as provisional instead of final. Same doctrine as
+  // week-rollup's disagreeDays: surface the disagreement, never silently pick.
+  const walkStale = st.walkTrusted === false && walk > corroborated;
   return {
     value: Math.max(corroborated, walk),
     rawFoldCount: typeof st.tradeCount === 'number' ? st.tradeCount : trades.length,
     degraded,
+    corroborated,
+    walkCount: walk,
+    walkStale,
     // 'verified' only when nothing rests on the fill edge. Callers keep
     // treating a degraded count as advisory rather than a hard lock — this
     // removes the phantom trades from the number, it does not claim the
     // remainder is beyond doubt.
-    evidence: degraded > 0 ? 'degraded' : 'verified',
+    // A stale walk figure is degraded evidence for the same reason: the number
+    // it is carrying was true of a walk the app no longer trusts.
+    evidence: (degraded > 0 || walkStale) ? 'degraded' : 'verified',
   };
 }
 
 module.exports.readBrokerPnl = readBrokerPnl;
 module.exports.effectiveDayPnl = effectiveDayPnl;
 module.exports.effectiveTradeCount = effectiveTradeCount;
+module.exports.reconcileOpeningPositions = reconcileOpeningPositions;
 module.exports.BROKER_PNL_MAX_AGE_MS = BROKER_PNL_MAX_AGE_MS;

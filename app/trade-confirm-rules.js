@@ -14,6 +14,7 @@
 // guardrail already enforces.
 
 const { sizeUpAfterLossViolation } = require('./renderer/size-freeze-guard.js');
+const drawdownGuard = require('./drawdown-guard'); // T4.1 headroom gate (pure decision)
 
 /**
  * @param {object} rules   result of server.js's getActiveRules() — reads
@@ -27,7 +28,7 @@ const { sizeUpAfterLossViolation } = require('./renderer/size-freeze-guard.js');
  * @param {number} requestedQty  size of the hypothetical trade being evaluated
  * @returns {{allowed:boolean, reason:string|null}}
  */
-function checkTradeAllowed(rules, stage, todayTrades, requestedQty) {
+function checkTradeAllowed(rules, stage, todayTrades, requestedQty, account) {
   const r = rules || {};
   const trades = Array.isArray(todayTrades) ? todayTrades : [];
   const qty = Number(requestedQty);
@@ -73,8 +74,24 @@ function checkTradeAllowed(rules, stage, todayTrades, requestedQty) {
     ? r.dailyLossCap
     : (r.dayStop && typeof r.dayStop[stage] === 'number' ? r.dayStop[stage] : Infinity);
   const dayPnl = trades.reduce((a, t) => a + (Number(t.pnl) || 0), 0);
+  // T4.2: the hard daily-loss tier ends the session in code, not just a banner.
+  const hardTier = (r.dailyLossTiers && typeof r.dailyLossTiers.hard === 'number') ? Math.abs(r.dailyLossTiers.hard) : null;
+  if (hardTier != null && dayPnl <= -hardTier) {
+    return { allowed: false, reason: `day P&L ${dayPnl.toFixed(2)} past the hard daily-loss tier -${hardTier} — session ended` };
+  }
   if (dayPnl <= -dayStopCap) {
     return { allowed: false, reason: `day P&L ${dayPnl.toFixed(2)} already at/past day-stop -${dayStopCap}` };
+  }
+
+  // T4.1: drawdown headroom gate — reduce size near the floor, stand down at it.
+  if (account && account.balance != null && account.floor != null) {
+    const hs = drawdownGuard.headroomState({ balance: account.balance, floor: account.floor, rules: r });
+    if (hs.tradingAllowed === false) {
+      return { allowed: false, reason: `drawdown headroom $${hs.headroom != null ? hs.headroom.toFixed(0) : '?'} is at stand-down — session ended` };
+    }
+    if (hs.effectiveCap != null && qty > hs.effectiveCap) {
+      return { allowed: false, reason: `drawdown headroom reduces the size cap to ${hs.effectiveCap} — size ${qty} exceeds it` };
+    }
   }
 
   if (sizeUpAfterLossViolation(trades, qty)) {

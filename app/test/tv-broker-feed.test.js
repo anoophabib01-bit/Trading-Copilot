@@ -3,6 +3,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const tvFeed = require('../tv-broker-feed.js');
 const { fold, freshState, parseBalance, istDayStartMs, readBrokerPnl, effectiveDayPnl, effectiveTradeCount, BROKER_PNL_MAX_AGE_MS } = require('../tv-broker-feed.js');
+const { reconcileOpeningPositions } = require('../tv-broker-feed.js');
+const { isWalkDesynced: isWalkDesyncedCheck } = require('../tv-broker-feed.js');
 
 test('parseBalance strips currency formatting and handles the U+2212 minus sign', () => {
   assert.equal(parseBalance('$50,123.45'), 50123.45);
@@ -1527,4 +1529,150 @@ test('a MISSING size is not the same as an observed zero — that trade is still
   const OPTS = { commissionPerContractPerSide: 0.95 };
   assert.strictEqual(tvFeed.missingFromDayRows([{ at: 1000, pnl: -203 }], [], OPTS).length, 1);
   assert.strictEqual(tvFeed.missingFromDayRows([{ at: 1000, pnl: -203, size: 0 }], [], OPTS).length, 0);
+});
+
+// ── A stale walk count must not read as final (2026-09-02) ─────────────────
+// Live: the walk desynced, so the app refused it for round-trip counting, for
+// trade direction and for exit prices — but closedRoundTripsScored kept its
+// last value (11), won the max() against 5 corroborated closes, and hard-locked
+// the UI at "10 trades — cap 10. Done." Third instance of this class
+// (2026-08-20 "9/3 — DONE", 2026-08-24 "15/5").
+test('a desynced walk marks the count degraded without lowering it', () => {
+  const st = {
+    trades: [{ size: 1 }, { size: 1 }, { size: 1 }, { size: 4 }, { size: 1 }],
+    closedRoundTripsScored: 11,
+    tradeCount: 6,
+    walkTrusted: false,
+  };
+  const r = effectiveTradeCount(st);
+  // NOT lowered — on a live-money account, quietly reducing a count fails in
+  // the permissive direction, and the walk may be the half that is right.
+  assert.equal(r.value, 11);
+  assert.equal(r.walkStale, true);
+  assert.equal(r.evidence, 'degraded');
+  // Both halves are exposed so the UI can say WHY, not merely THAT.
+  assert.equal(r.corroborated, 5);
+  assert.equal(r.walkCount, 11);
+});
+
+test('a trusted walk stays verified — this must not flag every healthy day', () => {
+  const st = {
+    trades: [{ size: 1 }, { size: 1 }],
+    closedRoundTripsScored: 2,
+    tradeCount: 2,
+    walkTrusted: true,
+  };
+  const r = effectiveTradeCount(st);
+  assert.equal(r.walkStale, false);
+  assert.equal(r.evidence, 'verified');
+});
+
+test('a stale walk that is NOT ahead of the corroborated count is not flagged', () => {
+  // Nothing is resting on the walk here, so its staleness costs nothing and
+  // must not raise a warning he would learn to ignore.
+  const st = { trades: [{ size: 1 }, { size: 1 }, { size: 1 }], closedRoundTripsScored: 2, walkTrusted: false };
+  const r = effectiveTradeCount(st);
+  assert.equal(r.walkStale, false);
+  assert.equal(r.evidence, 'verified');
+});
+
+test('fold carries walkTrusted onto the state so the flag cannot lag the number', () => {
+  const st = fold(freshState(),
+    { balance: 50000, isFlat: true, openSize: 0, nowMs: Date.now(), closedRoundTrips: null, walkTrusted: false });
+  assert.equal(st.walkTrusted, false);
+});
+
+// ── The day did not open flat (2026-09-02) ─────────────────────────────────
+// analyzeOrderWalk's window starts at midnight IST and starts every symbol at
+// zero, which ASSERTS the account was flat at midnight. Carry a position across
+// that boundary and the walk runs offset all day, never returns to zero, and
+// isWalkDesynced refuses it — taking trade counts, exit prices and direction
+// down for EVERY symbol over one stray contract.
+//
+// Live: WALK NET MNQU6 -1 against a flat panel, 44 order rows, 11 round trips.
+test('the residual against a flat panel IS the opening position, negated', () => {
+  const r = reconcileOpeningPositions({ MNQU6: -1 }, []);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.offsets, { MNQU6: 1 });
+  // Never claims to have READ this. It is inferred from the panel.
+  assert.equal(r.assumed, true);
+});
+
+test('an open position on the panel is accounted for, not treated as flat', () => {
+  // Walk says flat, panel says long 2 → the day opened long 2.
+  const r = reconcileOpeningPositions({}, [{ Symbol: 'MNQU6', Side: 'Buy', Qty: '2' }]);
+  assert.deepEqual(r.offsets, { MNQU6: 2 });
+});
+
+test('a short on the panel is signed correctly', () => {
+  const r = reconcileOpeningPositions({ MNQU6: -3 }, [{ Symbol: 'MNQU6', Side: 'Sell', Qty: '1' }]);
+  // panel -1 minus walk -3 = +2
+  assert.deepEqual(r.offsets, { MNQU6: 2 });
+});
+
+test('a walk that already agrees is left alone', () => {
+  const r = reconcileOpeningPositions({}, []);
+  assert.equal(r.ok, false);
+  assert.equal(r.assumed, false);
+});
+
+// A large residual is far likelier a broken read than an overnight hold, and
+// seeding it would manufacture round trips wholesale.
+test('an implausibly large residual is REFUSED, not seeded', () => {
+  const r = reconcileOpeningPositions({ MNQU6: -40 }, []);
+  assert.equal(r.ok, false);
+  assert.equal(r.offsets, null);
+  assert.match(r.reason, /exceeds/);
+});
+
+test('seeding the walk with the opening position makes it reconcile', () => {
+  // Carried 1 long across midnight, then sold it and did one clean round trip.
+  const day = Date.UTC(2026, 8, 2) - (5.5 * 3600000);
+  const t = (min) => new Date(day + min * 60000);
+  const fmt = (d) => {
+    const ist = new Date(d.getTime() + 5.5 * 3600000);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${ist.getUTCFullYear()}-${p(ist.getUTCMonth() + 1)}-${p(ist.getUTCDate())} ${p(ist.getUTCHours())}:${p(ist.getUTCMinutes())}:00`;
+  };
+  const orders = [
+    { Symbol: 'MNQU6', Side: 'Sell', 'Filled Qty': '1', 'Avg Fill Price': '29400', Status: 'Filled', 'Update Time': fmt(t(600)) },
+    { Symbol: 'MNQU6', Side: 'Buy', 'Filled Qty': '1', 'Avg Fill Price': '29380', Status: 'Filled', 'Update Time': fmt(t(610)) },
+    { Symbol: 'MNQU6', Side: 'Sell', 'Filled Qty': '1', 'Avg Fill Price': '29390', Status: 'Filled', 'Update Time': fmt(t(620)) },
+  ];
+  const bare = analyzeOrderWalk(orders, day);
+  assert.notEqual(bare.netBySymbol.MNQU6, undefined, 'unseeded, the walk is left holding a phantom short');
+
+  const rec = reconcileOpeningPositions(bare.netBySymbol, []);
+  const seeded = analyzeOrderWalk(orders, day, rec.offsets);
+  assert.deepEqual(seeded.netBySymbol, {}, 'seeded with the opening position it returns to flat');
+  // The carried position yields NO round-trip record, and that is correct: its
+  // entry price was never observed, so there is nothing honest to report for it.
+  // What the seeding buys is that the walk RECONCILES — which is what promotes
+  // it from refused to trusted, so every subsequent round trip keeps its prices.
+  // Reporting the carried leg with an invented entry would be the exact failure
+  // this file's fold-only doctrine exists to prevent.
+  assert.ok(seeded.closed.every(c => c.entryPrice != null),
+    'every reported round trip still has a real observed entry price');
+});
+
+// ── Which side is stale when the walk and the panel disagree? ──────────────
+// isWalkDesynced reports only THAT they differ; every caller then dropped the
+// WALK. The 2026-09-02 broker statement shows that assumption is backwards:
+//   desync logged 14:51:03Z — WALK NET: MNQU6 -1 | PANEL: flat
+//   broker SELL 1 14:50:57Z, BUY 1 14:52:55Z
+// He was genuinely short 1. The walk was right; the panel had not repainted.
+test('a live short reads as a desync when the panel is stale', () => {
+  // What the app saw: walk correctly short 1, panel not yet repainted.
+  assert.equal(isWalkDesyncedCheck({ MNQU6: -1 }, []), true);
+  // And with the panel freshly re-rendered, the same walk agrees.
+  assert.equal(isWalkDesyncedCheck({ MNQU6: -1 }, [{ Symbol: 'MNQU6', Side: 'Sell', Qty: '1' }]), false);
+});
+
+test('the walk being AHEAD of the panel is the common case, not a walk fault', () => {
+  // The walk reads a timestamped append-only order history; the panel is a
+  // widget that does not repaint while its tab is hidden. Right after a fill
+  // the walk leads. This is the shape the caller must re-render for, not refuse.
+  const justOpened = isWalkDesyncedCheck({ MNQU6: 2 }, []);
+  assert.equal(justOpened, true, 'still flagged — but the caller must now test the panel, not blame the walk');
+  assert.equal(isWalkDesyncedCheck({ MNQU6: 2 }, [{ Symbol: 'MNQU6', Side: 'Buy', Qty: '2' }]), false);
 });

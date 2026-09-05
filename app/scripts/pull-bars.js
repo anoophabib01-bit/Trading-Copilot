@@ -29,7 +29,11 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const CLI = path.join(__dirname, '..', '..', 'tradingview-mcp', 'src', 'cli', 'index.js');
-const EXPECTED_SPACING_MIN = { '15': 15, '30': 30, '60': 60, '240': 240 };
+// 1 and 5 added 2026-08-31: Anoop enters on 15m and 5m and his median gap
+// between trades is 6.6 min, so 15m and coarser cannot describe the window
+// between an exit and the next entry — the drift backtest built 4 usable pairs
+// out of 120 on 15m for exactly that reason.
+const EXPECTED_SPACING_MIN = { '1': 1, '5': 5, '15': 15, '30': 30, '60': 60, '240': 240 };
 
 function tv(args) {
   const raw = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8', timeout: 60000 });

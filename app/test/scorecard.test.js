@@ -53,3 +53,20 @@ test('avgR is null without a loss (no division by zero)', () => {
   assert.equal(s.byPlaybook.A.winPct, 100);
   assert.equal(s.byPlaybook.A.avgR, null);
 });
+
+// ── ALERTS COUNT AS FIRED, NOT AS VALID (2026-09-03) ────────────────────────
+// Playbook A alerts on every closed engulfing in both directions and arms only
+// the ones that pass the full check, under two event names. The scorecard's
+// two columns already mean exactly the two things: `fired` is what the app
+// told him about, `valid` is what passed. Leaving engulf-alert out would have
+// the panel report 1 fire on a day he was shown 3 — the surface whose job is
+// to say whether the app is working, understating the app.
+test('engulf-alert counts as fired but never as valid', () => {
+  const s = computeScorecard([], [
+    { event: 'engulf-fire', playbook: 'A', valid: true },
+    { event: 'engulf-alert', playbook: 'A', valid: false },
+    { event: 'engulf-alert', playbook: 'A', valid: false },
+  ]);
+  assert.equal(s.byPlaybook.A.fired, 3, 'he was shown three candles');
+  assert.equal(s.byPlaybook.A.valid, 1, 'only one was a full Playbook A setup');
+});

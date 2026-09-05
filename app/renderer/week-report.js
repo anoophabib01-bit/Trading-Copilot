@@ -97,12 +97,30 @@ function wkNav(delta) {
   renderWeekReport();
 }
 
+// ── Borrowed-week marker (2026-08-31) ──────────────────────────────────────
+// The Week tab now reads a week from whichever account actually traded it, so
+// a fresh eval no longer blanks out the weeks before it. That fix creates a
+// new way to be wrong: showing another account's P&L under the current
+// account's heading. This says whose week it is, every time it is not the
+// active one. Without it the tab would be confidently misattributing money.
+function wkBorrowedHtml(d) {
+  if (!d || !d.weekBorrowed) return '';
+  var who = d.weekOwnerLabel || d.weekOwnerSlot || 'another account';
+  return '<div style="margin:8px 0;padding:8px 11px;border:1px solid #7c5cff;'
+    + 'border-radius:6px;background:rgba(124,92,255,.10);color:#c9bcff;'
+    + 'font:12px/1.5 ui-monospace,Menlo,Consolas,monospace">'
+    + 'This week belongs to <b>' + who + '</b>, not the account open now. '
+    + 'Your current account had no trades this week, so the record is shown '
+    + 'from the account that did trade it. Nothing here is deleted history.'
+    + '</div>';
+}
 function wkPaint() {
   const body = document.getElementById('week-body');
   if (!body || !wkData) return;
   const d = wkData;
   body.innerHTML = [
     wkHeaderHtml(d),
+    wkBorrowedHtml(d),
     wkAccountHtml(d),
     wkCalendarHtml(d),
     wkQuadrantHtml(d),

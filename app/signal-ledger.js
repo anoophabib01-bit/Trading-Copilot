@@ -62,6 +62,30 @@ function buildSignalRow(fields, ctx) {
     valid: f.valid !== false,
     rejectReason: f.rejectReason || null,
     structure: f.structure || null,
+    // ── THE HIGHER-TIMEFRAME READ — ADDED 2026-09-03 ────────────────────────
+    // These four were being PASSED by every gated call site since 2026-09-01
+    // and dropped on the floor here, because this builder is a whitelist and
+    // nobody extended it. The engulf fire site even carries a comment saying
+    // storing htfConfirmation is what makes "how do 1H-only fires perform
+    // against confirmed ones" answerable — and the field it names never
+    // reached disk. Nine days of rows therefore record the verdict without the
+    // evidence behind it, which is exactly the audit gap the ledger exists to
+    // close.
+    //
+    // `structure` above stays the DECIDING timeframe's read (1H before
+    // 2026-09-03, 15M after). These name their chart explicitly so a row is
+    // readable without knowing when it was written.
+    structure15m: f.structure15m || null,
+    structure1h: f.structure1h || null,
+    htfBias: f.htfBias || null,
+    htfConfirmation: f.htfConfirmation || null,
+    // Playbook A's context verdict (structure / swing location / resting
+    // liquidity) once those stopped being a veto on 2026-09-03. On a row where
+    // valid is true this repeats the pass; on one where it is false this is the
+    // whole reason the alert was still worth sending. Without it the ledger
+    // could not tell a strict setup from a bare candle after the change, and
+    // the forward test would be pooling two different populations.
+    quality: f.quality || null,
     sessionTier: c.sessionTier || null,
     dailyTrend: c.dailyTrend || null,
     hourTrend: c.hourTrend || null,

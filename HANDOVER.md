@@ -166,20 +166,52 @@ match the existing style. Everything is one process. Structure:
 TradingView connection; without the lock the monitors race each other and corrupt each
 other's chart state. Any new code that reads or writes the chart **must** go through it.
 
-### 3.2 AI backends
+### 3.2 AI backend  *(single provider since 2026-09-02)*
 
-- **`claude-agent.js`** — the Anthropic-SDK agent. Owns `EVAL_RULES`, `FUNDED_RULES`,
-  `SHARED_RULES`, `buildSystemPrompt()`, `istDateLine()`, and the tool schemas
-  `TV_TOOLS` + `BOOK_TOOLS` = `ALL_TOOLS`. Note: its prompt text and tool schemas are
-  **reused by other paths even when `claude-agent.js` is not the executor** (e.g.
-  `handleChat` calls `groqAgent.stream()` with `claudeAgent._debug.ALL_TOOLS` converted
-  from Anthropic tool shape to OpenAI tool shape inline).
-- **`groq-agent.js`** — the multi-provider executor. Builds an ordered fallback chain via
-  `provider-chain.js` (Anthropic → Groq → Gemini → local Ollama, configured by env vars
-  `GROQ_HOST/PATH/MODEL`, `GEMINI_HOST/PATH/MODEL`, `OLLAMA_HOST/PORT/PATH`). Has a
-  `BLOCKED_TOOLS` set. This is what actually runs most agent turns.
-- **`anthropic-native.js`** — direct Anthropic call path.
-- **`provider-chain.js`** — pure logic for ordering/failing over providers. Unit-tested.
+Every AI call site in the app runs on **DeepSeek**, model
+`deepseek-v4-flash-vision-exp`. Anthropic, Groq, OmniRoute and local Ollama were
+removed in the consolidation — Anoop's reason was that five providers behind four
+key fields with non-obvious precedence "is creating a lot of confusion".
+
+- **`groq-agent.js`** — despite the name, this is now the single
+  provider-agnostic transport: OpenAI-shaped request, SSE parser, and the
+  tool-execution loop shared by every persona. Holds `BLOCKED_TOOLS` (trade
+  execution can never be reached from a chat reply) and the DeepSeek request
+  branch.
+  - **It sends `thinking: {type:'disabled'}` and floors `max_tokens` at 8192.
+    Do not remove either without the other.** DeepSeek V4 streams
+    `reasoning_content` out of the SAME budget as the visible answer; at 4096 a
+    heavy prompt spends the whole ceiling thinking and returns **zero content on
+    a 200 OK**, which the transport reads as a dead model and fails over. That
+    happened live on 2026-09-02 (the Power-of-3 debate agent silently swapped to
+    Gemini). Re-enabling thinking requires raising `max_tokens` to ~16000.
+    Pinned by `test/deepseek-request.test.js`.
+- **`provider-chain.js`** — pure, unit-tested provider selection. DeepSeek
+  primary, then `deepseek-v4-flash` → `gemini-3.5-flash`. The first step stays
+  inside DeepSeek so a retired `-exp` model ID is survivable without changing
+  vendor mid-verdict; **Gemini is break-glass only**, kept at Anoop's request for
+  "credits ran out" / vendor outage.
+  - **TWO REGISTRIES MUST AGREE**: `provider-chain.js`'s `KNOWN_PROVIDERS` and
+    `groq-agent.js`'s `VALID_PROVIDERS`. A provider in one and not the other is
+    **skipped, not rejected** (`pushCandidate` skips unknown providers), so a
+    configured paid key can serve zero requests while the console says it
+    loaded. `provider-chain.test.js` cross-checks the two real arrays.
+- **`claude-agent.js`** — **no longer an agent.** Kept its filename; contains only
+  `EVAL_RULES`, `FUNDED_RULES`, `SHARED_RULES`, `buildSystemPrompt()` and the
+  `TV_TOOLS` + `BOOK_TOOLS` = `ALL_TOOLS` schemas, imported via `_debug` by
+  `handleChat` and `telegram-bot.js` (converted Anthropic→OpenAI tool shape
+  inline) so there is exactly one copy of the Claude-path prompt in the repo.
+  The SDK client, `stream()` and the cache breakpoints are gone, as is
+  `anthropic-native.js` and the `@anthropic-ai/sdk` dependency.
+- **Fallback is ALARMED, not logged.** `modelBadgeHtml()` in `renderer/app.js`
+  flags any reply not from DeepSeek with an amber FALLBACK badge plus a
+  one-per-target chat notice. It lives there because that one function is what
+  every agent surface renders through — the Debate path never passed
+  `onFallback` at all, which is why the 2026-09-02 swap was silent.
+- **Voice needs no speech vendor**: STT is the browser's own recognition
+  (`msg.transcript`), TTS is Edge neural → local Windows SAPI → browser voice.
+  DeepSeek has no audio API; Groq Whisper/Orpheus are gone.
+
 - **`call-logger.js`** — writes `token-usage.jsonl` into the resolved `DATA_DIR`.
 - **`token-audit.js` / `token-usage-report.js`** — cost tooling (see `TOKEN_AUDIT_SETUP.md`).
 - **`supercompress.js`** — context/data compression helper.
@@ -273,6 +305,68 @@ loaded by `<script src>` tags at the bottom of `index.html` in dependency order:
   DOM handlers and are exactly why this pattern exists.
 - **`g5-premium.css` / `styles.css`** — theme. A pre-paint inline script in `<head>`
   applies the saved theme class before first paint to avoid a flash.
+- **`left-panel.js` / `left-panel.css`** (2026-09-03) — the left column. Account /
+  Today / No-Trade Windows are collapsed to one summary row each and open as a
+  flyout over the chat; "Since your last exit" is pinned open (Anoop asked for it
+  to be "constant"); Pattern Monitor was removed. The flyout bodies are the
+  ORIGINAL sections — nothing was moved in the DOM, so every id inside them is
+  still written by the same code as before, open or shut. `left-panel.js` only
+  MIRRORS those sections into the rows, via a MutationObserver rather than calls
+  added to each update path (same reasoning as `chat-archive.js`). Note the
+  specificity trap: `g5-premium.css` scopes its card rules as
+  `#left-panel .panel-section`, so a bare class in `left-panel.css` loses **even
+  with `!important`** — new rules there must carry the `#left-panel` /
+  `#quick-actions` prefix.
+- **`day-pnl.js` owns every "today" number** (2026-09-04). The bottom HUD and the
+  left panel's Today row each computed P&L, trade count and the break timer
+  separately and drifted: the panel read **+$127** while the HUD read
+  **-$2,308** on the same day, and the panel's Trades sat at 0 all session.
+  Cause in both cases: the panel's fields were written only on the MANUAL
+  "Log trade" path, plus an `enforceAccountInvariant` branch that assigned
+  nothing once today had a ledger entry. **These were enforcement bugs, not
+  display ones** — `acc.profit` feeds `computeMechanicalGoNogo()`'s `dayStopHit`
+  and the size ladder; `acc.tradeCount` feeds its `overTradeLimit`. Both gates
+  were reading numbers unrelated to the account. Precedence is live → ledger →
+  manual; the ledger tier is new to the HUD and deliberate (its own 2026-08-11
+  comment records a hand-typed -$637 against a CSV -$855.50). Whether the day
+  is STOPPED still keys off the live feed alone — enforcement precedence is not
+  display precedence.
+- **The size cap is user-adjustable 2..6 with a hard ceiling** (2026-09-04).
+  `sizeCapMin`/`sizeCapMax` in `rules.json`, clamped by
+  `stageRules.clampSizeCap()` on every `rules-set`, with
+  `enforceSizeCapCeiling()` applied in `getActiveRules()` **after** the stage and
+  scalper layers so nothing can exceed it. Note the trap this works around:
+  `applyStageRules` writes the stage block's value verbatim in eval, so a cap
+  raised only at the top level is reverted on the next read — the handler
+  writes both stage blocks too. See `Prop Trading/CLAUDE.md` rule 2 for why the
+  cap moved and why the evidence still says 2.
+- **`account-snapshot.js` — snapshot-before-destroy** (2026-09-04). Two paths could
+  destroy an account's record and both now copy it out first, to
+  `DATA/_snapshots/<slot>/<stamp>__<reason>/` — deliberately OUTSIDE the slot folder,
+  because every per-file `.bak` this repo wrote lived inside the thing being deleted.
+  Door 1 is `dataSave()` writing an empty store over a full one (a breach/clear/payout
+  reset); door 2 is `dataWipeAccount()`'s `fs.rmSync`, which emptied `DATA/accounts/s1/`
+  at 18:56 on 2026-09-04 and took all ten `.bak` files with it. The policy half
+  (`isDestructiveSave`) is pure and answers ONE question: is this write shrinking real
+  data? A GROWING write must not trigger it — `dataSave()` runs on every logged trade, so
+  a guard that fired there would write thousands of snapshots and bury the four that
+  matter. And it can never throw into its caller: it runs immediately before a reset the
+  user asked for, and a backup that turns "start fresh" into a crash on a live trading
+  account is worse than the loss it prevents. Retention keeps the newest 20 per slot and
+  `prunePlan()` is written so it can never return "delete everything".
+- **No-Trade Windows shows the WHOLE ForexFactory week** (2026-09-03). The feed
+  the server already polls (`ff_calendar_thisweek.json`) always carried the full
+  Sun-Sat week; `computeNewsStatus()` was discarding everything but today. It now
+  also returns `week` (grouped by IST day, server-side, so there is one
+  definition of which day an event belongs to), `todayIst` and
+  `weekRedRemaining`. `upcoming`/`holidaysToday` keep their exact today-only
+  meaning — the chart marker, the Jessi context and the Telegram alert read them.
+  There is **no next-week feed**: `ff_calendar_nextweek.json`, `_lastweek` and
+  `_thismonth` all 404 at `nfs.faireconomy.media` and `cdn-nfs.…` does not
+  resolve (probed 2026-09-03), so do not add a next-week section that renders
+  empty. The renderer orders upcoming days first and puts already-printed ones
+  under an "Earlier this week" divider; it publishes today's counts on
+  `#news-list`'s dataset so the collapsed rail row keeps meaning TODAY.
 
 ### 3.8 `main.js` / `preload.js`
 

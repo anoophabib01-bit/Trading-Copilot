@@ -215,10 +215,12 @@ function isPlaybookAllowed(rules, mode, playbook) {
   const cfg = modeConfig(rules, mode);
   if (!Array.isArray(cfg.playbooks)) return true;
   const p = String(playbook || '');
-  // The UI's "Playbook C" is the LTF-ENGULF spec — playbook-spec.js marks the
-  // real C as isGate:true and planEntry() refuses it outright, so a C arriving
-  // here is always the engulf setup. Same aliasing armSetup already does.
-  const alias = p === 'C' ? 'LTF-ENGULF' : p;
+  // A 'C' arriving here is an ENGULF SETUP, never the validity gate —
+  // playbook-spec.js marks the real C as isGate:true and planEntry() refuses
+  // it outright. Until 2026-09-01 that engulf was LTF-ENGULF; now every
+  // always-on engulf watcher is Playbook A, so 'C' and the retired
+  // 'LTF-ENGULF' both resolve there. Same aliasing armSetup does.
+  const alias = (p === 'C' || p === 'LTF-ENGULF') ? 'A' : p;
   return cfg.playbooks.includes(p) || cfg.playbooks.includes(alias);
 }
 

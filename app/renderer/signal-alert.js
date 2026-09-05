@@ -35,7 +35,8 @@ const REPEAT_WINDOW_MS = 20 * 60 * 1000;   // 20 min — longer than a 30M bar's
  */
 function signalKey(type, msg) {
   const m = msg || {};
-  const tf = m.tf != null ? String(m.tf) : '?';
+  // An armed setup carries tfCode/tfLabel where a watcher detection carries tf.
+  const tf = m.tf != null ? String(m.tf) : (m.tfCode != null ? String(m.tfCode) : '?');
   const dir = m.direction != null ? String(m.direction).toUpperCase() : '?';
 
   switch (type) {
@@ -62,6 +63,15 @@ function signalKey(type, msg) {
       // A transition, keyed by where it went. Re-entering the same phase later
       // is a genuinely new event, so `from` is part of the key.
       return 'po3|' + (m.symbol || m.symLabel || '?') + '|' + (m.from || '?') + '→' + (m.to || m.phase || '?');
+    case 'setup':
+      // An ARMED SETUP (2026-09-03). Unlike the four above, this is not a raw
+      // watcher detection — it is the server's single live-setup slot, which is
+      // re-broadcast on every client connect and on every re-render for as long
+      // as the setup lives (8 candles). `signalTs` is stamped once when the
+      // setup is armed and never changes, so it is the only field here that
+      // identifies THE SETUP rather than the moment we were told about it.
+      // Keying on anything else would re-chime on every page load.
+      return 'setup|' + (m.playbook || '?') + '|' + tf + '|' + dir + '|' + (m.signalTs != null ? m.signalTs : '?');
     default:
       return null;
   }
@@ -74,7 +84,7 @@ function signalKey(type, msg) {
  */
 function describeSignal(type, msg) {
   const m = msg || {};
-  const tf = m.tfLabel || (m.tf != null ? String(m.tf).toUpperCase() : '');
+  const tf = m.tfLabel || (m.tf != null ? String(m.tf).toUpperCase() : (m.tfCode != null ? String(m.tfCode).toUpperCase() : ''));
   const dir = m.direction != null ? String(m.direction).toUpperCase() : '';
 
   switch (type) {
@@ -97,6 +107,24 @@ function describeSignal(type, msg) {
       const to = m.to || m.phase || '?';
       return 'PO3 ' + (sym ? sym + ' ' : '') + (m.from ? m.from + ' → ' : '') + to;
     }
+    case 'setup':
+      // Named SETUP ARMED rather than just the playbook, because this line
+      // lands in the same chat stream as the detections above and the whole
+      // point of the distinction is that this one has passed every gate.
+      // T3.1: the line is a full instruction (entry/stop/target/size/R), with an
+      // explicit 'unknown' for anything missing — never silently omitted.
+      return 'SETUP ARMED — ' + (dir ? dir + ' ' : '') +
+        (Array.isArray(m.size) && m.size.length ? m.size.join('/') : 'unknown') + ' ' +
+        (m.playbook || '?') + (tf ? ' ' + tf : '') +
+        // entry falls back to entryRef: the server sets `entry` only when the
+        // playbook produced a plannable plan, but it always carries `entryRef`
+        // (the trigger bar's close). A known reference price is more use at the
+        // moment of the trade than the word "unknown", and without this an
+        // un-plannable setup announced a line with no price in it at all.
+        ' @ ' + (m.entry != null ? m.entry : (m.entryRef != null ? m.entryRef : 'unknown')) +
+        ' · stop ' + (m.stop != null ? m.stop : 'unknown') +
+        ' · target ' + (m.target != null ? m.target : 'unknown') +
+        ' · ' + (m.targetR != null ? Number(m.targetR).toFixed(1) + 'R' : 'unknownR');
     default:
       return type;
   }

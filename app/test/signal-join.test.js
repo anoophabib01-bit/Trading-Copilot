@@ -59,3 +59,26 @@ test('entryAt missing falls back to the fold close stamp', () => {
   assert.equal(r.signalBacked, true);
   assert.equal(r.minutesFromSignal, 1);
 });
+
+// A trade can only be BACKED by a real armed setup. An engulf-alert is a
+// candle Anoop was told about and judged himself — letting one back a trade
+// would relabel his own discretionary entries as playbook-driven, which is the
+// single number the signal-vs-freestyle split exists to keep honest.
+test('an engulf-alert cannot back a trade', () => {
+  const t = { entryTs: 1000000, direction: 'BULLISH' };
+  const r = joinTradeToSignal(t, [{ event: 'engulf-alert', playbook: 'A', direction: 'BULLISH', ts: 950000 }], { windowMinutes: 15 });
+  assert.equal(r.signalBacked, false);
+});
+
+test('ISO-string ts (the real ledger format) parses and backs the trade', () => {
+  // The bug this guards: the ledger stores ts as an ISO string, not a number.
+  // A bare typeof check for 'number' skipped every real row and left playbook
+  // null on all trades. Fixed 2026-09-04.
+  const t = { side: 'buy', entryAt: Date.parse('2026-09-03T10:00:00Z') };
+  const r = joinTradeToSignal(t, [
+    { event: 'engulf-fire', playbook: 'A', direction: 'BULLISH', ts: '2026-09-03T09:58:00Z' } // 2 min before
+  ], { windowMinutes: 15 });
+  assert.equal(r.signalBacked, true);
+  assert.equal(r.playbook, 'A');
+  assert.equal(r.minutesFromSignal, 2);
+});

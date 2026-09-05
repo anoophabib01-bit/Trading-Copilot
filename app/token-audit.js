@@ -31,8 +31,20 @@ const agent = require('./claude-agent.js')._debug; // internal-only accessor —
 // ── CONFIG — edit these to match your real usage ──────────────────────────
 const CONFIG = {
   MODEL: 'claude-sonnet-4-6',
-  PRICE_PER_MTOK_INPUT: 3.00,   // USD, Sonnet 4.6 published rate
-  PRICE_PER_MTOK_OUTPUT: 15.00, // USD, Sonnet 4.6 published rate
+  // 2026-09-02: repriced from Anthropic Sonnet ($3 / $15 per Mtok) to DeepSeek
+  // after the single-provider consolidation. These are the OFF-PEAK rates,
+  // which is the honest default for this app: DeepSeek charges peak between
+  // 11:30-15:30 and 06:30-09:30 IST, and Anoop's NY-session trading falls
+  // outside both windows. Peak is roughly double — multiply by 2 for a
+  // worst-case figure.
+  //
+  // Note the scale change: output is ~23x cheaper than the Sonnet rate this
+  // file used to assume, so any conclusion drawn from an older run of this
+  // audit about what the app "costs" is off by more than an order of
+  // magnitude and should be re-run rather than trusted.
+  PRICE_PER_MTOK_INPUT: 0.22,   // USD, deepseek-v4-flash* cache MISS, off-peak
+  PRICE_PER_MTOK_INPUT_CACHED: 0.007, // cache HIT, off-peak
+  PRICE_PER_MTOK_OUTPUT: 0.66,  // USD, deepseek-v4-flash*, off-peak
   // Your assumption to edit: how many Claude calls does one NY session
   // realistically trigger? Each user message + each tool-result round trip
   // is a separate call in your runLoop. A session with 3-5 questions to
@@ -41,7 +53,7 @@ const CONFIG = {
   // 15-25 calls. CHANGE THIS to your real observed number once you log it.
   ESTIMATED_CALLS_PER_SESSION: 20,
   ESTIMATED_SESSIONS_PER_MONTH: 20, // ~5 days/week
-  MAX_OUTPUT_TOKENS: 4096, // hardcoded in your claude-agent.js stream() call
+  MAX_OUTPUT_TOKENS: 8192, // groq-agent.js floors DeepSeek requests at 8192
 };
 
 // ── Realistic message history samples ──────────────────────────────────────
@@ -113,7 +125,7 @@ async function main() {
   const tools = agent.ALL_TOOLS;
 
   console.log('═══════════════════════════════════════════════════════════');
-  console.log(' STAGE 1 AUDIT — mnq-copilot-workflow / claude-agent.js');
+  console.log(' STAGE 1 AUDIT — MNQ Co-Pilot / DeepSeek (prompts from claude-agent.js)');
   console.log('═══════════════════════════════════════════════════════════\n');
 
   // 1. System prompt alone (no tools, no history) — the floor cost of every call

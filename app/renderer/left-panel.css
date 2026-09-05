@@ -1,0 +1,384 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   LEFT PANEL — collapsed rail + flyouts   (2026-09-03)
+
+   WHY THIS FILE EXISTS
+   Anoop, 2026-09-03: "left panel redesign is needed as i cannot see the 'since
+   your last exit' completely and it is hard for me to read... can they all be
+   pop up boxes when i click on them to show details only when i click so that
+   more space is saved but easy to read. but i need 'since your last exit' to me
+   constant."
+
+   Three separate problems, three separate fixes:
+
+   1. UNREADABLE EXIT BOX. Its type was set in INLINE styles on the elements
+      themselves (`font:11px/1.5 ui-monospace…`), so no stylesheet could grow
+      it — every attempt to fix readability from CSS lost to the inline rule.
+      The markup now carries .xd-* classes and the sizes live here, where they
+      can actually be changed. 11px monospace at 240px column width is also
+      where the clipping came from; body text is now 12.5px Inter that wraps.
+
+   2. NO ROOM. The column was 240px with five always-open boxes stacked in it.
+      Account / Today / No-Trade Windows each collapse to one summary row; the
+      full section opens as a flyout OVER the chat at 340px, which is wider
+      than the column could ever be. "Since your last exit" is the deliberate
+      exception — it never collapses, per the quote above.
+
+   3. FLAT BUTTON STACK. Twelve identical qa-btns meant Pre-Session Check —
+      pressed every morning — looked exactly like Mark NY Levels. One hero
+      button, two supporting, eight behind a "More actions" popover.
+
+   G5 DOCTRINE (see g5-premium.css header): no shadows, no sheen, no
+   translucency, flat solid fills. This file honours that for everything that
+   sits IN the column. Flyouts are the one exception and get --shadow-3: they
+   are a floating layer over unrelated content, and without an elevation cue a
+   flat card reads as part of the chat behind it. That is a deliberate,
+   argued departure, not drift — do not extend it to the rail rows.
+
+   Loads LAST, after g5-premium.css, so its !important declarations win.
+   Revert the whole pass by deleting the <link> in index.html.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 1 · Column ─────────────────────────────────────────────────────────────
+   300px, up from 240. The pinned exit box is the widest thing in the column
+   and 240 clipped it; the collapsed rows are short, so the extra 60px costs
+   the chat nothing that the rail was using anyway. The drag handle still
+   works — see the DEFAULTS/migration note in app.js's resizer IIFE. */
+#left-panel {
+  /* No !important: the resizer IIFE in app.js writes an inline width from
+     localStorage and must still win. This is the pre-JS paint value and the
+     value a fresh profile gets. */
+  width: 300px;
+  /* Lifts the whole column — rows AND their fixed-position flyouts — above the
+     click-away scrim (#lp-scrim, z-index 630). Without this the scrim swallows
+     the click that would open a different row, so switching between two boxes
+     took two clicks and looked broken. Nothing here clips a fixed child:
+     overflow:hidden alone does not establish a containing block, and no
+     ancestor sets transform/filter/contain. */
+  position: relative;
+  z-index: 650;
+}
+#left-scroll {
+  padding: 12px 12px 4px;
+  gap: 0;
+}
+#left-scroll .panel-section {
+  padding: 12px 13px !important;
+  margin-bottom: 10px !important;
+}
+
+/* ── 2 · Pinned "Since your last exit" ──────────────────────────────────────
+   The one box that never collapses. Given a left accent edge so it reads as
+   the standing item and not as another collapsed row that failed to open. */
+#left-panel .lp-pinned {
+  border-left: 3px solid var(--accent, var(--green)) !important;
+  border-radius: 12px !important;
+}
+#left-panel .lp-pinned .section-title { margin-bottom: 7px !important; }
+
+/* Verdict line — the sentence he reads first. Wraps rather than clipping:
+   "HIGHER than your last exit (24310.25)  7/10 Strong · 5m" is longer than any
+   column width, and truncating it hides the score, which is the point of it. */
+.xd-verdict {
+  font: 700 14px/1.35 'Inter', 'Segoe UI', system-ui, sans-serif;
+  letter-spacing: -0.01em;
+  margin: 2px 0 5px;
+  overflow-wrap: anywhere;
+}
+/* Detail sentence + measurements. Inter, not monospace: this is prose with
+   numbers in it, and monospace at a readable size does not fit the column. */
+.xd-detail {
+  font: 12.5px/1.55 'Inter', 'Segoe UI', system-ui, sans-serif;
+  color: var(--text-mid);
+  overflow-wrap: anywhere;
+}
+/* Figures inside that prose stay tabular so 15.5 / 129.0 line up on re-render */
+.xd-detail, .xd-verdict, .xd-bias { font-variant-numeric: tabular-nums; }
+.xd-bias {
+  font: 12px/1.5 'Inter', 'Segoe UI', system-ui, sans-serif;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.xd-btn { margin-top: 8px !important; width: 100%; }
+.xd-status {
+  font: 11px/1.4 'Inter', 'Segoe UI', system-ui, sans-serif;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+/* Idle placeholder — dimmer, no accent edge, so it never looks like live data */
+#left-panel .lp-pinned-idle { border-left-color: var(--border) !important; }
+.lp-pinned-idle .xd-detail { color: var(--text-dim); }
+
+/* ── 3 · Collapsed rail rows ────────────────────────────────────────────────
+   Grid: label | value | caret, with an optional sub-line spanning all three.
+   The whole row is one <button>, so keyboard and click hit the same target. */
+.lp-rail { display: flex; flex-direction: column; gap: 6px; }
+
+.lp-row {
+  display: grid;
+  grid-template-columns: 1fr auto 10px;
+  align-items: center;
+  gap: 8px 8px;
+  width: 100%;
+  text-align: left;
+  padding: 10px 11px;
+  border-radius: 11px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color .12s ease, background .12s ease;
+}
+.lp-row:hover  { border-color: var(--border2); background: var(--surface2); }
+.lp-row:focus-visible { outline: 2px solid var(--accent, var(--green)); outline-offset: 1px; }
+.lp-row.open   { border-color: var(--accent, var(--green)); }
+
+.lp-row-k {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.lp-row-v {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 13.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  white-space: nowrap;
+}
+.lp-row-v.green { color: var(--green); }
+.lp-row-v.red   { color: var(--red); }
+.lp-row-v.amber { color: var(--amber); }
+.lp-row-c { color: var(--text-dim); font-size: 14px; line-height: 1; transition: transform .12s ease; }
+.lp-row.open .lp-row-c { transform: rotate(90deg); }
+
+/* Sub-line: the second fact per row. Two lines max, then ellipsis — a row
+   that grows with its content would defeat the point of collapsing. */
+.lp-row-sub {
+  grid-column: 1 / -1;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.lp-row-sub:empty { display: none; }
+/* A row carrying live danger (blackout window, NO-GO, day stop) is tinted, so
+   the collapsed state can still shout. Collapsing must not mute a warning. */
+.lp-row.alert { border-color: var(--red); background: var(--red-dim); }
+.lp-row.alert .lp-row-sub { color: var(--red); }
+.lp-row.warn  { border-color: var(--amber); }
+
+/* GO / NO-GO / PENDING pill, shrunk to ride inside the Today row */
+.lp-pill {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  padding: 2px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.lp-pill.go      { border-color: var(--green); color: var(--green); }
+.lp-pill.nogo    { border-color: var(--red);   color: var(--red);   }
+.lp-pill.pending { border-color: var(--amber); color: var(--amber); }
+
+/* ── 4 · Flyouts ────────────────────────────────────────────────────────────
+   The section bodies. They stay exactly where they were in the DOM — every
+   id inside them is still written by the same code as before, open or shut —
+   and are only lifted out visually by position:fixed. left-panel.js sets
+   top/left; width and the rest live here.
+
+   display:none while closed is deliberate: it keeps them out of the tab order
+   and out of hit-testing without any JS bookkeeping. It does NOT stop them
+   updating — element.textContent writes to a display:none node fine. */
+#left-panel .lp-fly { display: none; }
+#left-panel .lp-fly.open {
+  display: block;
+  position: fixed;
+  z-index: 640;
+  width: 340px;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  padding: 14px 16px 15px !important;
+  margin: 0 !important;
+  background: var(--surface) !important;
+  border: 1px solid var(--border2) !important;
+  border-radius: 14px !important;
+  /* The one sanctioned shadow — see the G5 note in this file's header. */
+  box-shadow: var(--shadow-3) !important;
+  animation: lpFlyIn .13s ease-out;
+}
+@keyframes lpFlyIn {
+  from { opacity: 0; transform: translateX(-6px); }
+  to   { opacity: 1; transform: none; }
+}
+#left-panel .lp-fly.open .stat-row { padding: 5px 0; }
+#left-panel .lp-fly.open .stat-label { font-size: 12.5px !important; }
+#left-panel .lp-fly.open .stat-value { font-size: 13.5px !important; }
+/* The flyout is where the whole ForexFactory week is read (2026-09-03), so it
+   gets real height — the 260px in styles.css is the in-column fallback. */
+#left-panel .lp-fly.open .news-list { max-height: 58vh; overflow-y: auto; }
+/* The ↻ / 📍 Chart buttons stretched to the header's full height once the
+   flyout gave them room, which is why they rendered as two big slabs. */
+#left-panel .lp-fly.open .engulf-header { align-items: center; }
+/* The button group is an inline `display:flex` on the element itself, so only
+   the cross-axis alignment can be corrected from here — without it the two
+   buttons stretch to the header's height and read as slabs. */
+#left-panel .lp-fly.open .engulf-header > div { align-items: center; }
+#left-panel .lp-fly.open .engulf-header .engulf-check-btn {
+  align-self: center;
+  white-space: nowrap;
+  padding: 5px 9px !important;
+  line-height: 1.35;
+}
+
+.lp-fly-close {
+  position: absolute;
+  top: 9px;
+  right: 10px;
+  width: 24px;
+  height: 24px;
+  line-height: 1;
+  font-size: 16px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.lp-fly-close:hover { background: var(--surface2); border-color: var(--border); color: var(--text); }
+#left-panel .lp-fly.open { position: fixed; }           /* re-stated after .lp-fly-close for clarity */
+#left-panel .lp-fly.open > .section-title { padding-right: 26px; }
+
+/* Click-away catcher. Transparent, not dimmed: the chart and chat behind a
+   flyout are live trading information and must stay readable while one glance
+   is open. */
+#lp-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 630;
+  background: transparent;
+}
+
+/* ── 4b · Size-cap stepper (2026-09-04) ─────────────────────────────────────
+   Lives in the Today flyout next to Size. Deliberately looks like a control he
+   is meant to touch — the point of the change was that a cap he never engages
+   with is a cap he trades straight through. */
+.sizecap-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface2);
+  padding: 2px;
+}
+.sizecap-btn {
+  width: 22px;
+  height: 22px;
+  line-height: 1;
+  font-size: 14px;
+  font-weight: 700;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.sizecap-btn:hover:not(:disabled) { background: var(--surface3); }
+/* Disabled at the ceiling rather than hidden: he should be able to SEE that 6
+   is the end of the road, not wonder why the button stopped working. */
+.sizecap-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.sizecap-val {
+  min-width: 20px;
+  text-align: center;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 13.5px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+.sizecap-note {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  text-align: right;
+  margin-top: 2px;
+}
+
+/* ── 5 · Quick actions ──────────────────────────────────────────────────────
+   Hero + two + a popover. Everything below is a re-style of buttons that
+   already existed; none of their behaviour is touched here. */
+#quick-actions { padding: 10px 12px 12px !important; gap: 7px !important; }
+
+/* g5-premium fills every qa-btn with --surface2 — which in the Paper theme is
+   the same value as the panel behind it, so the whole stack rendered as plain
+   text rows with no edges. That is the "need to pop" complaint. Same card
+   treatment as the rail rows above them, so the column reads as one system. */
+#quick-actions .qa-btn {
+  background: var(--surface) !important;
+  border: 1px solid var(--border) !important;
+  color: var(--text) !important;
+  padding: 11px 12px !important;
+  border-radius: 10px !important;
+}
+#quick-actions .qa-btn:hover {
+  background: var(--surface2) !important;
+  border-color: var(--border2) !important;
+}
+/* Re-stated because the rule above (equal specificity, later in the file) would
+   otherwise flatten g5's coloured treatments back to a plain card. */
+#quick-actions .qa-btn.danger {
+  border-color: var(--red) !important;
+  color: var(--red) !important;
+}
+
+#quick-actions .qa-btn.qa-hero {
+  background: linear-gradient(90deg, color-mix(in srgb, var(--green) 16%, var(--surface)), var(--surface) 78%) !important;
+  border-color: var(--green) !important;
+  padding: 13px 14px !important;
+  font-size: 13.5px !important;
+  font-weight: 800 !important;
+  letter-spacing: .01em;
+  border-radius: 11px !important;
+  border-width: 1.5px !important;
+  color: var(--text) !important;
+}
+#quick-actions .qa-btn.qa-hero .btn-icon { font-size: 15px !important; }
+
+#quick-actions .qa-btn.qa-more { justify-content: flex-start; }
+#quick-actions .qa-btn.qa-more .lp-row-c { margin-left: auto; }
+#quick-actions .qa-btn.qa-more.open { border-color: var(--accent, var(--green)) !important; color: var(--text) !important; }
+#quick-actions .qa-btn.qa-more.open .lp-row-c { transform: rotate(90deg); }
+
+/* The popover reuses .lp-fly wholesale — same open/close code, same look. */
+#left-panel .qa-fly.open { display: flex; flex-direction: column; gap: 6px; }
+#left-panel .qa-fly.open .section-title { margin-bottom: 4px !important; }
+/* Inside the popover the ground is --surface, so the buttons step DOWN a tier
+   instead of up — the card treatment they get in the column would make them
+   invisible here. */
+#left-panel .qa-fly.open .qa-btn {
+  background: var(--surface2) !important;
+  border-color: transparent !important;
+}
+#left-panel .qa-fly.open .qa-btn:hover { border-color: var(--border2) !important; }
+
+/* ── 6 · Narrow window ──────────────────────────────────────────────────────
+   The flyout is 340px on top of a 300px column plus a resizer. On a laptop
+   screen that can crowd the chat, so it gives back 20px rather than pushing
+   the conversation off-screen. The column itself is unchanged — he can still
+   drag it, and the pinned box wraps at any width instead of clipping. */
+@media (max-width: 1200px) {
+  #left-panel .lp-fly.open { width: 320px; }
+}

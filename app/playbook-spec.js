@@ -67,22 +67,22 @@ const SPEC_DEFAULTS = {
 const PLAYBOOKS = {
   A: {
     id: 'A',
-    name: '4H Engulfing + TF Alignment',
-    source: 'Prop Trading/CLAUDE.md — Playbook A',
-    entryTf: '60',
-    biasTf: '240',
+    name: 'Engulfing candle (any always-on timeframe)',
+    source: 'Prop Trading/CLAUDE.md — Playbook A, as respecified by Anoop 2026-09-01',
+    // The watchers that ARE Playbook A. All are always-on and have no
+    // supported OFF; the timeframe is an attribute of the signal, not a
+    // different playbook. Kept here so one list answers "which watchers are A".
+    entryTfs: ['60', '30', '15', '5'],
+    entryTf: '60',      // the canonical one, for callers that want a single TF
+    biasTf: null,       // bias is NOT A's job — see the note below
     steps: [
-      { n: 1, kind: 'prep',    text: 'Mark all levels on the chart (PDH/PDL, prior swings, session ranges) before the session.' },
-      { n: 2, kind: 'gate',    text: '4H structure must be clean: HH-HL for longs, LL-LH for shorts. Mixed/ranging = no trade.' },
-      { n: 3, kind: 'trigger', text: 'Wait for a full-range engulfing candle to CLOSE on the 1H.' },
-      { n: 4, kind: 'gate',    text: 'Engulf direction must AGREE with 4H structure. Against it = No Action, not a smaller size.' },
-      { n: 5, kind: 'gate',    text: 'Playbook C validity gate must pass on that engulfing candle (see playbook C).' },
-      { n: 6, kind: 'entry',   text: 'Entry 1 at the engulfing candle close, stop beyond the engulfing candle extreme.' },
-      { n: 7, kind: 'manage',  text: 'If entry 1 goes into profit: add entry 2 and move the combined stop to breakeven.' },
-      { n: 8, kind: 'manage',  text: 'Exit at the marked levels from step 1 — not at an arbitrary point count.' },
+      { n: 1, kind: 'gate',    text: 'The higher-timeframe gate must be open: the 1H structure reads cleanly as HH-HL or LL-LH. This sits ABOVE every playbook and is not part of A. The 4H is read too, but since 2026-09-01 it cannot refuse a trade — it is reported as evidence, and every signal states whether it confirmed.' },
+      { n: 2, kind: 'trigger', text: 'An engulfing candle CLOSES on any always-on watcher — 1H, 30M, 15M or 5M. The candle takes out BOTH the high and the low of the previous candle, and covers its body. This is timeframe-agnostic: the same shape counts on every chart.' },
+      { n: 3, kind: 'gate',    text: 'Playbook C validity gate passes on that candle (swing location, and liquidity not already swept and rejected).' },
+      { n: 4, kind: 'gate',    text: 'Its direction matches the higher-timeframe bias. Against it is No Action, never a smaller size.' },
+      { n: 5, kind: 'entry',   text: 'Entry at the engulfing candle close; stop beyond the opposite extreme of that same candle.' },
+      { n: 6, kind: 'manage',  text: 'Report the TIMEFRAME with every signal — since 2026-09-01 all four watchers are Playbook A, so the timeframe is the only thing distinguishing a 5M engulf from a 1H one.' },
     ],
-    // Entry is at the close of the trigger candle, so it is always reachable:
-    // it is the price that just printed. Nothing to wait for.
     requiresFill: false,
   },
 
@@ -124,9 +124,24 @@ const PLAYBOOKS = {
     requiresFill: false,
   },
 
-  // ── DSH-V2 — the first candidate with out-of-sample evidence ─────────────
+  // ── Playbook C (ADX) — the first candidate with out-of-sample evidence ───
   // Long-only strong-uptrend Donchian breakout, from DSH's six backtest rounds
   // (see "DSH backtesting/" — STRATEGY_V2.md and ROBUSTNESS_GRID.md).
+  //
+  // ── WHY THE ID IS `C-ADX` AND NOT `C` ──────────────────────────────────
+  // Named "Playbook C (ADX)" at Anoop's instruction 2026-09-01. The id stays
+  // distinct because `C` is ALREADY TAKEN by the engulf validity gate above,
+  // and autonomy-modes.js:221 aliases an incoming 'C' to 'LTF-ENGULF'. Giving
+  // this setup the bare id 'C' would make three different things answer to one
+  // key and would silently route its orders through the LTF-ENGULF alias.
+  // Both DSH documents ask for exactly this split: 'Playbook C (ADX breakout)'
+  // vs 'Playbook C (engulf gate)'. `name` is what a human reads; `id` is what
+  // the ledger keys on, and those two jobs are not the same job.
+  //
+  // Rows written before this rename carry `DSH-V2`. That id is kept as an
+  // ALIAS (see PLAYBOOK_ALIASES) rather than rewritten in the ledger — a
+  // record of what the app actually did is not something to edit after the
+  // fact, and a resolver that cannot read its own history resolves nothing.
   //
   // WHY IT IS HERE AND THE OTHERS ARE NOT: it is the only rule in this repo
   // that stayed positive across four HELD-OUT market regimes and a 16-cell
@@ -144,9 +159,9 @@ const PLAYBOOKS = {
   // ADX>=35 was the consistency-safe choice at 1 contract and is borderline
   // at 2, where ADX>=25 reads better. Do not copy the published config
   // without re-deriving it at the size actually being traded.
-  'DSH-V2': {
-    id: 'DSH-V2',
-    name: 'Long-only strong-uptrend breakout (ADX-gated)',
+  'C-ADX': {
+    id: 'C-ADX',
+    name: 'Playbook C (ADX) — long-only strong-uptrend breakout',
     source: 'DSH backtesting/STRATEGY_V2.md — verified at 2 contracts 2026-08-26',
     entryTf: '60',
     biasTf: '60',
@@ -164,27 +179,48 @@ const PLAYBOOKS = {
     requiresFill: false,
   },
 
-  // See the header. Named rather than deleted, so its results stop being
-  // filed under a rulebook playbook that never authorised it.
-  'LTF-ENGULF': {
-    id: 'LTF-ENGULF',
-    name: 'Lower-timeframe engulf (30M/15M) — UNSANCTIONED, under evaluation',
-    source: 'server.js behaviour only — appears in no rulebook or Pine script',
-    entryTf: '30',
-    biasTf: null,
-    unsanctioned: true,
-    steps: [
-      { n: 1, kind: 'trigger', text: 'Full-range engulfing candle closes on 30M or 15M.' },
-      { n: 2, kind: 'gate',    text: 'Playbook C validity gate passes.' },
-      { n: 3, kind: 'gate',    text: 'NO higher-timeframe alignment requirement — this is what separates it from Playbook A, and why it is not Playbook A.' },
-      { n: 4, kind: 'entry',   text: 'Entry at the engulfing candle close (assumed — never specified anywhere).' },
-    ],
-    requiresFill: false,
-  },
+  // ── LTF-ENGULF — RETIRED 2026-09-01, folded into Playbook A ────────────
+  // It existed because the server tagged a 1H engulf 'A' and the identical
+  // candle on 30M/15M/5M something else, so results from one detector were
+  // filed under two names — neither of which the rulebook sanctioned for the
+  // lower timeframes. Anoop settled it: "I want all the monitors which are
+  // always on to be part of Playbook A... That is the only Playbook A setup."
+  //
+  // Not deleted, ALIASED (see PLAYBOOK_ALIASES). Rows written under the old id
+  // must keep resolving, and a resolver that cannot read its own history
+  // resolves nothing.
+};
+
+// ── Historical ids that must keep resolving ────────────────────────────────
+// A playbook can be RENAMED; the rows it already wrote cannot. Every id that
+// has ever reached disk maps here to its current key, so a ledger row, a
+// pending shadow order or an unresolved outcome written under the old name
+// still finds its spec. Deleting an entry from this map does not tidy
+// anything — it orphans real records.
+//
+//   DSH-V2 → C-ADX   renamed 2026-09-01 ("name it playbook C (ADX)").
+const PLAYBOOK_ALIASES = {
+  'DSH-V2': 'C-ADX',
+  // Retired 2026-09-01: every always-on engulf watcher is Playbook A. The
+  // lower-timeframe engulf is the same setup on a different chart, not a
+  // different setup.
+  'LTF-ENGULF': 'A',
 };
 
 function getPlaybook(id) {
-  return PLAYBOOKS[String(id || '').toUpperCase()] || PLAYBOOKS[id] || null;
+  const raw = String(id || '');
+  const up = raw.toUpperCase();
+  const key = PLAYBOOK_ALIASES[up] || PLAYBOOK_ALIASES[raw] || up;
+  return PLAYBOOKS[key] || PLAYBOOKS[raw] || null;
+}
+
+// Current canonical id for a possibly-historical one. Callers that key their
+// OWN maps on a playbook id (the resolver, the outcome ledger) need this so
+// old and new rows for the same strategy land in one bucket instead of two.
+function canonicalId(id) {
+  const raw = String(id || '');
+  const up = raw.toUpperCase();
+  return PLAYBOOK_ALIASES[up] || PLAYBOOK_ALIASES[raw] || (PLAYBOOKS[up] ? up : raw);
 }
 
 // Stable identity for a setup, so the SAME gap or the SAME engulfing candle
@@ -212,10 +248,19 @@ function setupId(playbookId, setup) {
       // A B setup is identified by the gap it will be entered in, plus the
       // raid that authorised it. Same gap + same sweep = same setup.
       return `B:${dir}:${px(s.gapLow)}-${px(s.gapHigh)}:sw${px(s.level)}`;
+    case 'FVG-ONLY':
+      // A displacement gap with NO raid behind it. Not a playbook and not a
+      // setup — it is deliberately absent from PLAYBOOKS so planEntry refuses
+      // it. It still needs a stable id because the FVG watcher logs it, and
+      // it must be keyed on the GAP: falling through to the default (which
+      // keys on `level`, always null here) would collapse every same-direction
+      // gap in a session into one id.
+      return `FVG-ONLY:${dir}:${px(s.gapLow)}-${px(s.gapHigh)}`;
     case 'A':
     case 'C':
-    case 'LTF-ENGULF':
-    case 'DSH-V2':
+    case 'LTF-ENGULF':   // retired id — kept so historical setupIds still match
+    case 'C-ADX':
+    case 'DSH-V2':   // historical alias — see PLAYBOOK_ALIASES
       // An engulf is identified by the candle itself: its own open time is
       // unique and never repaints once closed.
       return `${playbookId}:${dir}:${s.barTime != null ? s.barTime : 'na'}:${px(s.entryRef)}`;
@@ -324,4 +369,4 @@ function planEntry(playbookId, setup, rules) {
   };
 }
 
-module.exports = { PLAYBOOKS, SPEC_DEFAULTS, getPlaybook, planEntry, setupId };
+module.exports = { PLAYBOOKS, PLAYBOOK_ALIASES, SPEC_DEFAULTS, getPlaybook, canonicalId, planEntry, setupId };

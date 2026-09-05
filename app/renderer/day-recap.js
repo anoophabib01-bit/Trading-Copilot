@@ -55,7 +55,7 @@ function recapNoteLabel(text) {
 }
 
 function recapLoadHistory() {
-  try { return JSON.parse(localStorage.getItem('copilot_gr_history') || '[]') || []; }
+  try { return JSON.parse(acctRead('copilot_gr_history') || '[]') || []; }
   catch (e) { return []; }
 }
 
@@ -115,7 +115,7 @@ function recapFocusItem(day) {
 // 2026-07-28, so historical days already carry them — nothing to backfill.
 function recapDayTrades(dateStr) {
   try {
-    const dt = JSON.parse(localStorage.getItem('copilot_day_trades') || '{}');
+    const dt = JSON.parse(acctRead('copilot_day_trades') || '{}');
     return (dt && dt[dateStr]) || [];
   } catch (e) { return []; }
 }
@@ -148,11 +148,35 @@ function recapPx(v) {
 // finished. This is the "max single loss ≈ 5 avg winners" problem from
 // IMPROVEMENT_PLAN.md #6, turned into a number before the session instead of a
 // post-mortem after it.
-function recapSizeAdvice(day) {
+// Live cap from rules.json. Falls back to the SAFEST value, never a
+// permissive one: if the cap cannot be read, advising big is what costs money.
+function recapSizeCap() {
+  try {
+    if (typeof state !== "undefined" && state.rules && state.rules.sizeCap) return Number(state.rules.sizeCap);
+  } catch (e) {}
+  return 2;
+}
+
+function recapSizeAdvice(day, trades) {
+  // Never advise from a day the feed could not resolve (2026-08-31). This
+  // reads day.worst — the worst SINGLE trade — and on a fold-only day there
+  // are no single trades: the session is one balance-move row with a stale
+  // size. That produced "start at 5" from a -$61.40 row that was the whole day.
+  try {
+    if (typeof FoldOnly !== "undefined" && trades && !FoldOnly.hasTradeDetail(trades)) {
+      return { size: null, unreconciled: true,
+        text: "Yesterday was not reconciled — the feed lost trade-level detail, so there is no reliable worst-trade to size from. Start at your normal cap and reconcile the day first." };
+    }
+  } catch (e) {}
   const acc = (typeof state !== 'undefined' && state.account) ? state.account : {};
   const mode = (typeof state !== 'undefined' && state.mode) ? state.mode : 'eval';
   const dayStop = Math.abs(mode === 'eval' ? (acc.evalDayStop || 300) : (acc.fundedDayStop || 200));
-  const cap = 6;                                   // rules.json sizeCap
+  // sizeCap is READ, never copied. This said `const cap = 6` until 2026-08-31;
+  // rules.json lowered it to 2 on 2026-07-28 and this copy never followed, so
+  // the recap advised up to 3x the hard rule. Exactly the drift CLAUDE.md
+  // warns about, and the same shape as the 150K breach (sized 5 against a
+  // stated 2-cap the app was not enforcing).
+  const cap = recapSizeCap();
   const worst = Math.abs(day.worst || 0);          // worst SINGLE trade, from gr_history
   const usedSize = day.maxSize || 0;
   if (!worst || !dayStop) {
@@ -172,6 +196,12 @@ function recapSizeAdvice(day) {
   } else {
     size = Math.min(cap, Math.max(2, usedSize || 3));
     why = 'Worst trade was only ' + Math.round(share * 100) + '% of the day stop — risk was controlled. Same opener, same discipline.';
+  }
+  // Hard clamp: a recommendation above the cap must be unreachable, not
+  // merely unlikely. trust-protocol check T2 asserts this.
+  if (size != null && size > cap) {
+    why = "Capped at " + cap + " by your size rule. " + why;
+    size = cap;
   }
   return { size: size, text: why };
 }
@@ -321,16 +351,32 @@ function recapRender(day, today) {
       '</div><div class="rf-text">' + recapEsc(focus.text) + '</div>';
   }
 
+  // Per-trade tiles need per-trade data. best/worst/win-loss/max-size cannot
+  // come from a balance delta; on 2026-08-31 they were published anyway and
+  // every one was wrong (shown 1W/1L, best $8, worst -$52 — the broker said
+  // 6W/4L, +$30, -$59). Net P&L and TRADES-moved stay: those are real.
+  var recapTrades = [];
+  try { recapTrades = recapDayTrades(day.date) || []; } catch (e) {}
+  // Per-FIELD trust, not one blanket flag. A balance-delta fold really does
+  // know each trade's P&L and size, so best/worst/max-size/win-loss are true
+  // and must show. It does NOT know hold times: every folded row carries
+  // hold:0, meaning unknown. Blanking the true four while printing "median
+  // hold 0s" was the 2026-09-01 recap getting it backwards in both directions.
+  var _trust = { money: true, size: true, timing: true };
+  try { if (typeof FoldOnly !== "undefined") _trust = FoldOnly.fieldTrust(recapTrades); } catch (e) {}
+  var _recapDetail = _trust.money;
+  try { if (typeof FoldOnly !== "undefined") _recapDetail = FoldOnly.hasTradeDetail(recapTrades); } catch (e) {}
+
   const stats = [
     ['P&L', money(day.pnl || 0), (day.pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'],
     ['TRADES', String(day.n || 0), (day.n || 0) > 20 ? 'var(--red)' : ''],
     ['DISCIPLINE', (day.disc || 0) + '%',
       (day.disc || 0) >= 75 ? 'var(--green)' : (day.disc || 0) >= 50 ? 'var(--amber)' : 'var(--red)'],
-    ['WIN / LOSS', (day.wins || 0) + ' / ' + (day.losses || 0), ''],
+    ['WIN / LOSS', _recapDetail ? (day.wins || 0) + ' / ' + (day.losses || 0) : '—', ''],
     // Best/worst SINGLE trade — the two numbers that decide today's size.
-    ['BEST TRADE', money(day.best || 0), 'var(--green)'],
-    ['WORST TRADE', money(day.worst || 0), 'var(--red)'],
-    ['MAX SIZE', String(day.maxSize || 0), (day.maxSize || 0) > 6 ? 'var(--red)' : ''],
+    ['BEST TRADE', _recapDetail ? money(day.best || 0) : '—', _recapDetail ? 'var(--green)' : 'var(--text-dim)'],
+    ['WORST TRADE', _recapDetail ? money(day.worst || 0) : '—', _recapDetail ? 'var(--red)' : 'var(--text-dim)'],
+    ['MAX SIZE', _trust.size ? String(day.maxSize || 0) : '—', ''],
     ['REVENGE', String(day.revenge || 0), (day.revenge || 0) ? 'var(--red)' : '']
   ];
   const sEl = document.getElementById('recap-stats');
@@ -342,7 +388,7 @@ function recapRender(day, today) {
   }
 
   // ── Contract size for today, from yesterday's worst single trade ──────────
-  const advice = recapSizeAdvice(day);
+  const advice = recapSizeAdvice(day, recapTrades);
   const szEl = document.getElementById('recap-size');
   if (szEl) {
     szEl.innerHTML = '<div class="rf-label" style="color:var(--text-dim)">TODAY’S STARTING SIZE</div>' +

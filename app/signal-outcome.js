@@ -30,6 +30,8 @@
 // proposed an entry, so there is nothing to score for them. Kept as its own
 // constant rather than imported so the two can diverge deliberately if the
 // vocabularies ever do; a silent shared coupling would be worse.
+const tradeForensics = require('./trade-forensics'); // shared excursion kernel (F1)
+
 const ARMING_EVENTS = new Set(['engulf-fire', 'fvg-fire', 'playbook-b-confirm']);
 
 function isArmingEvent(event) {
@@ -41,6 +43,12 @@ function dirSign(direction) {
   if (d === 'BULLISH') return 1;
   if (d === 'BEARISH') return -1;
   return 0;
+}
+
+// Bar width in seconds for a timeframe code ('1','5','15','30','60','240').
+function tfToSeconds(tf) {
+  const n = Number(tf);
+  return Number.isFinite(n) && n > 0 ? n * 60 : null;
 }
 
 /**
@@ -88,6 +96,14 @@ function resolveSignalOutcome(signal, bars, opts) {
 
   if (!after.length) return { resolved: false, reason: 'no bars after the signal yet' };
 
+  // F0.1 staleness bound: the first bar after the signal must be within a few
+  // bar-widths of it. A signal from Aug-28 resolved against Sep-05 bars is a
+  // different market scored as if continuous.
+  const tfSec = tfToSeconds(signal.tf);
+  if (tfSec && (after[0].time - signalSec) > tfSec * 3) {
+    return { resolved: false, reason: 'stale bars — first bar is ' + Math.round((after[0].time - signalSec) / 3600) + 'h after the signal' };
+  }
+
   const window = after.slice(0, horizonBars);
   // Refuse to resolve on a partial window: a signal scored over 3 of its 12
   // bars is not a small-sample version of the same measurement, it is a
@@ -97,8 +113,11 @@ function resolveSignalOutcome(signal, bars, opts) {
     return { resolved: false, reason: `only ${window.length}/${horizonBars} bars available yet`, pending: true };
   }
 
-  let mfe = 0;
-  let mae = 0;
+  // F1 shared kernel: mfe/mae via trade-forensics.excursion (one fix fixes
+  // both signal scoring and per-trade forensics).
+  const ex = tradeForensics.excursion(window, level, sign, null, null);
+  const mfe = ex.mfe;
+  const mae = ex.mae;
   let hit = null;        // 'target' | 'stop' | null
   let hitBarIndex = null;
 
@@ -111,8 +130,6 @@ function resolveSignalOutcome(signal, bars, opts) {
     // Favourable/adverse excursion in the signal's own direction.
     const fav = sign === 1 ? hi - level : level - lo;
     const adv = sign === 1 ? level - lo : hi - level;
-    if (fav > mfe) mfe = fav;
-    if (adv > mae) mae = adv;
 
     if (hit == null && (stopPoints != null || targetPoints != null)) {
       const hitTarget = targetPoints != null && fav >= targetPoints;
@@ -193,4 +210,28 @@ function aggregateOutcomes(rows) {
   })).sort((a, b) => b.n - a.n);
 }
 
-module.exports = { resolveSignalOutcome, aggregateOutcomes, isArmingEvent, ARMING_EVENTS };
+/**
+ * Do two instrument symbols refer to the same contract family (MNQ vs MGC)?
+ * The ledger stores the full form ("CME_MINI:MNQ1!") while the live chart may
+ * report a shorter form ("MNQ1!") or a different month ("MNQU6"); all three are
+ * the same instrument for the purpose of "did I resolve this signal against the
+ * right bars". Empty on either side returns TRUE ("unknown must not block") so a
+ * symbol-less row falls back to the previous symbol-agnostic behaviour instead
+ * of silently never resolving.
+ */
+function sameInstrument(a, b) {
+  if (a == null || b == null) return true;
+  const root = (s) => {
+    let x = String(s).toUpperCase().trim();
+    const i = x.lastIndexOf(':');
+    if (i >= 0) x = x.slice(i + 1);           // drop exchange prefix (CME_MINI:)
+    const m = x.match(/[A-Z]+/);              // leading letters, stops at the month digit/number
+    const letters = m ? m[0] : x.replace(/[^A-Z0-9]/g, '');
+    return letters.slice(0, 3);               // MNQ / MGC — the contract month (U/Z/H/M) is the 4th char
+  };
+  const ra = root(a), rb = root(b);
+  if (!ra || !rb) return true;                // unreadable either side → don't block
+  return ra === rb;
+}
+
+module.exports = { resolveSignalOutcome, aggregateOutcomes, isArmingEvent, sameInstrument, tfToSeconds, ARMING_EVENTS };

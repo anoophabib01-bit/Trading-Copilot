@@ -9,7 +9,9 @@
  *   DATA/weekly/<slot>/<weekKey>.json   a FROZEN completed week
  *   DATA/weekly/<slot>/commitments.json what he promised, keyed by the week it applies TO
  *   DATA/weekly/doctrine.json           the 50K state-of-mind text (account-wide, not per slot)
- *   sessions/Week-<weekKey>.md          the Obsidian-readable copy
+ *   sessions/Week-<weekKey>-<slot>.md   the Obsidian-readable copy (slot-scoped
+ *                                       since 2026-08-31 — one filename per week
+ *                                       let an empty account overwrite a real one)
  *
  * WHY WEEKS ARE FROZEN. A completed week is a RECORD, unlike sessions/Now.md
  * which is a projection. Once frozen it stops tracking later repairs to
@@ -75,7 +77,12 @@ function buildWeek(dataDir, slot, anyDateInWeek, todayKey, accountRules) {
   return WR.rollupWeek(anyDateInWeek, {
     grDays: grDays,
     tradesByDay: tradesByDay,
-    dataStart: dataStartOf(grDays, tradesByDay),
+    // A slot with NO records at all must not fall back to "no horizon known":
+    // that disables the pre-history check entirely and credits every weekday as
+    // restraint. The empty s2 account froze 2026-W35 reporting "held fire 5
+    // days" for a week it had never traded — the same absence-as-virtue bug the
+    // horizon exists to prevent, arriving through the one door left open.
+    dataStart: dataStartOf(grDays, tradesByDay) || NO_RECORDS_HORIZON,
     ledger: readJson(path.join(dir, 'balance_ledger.json'), {}) || {},
     ckByDate: ckByDate,
     notesByDate: readJson(path.join(dir, 'notes.json'), {}) || {},
@@ -91,6 +98,10 @@ function buildWeek(dataDir, slot, anyDateInWeek, todayKey, accountRules) {
  * Returns null when there is no history at all, which disables the horizon
  * rather than treating everything as pre-history.
  */
+// Sentinel horizon for an account with zero records: every real date is before
+// it, so every day is pre-history and nothing can be scored as held fire.
+const NO_RECORDS_HORIZON = '9999-12-31';
+
 function dataStartOf(grDays, tradesByDay) {
   const keys = [];
   (Array.isArray(grDays) ? grDays : []).forEach(d => { if (d && d.date) keys.push(d.date); });
@@ -470,7 +481,12 @@ function renderWeekMarkdown(week, findings, trend, opts) {
 function writeWeekMarkdown(sessionsDir, week, findings, trend, opts) {
   try {
     fs.mkdirSync(sessionsDir, { recursive: true });
-    const fp = path.join(sessionsDir, 'Week-' + week.weekKey + '.md');
+    // SLOT-SCOPED (2026-08-31). Was 'Week-<key>.md', which is one filename for
+    // every account: switching to slot s2 and auto-freezing overwrote the s1
+    // note describing a -$1,392 week with an empty one. The frozen JSON was
+    // always slot-scoped, so the RECORD survived and only this projection was
+    // lost — but the projection is the half he actually reads.
+    const fp = path.join(sessionsDir, 'Week-' + week.weekKey + '-' + safeSlot(opts && opts.slot) + '.md');
     atomicWrite.writeAtomic(fp, renderWeekMarkdown(week, findings, trend, opts), 'utf8');
     return fp;
   } catch (e) { console.error('[week-store] markdown write failed:', e.message); return null; }

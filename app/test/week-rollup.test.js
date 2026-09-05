@@ -14,7 +14,14 @@ const fs = require('fs');
 const path = require('path');
 const W = require('../week-rollup');
 
-const DATA = path.join(__dirname, '..', '..', 'DATA', 'accounts', 's1');
+// 2026-09-05: was DATA/accounts/s1, which was archived and reset on 2026-09-04
+// — the replays below went red because the week they assert moved out from
+// under them. They now read the FROZEN _recovered_20260904 snapshot, so the
+// hand-checked figures stay assertable forever. See test/helpers/recovered-fixture.js.
+const recovered = require('./helpers/recovered-fixture');
+const DATA = recovered.available()
+  ? recovered.accountDir()
+  : path.join(__dirname, '..', '..', 'DATA', 'accounts', 's1');
 
 // Function declaration, not a const: the replay tests are spread through the
 // file and a `const` would be in its temporal dead zone for the earlier ones.

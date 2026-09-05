@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { PLAYBOOKS, getPlaybook, planEntry, setupId } = require('../playbook-spec.js');
+const { PLAYBOOKS, getPlaybook, canonicalId, planEntry, setupId } = require('../playbook-spec.js');
 
 const RULES = { playbooks: { stopBufferPoints: 3, targetR: 2, fvgFillWindowBars: 8 }, perTradeMaxLoss: 300 };
 const bar = (o, h, l, c, t = 1000) => ({ open: o, high: h, low: l, close: c, time: t });
@@ -13,13 +13,41 @@ test('Playbook C is a GATE and refuses to propose an entry', () => {
   assert.match(r.reason, /gate, not a setup/);
 });
 
-test('the 30M engulf the app labels "Playbook C" is exposed as its own unsanctioned id', () => {
+// Rewritten 2026-09-01. This test used to assert LTF-ENGULF was its own
+// UNSANCTIONED playbook, which was correct for the design it described: a 1H
+// engulf was Playbook A and the identical candle on 30M/15M/5M was a separate
+// id that appeared in no rulebook. Anoop retired that split — "I want all the
+// monitors which are always on to be part of Playbook A... That is the only
+// Playbook A setup." The id now aliases to A rather than existing separately.
+test('the retired LTF-ENGULF id resolves to Playbook A, so old rows still read', () => {
   const pb = getPlaybook('LTF-ENGULF');
-  assert.equal(pb.unsanctioned, true);
-  assert.match(pb.source, /appears in no rulebook/);
-  // and it explicitly documents the absence of an HTF gate — the thing that
-  // distinguishes it from Playbook A
-  assert.ok(pb.steps.some((s) => /NO higher-timeframe alignment/.test(s.text)));
+  assert.ok(pb, 'a historical id must never fail to resolve — a resolver that cannot read its own history resolves nothing');
+  assert.equal(pb.id, 'A');
+  assert.equal(canonicalId('LTF-ENGULF'), 'A');
+  assert.equal(pb.unsanctioned, undefined, 'it is no longer a separate unsanctioned setup');
+});
+
+test('Playbook A covers every always-on engulf watcher, not just the 1H', () => {
+  const a = getPlaybook('A');
+  assert.deepEqual(a.entryTfs, ['60', '30', '15', '5']);
+  // The higher timeframe is a gate ABOVE the playbook, not a field inside it.
+  assert.equal(a.biasTf, null);
+  assert.ok(a.steps.some((s) => /higher-timeframe gate/i.test(s.text)),
+    'A must name the gate it runs under');
+  // The timeframe is what distinguishes one A signal from another now, so the
+  // spec has to say it travels with the signal.
+  assert.ok(a.steps.some((s) => /TIMEFRAME/.test(s.text)),
+    'A must require the timeframe to be reported');
+});
+
+test('A plans the same trade regardless of which watcher fired it', () => {
+  // Engulfing is timeframe-agnostic by definition, so the plan must be too:
+  // same candle geometry, same entry and stop, whichever chart it closed on.
+  const b = bar(10, 12, 8, 11);
+  const plan = planEntry('A', { direction: 'BULLISH', bar: b }, RULES);
+  const legacy = planEntry('LTF-ENGULF', { direction: 'BULLISH', bar: b }, RULES);
+  assert.equal(plan.plannable, true);
+  assert.deepEqual(legacy, plan, 'the retired id must plan identically to A');
 });
 
 test('every playbook has ordered, numbered steps', () => {

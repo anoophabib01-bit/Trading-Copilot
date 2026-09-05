@@ -107,7 +107,7 @@ function run(bars, opts) {
     if (dailyCap && (dayPnl[day] || 0) >= dailyCap) { cappedOut++; continue; }
 
     const sim = backtest.simulateTrade(
-      { playbook: 'DSH-V2', direction: 'BULLISH', entry, stop, target: entry + risk * rr, requiresFill: false },
+      { playbook: 'C-ADX', direction: 'BULLISH', entry, stop, target: entry + risk * rr, requiresFill: false },
       bars, i, { horizonBars: horizon, slippagePoints: 0.5, flattenByISTMinutes: RULES.flattenByISTMinutes }
     );
     if (!sim) continue;

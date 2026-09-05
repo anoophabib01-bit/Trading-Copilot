@@ -40,7 +40,7 @@ test('missing context never becomes a fabricated value', () => {
 
 // ── machine orders ──────────────────────────────────────────────────────────
 test('a machine order is born unresolved and carries no P&L', () => {
-  const o = buildMachineOrder({ playbook: 'DSH-V2', direction: 'BULLISH', entry: 100, stop: 90, riskPoints: 10 }, { contracts: 4, pointValue: 2 });
+  const o = buildMachineOrder({ playbook: 'C-ADX', direction: 'BULLISH', entry: 100, stop: 90, riskPoints: 10 }, { contracts: 4, pointValue: 2 });
   assert.equal(o.resolved, false);
   assert.equal(o.netUsd, null);
   assert.equal(o.riskUsd, 80);   // 10pt * $2 * 4

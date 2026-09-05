@@ -62,10 +62,20 @@ function detectEngulfFromBars(bars) {
 
 // Bar-over-bar higher-high/higher-low majority vote. NOT a real swing-pivot
 // market-structure read — see get4HTrend's comment in server.js for the full
-// caveat, and playbook-c.js's findPivots() for the stricter version used by
-// the Playbook C gate. Kept as-is because Playbook A's alignment filter has
-// always used this one, and changing what a live gate means is a decision,
-// not a refactor.
+// caveat, and classifyStructureFromPivots() below for the real one.
+//
+// ── DO NOT WIDEN THE WINDOW YOU FEED THIS (2026-09-01) ────────────────────
+// The 60% threshold counts CONSECUTIVE bar-to-bar transitions, so its
+// strictness scales with the window. At the 5 bars get4HTrend passes it, that
+// is 3 of 4 transitions — a reasonable majority vote. At 39 bars it demands 23
+// of 38 consecutive higher highs AND 23 higher lows, which real price action
+// almost never produces: measured on 1,037 real MNQ 1H bars it reads clearly
+// 42.7% of the time at 5 bars but only 21.1% at 39.
+//
+// This was found live. The HTF gate was briefly wired to call this with 39
+// bars, which drove it to `htf-1h-unclear` on 78% of all blocks — the app
+// failing to read structure, wearing the costume of a rule refusing a trade.
+// Use classifyStructureFromPivots() for any structure read on a real window.
 function classifyTrendFromBars(bars) {
   if (!Array.isArray(bars) || bars.length < 3) return 'unclear';
   let higherHighs = 0, higherLows = 0, lowerHighs = 0, lowerLows = 0;
@@ -79,6 +89,67 @@ function classifyTrendFromBars(bars) {
   const threshold = Math.ceil(n * 0.6);
   if (higherHighs >= threshold && higherLows >= threshold) return 'bullish';
   if (lowerHighs >= threshold && lowerLows >= threshold) return 'bearish';
+  return 'unclear';
+}
+
+// ── Swing-pivot market structure ──────────────────────────────────────────
+// Moved here from playbook-c.js on 2026-09-01 so the HTF gate and Playbook C
+// read structure through ONE definition. The gate sits above every playbook,
+// so it must not import one; both now import this.
+//
+// PIVOT_LEG/LEVEL_TOL live here for the same reason — playbook-c.js re-imports
+// them under its old PBC_* names, so the tolerance findPivots collapses on and
+// the tolerance Playbook C's retest checks use can never drift apart.
+const PIVOT_LEG = 2;         // bars each side for a confirmed fractal pivot
+const LEVEL_TOL = 0.0005;    // 0.05% — same tolerance getSwingLevels dedupes on
+
+// Confirmed fractal pivots WITH their bar index. getSwingLevels() returns
+// prices only, which is enough for the SFP level pool but not for reading
+// structure (which needs to know the ORDER pivots occurred in).
+//
+// Strict on the left, inclusive on the right, is the standard way to
+// disambiguate a plateau. Without it, two adjacent bars sharing the same high
+// BOTH register as pivots, the structure check then compares two equal prices,
+// `h2 > h1` is false, and every flat-topped move is misread as "mixed/ranging".
+// Equal highs are common in futures, so this mattered immediately in testing.
+// Near-equal consecutive pivots are then collapsed to one (the later).
+function findPivots(bars, leg = PIVOT_LEG) {
+  const highs = [], lows = [];
+  for (let i = leg; i < bars.length - leg; i++) {
+    const left = bars.slice(i - leg, i);
+    const right = bars.slice(i + 1, i + leg + 1);
+    if (left.every(b => bars[i].high > b.high) && right.every(b => bars[i].high >= b.high)) {
+      highs.push({ i, price: bars[i].high });
+    }
+    if (left.every(b => bars[i].low < b.low) && right.every(b => bars[i].low <= b.low)) {
+      lows.push({ i, price: bars[i].low });
+    }
+  }
+  const collapse = (arr) => arr.filter((p, k) =>
+    k === arr.length - 1 || Math.abs(arr[k + 1].price - p.price) / p.price >= LEVEL_TOL);
+  return { pivotHighs: collapse(highs), pivotLows: collapse(lows) };
+}
+
+// HH-HL / LL-LH read off confirmed swing pivots — "higher high, higher low"
+// in the sense Anoop actually means it: the last two swing highs ascending AND
+// the last two swing lows ascending, not a count of consecutive candles.
+//
+// Returns the same vocabulary as classifyTrendFromBars ('bullish' | 'bearish'
+// | 'unclear') so it is a drop-in for callers that read structure.
+//
+// Fewer than two pivots each side is 'unclear', never a guess: with one swing
+// high there is nothing to compare it to, and answering anyway is how a gate
+// starts inventing a trend out of a flat chart.
+function classifyStructureFromPivots(bars) {
+  if (!Array.isArray(bars) || bars.length < PIVOT_LEG * 2 + 1) return 'unclear';
+  const { pivotHighs, pivotLows } = findPivots(bars);
+  if (pivotHighs.length < 2 || pivotLows.length < 2) return 'unclear';
+  const h1 = pivotHighs[pivotHighs.length - 2].price;
+  const h2 = pivotHighs[pivotHighs.length - 1].price;
+  const l1 = pivotLows[pivotLows.length - 2].price;
+  const l2 = pivotLows[pivotLows.length - 1].price;
+  if (h2 > h1 && l2 > l1) return 'bullish';
+  if (h2 < h1 && l2 < l1) return 'bearish';
   return 'unclear';
 }
 
@@ -222,12 +293,92 @@ function priorHigh(bars, i, lookback) {
   return Number.isFinite(hi) ? hi : null;
 }
 
+// ── Playbook C (ADX) breakout — the four gates, as one decision ────────────
+// Added 2026-09-01 so the strategy in "DSH backtesting/" can be FORWARD
+// TESTED. adxSeries() and priorHigh() already existed and were used only by
+// the offline backtests; this composes them into the single yes/no the live
+// monitor needs, so the live path and the backtest cannot drift apart by
+// re-implementing the same four conditions twice.
+//
+// The four gates, per the playbook (all must hold at the CLOSED bar):
+//   1. ADX(period) >= adxMin        — strong trend, not chop
+//   2. +DI > -DI                    — the strong trend is UP
+//   3. close > priorHigh(lookback)  — fresh breakout, prior bars only
+//   4. close > open                 — the breakout candle is bullish
+//
+// LONG ONLY. There is deliberately no bearish mirror: shorting breakdowns lost
+// money in every regime DSH tested, including clean downtrends, and a
+// symmetrical detector would be the easiest possible way to reintroduce that.
+//
+// ── WHY IT EVALUATES bars[n-2] AND NOT bars[n-1] ──────────────────────────
+// Every gate is defined "at the 1H candle CLOSE". A live chart's last bar is
+// still FORMING: its close, high and open all move until the hour ends, so a
+// bar that passes at :17 can fail by :59. Scoring the forming bar would record
+// signals that never existed — the same repaint that makes a backtest lie,
+// except live and unfalsifiable. The last CLOSED bar is index n-2.
+//
+// Returns null when there is no signal or not enough data to judge one — never
+// a partial or a guess (TRUST-PROTOCOL Rule 1). On a signal it returns the
+// gate VALUES, not just `true`, so a recorded row can be audited later against
+// the bars it claims to have read.
+function detectAdxBreakoutFromBars(bars, opts) {
+  const o = opts || {};
+  const period = Number.isFinite(o.period) ? o.period : 14;
+  const adxMin = Number.isFinite(o.adxMin) ? o.adxMin : 35;
+  const lookback = Number.isFinite(o.lookback) ? o.lookback : 10;
+  if (!Array.isArray(bars)) return null;
+
+  // Need warm-up for ADX (2*period+1) plus the lookback window plus the
+  // forming bar we are about to ignore. Short of that, refuse.
+  const need = period * 2 + 2 + lookback;
+  if (bars.length < need) return null;
+
+  const i = bars.length - 2;              // the last CLOSED bar
+  const bar = bars[i];
+  if (!bar) return null;
+  const fin = (v) => typeof v === 'number' && Number.isFinite(v);
+  if (!fin(bar.open) || !fin(bar.high) || !fin(bar.low) || !fin(bar.close)) return null;
+
+  const { adx, plusDI, minusDI } = adxSeries(bars, period);
+  const a = adx[i], pdi = plusDI[i], mdi = minusDI[i];
+  // NaN during warm-up, and NaN fails every comparison — which is the correct
+  // reading of "we do not know yet", not "not trending".
+  if (!fin(a) || !fin(pdi) || !fin(mdi)) return null;
+
+  const ph = priorHigh(bars, i, lookback);
+  if (!fin(ph)) return null;
+
+  if (!(a >= adxMin)) return null;        // gate 1
+  if (!(pdi > mdi)) return null;          // gate 2
+  if (!(bar.close > ph)) return null;     // gate 3
+  if (!(bar.close > bar.open)) return null; // gate 4
+
+  return {
+    playbook: 'C-ADX',
+    direction: 'BULLISH',
+    bar: { open: bar.open, high: bar.high, low: bar.low, close: bar.close, time: bar.time },
+    barTime: bar.time,
+    entryRef: bar.close,
+    adx: Math.round(a * 10) / 10,
+    plusDI: Math.round(pdi * 10) / 10,
+    minusDI: Math.round(mdi * 10) / 10,
+    priorHigh: ph,
+    lookback,
+    adxMin,
+  };
+}
+
 module.exports = {
   adxSeries,
   priorHigh,
+  detectAdxBreakoutFromBars,
   detectEngulfFromBars,
   bodyEngulfs,
   classifyTrendFromBars,
+  classifyStructureFromPivots,
+  findPivots,
+  PIVOT_LEG,
+  LEVEL_TOL,
   detectFVGFromBars,
   getSwingLevels,
   detectSFPFromBars,

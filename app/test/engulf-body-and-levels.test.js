@@ -93,7 +93,22 @@ test('GUARD: only a 1H engulf can convene the debate', () => {
   const calls = SERVER.match(/triggerPlaybookDebate\(\{\s*playbook:\s*'A'/g) || [];
   assert.ok(calls.length >= 1, 'the Playbook A debate trigger disappeared entirely');
   // Every engulf-path debate trigger must sit behind a key === '1h' test.
-  assert.match(SERVER, /if \(key === '1h' && playbookAValid\) \{\s*\n\s*triggerPlaybookDebate/);
+  assert.match(SERVER, /if \(key === '1h' && playbookAFullyAligned\) \{\s*\n\s*triggerPlaybookDebate/);
+});
+
+// 2026-09-01: the engulf TRIGGER was loosened to fire on a 1H bias alone, with
+// the 4H's answer attached as evidence rather than used as a veto. The debate
+// deliberately did NOT follow, because it is the path that can emit a
+// TRADE_TICKET — the only route in this app to a real order — and inheriting a
+// ~6.7x looser trigger would have multiplied order-adjacent activity off an
+// instruction that was about alerts. This guards that gap from being closed by
+// accident: closing it is a decision, and should have to edit this test too.
+test('GUARD: the debate still requires a CONFIRMED 4H, not merely a 1H bias', () => {
+  const decl = SERVER.match(/const playbookAFullyAligned = [^;]+;/);
+  assert.ok(decl, 'playbookAFullyAligned disappeared — did the debate silently follow the trigger?');
+  assert.match(decl[0], /htfRead\.ok/);
+  assert.match(decl[0], /CONFIRMATION\.CONFIRMED/,
+    'the debate must require the 4H to have actually confirmed');
 });
 
 test('GUARD: all four engulf timeframes are registered and auto-armed', () => {

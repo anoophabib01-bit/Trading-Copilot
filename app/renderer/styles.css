@@ -176,7 +176,7 @@ body {
 /* ── Layout ───────────────────────────────────────────────────────────────── */
 #app {
   display: flex;
-  height: calc(100vh - 66px);
+  height: calc(100vh - 82px);  /* 36px title bar + 46px guardrail HUD */
   overflow: hidden;
 }
 
@@ -294,6 +294,69 @@ body {
 .news-item.high    { background: var(--red-dim);   color: var(--red); }
 .news-item.high    .news-time { color: var(--red); opacity: 0.75; }
 .news-item.holiday { background: var(--amber-dim); color: var(--amber); }
+
+/* ── Whole-week calendar (2026-09-03) ───────────────────────────────────────
+   Day groups. Anoop asked to see the full ForexFactory week here so he can
+   prepare, not just today's remaining events. Today's group is the only one
+   that gets an accent — the rest is planning context, and making every day
+   equally loud is how a planning list stops being read. */
+.news-day { display: flex; flex-direction: column; gap: 4px; }
+.news-day + .news-day { margin-top: 9px; }
+.news-day-h {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--border);
+}
+.news-day.is-today .news-day-h { color: var(--text); }
+.news-day-tag {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--amber-dim);
+  color: var(--amber);
+}
+/* Already happened. Kept visible so the week is complete, damped so the eye
+   goes to what is still ahead. */
+.news-day.is-past .news-day-h { opacity: 0.5; }
+.news-item.is-past,
+.news-day.is-past .news-item { opacity: 0.42; box-shadow: none; }
+
+/* Divider before the already-printed part of the week. */
+.news-week-sep {
+  margin: 12px 0 2px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+.news-week-sep + .news-day { margin-top: 0; }
+
+/* A clear day. Deliberately quiet — green would read as a GO signal, and the
+   absence of a scheduled event is not permission to trade. */
+.news-item.news-clear {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-dim);
+  box-shadow: none;
+}
+
+/* The panel now holds a week, not a handful of rows, so it needs its own
+   scroll — 150px was sized for "today only". In the left-panel flyout this is
+   raised again (left-panel.css §4). */
+.news-list { max-height: 260px; }
 
 /* Quick actions */
 #quick-actions {
@@ -474,6 +537,68 @@ body {
   font-size: 11px;
   border-radius: var(--radius-sm);
 }
+
+/* ── Folded system message (2026-09-03) ─────────────────────────────────────
+   Anoop: the LIVE FEED PROTOCOL and BAR RECORD GAP reports were eating the
+   chat pane. Headline stays on the surface, evidence folds behind it (see
+   addFoldedSystemMessage in app.js for why it is folded and not deleted).
+
+   Specificity note: g5-premium.css styles system bubbles as
+   `#messages .msg.system-msg .msg-bubble` (1,3,0) with !important, so the
+   overrides below carry the extra `.sys-fold` class to outrank it. */
+#messages .msg.system-msg .msg-bubble.sys-fold {
+  padding: 0 !important;
+  border-radius: 10px !important;
+  text-align: left;
+  max-width: 620px;
+}
+.sys-fold-head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  width: 100%;
+  padding: 6px 12px;
+  background: transparent;
+  border: none;
+  border-radius: 10px;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.sys-fold-head:hover { background: var(--surface2); }
+.sys-fold-caret {
+  font-size: 9px;
+  line-height: 1.6;
+  opacity: 0.65;
+  transition: transform .12s ease;
+}
+.sys-fold.open .sys-fold-caret { transform: rotate(90deg); }
+.sys-fold-title { flex: 1; min-width: 0; }
+/* The affordance is spelled out. A bare caret on a chat line reads as
+   decoration, and a diagnostic nobody knows they can open is a hidden one. */
+.sys-fold-more {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+.sys-fold-head:hover .sys-fold-more { opacity: 0.9; }
+.sys-fold-body {
+  display: none;
+  padding: 2px 12px 9px 26px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.55;
+  border-top: 1px solid var(--border);
+  margin-top: 2px;
+  padding-top: 7px;
+}
+.sys-fold.open .sys-fold-body { display: block; }
 
 /* Phase 2b: trade ticket card (2026-08-17) */
 .trade-ticket-bubble {
@@ -1317,6 +1442,43 @@ body.panel-resizing * { user-select: none !important; }
   border-top: 1px solid var(--border);
 }
 
+/* 2026-09-03: rejected-candle rows and the SIDE band. Both exist to answer
+   "which side is the engulfing being checked" — the band states what CAN fire,
+   the rejected rows are the proof the other side was actually looked at. The
+   rejected row is deliberately muted and wraps its reason onto its own line:
+   it is evidence, not an alert, and must not compete with a real signal. */
+.engulf-hist-row.engulf-hist-rejected {
+  flex-wrap: wrap;
+  color: var(--text-dim);
+  opacity: 0.8;
+}
+.engulf-hist-reason {
+  flex-basis: 100%;
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+.engulf-side {
+  margin: 8px 0 0;
+  padding: 6px 9px;
+  border-radius: 6px;
+  border-left: 3px solid var(--eside-accent, #666);
+  background: var(--eside-bg, rgba(255,255,255,0.03));
+}
+.engulf-side .engulf-side-head {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.03em;
+  color: var(--eside-accent, #888);
+}
+.engulf-side .engulf-side-detail {
+  font-size: 10px; opacity: 0.75; margin-top: 2px;
+}
+.engulf-side.engulf-side-bull    { --eside-accent: #26a69a; --eside-bg: rgba(38,166,154,0.10); }
+.engulf-side.engulf-side-bear    { --eside-accent: #ef5350; --eside-bg: rgba(239,83,80,0.10); }
+.engulf-side.engulf-side-none    { --eside-accent: #9e9e9e; --eside-bg: rgba(158,158,158,0.10); }
+.engulf-side.engulf-side-stale   { --eside-accent: #ffa726; --eside-bg: rgba(255,167,38,0.14); }
+.engulf-side.engulf-side-unknown { --eside-accent: #666;    --eside-bg: rgba(255,255,255,0.03); }
+
 /* Engulf signal badge (in analysis panel) */
 .engulf-signal-badge {
   display: inline-block;
@@ -1525,12 +1687,24 @@ input.ladder-in{width:62px;background:var(--surface);border:1px solid var(--bord
 .plan-metric{margin-top:8px;padding:11px 13px;border-radius:var(--radius-xs);background:var(--green-dim);border-left:3px solid var(--green);color:var(--text);font-size:12px;line-height:1.6;}
 
 /* ── Tier-1 Guardrail HUD + Stop overlay ─────────────────────────────────── */
-#gr-hud{position:fixed;bottom:0;left:0;right:0;height:30px;z-index:9000;display:flex;align-items:center;gap:12px;padding:0 12px;font-size:11px;border-top:1px solid var(--border2);}
+/* 2026-09-04 (Anoop: "increase the size of HUD little height wise so everything
+   is readable"). At 30px with nowrap the meta line ran off the right edge and
+   the tail — the trade-count reconciliation warning and the feed-degraded
+   notice, the two items most worth reading — were the ones that got cut. It is
+   now 46px and the meta line is allowed a second row, so the readout grows
+   downward instead of disappearing sideways.
+   IF YOU CHANGE THIS HEIGHT, change #app's calc() below with it: the app pane
+   is sized as 100vh minus the 36px title bar minus this bar. */
+#gr-hud{position:fixed;bottom:0;left:0;right:0;height:46px;z-index:9000;display:flex;align-items:center;gap:12px;padding:0 12px;font-size:12px;border-top:1px solid var(--border2);}
 #gr-hud.gr-clear{background:var(--green-dim);}
 #gr-hud.gr-cool{background:var(--amber-dim);}
 #gr-hud.gr-stop{background:var(--red-dim);}
-#gr-hud .gr-state{font-weight:700;color:var(--text);}
+#gr-hud .gr-state{font-weight:700;color:var(--text);flex-shrink:0;font-size:12.5px;}
+/* Two lines, then clip. The meta string can reach ~300 chars with every tag
+   present; letting it grow without bound would push the log controls out. */
+#gr-hud .gr-meta{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.35;min-width:0;}
 #gr-hud .gr-meta{color:var(--text-mid);}
+#gr-hud .gr-log{flex-shrink:0;}
 /* Phase 2b: persistent pending-trade-ticket pill (2026-08-17) */
 #gr-hud .gr-ticket-pill{font-weight:700;color:#fff;background:var(--accent,#3b82f6);padding:2px 10px;border-radius:999px;cursor:pointer;animation:gr-ticket-pulse 1.6s ease-in-out infinite;}
 @keyframes gr-ticket-pulse{0%,100%{opacity:1;}50%{opacity:.55;}}
@@ -1901,7 +2075,7 @@ html.theme-dark body {
 
 /* ── Floating panel layout: side columns become inset glass cards, chat is
       the centered hero column (his one hard requirement) ─────────────────── */
-html.theme-dark #app { gap: 12px; padding: 12px; height: calc(100vh - 66px); }
+html.theme-dark #app { gap: 12px; padding: 12px; height: calc(100vh - 82px);  /* 36px title bar + 46px guardrail HUD */ }
 html.theme-dark #left-panel,
 html.theme-dark #right-panel {
   border: 1px solid var(--border);
@@ -2386,6 +2560,10 @@ html.theme-dark ::-webkit-scrollbar-thumb:hover {
   color: #fff;
 }
 html:not(.theme-dark):not(.theme-graphite) .theme-switch-btn.active { color: var(--surface); }
+/* 2026-09-05: the switcher now lives in the Settings modal, not the titlebar.
+   .settings-field stretches its children to full width; the pill should stay the
+   width of its three buttons. */
+#settings-box .theme-switch { width: max-content; }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    MATCH-MOCKUP PASS — 2026-08-02 · make the LIVE app look like variant-G5.
@@ -2747,14 +2925,29 @@ html.theme-dark .analysis-block { padding: 14px; margin-bottom: 14px; }
    version: shown ONLY while something is failing, so it can never become
    wallpaper the eye learns to skip. */
 #live-feed-health {
+  /* 2026-09-05 (Anoop: "not letting me work with other data behind ... keep it
+     fixed or constant box that can not interfere"). It used to be centred at
+     top:46px, which parked it squarely over the chart and the chat — the two
+     surfaces you actually need while repairing the feed, and the reason it read
+     as a modal you had to clear before working. It is docked to the BOTTOM-LEFT
+     corner now, above the bottom bar, over the left panel's action buttons.
+     There is no genuinely empty region on this screen, so this is a choice about
+     WHICH content it may cover: the left rail's buttons are the least needed
+     while the feed is down. Fixed position is kept deliberately — it must not
+     scroll away with a panel — and Dismiss still clears it for the session. */
   position: fixed;
-  top: 46px;
-  left: 50%;
-  transform: translateX(-50%);
+  left: 12px;
+  bottom: 52px;
   z-index: 9997;
-  min-width: 420px;
-  max-width: 720px;
-  padding: 12px 16px;
+  /* 2026-09-05 (Anoop: "keep it small and minimal"). Was 420-720px with 12/16
+     padding and a row per leg including the passing ones — a box big enough to
+     cover the chart, for information the titlebar line already summarises. It
+     is narrower and tighter now, and renderLiveFeedHealth only draws the legs
+     that FAILED, so the panel's size tracks how much is actually wrong. The
+     loudness that matters is the red border and the fixed position, not area. */
+  width: 300px;
+  max-width: calc(100vw - 24px);
+  padding: 9px 11px;
   border-radius: 8px;
   background: var(--panel, #171b21);
   border: 1px solid var(--red, #ff5c5c);
@@ -2764,28 +2957,39 @@ html.theme-dark .analysis-block { padding: 14px; margin-bottom: 14px; }
 }
 #live-feed-health .lfh-title {
   font-weight: 700;
-  font-size: 11px;
-  letter-spacing: .1em;
+  font-size: 10.5px;
+  letter-spacing: .06em;
   text-transform: uppercase;
   color: var(--red, #ff5c5c);
-  margin-bottom: 8px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  justify-content: space-between;
+  margin-bottom: 6px;
+  display: block;
+}
+/* The consequence line. Wraps under the title now instead of competing with it
+   on one row — that side-by-side layout is what forced the 720px width. It is
+   NOT dropped: "trades are not being counted" is the reason to care. */
+#live-feed-health .lfh-why {
+  display: block;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  font-size: 10.5px;
+  color: var(--text-dim, #97a1ad);
+  margin-top: 2px;
 }
 #live-feed-health .lfh-row {
-  display: flex;
-  align-items: baseline;
-  gap: 9px;
-  padding: 3px 0;
+  display: block;
+  padding: 2px 0;
 }
-#live-feed-health .lfh-mark { flex: none; width: 14px; font-weight: 700; }
+#live-feed-health .lfh-mark { font-weight: 700; margin-right: 5px; }
 #live-feed-health .lfh-ok   { color: var(--green, #3ecf8e); }
 #live-feed-health .lfh-bad  { color: var(--red, #ff5c5c); }
-#live-feed-health .lfh-label { flex: none; min-width: 168px; color: var(--text, #e3e8ed); font-weight: 600; }
+/* The 168px label gutter was the other half of the width problem: it reserved
+   space for the longest label on every row, passing or not. Label and detail
+   now flow as one sentence. */
+#live-feed-health .lfh-label { color: var(--text, #e3e8ed); font-weight: 600; }
 #live-feed-health .lfh-detail { color: var(--text-dim, #97a1ad); }
-#live-feed-health .lfh-actions { margin-top: 10px; display: flex; gap: 8px; }
+#live-feed-health .lfh-ok-note { color: var(--text-dim, #97a1ad); font-size: 11px; padding: 2px 0; }
+#live-feed-health .lfh-actions { margin-top: 8px; display: flex; gap: 6px; }
 #live-feed-health button {
   font: inherit;
   font-size: 11px;
@@ -2807,7 +3011,7 @@ html.theme-dark .analysis-block { padding: 14px; margin-bottom: 14px; }
    are not peers — one of them means an automated system is sending real
    orders. Colour is the fastest possible answer to "who is in charge", which
    is exactly what Anoop asked the toggle to make unmistakable. */
-.control-toggle { display: flex; background: var(--surface2); border: 1px solid var(--border2); border-radius: var(--radius-sm); overflow: hidden; margin-left: 14px; margin-top: 6px; }
+.control-toggle { display: flex; flex-wrap: wrap; background: var(--surface2); border: 1px solid var(--border2); border-radius: var(--radius-sm); overflow: hidden; margin-left: 14px; margin-top: 6px; }
 .ctrl-btn { background: none; border: none; color: var(--text-dim); font-size: 10px; font-weight: 700; letter-spacing: 0.06em; padding: 5px 10px; cursor: pointer; transition: all 0.15s; }
 .ctrl-btn:hover { color: var(--text); }
 .ctrl-btn.active { background: var(--white); color: #000; }
@@ -2827,3 +3031,164 @@ html.theme-dark .analysis-block { padding: 14px; margin-bottom: 14px; }
    who is in charge, which is the one thing this toggle exists to answer. */
 #control-status.assist { color: #4aa8d8; font-weight: 700; }
 #control-status.live { color: #ff6b5a; font-weight: 700; }
+
+/* ── Account-ending days in the P&L calendar (2026-08-31) ────────────────────
+   Anoop: "only when breached that day should be more red compared to others or
+   more green when account cleared". These sit ON TOP of .jr-red/.jr-green, so a
+   breach day is still a red day — just unmistakably the one that ended the
+   account. Set only on an account's LAST traded day (lifetime-history.js's
+   accountEvent), never across the account. The ring is what carries at a glance
+   in a grid of 30 cells; the saturation alone reads as "slightly worse day". */
+.jr-day.jr-breached {
+  background: rgba(239, 83, 80, 0.42);
+  border-color: rgba(239, 83, 80, 0.95);
+  box-shadow: inset 0 0 0 1px rgba(239, 83, 80, 0.75);
+}
+.jr-day.jr-breached .jr-pnl { color: #ff8a85; font-weight: 700; }
+.jr-day.jr-breached .jr-dn  { color: #ffb3af; }
+
+.jr-day.jr-cleared {
+  background: rgba(38, 166, 154, 0.42);
+  border-color: rgba(38, 166, 154, 0.95);
+  box-shadow: inset 0 0 0 1px rgba(38, 166, 154, 0.75);
+}
+.jr-day.jr-cleared .jr-pnl { color: #5ff0e0; font-weight: 700; }
+.jr-day.jr-cleared .jr-dn  { color: #9df3e9; }
+
+/* ── HTF bias band (2026-09-02) ────────────────────────────────────────────
+   Which side the watchers are looking at, above the watcher rows. Colour
+   carries the side; the stale state deliberately does NOT use the bull/bear
+   colours, because a confident green/red on a dead feed is exactly the
+   misreading this panel exists to prevent. */
+.htf-bias {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 7px 10px; margin-bottom: 8px;
+  border-radius: 6px; border-left: 3px solid var(--htf-accent, #666);
+  background: var(--htf-bg, rgba(255,255,255,0.03));
+}
+.htf-bias .htf-side {
+  font-weight: 700; font-size: 12px; letter-spacing: 0.04em;
+  color: var(--htf-accent, #888); white-space: nowrap;
+}
+.htf-bias .htf-detail {
+  font-size: 10.5px; opacity: 0.75; font-variant-numeric: tabular-nums;
+}
+.htf-bias.htf-bull    { --htf-accent: #26a69a; --htf-bg: rgba(38,166,154,0.10); }
+.htf-bias.htf-bear    { --htf-accent: #ef5350; --htf-bg: rgba(239,83,80,0.10); }
+.htf-bias.htf-none    { --htf-accent: #9e9e9e; --htf-bg: rgba(158,158,158,0.10); }
+.htf-bias.htf-stale   { --htf-accent: #ffa726; --htf-bg: rgba(255,167,38,0.14); }
+.htf-bias.htf-unknown { --htf-accent: #666;    --htf-bg: rgba(255,255,255,0.03); }
+
+/* 2026-09-02: the "answered by" badge doubles as the fallback alarm. A reply
+   that did NOT come from DeepSeek must not look like a quiet caption — on
+   2026-09-02 a debate agent silently swapped vendor and the muted grey badge
+   was the only trace. Amber + border so it reads as a warning at a glance. */
+.model-answered-by-warn{color:var(--amber,#f59e0b);opacity:1;font-weight:600;
+  border:1px solid var(--amber,#f59e0b);border-radius:4px;padding:3px 6px;display:inline-block;}
+
+/* ── Oversize guard chip (2026-09-02) ──────────────────────────────────────
+   Colour carries the meaning at a glance, but never colour ALONE — the label
+   always spells the state out, because this chip's whole job is to make a
+   silent protection impossible. `blind` and `stuck` are amber/red rather than
+   grey: they are failures of a guard he believes is protecting him, which is
+   more dangerous than it plainly being off. */
+#oversize-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px; margin-right: 8px;
+  border-radius: 11px; font-size: 11px; font-weight: 600;
+  letter-spacing: .02em; cursor: pointer; user-select: none;
+  border: 1px solid var(--border); background: var(--surface);
+  color: var(--text-dim); white-space: nowrap;
+}
+#oversize-chip:hover { filter: brightness(1.15); }
+#oversize-chip-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: currentColor; flex: none;
+}
+#oversize-chip.og-armed      { color: var(--green);  border-color: color-mix(in srgb, var(--green) 45%, transparent); }
+#oversize-chip.og-alarm-only { color: var(--amber);  border-color: color-mix(in srgb, var(--amber) 45%, transparent); }
+#oversize-chip.og-blind,
+#oversize-chip.og-stuck      { color: var(--red);    border-color: color-mix(in srgb, var(--red) 55%, transparent);
+                               animation: og-pulse 1.6s ease-in-out infinite; }
+#oversize-chip.og-off        { color: var(--text-dim); border-style: dashed; }
+@keyframes og-pulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+
+/* Size cap, sat beside the guard that enforces it (2026-09-05). Deliberately
+   the same pill geometry as #oversize-chip so the two read as one control —
+   the number and the switch that acts on it. Neutral, never coloured: the
+   guard's chip owns the alarm states, and two pulsing red things next to each
+   other would dilute the one that means "size is unenforced right now". */
+#sizecap-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 4px 2px 4px; margin-right: 8px;
+  border-radius: 11px; font-size: 11px; font-weight: 600;
+  letter-spacing: .02em; user-select: none; white-space: nowrap;
+  border: 1px solid var(--border); background: var(--surface);
+  color: var(--text-dim);
+}
+#sizecap-chip .sizecap-chip-k { color: var(--text-dim); font-weight: 600; }
+#sizecap-chip .sizecap-val {
+  min-width: 12px; text-align: center;
+  color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums;
+}
+#sizecap-chip .sizecap-btn {
+  border: none; background: transparent; color: var(--text-dim);
+  font-size: 13px; line-height: 1; font-weight: 700;
+  padding: 2px 5px; border-radius: 7px; cursor: pointer; font-family: inherit;
+}
+#sizecap-chip .sizecap-btn:hover:not(:disabled) { background: var(--surface2); color: var(--text); }
+/* At the floor or the ceiling the button must LOOK spent, not merely refuse to
+   work — a + that still lights up at 6 reads as a broken app, not a limit. */
+#sizecap-chip .sizecap-btn:disabled { opacity: .3; cursor: default; }
+
+/* ── Forensics tab (2026-09-05) ───────────────────────────────────────────
+   Reuses the existing palette variables so it themes with everything else.
+   The one non-obvious rule: .fx-na is DELIBERATELY visible rather than blank.
+   A missing MAE/MFE is a fact worth reading — the em-dash plus its tooltip is
+   what stops an unmeasured trade from being mistaken for a flat one. */
+.fx-cov { border:1px solid var(--border); border-radius:var(--radius-md); padding:12px 14px; margin-bottom:14px; background:var(--surface); }
+.fx-cov-empty { border-color:var(--amber); background:var(--amber-dim); }
+.fx-cov-thin  { border-color:var(--amber); }
+.fx-cov-head  { font-weight:700; margin-bottom:8px; }
+.fx-cov-bar   { height:6px; border-radius:3px; background:var(--surface3); overflow:hidden; margin-bottom:8px; }
+.fx-cov-bar span { display:block; height:100%; background:var(--green); }
+.fx-cov-nums  { font-size:12px; color:var(--text-mid); margin-bottom:6px; }
+.fx-cov-note  { font-size:12px; color:var(--text-dim); line-height:1.5; }
+.fx-cov-why   { margin:6px 0 0 18px; font-size:11.5px; color:var(--text-dim); }
+
+.fx-section { margin-bottom:20px; }
+.fx-section h3 { margin:0 0 8px; font-size:14px; }
+.fx-block { margin-bottom:14px; }
+.fx-block h4 { margin:0 0 6px; font-size:12.5px; color:var(--text-mid); }
+.fx-note { font-size:11.5px; color:var(--text-dim); line-height:1.5; margin-bottom:10px; }
+
+/* Wide tables scroll inside their own container — the panel must never scroll
+   sideways as a whole. */
+.fx-scroll { overflow-x:auto; border:1px solid var(--border); border-radius:var(--radius-sm); }
+.fx-tbl { border-collapse:collapse; width:100%; font-size:11.5px; white-space:nowrap; }
+.fx-tbl th, .fx-tbl td { padding:5px 8px; border-bottom:1px solid var(--border); text-align:left; }
+.fx-tbl th { background:var(--surface2); font-weight:600; position:sticky; top:0; }
+.fx-tbl td.num, .fx-tbl th.num { text-align:right; font-variant-numeric:tabular-nums; }
+.fx-tbl tbody tr:hover { background:var(--surface2); }
+.fx-undermin { opacity:.55; }
+.fx-thin { font-size:10px; color:var(--amber); border:1px solid var(--amber); border-radius:3px; padding:0 3px; }
+.fx-na { color:var(--text-dim); cursor:help; }
+.fx-pos { color:var(--green); }
+.fx-neg { color:var(--red); }
+.fx-tags span { display:inline-block; background:var(--surface3); border-radius:3px; padding:0 4px; margin-right:3px; font-size:10px; }
+
+.fx-filters { display:flex; gap:6px; margin-bottom:8px; }
+.fx-filter { font-size:11px; padding:3px 9px; border:1px solid var(--border2); border-radius:var(--radius-xs);
+             background:var(--surface); color:var(--text); cursor:pointer; }
+.fx-filter.on { background:var(--surface3); font-weight:600; }
+
+.fx-cf-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:10px; }
+.fx-cf { border:1px solid var(--border); border-radius:var(--radius-sm); padding:10px 12px; background:var(--surface); }
+.fx-cf-good { border-left:3px solid var(--green); }
+.fx-cf-bad  { border-left:3px solid var(--red); }
+.fx-cf-off  { border-left:3px solid var(--border2); opacity:.75; }
+.fx-cf-label { font-weight:600; font-size:12px; margin-bottom:4px; }
+.fx-cf-delta { font-size:17px; font-variant-numeric:tabular-nums; margin-bottom:4px; }
+.fx-cf-meta { font-size:10.5px; color:var(--text-dim); line-height:1.5; }
+.fx-cf-why  { font-size:10.5px; color:var(--text-dim); line-height:1.5; font-style:italic; }
+.fx-built { font-size:10.5px; color:var(--text-dim); margin-top:6px; }

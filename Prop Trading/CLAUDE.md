@@ -10,7 +10,7 @@ This file gives Claude full context to act as Anoop's trading advisor and co-pil
 **Location:** Hubballi, Karnataka, India — IST (UTC+5:30)  
 **Instruments:** MNQ (Micro Nasdaq), MGC (Micro Gold)  
 **Platforms:** Tradovate (execution) + TradingView desktop (charting)  
-**Prop Firm:** Lucid Trading — LucidFlex $50K Funded Account  
+**Prop Firm:** Tradeify (Select, 50K eval, account TDFYSL50413184562) — previously Lucid Trading / Apex (see history below)  
 **Primary Claude interface:** Mobile app (voice check-ins) + Cowork desktop
 
 **Monitor setup:** 3-screen  
@@ -125,7 +125,7 @@ This account was already being tracked in memory (`project_active_evaluation.md`
 ## Core Trading Rules (Non-Negotiable)
 
 1. **HTF Alignment First:** Daily sets bias. 1H must confirm Daily direction. Scalp must match BOTH. If Daily and 1H disagree → NO TRADE.
-2. **Max 2 contracts per entry.** Hard cap. No exceptions, no "high conviction" override. **ENFORCEMENT FIX (2026-07-28):** `rules.json`'s `sizeCap` was silently set to 6, three times looser than this rule, and the CSV compliance scorer had a second hardcoded copy at 6 as well — this rule was documented but never actually enforced at the right number. Both are now fixed to 2 and the scorer reads `rules.json` live instead of a separate hardcoded constant. **NEW HARD RULE, same date, from the 150K eval breach:** sizing UP relative to your previous trade while the day's running P&L is already negative is now a forced hard stop in the app the moment it's logged — not a caution flag. This is the exact pattern that killed the 150K eval on 2026-07-21 (5 lots, doubled to 10, while already down). Lesson logged and promoted; see the in-app Lessons Log (Rules tab) for the running record of lessons like this one.
+2. **Size cap: 2 by default, adjustable to 6, and 6 can never be exceeded.** **CHANGED 2026-09-04 (Anoop):** *"the size guard is too small or off which was the reason for account to blow up so make size changeable from 2 minimum to 6 as maximum size so that i always use it and not go beyond 6 size. i can handle 6 but yesterday i took 20 size which was unacceptable."* On 2026-09-03 he traded **20 lots against a cap of 2** — so the previous version of this rule ("Hard cap. No exceptions.") was not a hard cap at all, it was a request, and it was ignored. The cap is now **his to move between 2 and 6** from the Today panel, and **6 is a ceiling enforced in code**: `stage-rules.js` clamps every `rules-set` request and `getActiveRules()` re-applies the ceiling after the stage and scalper layers, so no overlay, hand-edit of `rules.json`, or UI message can produce an effective cap above 6. **The evidence still says 2.** Every funded size except 2 loses money in his own ledger — 1c -$345, 3c -$437, 4c -$103, 5-6c -$384, 7c+ -$449, totalling -$1,717 over 31 trades (see `stageRules.funded._comment` in `rules.json`), and the 150K eval breach on 2026-07-21 was 5 lots doubled to 10. So `sizeCap` stays at **2** until he raises it deliberately; raising it is a decision he makes, not a default. The trade being made knowingly is that a ceiling of 6 he trades inside beats a cap of 2 he trades through. **ENFORCEMENT HISTORY (2026-07-28):** `rules.json`'s `sizeCap` was silently set to 6, three times looser than the rule as written then, and the CSV compliance scorer had a second hardcoded copy at 6 as well — the rule was documented but never enforced at the right number. Both were fixed to 2 and the scorer now reads `rules.json` live instead of a separate hardcoded constant. **NEW HARD RULE, same date, from the 150K eval breach:** sizing UP relative to your previous trade while the day's running P&L is already negative is a forced hard stop in the app the moment it's logged — not a caution flag. This is the exact pattern that killed the 150K eval on 2026-07-21. Lesson logged and promoted; see the in-app Lessons Log (Rules tab) for the running record.
 3. **Daily loss tiers (CHANGED 2026-07-28, was -$100/-$150/-$200 since 2026-07-02):**
    - **–$250 = YELLOW.** Caution flag. Reassess mental state before any further entries.
    - **–$350 = RED.** Reduce size, tighten criteria — only A+ setups from here.
@@ -133,7 +133,7 @@ This account was already being tracked in memory (`project_active_evaluation.md`
    **UNRESOLVED as of 2026-07-28:** `state.account.evalDayStop` (the number shown in the left sidebar as "Day stop") is still hardcoded to $300 in `acctDefaults()` — tighter than the new $500 hard tier above. On the eval stage specifically, the sidebar's $300 stop will fire before this tier's $500 ever would, so the two numbers currently disagree. Anoop asked for the tiers above; whether the sidebar's $300 should also move is unconfirmed — ask before changing it.
 4. **Daily target: $150–$300** → hit $300 → strongly consider stopping.
 5. **Max 5 trades per session, 10 per day — hard limit.** (CHANGED 2026-07-28, replaces the old flat 20/day cap.) Two sessions (London + NY), 5 each. **Only trades that close with |P&L| ≥ $100 count toward the cap** — anything that closes between -$100 and +$100 is a scratch/near-breakeven trade and doesn't use up one of the 5. Hitting 5 qualifying trades in a session is the hard stop for that session, not a caution checkpoint like the old rule.
-6. **Session windows: London (1:30–3:00 PM IST / 8:00–9:30 AM UTC / 4:00–5:30 AM ET) and NY (7:00–9:00 PM IST / 13:30–15:30 UTC).** London is prep/small-size only — reviewing the previous NY session and building context, lower stakes, smaller size, NOT a full second main session. NY remains the primary session with full rules. No trades outside either window. Do not treat London as license to double your daily risk — see failure mode on trading after consecutive sessions, below. (Reactivated 2026-07-02 per Anoop's decision to merge Trade Healer's London context back in — this window existed in earlier project notes and was dropped from this file at some point before Jun 25; if that removal was deliberate rather than an oversight, say so and this reverts.)
+6. **Session windows: London (8:00–9:30 AM *London local time*) and NY (9:30–11:30 AM *New York local time*).** **CHANGED 2026-09-03 — the windows now follow the real exchange opens, and their IST times therefore MOVE twice a year.** In IST: London is 12:30–2:00 PM while the UK is on BST (late Mar–late Oct) and 1:30–3:00 PM on GMT; NY is 7:00–9:00 PM while the US is on EDT (mid Mar–early Nov) and 8:00–10:00 PM on EST. Never quote a session time from memory — read it off the app, which computes it from `app/rules.json`'s `sessionWindows` block. *Why this changed: these were previously pinned to fixed UTC times (London 8:00–9:30 AM UTC, NY 13:30–15:30 UTC), expressed as fixed IST times. India has no DST; London and New York both do, and they shift on different dates — so one of the two windows was always an hour out, and they swapped over at each transition. On 2026-09-03 the app's "London" window opened a full hour after London actually did. Durations are unchanged (London 90 min, NY 120 min) — only the opens moved.* London is prep/small-size only — reviewing the previous NY session and building context, lower stakes, smaller size, NOT a full second main session. NY remains the primary session with full rules. No trades outside either window. Do not treat London as license to double your daily risk — see failure mode on trading after consecutive sessions, below. (Reactivated 2026-07-02 per Anoop's decision to merge Trade Healer's London context back in — this window existed in earlier project notes and was dropped from this file at some point before Jun 25; if that removal was deliberate rather than an oversight, say so and this reverts.)
 7. **15-minute break after every trade** — win or loss. No re-entries within 15 minutes.
 8. **Pre-marked zones mandatory.** All 4H key zones must be marked on TradingView before session opens. No pre-marked zones = no trade.
 9. **One instrument per day** (updated 2026-07-02 — was "per session," tightened now that London + NY are both active). Never trade both MNQ and MGC on the same day, even across different sessions. Every documented account blow-up shows both instruments being traded the same day.
@@ -201,12 +201,17 @@ The sequence is **Daily → 1H → scalp entry**. Never start from 1H alone.
 
 ## Playbooks
 
-### Playbook A — 4H Engulfing + TF Alignment
+### Playbook A — Engulfing + TF Alignment
+*Revised 2026-09-03. Was "4H Engulfing": structure was read on the 4H, then briefly on the 1H, and an engulfing against it was No Action. Anoop's reason for moving it down: "As i am intra day trader and need better reading of smaller time frames... All these playbooks are here to determine the direction of the day at peak hours and 4hrs is too high and cannot do that. i will check 4hr and daily candle manually."*
+
 1. Mark all levels on chart
-2. Check 4H: Higher High / Higher Low (bullish) OR Lower Low / Lower High (bearish)
-3. Wait for **engulfing candle at 1H close**
-4. If WITH 4H TF → entry 1 with 1H SL → if in profit, entry 2 + move SL to breakeven → exit at marker levels
-5. If AGAINST 4H TF → No Action
+2. Check **15M** structure: Higher High / Higher Low (bullish) OR Lower Low / Lower High (bearish). The **1H** is checked too and reported as agreeing or not — it is evidence, not permission. The 4H and Daily are Anoop's own manual read and are no longer part of this step.
+3. Wait for an **engulfing candle CLOSE** — on any of 1H / 30M / 15M / 5M. The app watches all four and alerts on the close of the candle, never mid-candle.
+4. **The app alerts in BOTH directions.** It states whether the candle is WITH or AGAINST the 15M bias, and whether it passed the full Playbook C check or is a bare candle. **Anoop picks the side** — "after which i will decide manually which side should i take the entry at."
+5. Entry 1 with the stop beyond the candle → if in profit, entry 2 + move SL to breakeven → exit at marker levels.
+6. **Read the entry on the lower timeframe; manage the exit on the higher one** — "i want to read lower time frame and exit as per higher time fame."
+
+> An alert AGAINST the 15M bias is not a trade, and not a No Action either — it is a candle he was told about so he could judge it. Measured on real MNQ bars, this change takes the alert rate from 8 to 30 over the same window (3.8x), and roughly a third of the new alerts point against the bias. If that proves noisy, the lever is to put the veto back for the against-bias side, not to hide the label.
 
 ### Playbook B — JadeCap 3-Step (SFP + FVG Entry)
 1. **Daily Bias:** HTF trend (Weekly/Daily/4H), mark PH/PL, PDH/PDL, equal H&L
@@ -216,10 +221,19 @@ The sequence is **Daily → 1H → scalp entry**. Never start from 1H alone.
 **Avoid:** Neutral/range day, trading against major trend, equal liquidity on both sides.
 
 ### Playbook C — Engulfing Bar Validity Rules
-- **Bullish engulfing valid:** Must form at swing low in HH-HL pattern, close above previous candle on 4H, take out BOTH the low AND high of previous candle.
+*Since 2026-09-03 this **grades** an engulfing rather than **gating** it: a candle that fails one of these is still reported, labelled "candle only", and the call is his. A candle that is not an engulfing at all — no colour flip, no full-range engulf, or a body that does not cover the previous body — is not reported, because calling that an engulfing would simply be false.*
+
+- **Bullish engulfing valid:** Must form at swing low with **15M** structure in HH-HL, close above the previous candle, take out BOTH the low AND high of the previous candle, and its **body must cover the previous body** (wicks straddling both extremes is not enough — added 2026-08-27).
   - ⚠️ NEVER take a bullish engulfing AFTER buy-side liquidity has already been swept.
-- **Bearish engulfing valid:** Must form at swing high in LL-LH pattern, close below previous candle on 4H, take out BOTH the high AND low of previous candle.
+- **Bearish engulfing valid:** Must form at swing high with **15M** structure in LL-LH, close below the previous candle, take out BOTH the high AND low of the previous candle, body over body.
   - ⚠️ NEVER take a bearish engulfing AFTER sell-side liquidity has already been swept.
+
+### Playbook C (ADX) — Long-Only Breakout, shadow forward test
+*A separate strategy that shares the "Playbook C" name; see `DSH backtesting/Playbook_C_ADX_Long_Only_Breakout.md`. Moved from **1H to 30M** candle close on 2026-09-03 at Anoop's request. It places nothing — it records.*
+
+- Long only. ADX(14) ≥ 35, +DI > -DI, close breaks the prior 10-bar high, on a green candle.
+- **Still gated by the 15M bias** (unlike Playbook A), because it produces a specific entry and stop rather than an alert to look at.
+- ⚠️ **The ADX ≥ 35 threshold, not the timeframe, is why this has never fired.** Measured with the live 120-bar warm-up: 9 signals in 1,037 1H bars, and **0 in 300 30M bars**. The parameters were fitted on 1H; running them on 30M is a *new* rule with an unmeasured edge, not the backtested one at a faster clock. If it stays silent, the lever is `playbookCAdx.adxMin` in `app/rules.json`, not the timeframe.
 
 ---
 
@@ -269,9 +283,9 @@ All 6 prior blown accounts hit the Max Loss Limit. Root causes:
 | Trade count hits 5 | ⚠️ **CAUTION.** Checkpoint, not a stop — reassess setup quality. Profitable days run 6–12 trades; blow-up days run into the 60s. |
 | Trade count > daily limit (20) | 🚨 **STOP.** Limit reached. You blew 6 accounts going past this. |
 | "I lost, going to switch to MGC" | 🚨 **STOP.** Multi-instrument trading amplified every blow-up. |
-| Down $100 (funded) | ⚠️ **YELLOW.** Caution flag — reassess mental state before continuing. |
-| Down $150 (funded) | 🔶 **RED.** Reduce size, only A+ setups from here. |
-| Down $200 (funded) | 🚨 **HARD STOP.** Daily limit hit. Non-negotiable. |
+| Down $250 (funded) | ⚠️ **YELLOW.** Caution flag — reassess mental state before continuing. |
+| Down $350 (funded) | 🔶 **RED.** Reduce size, only A+ setups from here. |
+| Down $500 (funded) | 🚨 **HARD STOP.** Daily limit hit. Non-negotiable. |
 | Win, then "I want to keep going" | ⚠️ Caution. Account 6 peaked at +$937 and gave it all back. |
 | "I'm holding, it'll come back" | 🚨 **STOP.** Apr 2 average loser held to $246 avg loss. Cut it. |
 | Trading after 2 bad days in a row | ⚠️ Rest day flag. 5 of 6 accounts died in ≤5 sessions with no rest after bad days. |
@@ -309,7 +323,7 @@ Start every session by asking Anoop to send his Performance CSV from Tradovate, 
 - Trade count vs limit
 - Trade timestamps (check for window violations and 15-min break rule)
 - P&L sequence (identify revenge clusters)
-- Max intraday drawdown vs the $100 yellow / $150 red / $200 hard-cutoff tiers
+- Max intraday drawdown vs the $250 yellow / $350 red / $500 hard-cutoff tiers
 - Net P&L after commission ($0.95/contract/side on Tradovate - corrected 2026-08-24; the earlier ~$0.59 estimate under-charged by $0.72 per contract round turn and made the app's balance read high. Confirmed against Tradovate's own Performance export and Tradeify's P&L calendar; see `app/rules.json`'s `_commission_comment`.)
 - Whether session profit was broadly distributed or saved by 1–2 outlier trades
 - System verdict
@@ -402,7 +416,7 @@ or by running `G:\MNQ-CoPilot\app\launch.bat` directly. TradingView MCP is
 
 *Last updated: Jul 2 2026 — merged Trade Healer's journal notes, checklist suggestions, and London session into this rulebook. Reviewed `edgedesk-monitor/` and `Futures_Trading_Tools_Research_2026.docx` for conflicts. Adopted the tiered daily-loss rule ($100 yellow / $150 red / $200 cut-off) from the research doc, replacing the old flat $200 stop. Added a placeholder Session Log row for the Jun 25 loss event referenced in that doc — needs the real Tradovate CSV to complete. Bring that CSV next check-in.*
 
-*Still open: three sources now define "London session" boundaries differently — this file (1:30–3:00 PM IST, separate block), `edgedesk-monitor/monitor.py` (continuous 1:00 PM–9:00 PM IST scan, internally split at 4:00 PM IST), and the original project memory. Not reconciled yet — ask Anoop which one reflects how he actually trades before treating London hours here as final. Also unreviewed: `EdgeDesk.html`, `EdgeDesk-agent.bat`, and the 22-tool research roadmap in the Trade Healer docx (Edgewonk, ATAS, NinjaTrader, etc.) — informational for now, no rule impact, not actioned.*
+*London hours RESOLVED 2026-09-03 (Anoop's decision): the window tracks the real London open (08:00 Europe/London), so it is DST-aware and its IST time moves twice a year — see rule #6 above, and `app/session-windows.js` for the drift table that prompted it. This supersedes the long-open question below, which is kept for the record: three sources defined "London session" differently — this file (1:30–3:00 PM IST, separate block), `edgedesk-monitor/monitor.py` (continuous 1:00 PM–9:00 PM IST scan, internally split at 4:00 PM IST), and the original project memory. `edgedesk-monitor/monitor.py` is still NOT reconciled with this and still uses its own fixed hours. Also unreviewed: `EdgeDesk.html`, `EdgeDesk-agent.bat`, and the 22-tool research roadmap in the Trade Healer docx (Edgewonk, ATAS, NinjaTrader, etc.) — informational for now, no rule impact, not actioned.*
 
 *Post-merge full read-through (2026-07-02): propagated the tiered daily-loss rule into the Session Warning Triggers table and Daily Review Protocol, which still referenced the old flat $200 only. Tightened rule #9 from "per session" to explicit "per day" now that London + NY are both active — the failure-mode data backs one-instrument-per-day, not per-session.*
 

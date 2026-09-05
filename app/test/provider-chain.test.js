@@ -3,168 +3,145 @@
  * Tests for provider-chain.js — provider selection and the fail-open chain.
  *
  * This is the code that keeps the co-pilot answering when a provider dies
- * mid-session. It had zero test coverage because it lived in server.js, which
- * exports nothing.
+ * mid-session. It had zero coverage originally because it lived in server.js,
+ * which exports nothing.
+ *
+ * 2026-09-02 (Landing 2): rewritten for the two-provider world. The Anthropic,
+ * Groq, OmniRoute and Ollama cases are gone because those providers are gone —
+ * not because they stopped mattering. What replaces them is a smaller set of
+ * properties that matter MORE now that there is almost nowhere left to fall:
+ * DeepSeek must win, the ladder must stay inside DeepSeek for one step, and
+ * the Gemini break-glass must never be silently dropped.
  */
 const test = require('node:test');
 const assert = require('node:assert');
 const {
-  STANDARD_FALLBACK_CHAIN, DEFAULT_GEMINI_MODEL,
+  STANDARD_FALLBACK_CHAIN, KNOWN_PROVIDERS,
+  DEFAULT_GEMINI_MODEL, DEFAULT_DEEPSEEK_MODEL, DEEPSEEK_STABLE_MODEL,
   primaryProviderModel, fallbackChainFor
 } = require('../provider-chain');
 
 const names = ch => ch.map(c => c.provider + '/' + c.model);
 
 // ── primaryProviderModel ─────────────────────────────────────────────────────
-test('an Anthropic key makes Anthropic primary, on Haiku 4.5', () => {
-  const p = primaryProviderModel({ apiKey: 'sk-ant-x' });
-  assert.deepStrictEqual(p, { provider: 'anthropic', model: 'claude-haiku-4-5' });
+test('a DeepSeek key makes DeepSeek primary, on the vision-exp model', () => {
+  assert.deepStrictEqual(primaryProviderModel({ deepseekApiKey: 'sk-ds-x' }),
+    { provider: 'deepseek', model: DEFAULT_DEEPSEEK_MODEL });
 });
 
-test('agentModel overrides the default without a code change', () => {
-  assert.strictEqual(primaryProviderModel({ apiKey: 'k', agentModel: 'claude-sonnet-4-6' }).model, 'claude-sonnet-4-6');
+test('deepSeekModel overrides the default without a code change', () => {
+  assert.strictEqual(primaryProviderModel({ deepseekApiKey: 'd', deepSeekModel: 'deepseek-v4-pro' }).model, 'deepseek-v4-pro');
 });
 
-test('no key at all falls back to Gemini, never to nothing', () => {
+test('THE KILL SWITCH: disableDeepSeek drops to the backup without deleting the paid key', () => {
+  // Anoop needs a way out mid-session that does not involve retyping a key he
+  // has paid for, on a machine he is actively trading from.
+  const p = primaryProviderModel({ deepseekApiKey: 'd', geminiApiKey: 'g', disableDeepSeek: true });
+  assert.deepStrictEqual(p, { provider: 'gemini', model: DEFAULT_GEMINI_MODEL });
+});
+
+test('no DeepSeek key falls back to Gemini, never to nothing', () => {
+  // A co-pilot that refuses to answer mid-session is worse than a degraded one.
   assert.deepStrictEqual(primaryProviderModel({}), { provider: 'gemini', model: DEFAULT_GEMINI_MODEL });
+  assert.strictEqual(primaryProviderModel({ deepseekApiKey: '' }).provider, 'gemini');
 });
 
-test('disableAnthropic is honoured even when a key exists', () => {
-  assert.strictEqual(primaryProviderModel({ apiKey: 'k', disableAnthropic: true }).provider, 'gemini');
-});
-
-test('OmniRoute is only chosen when its health probe passes', () => {
-  assert.strictEqual(primaryProviderModel({}, false).provider, 'gemini');
-  assert.strictEqual(primaryProviderModel({}, true).provider, 'omniroute');
-});
-
-test('Anthropic outranks a healthy OmniRoute', () => {
-  assert.strictEqual(primaryProviderModel({ apiKey: 'k' }, true).provider, 'anthropic');
+test('AUDIT C2: null config does not throw — it degrades to Gemini', () => {
+  // This function is on the path of EVERY AI call, so a throw here is a hard
+  // failure of the whole co-pilot, not a degraded read.
+  assert.strictEqual(primaryProviderModel(null).provider, 'gemini');
+  assert.strictEqual(primaryProviderModel(undefined).provider, 'gemini');
+  assert.strictEqual(primaryProviderModel('nonsense').provider, 'gemini');
 });
 
 // ── fallbackChainFor ─────────────────────────────────────────────────────────
-test('THE FIX: an Anthropic primary gets gemini-3.5-flash FIRST', () => {
-  const ch = fallbackChainFor({ provider: 'anthropic', model: 'claude-haiku-4-5' });
-  assert.strictEqual(ch[0].model, DEFAULT_GEMINI_MODEL,
-    'without this the chain wastes its first two steps on possibly-retired Gemini IDs');
+test('THE "exp" INSURANCE: a DeepSeek primary degrades to its stable sibling FIRST', () => {
+  // vision-exp can be retired without notice — this app has been broken that
+  // way twice already. Step 1 must stay inside DeepSeek so a retirement is
+  // survivable without swapping vendor mid-verdict.
+  const ch = fallbackChainFor({ provider: 'deepseek', model: DEFAULT_DEEPSEEK_MODEL });
+  assert.deepStrictEqual(ch[0], { provider: 'deepseek', model: DEEPSEEK_STABLE_MODEL });
 });
 
-test('an OmniRoute primary also gets gemini-3.5-flash first', () => {
-  assert.strictEqual(fallbackChainFor({ provider: 'omniroute', model: 'free-quality-first' })[0].model, DEFAULT_GEMINI_MODEL);
+test('the Gemini break-glass is the LAST step and is never dropped', () => {
+  // Anoop asked for this explicitly ("in case the credits in deepseek are
+  // over"). It is the only step that survives a whole-vendor outage, and it
+  // earned its place the day it was added.
+  const ch = fallbackChainFor({ provider: 'deepseek', model: DEFAULT_DEEPSEEK_MODEL });
+  assert.deepStrictEqual(ch[ch.length - 1], { provider: 'gemini', model: DEFAULT_GEMINI_MODEL });
 });
 
-test('a Gemini primary keeps the plain standard chain', () => {
-  const ch = fallbackChainFor({ provider: 'gemini', model: 'gemini-3.5-flash' });
-  assert.deepStrictEqual(names(ch), names(STANDARD_FALLBACK_CHAIN));
-});
-
-test('the chain NEVER retries the exact primary that just failed', () => {
-  const ch = fallbackChainFor({ provider: 'gemini', model: 'gemini-3.1-flash-lite' });
-  assert.ok(!names(ch).includes('gemini/gemini-3.1-flash-lite'), 'retrying the failed model wastes time mid-session');
-});
-
-test('every chain ends at Groq — the last resort must always exist', () => {
-  for (const p of [
-    { provider: 'anthropic', model: 'claude-haiku-4-5' },
-    { provider: 'omniroute', model: 'free-quality-first' },
-    { provider: 'gemini', model: 'gemini-3.5-flash' }
-  ]) {
-    const ch = fallbackChainFor(p);
-    assert.strictEqual(ch[ch.length - 1].provider, 'groq', `${p.provider} chain must end at Groq`);
-  }
+test('the primary is never repeated inside its own chain', () => {
+  const ch = fallbackChainFor({ provider: 'deepseek', model: DEEPSEEK_STABLE_MODEL });
+  assert.ok(!names(ch).includes('deepseek/' + DEEPSEEK_STABLE_MODEL),
+    'retrying the model that just failed wastes the one thing in short supply mid-session');
+  assert.ok(ch.length > 0, 'excluding the primary must never empty the chain');
 });
 
 test('every chain is non-empty — a failure must always have somewhere to go', () => {
   for (const p of [
-    { provider: 'anthropic', model: 'claude-haiku-4-5' },
-    { provider: 'omniroute', model: 'x' },
-    { provider: 'gemini', model: 'gemini-3.5-flash' },
-    { provider: 'groq', model: 'openai/gpt-oss-20b' }
+    { provider: 'deepseek', model: DEFAULT_DEEPSEEK_MODEL },
+    { provider: 'deepseek', model: DEEPSEEK_STABLE_MODEL },
+    { provider: 'gemini', model: DEFAULT_GEMINI_MODEL }
   ]) {
-    assert.ok(fallbackChainFor(p).length > 0, `${p.provider} left with no fallback`);
+    assert.ok(fallbackChainFor(p).length > 0, p.provider + '/' + p.model + ' left with no fallback');
   }
 });
 
 test('a malformed/missing primary still yields a usable chain', () => {
   assert.ok(fallbackChainFor(undefined).length > 0);
   assert.ok(fallbackChainFor({}).length > 0);
-});
-
-test('the returned chain is a copy — callers cannot corrupt the shared constant', () => {
-  const ch = fallbackChainFor({ provider: 'gemini', model: 'gemini-3.5-flash' });
-  ch.push({ provider: 'bogus', model: 'bogus' });
-  assert.strictEqual(STANDARD_FALLBACK_CHAIN.length, 3, 'the module constant must not be mutated');
-});
-
-// ── the real end-to-end path ─────────────────────────────────────────────────
-test('full path: Anthropic key present -> Anthropic primary, 4-deep fail-open', () => {
-  const p = primaryProviderModel({ apiKey: 'sk-ant-x' }, false);
-  const ch = fallbackChainFor(p);
-  assert.deepStrictEqual(
-    [p.provider + '/' + p.model, ...names(ch)],
-    [
-      'anthropic/claude-haiku-4-5',
-      'gemini/gemini-3.5-flash',
-      'gemini/gemini-3.1-flash-lite',
-      'gemini/gemini-2.5-flash',
-      'groq/openai/gpt-oss-20b'
-    ]
-  );
-});
-
-// ═══════════════════════════════════════════════════════════════════════════
-// AUDIT HARDENING (2026-08-12). C2 was a confirmed TypeError on the path of
-// EVERY AI call in the app. M6/M7 allowed a caller to silently corrupt the
-// fail-open chain for the rest of the process.
-// ═══════════════════════════════════════════════════════════════════════════
-const { KNOWN_PROVIDERS } = require('../provider-chain');
-
-test('AUDIT C2: null config does not throw — it degrades to Gemini', () => {
-  assert.doesNotThrow(() => primaryProviderModel(null, false));
-  assert.strictEqual(primaryProviderModel(null, false).provider, 'gemini');
-  assert.strictEqual(primaryProviderModel(undefined).provider, 'gemini');
-  assert.strictEqual(primaryProviderModel('nonsense').provider, 'gemini');
-  assert.strictEqual(primaryProviderModel(42).provider, 'gemini');
-});
-
-test('AUDIT M6: the exported chain is frozen — push() cannot corrupt it', () => {
-  assert.throws(() => STANDARD_FALLBACK_CHAIN.push({ provider: 'evil', model: 'x' }), TypeError);
-  assert.throws(() => { STANDARD_FALLBACK_CHAIN[0].provider = 'evil'; }, TypeError);
-  assert.strictEqual(STANDARD_FALLBACK_CHAIN.length, 3);
-  assert.strictEqual(STANDARD_FALLBACK_CHAIN[0].provider, 'gemini');
-});
-
-test('AUDIT M7: returned entries are copies — mutating one cannot poison the source', () => {
-  const a = fallbackChainFor({ provider: 'anthropic', model: 'claude-haiku-4-5' });
-  a[0].provider = 'MUTATED';
-  const b = fallbackChainFor({ provider: 'anthropic', model: 'claude-haiku-4-5' });
-  assert.strictEqual(b[0].provider, 'gemini', 'a later caller must not see the mutation');
-  assert.strictEqual(STANDARD_FALLBACK_CHAIN[0].provider, 'gemini');
+  assert.ok(fallbackChainFor({ provider: 'deepseak' }).length > 0, 'a typo must still leave a working chain');
 });
 
 test('AUDIT H3/H4: an unknown provider is not treated as a known one', () => {
-  // Still returns a usable chain (never strand a caller) but does NOT get the
-  // anthropic/omniroute-specific gemini-3.5 prepend it never earned.
-  const typo = fallbackChainFor({ provider: 'anthropc', model: 'x' });
-  assert.ok(typo.length > 0);
-  assert.strictEqual(typo[0].model, 'gemini-3.1-flash-lite', 'no tailored prepend for an unknown provider');
-  assert.strictEqual(fallbackChainFor({ provider: '', model: 'x' })[0].model, 'gemini-3.1-flash-lite');
+  // It still degrades to a usable chain, but nothing is EXCLUDED on its behalf.
+  const ch = fallbackChainFor({ provider: 'not-a-provider', model: DEEPSEEK_STABLE_MODEL });
+  assert.ok(names(ch).includes('deepseek/' + DEEPSEEK_STABLE_MODEL),
+    'an unrecognised provider must not silently drop a real fallback entry');
 });
 
 test('AUDIT M9: a falsy model never drops a legitimate fallback entry', () => {
-  const ch = fallbackChainFor({ provider: 'gemini', model: '' });
-  assert.strictEqual(ch.length, 3, 'all three standard entries must survive');
-  assert.strictEqual(fallbackChainFor({ provider: 'gemini', model: null }).length, 3);
+  assert.strictEqual(fallbackChainFor({ provider: 'deepseek', model: null }).length, STANDARD_FALLBACK_CHAIN.length);
+  assert.strictEqual(fallbackChainFor({ provider: 'deepseek', model: '' }).length, STANDARD_FALLBACK_CHAIN.length);
 });
 
-test('the real exclusion still works when provider AND model are both real', () => {
-  const ch = fallbackChainFor({ provider: 'groq', model: 'openai/gpt-oss-20b' });
-  assert.ok(!ch.some(c => c.provider === 'groq' && c.model === 'openai/gpt-oss-20b'));
-});
-
-test('KNOWN_PROVIDERS is frozen and covers every provider groq-agent accepts', () => {
+test('AUDIT M6: the exported constants are frozen — push() cannot corrupt them', () => {
+  assert.throws(() => STANDARD_FALLBACK_CHAIN.push({ provider: 'x', model: 'y' }), TypeError);
   assert.throws(() => KNOWN_PROVIDERS.push('x'), TypeError);
-  for (const p of ['anthropic', 'gemini', 'groq', 'ollama', 'omniroute']) {
-    assert.ok(KNOWN_PROVIDERS.includes(p), p + ' missing');
+});
+
+test('AUDIT M7: returned entries are copies — mutating one cannot poison the source', () => {
+  const ch = fallbackChainFor({ provider: 'deepseek', model: DEFAULT_DEEPSEEK_MODEL });
+  ch[0].provider = 'hijacked';
+  ch.push({ provider: 'bogus', model: 'bogus' });
+  const fresh = fallbackChainFor({ provider: 'deepseek', model: DEFAULT_DEEPSEEK_MODEL });
+  assert.strictEqual(fresh[0].provider, 'deepseek');
+  assert.ok(!names(fresh).includes('bogus/bogus'));
+});
+
+// ── cross-module: the two provider registries must agree ─────────────────────
+test('KNOWN_PROVIDERS matches groq-agent VALID_PROVIDERS exactly', () => {
+  // 2026-09-02: this used to compare against a HAND-COPIED list, which cannot
+  // detect drift — only restate it. It duly passed while DeepSeek was present
+  // in provider-chain.js and absent from groq-agent.js, a combination that is
+  // silent by construction: the chain builder SKIPS an unrecognised provider
+  // instead of throwing, so a configured paid key would have served zero
+  // requests while the app looked perfectly healthy. Reads the real arrays now.
+  const { VALID_PROVIDERS, DEFAULT_MODEL_BY_PROVIDER } = require('../groq-agent')._debug;
+  assert.deepStrictEqual([...KNOWN_PROVIDERS].sort(), [...VALID_PROVIDERS].sort(),
+    'a provider present in one registry and not the other fails SILENTLY');
+  for (const p of VALID_PROVIDERS) {
+    assert.ok(DEFAULT_MODEL_BY_PROVIDER[p],
+      p + ' has no default model — a chain entry without an explicit model would send no model at all');
+  }
+});
+
+test('REGRESSION: every entry of a real DeepSeek chain survives the groq-agent candidate filter', () => {
+  const { VALID_PROVIDERS } = require('../groq-agent')._debug;
+  const primary = primaryProviderModel({ deepseekApiKey: 'sk-ds-x' });
+  assert.strictEqual(primary.provider, 'deepseek');
+  for (const c of [primary, ...fallbackChainFor(primary)]) {
+    assert.ok(VALID_PROVIDERS.includes(c.provider), c.provider + ' would be silently skipped by groq-agent');
   }
 });

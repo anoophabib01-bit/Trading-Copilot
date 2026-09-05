@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { dropFormingBar, findPivots, validateEngulfPlaybookC } = require('../playbook-c.js');
+const { dropFormingBar, findPivots, validateEngulfPlaybookC, STAGE } = require('../playbook-c.js');
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 const B = (o, h, l, c) => ({ time: 0, open: o, high: h, low: l, close: c });
@@ -177,5 +177,144 @@ test('every rejection carries a human-readable reason', () => {
     const r = validateEngulfPlaybookC(bars, dir, pd);
     assert.equal(typeof r.reason, 'string');
     assert.ok(r.reason.length > 10, 'reason too short to be useful in the UI');
+  }
+});
+
+// ── Structure comes from the 1H, not the trigger timeframe (2026-09-01) ────
+// Anoop: "Higher high, higher low ... analysis should be done only in 1 hour,
+// which should also sync with 4 hour time frame."
+//
+// Requirement 3 used to be computed from `bars` — whatever timeframe the
+// watcher was polling. On the 30M/15M/5M engulf watchers that meant reading
+// structure off a chart he does not read structure on. The 4th argument lets
+// the caller hand in the 1H verdict instead.
+
+test('injected 1H structure OVERRIDES the local pivot read', () => {
+  // A local DOWNTREND, but the 1H says bullish. A bullish engulf must now pass
+  // requirement 3 on the 1H's word, not the trigger timeframe's.
+  const bars = withEngulf(DOWNTREND, 'BULLISH');
+  const local = validateEngulfPlaybookC(bars, 'BULLISH', { pdh: 300, pdl: 10 });
+  const withHtf = validateEngulfPlaybookC(bars, 'BULLISH', { pdh: 300, pdl: 10 }, 'bullish');
+
+  assert.equal(local.valid, false, 'local read should reject a bullish engulf in an LL-LH series');
+  assert.match(local.reason, /HH-HL/);
+  // The 15M read replaces the structure verdict; whether it ultimately passes
+  // depends on the remaining local requirements, but it must no longer be
+  // rejected FOR STRUCTURE.
+  if (!withHtf.valid) assert.doesNotMatch(withHtf.reason, /needs an HH-HL structure/);
+  assert.match(withHtf.structure, /15M/, 'the label must say which read decided');
+});
+
+test('injected 15M structure can REFUSE what the local read would have allowed', () => {
+  const bars = withEngulf(UPTREND, 'BULLISH');
+  const local = validateEngulfPlaybookC(bars, 'BULLISH', { pdh: 300, pdl: 50 });
+  assert.equal(local.valid, true, 'baseline: passes on its own timeframe');
+
+  const against = validateEngulfPlaybookC(bars, 'BULLISH', { pdh: 300, pdl: 50 }, 'bearish');
+  assert.equal(against.valid, false, 'a bearish 15M must disqualify a bullish engulf');
+  assert.match(against.reason, /HH-HL/);
+  assert.equal(against.structure, 'LL-LH (15M)');
+});
+
+test('omitting the argument preserves the old local-pivot behaviour exactly', () => {
+  const bars = withEngulf(UPTREND, 'BULLISH');
+  const a = validateEngulfPlaybookC(bars, 'BULLISH', { pdh: 300, pdl: 50 });
+  const b = validateEngulfPlaybookC(bars, 'BULLISH', { pdh: 300, pdl: 50 }, null);
+  const c = validateEngulfPlaybookC(bars, 'BULLISH', { pdh: 300, pdl: 50 }, 'unclear');
+  assert.deepEqual(a, b, 'null must not change behaviour');
+  assert.deepEqual(a, c, 'an unclear 15M falls back to the local read rather than refusing');
+});
+
+test('the candle-level requirements still bind regardless of the 1H', () => {
+  // A non-engulfing candle is not rescued by a friendly higher timeframe.
+  const notEngulf = UPTREND.concat([B(100, 101, 99, 100.5), B(100.5, 100.8, 100.2, 100.6)]);
+  const r = validateEngulfPlaybookC(notEngulf, 'BULLISH', { pdh: 300, pdl: 50 }, 'bullish');
+  assert.equal(r.valid, false);
+  assert.doesNotMatch(r.reason, /HH-HL/, 'should fail on the candle, not on structure');
+});
+
+// ── THE VETO / EVIDENCE SPLIT (2026-09-03) ──────────────────────────────────
+// Anoop: "playbook A should be active in both direction and should intimate me
+// when any engulfing in any direction takes place after which i will decide
+// manually which side should i take the entry at."
+//
+// server.js's engulf monitor now alerts on a CONTEXT failure and still refuses
+// a SHAPE failure. That split is only safe if `stage` is exactly right, so
+// these pin each class to the reason that produces it. Get one wrong in the
+// SHAPE direction and the app announces engulfings that are not engulfings;
+// get one wrong in the CONTEXT direction and he silently stops being told
+// about candles again, which is the bug this whole change exists to fix.
+test('a candle that is not an engulfing at all is a SHAPE failure', () => {
+  const base = UPTREND;
+  const last = base[base.length - 1].close;
+
+  // wrong colour sequence: green then green
+  const noFlip = base.concat([
+    B(last, last + 2, last - 0.5, last + 1.5),
+    B(last + 1.5, last + 3, last + 1, last + 2.5),
+  ]);
+  const r1 = validateEngulfPlaybookC(noFlip, 'BULLISH', null, 'bullish');
+  assert.equal(r1.valid, false);
+  assert.equal(r1.stage, STAGE.SHAPE, 'a colour-flip failure must never reach the alert');
+
+  // colour flips, but the second bar does not take out both extremes
+  const noRange = base.concat([
+    B(last, last + 3, last - 3, last - 2.5),                       // red, wide
+    B(last - 2.5, last + 1, last - 2, last + 0.5),                 // green, inside
+  ]);
+  const r2 = validateEngulfPlaybookC(noRange, 'BULLISH', null, 'bullish');
+  assert.equal(r2.valid, false);
+  assert.equal(r2.stage, STAGE.SHAPE);
+
+  // takes out both extremes with WICKS, but the body does not cover the body
+  const wickOnly = base.concat([
+    B(last, last + 0.6, last - 0.6, last - 0.5),                   // red, small body
+    B(last - 0.52, last + 3, last - 3, last - 0.48),               // green, huge wicks, tiny body
+  ]);
+  const r3 = validateEngulfPlaybookC(wickOnly, 'BULLISH', null, 'bullish');
+  assert.equal(r3.valid, false);
+  assert.equal(r3.stage, STAGE.SHAPE, 'the 2026-08-27 body-engulf check is part of the definition');
+});
+
+test('a real engulfing in the wrong CONTEXT is a context failure, not a shape one', () => {
+  // A genuine bullish engulfing candle, judged against a bearish 15M bias.
+  // Every shape requirement holds; only requirement 3 fails.
+  const bars = withEngulf(UPTREND, 'BULLISH');
+  const r = validateEngulfPlaybookC(bars, 'BULLISH', { pdh: 300, pdl: 50 }, 'bearish');
+  assert.equal(r.valid, false);
+  assert.equal(r.stage, STAGE.CONTEXT,
+    'the candle is real — only its location is wrong, and that is his call now');
+  assert.match(r.reason, /HH-HL/, 'and the reason must name what he is overriding');
+});
+
+test('a full pass is stamped OK, so "valid" and "alertable" stay separable', () => {
+  const bars = withEngulf(UPTREND, 'BULLISH');
+  const r = validateEngulfPlaybookC(bars, 'BULLISH', { pdh: 300, pdl: 50 });
+  assert.equal(r.valid, true);
+  assert.equal(r.stage, STAGE.OK);
+});
+
+test('too little history is DATA, which is neither a pass nor a rejection', () => {
+  const r = validateEngulfPlaybookC([B(1, 2, 0, 1), B(1, 2, 0, 1)], 'BULLISH', null, 'bullish');
+  assert.equal(r.valid, false);
+  assert.equal(r.stage, STAGE.DATA,
+    'the caller must be able to tell "could not look" from "looked and said no"');
+});
+
+test('every rejection carries a stage — an untagged one would silently alert', () => {
+  // The failure mode this guards: server.js treats anything that is not SHAPE
+  // or DATA as alertable. A reason added later with no stage would therefore
+  // default into the alerting path rather than out of it.
+  const cases = [
+    [withEngulf(UPTREND, 'BULLISH'), 'BULLISH', { pdh: 300, pdl: 50 }, 'bearish'],
+    [withEngulf(DOWNTREND, 'BEARISH'), 'BEARISH', { pdh: 300, pdl: 10 }, 'bullish'],
+    [withEngulf(UPTREND, 'BULLISH'), 'BULLISH', null, null],
+    [UPTREND.concat([B(100, 101, 99, 100.5), B(100.5, 101, 100, 100.8)]), 'BULLISH', null, 'bullish'],
+    [[B(1, 2, 0, 1)], 'BULLISH', null, null],
+  ];
+  for (const [bars, dir, pdh, htf] of cases) {
+    const r = validateEngulfPlaybookC(bars, dir, pdh, htf);
+    assert.ok(Object.values(STAGE).includes(r.stage),
+      'unstaged result: ' + JSON.stringify(r));
   }
 });

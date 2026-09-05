@@ -38,3 +38,6 @@ Untitled.canvas
 Untitled.base
 *.canvas
 *.base
+
+# Personal career documents (resume, Upwork profile copy) - not project source.
+career/

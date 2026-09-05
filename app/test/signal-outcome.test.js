@@ -170,3 +170,14 @@ test('aggregate ordering puts the largest sample first', () => {
   ];
   assert.equal(aggregateOutcomes(rows)[0].playbook, 'A');
 });
+
+// ── AN ALERT IS NOT AN ARMED SETUP (2026-09-03) ─────────────────────────────
+// The Playbook A alert/setup split is carried by the EVENT NAME because three
+// separate modules key on it and none of them checks `valid`. If engulf-alert
+// ever leaks into ARMING_EVENTS, every bare against-bias candle gets scored as
+// a Playbook A signal and the forward test silently starts measuring a rule
+// nobody trades — pooled with, and outnumbering ~4:1, the setups he does take.
+test('engulf-alert is NOT an arming event — alerts must not be scored as setups', () => {
+  assert.equal(isArmingEvent('engulf-alert'), false);
+  assert.equal(isArmingEvent('engulf-fire'), true);
+});

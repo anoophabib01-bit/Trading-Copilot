@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-// ── Can DSH-V2 clear a 50K eval in ONE month? (2026-08-26) ─────────────────
+// ── Can Playbook C (ADX) clear a 50K eval in ONE month? (2026-08-26) ──────
 // Anoop: "i want results on 1month even if size is increased. do you think it
 // is possible?"
 //
@@ -55,7 +55,7 @@ function load(file) {
   return (d.bars || d).filter((b) => b && typeof b.time === 'number' && typeof b.close === 'number');
 }
 
-// DSH-V2, using the shared detectors. Risk cap scales with size (see header).
+// Playbook C (ADX), using the shared detectors. Risk cap scales with size (see header).
 function runStrategy(bars, contracts, opts) {
   const o = opts || {};
   const lookback = o.lookback || 10, adxMin = o.adxMin || 35;
@@ -81,7 +81,7 @@ function runStrategy(bars, contracts, opts) {
     if ((dayPnl[day] || 0) >= dailyCap) continue;
 
     const sim = backtest.simulateTrade(
-      { playbook: 'DSH-V2', direction: 'BULLISH', entry, stop, target: entry + risk * rr, requiresFill: false },
+      { playbook: 'C-ADX', direction: 'BULLISH', entry, stop, target: entry + risk * rr, requiresFill: false },
       bars, i, { horizonBars: horizon, slippagePoints: 0.5, flattenByISTMinutes: RULES.flattenByISTMinutes }
     );
     if (!sim) continue;
@@ -143,7 +143,7 @@ function main() {
   }
 
   console.log('═'.repeat(80));
-  console.log(' CAN DSH-V2 CLEAR A 50K EVAL IN ONE MONTH?');
+  console.log(' CAN PLAYBOOK C (ADX) CLEAR A 50K EVAL IN ONE MONTH?');
   console.log(` Target $${TARGET} · hard floor $${DD_LIMIT} · ${TRADING_DAYS}-trading-day rolling windows`);
   console.log(' Real MNQ 1H data, Sep 2025 - Aug 2026 (5 regimes). Risk cap scaled WITH size.');
   console.log('═'.repeat(80));

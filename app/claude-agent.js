@@ -2,7 +2,6 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const Anthropic = require('@anthropic-ai/sdk');
 const mcpBridge = require('./mcp-bridge');
 const booksIndex = require('./books-index');
 const supercompress = require('./supercompress');
@@ -16,14 +15,11 @@ const callLogger = require('./call-logger');
 // server.js already reads (~/.mnq-copilot-config.json); this file has no
 // other dependency on server.js, just its own tiny synchronous read.
 const CONFIG_PATH = path.join(os.homedir(), '.mnq-copilot-config.json');
-function isTokenOptDisabled() {
-  try {
-    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-    return !!cfg.disableTokenOpt;
-  } catch {
-    return false; // config unreadable/missing → default to token-opt ON (safe: caching degrades transparently on any error)
-  }
-}
+// 2026-09-02: isTokenOptDisabled() removed with the Anthropic prompt-cache
+// breakpoints it gated. Its Settings toggle ("Disable prompt caching") was
+// still on screen after the caching code was deleted, writing a config value
+// nothing read — a kill switch that promised a behaviour it could no longer
+// deliver. DeepSeek caches automatically with no markers and no opt-out.
 
 // 2026-08-11: the model used to be hardcoded 'claude-sonnet-4-6' at the call
 // site, which meant changing it required editing this file. Anoop is funding
@@ -138,11 +134,14 @@ TradingView: HTF ONLY — Daily, 4H, 1H, 15Min. Pre-market zone marking. Bias on
 Tradovate: Execution ONLY — 3Min and 1Min for entry triggers and management.
 
 ## PLAYBOOKS
-Playbook A — 4H Engulfing + TF Alignment:
-- Mark all levels. Check 4H: HH/HL = bullish, LL/LH = bearish.
-- Wait for engulfing at 1H close. IF WITH 4H → Entry 1 with 1H SL → if profitable, Entry 2 + move SL to BE → exit at marker levels.
-- IF AGAINST 4H → NO ACTION.
-- Validity check: any engulfing candle used for entry (here or elsewhere) must pass Playbook C before it counts as valid.
+Playbook A — Engulfing + TF Alignment (BOTH DIRECTIONS, updated 2026-09-03):
+- Structure (HH/HL = bullish, LL/LH = bearish) is read on the 15M, and the 1H is reported as evidence for or against it. NOT the 4H — Anoop checks 4H and Daily himself: "All these playbooks are here to determine the direction of the day at peak hours and 4hrs is too high and cannot do that."
+- The watchers cover 1H, 30M, 15M and 5M and alert on the CLOSE of any engulfing candle, in EITHER direction. Mark all levels first as always.
+- ANOOP PICKS THE SIDE — "after which i will decide manually which side should i take the entry at." An alert is a report that a candle closed, not a recommendation. On an alert, say what the chart supports, including when the honest answer is No Action. Never talk him into the direction the candle happened to point.
+- An alert AGAINST the 15M bias is the one to slow down on. Say so plainly and never treat it as equivalent to an aligned one.
+- Read the ENTRY on the lower timeframe; manage the EXIT on the higher one ("i want to read lower time frame and exit as per higher time fame").
+- Sizing unchanged: Entry 1 with the stop beyond the candle → if it works, Entry 2 and move the first stop to BE → exit at marked levels.
+- Validity: an engulfing used for entry is still graded by Playbook C. Failing it no longer suppresses the alert — it downgrades it to "candle only", and you must say which of the two you are looking at.
 
 Playbook B — JadeCap 3-Step (SFP + FVG):
 - Daily HTF bias. Mark PH/PL, PDH/PDL, equal H&L.
@@ -150,9 +149,10 @@ Playbook B — JadeCap 3-Step (SFP + FVG):
 - Displacement/FVG Entry: Strong move post-SFP leaves FVG. Enter on retrace. SL beyond SFP wick.
 - Avoid: neutral/range day, against major trend, equal liquidity both sides.
 
-Playbook C — Engulfing Bar Validity Rules (gates Playbook A and any other engulfing-based entry):
-- Bullish valid: forms at a swing low in an HH-HL pattern, closes above the previous candle on 4H, takes out BOTH the low AND the high of the previous candle. NEVER take a bullish engulfing AFTER buy-side liquidity has already been swept.
-- Bearish valid: forms at a swing high in an LL-LH pattern, closes below the previous candle on 4H, takes out BOTH the high AND the low of the previous candle. NEVER take a bearish engulfing AFTER sell-side liquidity has already been swept.
+Playbook C — Engulfing Bar Validity Rules (GRADES Playbook A and any other engulfing-based entry):
+- Bullish valid: forms at a swing low with the 15M structure in HH-HL, closes above the previous candle, takes out BOTH the low AND the high of the previous candle, and its BODY covers the previous body (wicks straddling both extremes is not enough). NEVER take a bullish engulfing AFTER buy-side liquidity has already been swept.
+- Bearish valid: the mirror — swing high, 15M LL-LH, closes below the previous candle, takes out BOTH extremes, body over body. NEVER take a bearish engulfing AFTER sell-side liquidity has already been swept.
+- It GRADES rather than GATES since 2026-09-03: a candle failing on structure, swing location or liquidity is still reported to him, labelled "candle only", and it is his call. A candle that is not an engulfing at all — no colour flip, no full-range engulf, body not covering body — is not reported, because calling that an engulfing would be false.
 
 ## 7 DOCUMENTED FAILURE MODES — FLAG IMMEDIATELY BY NUMBER
 1. Trade count escalation — profitable days: 6–12 trades. Blow-up days: 65 trades, 20% win rate. "STOP — escalation."
@@ -259,7 +259,18 @@ const TV_TOOLS = [
 const BOOK_TOOLS = [
   { name: 'search_books', description: 'Search Anoop\'s trading book library (Stock Market Wizards, Trading in the Zone, Intraday Trading Techniques, Prop Trading Secrets, TradeApp\'s Guide to Proprietary Trading) for passages relevant to a topic. Use when grounding a rules violation or coaching point in what one of these books actually says, e.g. "revenge trading", "probabilistic thinking", "position sizing".', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'topic or question to search for' }, book: { type: 'string', description: 'optional — restrict to one: stock_market_wizards, trading_in_the_zone, intraday_trading_techniques, prop_trading_secrets, tradeapp_prop_trading_guide' } }, required: ['query'] } }
 ];
-const ALL_TOOLS = [...TV_TOOLS, ...BOOK_TOOLS];
+// 2026-09-03: the chat archive, read back. Like BOOK_TOOLS this is a local
+// tool, not an MCP one — server.js's handleChat owns a toolExecutor that
+// answers both before falling through to the TradingView bridge. Added so the
+// main co-pilot can check what was actually said on an earlier day instead of
+// relying on the 40-turn window renderer/app.js keeps in context. See
+// app/chat-archive.js for why that window is not a record.
+const ARCHIVE_TOOLS = [
+  { name: 'recall_chat', description: 'Search or re-read the permanent archive of this app\'s chat — every message, verdict, watcher alert, guardrail alarm and trade ticket that has ever appeared in the chat pane, not just the recent turns still in your context. Use it when Anoop refers to something said earlier ("you told me last week", "what did we decide about X"), or when a claim about the past needs evidence rather than recall. Pass "query" to search (all terms must appear), "day" (YYYY-MM-DD) for one trading day, or neither for the most recent rows. Quote what you find rather than paraphrasing from memory.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'words that must all appear in the row' }, day: { type: 'string', description: 'optional YYYY-MM-DD trading day to read' }, limit: { type: 'number', description: 'max rows to return (default 25, max 60)' } }, required: [] } },
+  { name: 'recall_patterns', description: 'Read the permanent pattern memory — every mistake and every good trade Anoop has made, with how many times each has happened, on how many days, what it has cost or made, and whether it is getting better or worse. Call this before making ANY claim about a repeated behaviour ("you keep doing X", "this is the third time") and before telling him a pattern is improving — the ledger knows, you do not. Pass "kind" for one pattern in full (oversize, revenge, hold-exceeded, out-of-window, news, size-up-into-loss, overtrading, traded-past-3-losses, giveback, clean-winner, disciplined-loss, clean-day, stopped-in-profit); omit it for the whole memory. Lead with the positives when they are real.', input_schema: { type: 'object', properties: { kind: { type: 'string', description: 'optional — one pattern kind to expand in full' }, limit: { type: 'number', description: 'max patterns to list (default 10)' } }, required: [] } },
+  { name: 'diagnose_day', description: 'Reconstruct WHY a trading day went the way it did: the trades in order with sizes, holds and gaps, the turning point where the day changed character, how concentrated the damage was, and the loss attributed to each cause (mutually exclusive, so the dollars add up to the day). Call this whenever Anoop asks what went wrong, why a day failed, or what to change — a count of broken rules is NOT a cause and he already knows it. A disagreement between the app record and the broker record is a caveat about measurement, never the reason: the sequence is still true when the totals are uncertain. Omit "date" for the most recent day on file.', input_schema: { type: 'object', properties: { date: { type: 'string', description: 'optional YYYY-MM-DD' } }, required: [] } }
+];
+const ALL_TOOLS = [...TV_TOOLS, ...BOOK_TOOLS, ...ARCHIVE_TOOLS];
 // Prompt-caching variant of ALL_TOOLS — identical tools, with a cache_control
 // breakpoint on the last one. Built once at module load (the tool list is
 // static) rather than per-call. Kept as a separate array so token-audit.js's
@@ -283,199 +294,23 @@ const ALL_TOOLS = [...TV_TOOLS, ...BOOK_TOOLS];
 // 1.25x for 5m. So this is a LOSS if he asks one question and closes the app,
 // and a large win from roughly the third call onward in a session. Given a
 // session is 20+ calls, that's the right side of the bet.
-const CACHE_TTL = '1h';
-const CACHE_CONTROL = { type: 'ephemeral', ttl: CACHE_TTL };
-const ALL_TOOLS_CACHED = ALL_TOOLS.map((t, i) =>
-  i === ALL_TOOLS.length - 1 ? { ...t, cache_control: { ...CACHE_CONTROL } } : t
-);
-
-class ClaudeAgent {
-  constructor() {
-    this.client = null;
-    this.apiKey = null;
-  }
-
-  init(apiKey) {
-    this.apiKey = apiKey;
-    this.client = new Anthropic({ apiKey });
-    console.log(isTokenOptDisabled()
-      ? '⚠  Token-opt kill switch is ON — prompt caching disabled, using legacy (uncached) calls'
-      : '✓ Token-opt: prompt caching enabled (cache_control on system + tools)');
-  }
-
-  isReady() { return !!this.client; }
-
-  async stream(messages, { mode = 'funded', extraContext, signal, onToken, onToolStart, onToolDone, onDone, onError } = {}) {
-    if (!this.client) {
-      onError && onError('API key not configured. Please enter your Anthropic API key in Settings.');
-      return;
-    }
-
-    // extraContext (e.g. recent Alignment-tab entries, server.js) is appended
-    // before caching, so it's simply part of what gets cached — no different
-    // in kind from EVAL_RULES/FUNDED_RULES already being in there. If it
-    // changes between calls (rare — notes don't change every message), that
-    // call pays a cache write instead of a read; self-correcting, not a bug.
-    const systemPrompt = buildSystemPrompt(mode) + (extraContext ? '\n\n' + extraContext : '');
-    // Checked fresh per call (not cached in memory) so the kill switch takes
-    // effect immediately, mid-session, without a restart.
-    const tokenOptOff = isTokenOptDisabled();
-    const systemForRequest = tokenOptOff
-      ? systemPrompt
-      : [{ type: 'text', text: systemPrompt, cache_control: { ...CACHE_CONTROL } }];
-    const toolsForRequest = tokenOptOff ? ALL_TOOLS : ALL_TOOLS_CACHED;
-    const abortCtrl = new AbortController();
-    // 2026-08-06: real end-to-end cancellation. `signal` is an external
-    // AbortSignal server.js creates per reqId and aborts on 'cancel-request'
-    // — reuses the same abortCtrl the 5-min timeout already had, so a user
-    // cancel and a timeout are handled identically (both hit the existing
-    // AbortError branch below).
-    if (signal) {
-      if (signal.aborted) abortCtrl.abort();
-      else signal.addEventListener('abort', () => abortCtrl.abort(), { once: true });
-    }
-
-    // 5-minute global timeout — prevents infinite hangs
-    const globalTimer = setTimeout(() => {
-      abortCtrl.abort();
-      onError && onError('Response timed out after 5 minutes. Try a shorter request or check TradingView connection.');
-    }, 5 * 60 * 1000);
-
-    const runLoop = async (msgs) => {
-      let stream;
-      try {
-        stream = await this.client.messages.stream({
-          model: claudeModel(),
-          max_tokens: 4096,
-          system: systemForRequest,
-          tools: toolsForRequest,
-          messages: msgs
-        }, { signal: abortCtrl.signal });
-      } catch (e) {
-        clearTimeout(globalTimer);
-        onError && onError(e.name === 'AbortError' ? 'Request cancelled.' : e.message);
-        return;
-      }
-
-      let fullText = '';
-      let toolUseBlocks = [];
-      let currentToolId = null;
-      let currentToolName = null;
-      let currentToolInputRaw = '';
-
-      for await (const event of stream) {
-        if (event.type === 'content_block_start') {
-          if (event.content_block.type === 'tool_use') {
-            currentToolId   = event.content_block.id;
-            currentToolName = event.content_block.name;
-            currentToolInputRaw = '';
-            onToolStart && onToolStart(currentToolName, currentToolId);
-          }
-        } else if (event.type === 'content_block_delta') {
-          const d = event.delta;
-          if (d.type === 'text_delta') {
-            fullText += d.text;
-            onToken && onToken(d.text);
-          } else if (d.type === 'input_json_delta') {
-            currentToolInputRaw += d.partial_json;
-          }
-        } else if (event.type === 'content_block_stop') {
-          if (currentToolName) {
-            let input = {};
-            try { input = JSON.parse(currentToolInputRaw || '{}'); } catch {}
-            toolUseBlocks.push({ type: 'tool_use', id: currentToolId, name: currentToolName, input });
-            currentToolName = null;
-            currentToolId   = null;
-            currentToolInputRaw = '';
-          }
-        }
-      }
-
-      const finalMsg   = await stream.finalMessage();
-      const stopReason = finalMsg.stop_reason;
-
-      // One real billed API call just completed — log it regardless of what
-      // happens next (tool round trip or final answer). See call-logger.js.
-      callLogger.logCall({
-        mode,
-        usage: finalMsg.usage,
-        stopReason,
-        toolCallCount: toolUseBlocks.length,
-      });
-
-      // 2026-08-11: print the cache outcome of every call to the server console.
-      // Anoop asked "where do I check prompt caching is enabled?" — the startup
-      // banner only proves the kill switch is OFF, it does NOT prove the API
-      // actually cached anything. These are the API's own reported numbers, so
-      // they're the real evidence:
-      //   WRITE = first call of a cache lifetime (billed 2x input at 1h TTL)
-      //   READ  = a hit (billed 0.1x input) — this is where the money is saved
-      //   MISS  = neither, i.e. caching silently not working — investigate
-      // Expect one WRITE then READs for the rest of the hour. If you only ever
-      // see WRITE, the cached prefix is changing between calls and the 1h TTL
-      // is buying nothing.
-      try {
-        const u = finalMsg.usage || {};
-        const wrote = u.cache_creation_input_tokens || 0;
-        const read  = u.cache_read_input_tokens || 0;
-        const fresh = u.input_tokens || 0;
-        const tag = read ? `READ ${read}` : (wrote ? `WRITE ${wrote}` : 'MISS');
-        console.log(`[cache ${CACHE_TTL}] ${tag} · uncached-in ${fresh} · out ${u.output_tokens || 0}`);
-      } catch (e) {}
-
-      if (stopReason === 'tool_use' && toolUseBlocks.length > 0) {
-        const assistantContent = finalMsg.content;
-        const toolResults = [];
-
-        for (const block of toolUseBlocks) {
-          let resultText;
-          try {
-            if (block.name === 'search_books') {
-              const query = (block.input && block.input.query) || '';
-              const results = query.trim()
-                ? booksIndex.searchBooks(query, { limit: 4, book: (block.input && block.input.book) || null })
-                : [];
-              resultText = results.length
-                ? results.map(r => `[${r.title}]\n${r.text}`).join('\n\n---\n\n')
-                : `No passages found for "${query}" in the book library.`;
-              if (results.length && supercompress.isReady()) {
-                resultText = await supercompress.compress(resultText, query);
-              }
-            } else {
-              const raw = await mcpBridge.callTool(block.name, block.input);
-              resultText = (raw && raw.content) ? raw.content.map(c => c.text || '').join('\n') : JSON.stringify(raw);
-            }
-            onToolDone && onToolDone(block.name, block.id, true, resultText);
-          } catch (e) {
-            resultText = `Error: ${e.message}`;
-            onToolDone && onToolDone(block.name, block.id, false, resultText);
-          }
-          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: resultText });
-        }
-
-        await runLoop([
-          ...msgs,
-          { role: 'assistant', content: assistantContent },
-          { role: 'user', content: toolResults }
-        ]);
-      } else {
-        clearTimeout(globalTimer);
-        onDone && onDone(fullText);
-      }
-    };
-
-    try {
-      await runLoop(messages);
-    } catch (e) {
-      clearTimeout(globalTimer);
-      onError && onError(e.message);
-    }
-  }
-}
-
-module.exports = new ClaudeAgent();
-// Internal-only accessor for token-audit.js (an offline token/cost analysis
-// script, not part of the live app) — namespaced under _debug rather than
-// exported directly on the singleton so nothing else in the app can
-// accidentally come to depend on these implementation details.
+// 2026-09-02 (Landing 2): everything from here down — the Anthropic SDK
+// client, the prompt-cache breakpoints and the whole ClaudeAgent streaming
+// class — has been removed. This file is now ONLY the source of the
+// Claude-path persona and tool schemas, which server.js's handleChat and
+// telegram-bot.js still import via _debug so there stays exactly ONE copy of
+// them in the codebase.
+//
+// Why the cache machinery went with it: `cache_control` is an Anthropic-only
+// field. DeepSeek caches automatically by hashing the request prefix, so the
+// markers have no meaning there and would be a foreign key on an OpenAI-shaped
+// request. (Worth knowing for later: automatic prefix caching only pays off
+// when the prefix is STABLE, and buildSystemPrompt's output is concatenated
+// with live P&L and timestamps at the call site — so cache hits are currently
+// rare. Fixing that is a prompt-structure change and deliberately not bundled
+// into the provider swap.)
+//
+// The file keeps its name because renaming it would churn every import for no
+// behavioural gain; treat it as "claude-path prompts", not an agent.
+module.exports = {};
 module.exports._debug = { buildSystemPrompt, ALL_TOOLS };

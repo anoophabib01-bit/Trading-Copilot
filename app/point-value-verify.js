@@ -90,4 +90,16 @@ function verifyPointValue(symbol, expected, info) {
   };
 }
 
-module.exports = { verifyPointValue, tickSizeFrom };
+// X7: the single source of point-value truth (dollars per 1.0 point). Every
+// dollar figure must come from here, not a caller-supplied multiplier. Add a
+// symbol ONLY after verifyPointValue confirms it against TradingView.
+const POINT_VALUES = { MNQ: 2, MES: 5, MGC: 10, NQ: 20, GC: 100, ES: 50 };
+function pointValueFor(symbol) {
+  const s = String(symbol || '').toUpperCase();
+  for (const k of Object.keys(POINT_VALUES)) {
+    if (s.includes(k)) return POINT_VALUES[k];
+  }
+  return null;
+}
+
+module.exports = { verifyPointValue, tickSizeFrom, pointValueFor, POINT_VALUES };

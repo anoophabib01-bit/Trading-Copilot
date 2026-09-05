@@ -38,8 +38,12 @@ function joinTradeToSignal(trade, signals, opts) {
   let bestDelta = Infinity;
   for (const s of list) {
     if (!s || !ARMING_EVENTS.has(s.event)) continue;
-    if (typeof s.ts !== 'number') continue;
-    const delta = tAt - s.ts;
+    // 2026-09-04 FIX: the ledger stores ts as an ISO string, so a bare
+    // typeof check skipped EVERY row (0 of 46 numeric) and playbook was null
+    // on all trades. Parse it, mirroring resolveSignalOutcome's Date.parse.
+    const sTs = typeof s.ts === 'number' ? s.ts : (typeof s.ts === 'string' ? Date.parse(s.ts) : NaN);
+    if (!Number.isFinite(sTs)) continue;
+    const delta = tAt - sTs;
     if (delta < 0 || delta > windowMs) continue; // preceding only, inside the window
     if (dir && s.direction && s.direction !== dir) continue;
     if (delta < bestDelta) { bestDelta = delta; best = s; }

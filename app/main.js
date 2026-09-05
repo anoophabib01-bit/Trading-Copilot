@@ -4,7 +4,6 @@ const path = require('path');
 const fs = require('fs');
 
 const mcpBridge = require('./mcp-bridge');
-const claudeAgent = require('./claude-agent');
 const sessionMgr = require('./session-manager');
 const supercompress = require('./supercompress');
 
@@ -129,7 +128,6 @@ function createWindow() {
   // Initialise API key from config
   const cfg = loadConfig();
   if (cfg.apiKey) {
-    claudeAgent.init(cfg.apiKey);
   }
   if (cfg.supercompressApiKey) {
     supercompress.init(cfg.supercompressApiKey);
@@ -179,7 +177,6 @@ ipcMain.handle('config:set', (_, key, val) => {
   cfg[key] = val;
   saveConfig(cfg);
   if (key === 'apiKey') {
-    claudeAgent.init(val);
   }
   if (key === 'supercompressApiKey') {
     supercompress.init(val);
@@ -191,23 +188,13 @@ ipcMain.handle('config:set', (_, key, val) => {
 ipcMain.handle('chat:send', async (event, messages) => {
   const sender = event.sender;
 
-  await claudeAgent.stream(messages, {
-    onToken: (text) => {
-      if (!sender.isDestroyed()) sender.send('chat:token', text);
-    },
-    onToolStart: (name, id) => {
-      if (!sender.isDestroyed()) sender.send('chat:tool-start', name, id);
-    },
-    onToolDone: (name, id, ok, result) => {
-      if (!sender.isDestroyed()) sender.send('chat:tool-done', name, id, ok, result);
-    },
-    onDone: (fullText) => {
-      if (!sender.isDestroyed()) sender.send('chat:done', fullText);
-    },
-    onError: (msg) => {
-      if (!sender.isDestroyed()) sender.send('chat:error', msg);
-    }
-  });
+  // 2026-09-02 (Landing 2): this Electron shell is LEGACY and not part of any
+  // supported launch path — `electron` is not even in package.json, and
+  // "START CO-PILOT.bat" runs server.js directly. It used to call
+  // claudeAgent.stream(); that method no longer exists, so rather than leave a
+  // latent crash pretending to be a feature, it now says what it is.
+  // The real chat path is server.js's handleChat over WebSocket.
+  sender.send('chat:error', 'The Electron shell is legacy and no longer wired to a model. Launch the app with "START CO-PILOT.bat" instead.');
 
   return true;
 });

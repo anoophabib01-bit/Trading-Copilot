@@ -24,7 +24,9 @@ try {
   // has pulled this dependency in, matching the "must not throw" requirement.
 }
 
-const claudeAgent = require('./claude-agent');
+const claudeAgent = require('./claude-agent');   // persona + tool schemas only (see _handleChat)
+const groqAgent = require('./groq-agent');       // the shared multi-provider transport
+const providerChain = require('./provider-chain');
 const sessionMgr = require('./session-manager');
 
 const TELEGRAM_MSG_LIMIT = 4096;
@@ -424,10 +426,43 @@ ${modeRules}
     const mode = this.deps.getCurrentMode();
     const messages = [this._buildContextMessage(), ...this.chatHistory];
 
+    // 2026-09-02: repointed off claudeAgent.stream() onto the same
+    // groqAgent.stream() + primaryProviderModel() path every other agent in
+    // this app uses, so DeepSeek serves this call site too.
+    //
+    // WHY REPOINT A FEATURE ANOOP DOESN'T USE, INSTEAD OF DELETING IT
+    // This was the ninth AI call site and the last thing in the app still
+    // reaching Anthropic directly through the SDK — every other agent had
+    // already moved to the shared transport. Left alone it would have kept the
+    // whole @anthropic-ai/sdk dependency alive purely to serve a bridge with
+    // no bot token configured, and it would have silently stayed on a provider
+    // the rest of the app had abandoned. Repointing is a handful of lines and
+    // means "everything runs on one API" is literally true rather than nearly.
+    //
+    // STILL DORMANT, AND THEREFORE UNVERIFIED: `telegramBotToken` is blank in
+    // Anoop's config, so start() never builds a bot and this function is
+    // unreachable. That means this path is NOT covered by the Landing 1 smoke
+    // test — nothing exercises it. Treat it as untested until a token exists.
+    //
+    // claude-agent.js is still required above, but only for its persona and
+    // tool schemas via _debug — exactly how handleChat in server.js uses it —
+    // so there remains one copy of the Claude-path prompt in the codebase.
+    // Tool shape is converted Anthropic -> OpenAI here for the same reason it
+    // is in handleChat. No toolExecutor is passed, so groq-agent defaults to
+    // the TV MCP bridge, which is what claudeAgent.stream() did too.
+    const systemPrompt = claudeAgent._debug.buildSystemPrompt(mode);
+    const chatTools = claudeAgent._debug.ALL_TOOLS.map(t => ({
+      type: 'function',
+      function: { name: t.name, description: t.description, parameters: t.input_schema }
+    }));
+    const primary = providerChain.primaryProviderModel(this.cfg || {}, false);
+
     await new Promise((resolve) => {
       let fullText = '';
-      claudeAgent.stream(messages, {
-        mode,
+      groqAgent.stream(messages, systemPrompt, chatTools, {
+        provider: primary.provider,
+        model: primary.model,
+        fallbackChain: providerChain.fallbackChainFor(primary),
         onToken: () => {}, // Telegram isn't a token-streaming UI — send once on completion
         onToolStart: () => {},
         onToolDone: () => {},

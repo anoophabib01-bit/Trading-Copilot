@@ -22,9 +22,9 @@ function effective(stage, mode) {
 
 // ── The four combinations ────────────────────────────────────────────────────
 
-test('normal + eval: size opens to 4, trade count stays at the mode\'s 5', () => {
+test('normal + eval: eval permits 4, trade count stays at the mode\'s 5', () => {
   const r = effective('eval', 'standard');
-  assert.strictEqual(r.sizeCap, 4);
+  assert.strictEqual(r.sizeCap, 4, 'SUPERSEDED AGAIN 2026-09-04/05 — see the decision-history test below');
   assert.strictEqual(r.sizeFloor, 2);
   assert.strictEqual(r.tradesPerDay, 5, 'eval must NOT raise the trade count — count is owned by tradingMode');
   assert.strictEqual(r.contractsPerDay.max, 36);
@@ -40,9 +40,9 @@ test('normal + funded: everything clamps to the safe base', () => {
   assert.strictEqual(r.dailyLossCap, 200);
 });
 
-test('scalper + eval: fast holds AND the bigger size, 10 trades', () => {
+test('scalper + eval: fast holds, eval size 4, 10 trades', () => {
   const r = effective('eval', 'scalper');
-  assert.strictEqual(r.sizeCap, 4);
+  assert.strictEqual(r.sizeCap, 4, 'scalper must not change SIZE — only speed and count');
   assert.strictEqual(r.tradesPerDay, 10);
   assert.strictEqual(r.maxHoldSeconds, 900, 'scalper tightens the hold ceiling to 15 min');
   assert.strictEqual(r.contractsPerDay.max, 36);
@@ -77,7 +77,12 @@ test('the funded clamp is one-way: a LOOSER funded block still cannot loosen', (
   loose.stageRules.funded.sizeCap = 8;
   loose.stageRules.funded.tradesPerDay = 50;
   const r = SR.applyStageRules(loose, 'funded');
-  assert.strictEqual(r.sizeCap, 2, 'min(base 2, funded 8) = 2');
+  // 2026-09-05: this asserted a literal 2, which was only true while the BASE
+  // sizeCap was also 2. The base is now Anoop's adjustable 2..6 dial, so the
+  // guarantee this test actually protects is the INVARIANT, not the number:
+  // a loosened funded block can never produce a cap looser than the base.
+  assert.strictEqual(r.sizeCap, RULES.sizeCap, 'min(base, funded 8) = base — never the 8');
+  assert.ok(r.sizeCap < 8, 'the loosened config value must never win');
   assert.strictEqual(r.tradesPerDay, 5, 'min(base 5, funded 50) = 5');
 });
 
@@ -90,21 +95,38 @@ test('sizeFloor clamps by MAX, not MIN — a higher floor is the tighter one', (
 
 // ── Fail-safe behaviour ──────────────────────────────────────────────────────
 
-test('a missing stageRules block leaves the rules untouched — and untouched IS safe', () => {
+test('a missing stageRules block FAILS CLOSED to the tightest cap', () => {
+  // REWRITTEN 2026-09-05. This used to assert "untouched IS safe", which held
+  // only while the base sizeCap was 2 — the base was effectively the funded
+  // ruleset, so any failure of the stage layer landed on the tightest number in
+  // the file. Once the base became the adjustable 2..6 dial (currently 4) that
+  // assumption inverted, and a missing block handed back 4 on a FUNDED account.
+  // The module now clamps DOWN instead of passing the base through.
   const bare = Object.assign({}, RULES);
   delete bare.stageRules;
   const r = SR.applyStageRules(bare, 'eval');
-  assert.strictEqual(r.sizeCap, RULES.sizeCap, 'falls back to the base, which is the FUNDED ruleset');
-  assert.strictEqual(r.sizeCap, 2);
+  assert.strictEqual(r.sizeCap, 2, 'no stageRules at all → the hard floor, not the base');
+  assert.ok(r.sizeCap <= RULES.sizeCap, 'a failure of this layer may only ever tighten');
 });
 
 test('a malformed stageRules block does not throw and does not loosen', () => {
-  for (const junk of [null, 'nonsense', 42, [], { eval: 'not-an-object' }, { eval: { sizeCap: 'huge' } }]) {
+  // Two different kinds of malformed, and they are NOT the same failure:
+  //   - the block cannot be resolved at all  → fail closed to the hard floor
+  //   - the block exists but carries a junk VALUE → the junk is ignored and the
+  //     base stands (nothing was loosened, which is the property that matters)
+  // In neither case may the cap end up looser than the base.
+  const unusable = [null, 'nonsense', 42, [], { eval: 'not-an-object' }];
+  for (const junk of unusable) {
     const bad = Object.assign({}, RULES, { stageRules: junk });
     let r;
     assert.doesNotThrow(() => { r = SR.applyStageRules(bad, 'eval'); });
-    assert.strictEqual(r.sizeCap, 2, 'garbage config must never raise the cap above the safe base');
+    assert.strictEqual(r.sizeCap, 2, 'an unusable stageRules block must fail closed: ' + JSON.stringify(junk));
   }
+  const junkValue = Object.assign({}, RULES, { stageRules: { eval: { sizeCap: 'huge' } } });
+  let r2;
+  assert.doesNotThrow(() => { r2 = SR.applyStageRules(junkValue, 'eval'); });
+  assert.strictEqual(r2.sizeCap, RULES.sizeCap, 'a junk value is ignored, the base stands');
+  assert.ok(r2.sizeCap <= RULES.sizeCap, 'garbage config must never RAISE the cap');
 });
 
 test('an unknown stage falls through to the base rules rather than guessing', () => {
@@ -162,11 +184,69 @@ test('DECIDED 2026-08-15: funded size is fixed at exactly 2, floor and cap', () 
   assert.strictEqual(r.sizeFloor, 2);
 });
 
-test('DECIDED 2026-08-15: eval caps at 4, NOT the 6 from the handwritten note', () => {
-  // 5-6 contracts in eval is +$506 that becomes +$24 once its single best
-  // trade is removed — one lucky trade, not an edge.
-  assert.strictEqual(effective('eval', 'standard').sizeCap, 4);
-  assert.strictEqual(effective('eval', 'scalper').sizeCap, 4);
+test('SUPERSEDED 2026-08-31: eval caps at 2, not 4 — "its 2 everything"', () => {
+  // HISTORY, kept deliberately. On 2026-08-15 eval was allowed 4 on the
+  // evidence that 3-4 contracts made +$2,007 in eval while 5-6 made only +$506
+  // (and +$24 with its single best trade removed) — so 4 looked like the honest
+  // ceiling and 6 did not.
+  //
+  // OVERRIDDEN by Anoop on 2026-08-31, verbatim: "its 2 everything".
+  //
+  // What changed his mind was not the backtest, it was the 2026-08-31 oversize
+  // incident: the guard read the eval cap as 4, so a LONG 5 was reduced by 1
+  // instead of 3 — six times, on a frozen read, ending SHORT 1. Two definitions
+  // of "his size cap" existed in one file (base 2, stageRules.eval 4), and the
+  // guard enforced the looser one while the Week tab, mind_log, day-rollup and
+  // CLAUDE.md all called anything over 2 oversize.
+  //
+  // The lesson is not "4 was wrong on the numbers" — it is that a stage layer
+  // permitted to LOOSEN the single most dangerous rule gives the app two
+  // answers to the one question that can end the account.
+  // SUPERSEDED AGAIN on 2026-09-04, and this time it is not a reversal of the
+  // lesson above — it is the lesson applied. Anoop, verbatim: "make size
+  // changeable from 2 minimum to 6 as maximum size so that i always use it and
+  // not go beyond 6 size. i can handle 6 but yesterday i took 20 size which was
+  // unacceptable." On 2026-09-03 he traded 20 lots against a cap of 2, so the
+  // cap of 2 was not being enforced by agreement at all. A ceiling he trades
+  // inside beats a lower one he ignores.
+  //
+  // What did NOT change is the thing the 2026-08-31 incident was actually
+  // about: there is still exactly ONE answer to "what is his size cap", it is
+  // still bounded in code (2..6), and no layer may raise it above the base.
+  // Those assertions live below and must never be relaxed.
+  //
+  // FUNDED was pulled back to 2 on 2026-09-05 (Anoop, asked directly: "No,
+  // funded stays at 2"). It had been raised to 4 as a side effect of making the
+  // top-level cap adjustable, against his own funded record of -$1,717 across
+  // every size except 2.
+  assert.strictEqual(effective('eval', 'standard').sizeCap, 4, 'eval permits 4');
+  assert.strictEqual(effective('eval', 'scalper').sizeCap, 4, 'scalper does not change size');
+  assert.strictEqual(effective('funded', 'standard').sizeCap, 2, 'funded stays at 2 — 2026-09-05');
+  assert.strictEqual(effective('funded', 'scalper').sizeCap, 2, 'funded stays at 2 in every mode');
+});
+
+// The bound that replaced the flat "always 2": whatever any layer does, the
+// effective cap must land inside the 2..6 range Anoop set for himself.
+test('DECIDED 2026-09-04: the effective cap is always within 2..6, in every combination', () => {
+  for (const stage of ['eval', 'funded']) {
+    for (const mode of ['standard', 'scalper']) {
+      const cap = effective(stage, mode).sizeCap;
+      assert.ok(cap >= 2 && cap <= 6, stage + '+' + mode + ' cap ' + cap + ' escaped the 2..6 bound');
+    }
+  }
+});
+
+test('NO stage or mode may ever raise the size cap above the base', () => {
+  // The structural version of the rule above: whatever else the layers do,
+  // size may only ever be clamped DOWN. This is the assertion that would have
+  // caught the incident config before it reached a live account.
+  for (const stage of ['eval', 'funded']) {
+    for (const mode of ['standard', 'scalper']) {
+      const r = effective(stage, mode);
+      assert.ok(r.sizeCap <= RULES.sizeCap,
+        `${mode}+${stage}: sizeCap ${r.sizeCap} must never exceed the base ${RULES.sizeCap}`);
+    }
+  }
 });
 
 test('DECIDED 2026-08-15: no 1-contract trades in either stage', () => {

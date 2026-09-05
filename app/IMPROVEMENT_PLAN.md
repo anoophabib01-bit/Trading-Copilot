@@ -1,5 +1,9 @@
 # MNQ Co-Pilot — Improvement Plan (2026-07-16)
 
+> **SUPERSEDED SNAPSHOT (T5.3, 2026-09-04):** built on 4 days / 56 trades. The hour-edge
+> conclusion survives the 151-trade pooled sample, but the exact per-hour numbers here
+> (e.g. +$3,032 at 19:00 IST) do not — the pooled figure is +$433 at 61%. Read as history, not current.
+
 Based on: full code review of MNQ-CoPilot-App, Edgedesk review, and 4 trading days
 (07/09, 07/13, 07/14, 07/15) reconstructed from your 6 Performance CSVs.
 

@@ -24,23 +24,14 @@ const https = require('https');
 const http = require('http');
 const mcpBridge = require('./mcp-bridge');
 const callLogger = require('./call-logger');
-const anthropicNative = require('./anthropic-native');
 
-// 2026-07-25: was 'llama-3.3-70b-versatile', which Groq DEPRECATED on
-// 2026-06-17 (alongside llama-3.1-8b-instant, retiring 08/16/26). Groq's own
-// migration targets are openai/gpt-oss-20b / gpt-oss-120b / qwen/qwen3.6-27b.
-// Defaulting to gpt-oss-20b since the app's existing fallback path already
-// proved it works here.
-const GROQ_MODEL = 'openai/gpt-oss-20b';
-const GROQ_HOST = 'api.groq.com';
-const GROQ_PATH = '/openai/v1/chat/completions';
-
-// Ollama (local, unlimited) exposes an OpenAI-compatible endpoint. Same SSE
-// streaming + tool-call format as Groq, so the existing parser is reused — the
-// only differences are http (not https), no auth, and localhost:11434.
-const OLLAMA_HOST = '127.0.0.1';
-const OLLAMA_PORT = 11434;
-const OLLAMA_PATH = '/v1/chat/completions';
+// 2026-09-02 (Landing 2): the Groq and local-Ollama constants that stood here
+// are gone with their providers. Kept as a note because the reason matters:
+// Groq's free tier capped tokens PER MINUTE at 6,000-8,000, and a full Jessi
+// turn genuinely did not fit — that produced live 413 "Request too large" and
+// 429 "TPM Limit 8000" failures, and it is why the app grew a multi-provider
+// chain in the first place. A single paid provider removes the cause rather
+// than routing around it.
 
 // Google Gemini via its OpenAI-COMPATIBILITY endpoint (ai.google.dev/gemini-api/docs/openai),
 // not the native generateContent API — so the exact same SSE parser and
@@ -69,28 +60,52 @@ const GEMINI_MODEL = 'gemini-3.5-flash';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
 const GEMINI_PATH = '/v1beta/openai/chat/completions';
 
-// OmniRoute — self-hosted, locally-run LLM routing proxy (OpenAI-compatible),
-// added 2026-08-07 per the approved office-hours design doc. Anoop runs it
-// himself at localhost:20128 with his own API key/account pool behind it, so
-// this is plain http to a local port, same shape as the Ollama branch below.
-// DELIBERATE SCOPE NOTE: some models OmniRoute exposes ride pooled/shared
-// "free" CLI-subscription accounts (its Tier-1 stealth layer) rather than
-// real paid API keys — a real account-ban risk, acknowledged and accepted by
-// Anoop for the reasoning/large-context capability it unlocks. This is why
-// OmniRoute is wired as the PRIMARY provider with the existing Gemini/Groq
-// chain kept as an unmodified fail-open fallback (see server.js
-// primaryProviderModel()/fallbackChainFor()) — a ban or outage here falls
-// through to the same chain that worked before OmniRoute existed, not a dead
-// end. Host/port are read from config at call time (initOmniRoute), not
-// hardcoded, since this runs on Anoop's machine only.
-const OMNIROUTE_PATH = '/v1/chat/completions';
-// 2026-08-07 (revised, same day): Anoop's explicit pick — oc/deepseek-v4-flash-free
-// as the starting model, verified working via a direct curl before wiring in.
-// Was 'auto/best-reasoning'. The shift-down-on-failure "plan" this starts is
-// unchanged: server.js's fallbackChainFor() still degrades OmniRoute -> Gemini
-// (x3 candidates) -> Groq exactly as before — only the OmniRoute starting
-// model changed, not the fail-open chain around it.
-const OMNIROUTE_MODEL = 'oc/deepseek-v4-flash-free';
+// 2026-09-02 (Landing 2): OmniRoute is removed. It routed some models through
+// pooled/shared "free" CLI-subscription accounts — an accepted account-ban risk
+// while it was buying reasoning capability the free tier lacked. A first-party
+// paid key makes that trade pointless, and Anoop had already disabled it via
+// its own kill switch before this change.
+
+// DeepSeek — first-party, paid, OpenAI-compatible (2026-09-02, "Landing 1" of
+// the single-provider consolidation Anoop asked for). Direct to the vendor,
+// NOT through OmniRoute's pooled-account layer above — that route shares
+// "free" CLI-subscription accounts and carries a ban risk; this one is his own
+// prepaid key and answers to nobody else's quota.
+//
+// WHY THIS PROVIDER, AND WHY IT REPLACES FOUR OTHERS
+// The app had grown five AI providers (Anthropic primary, Gemini x3 fallback
+// models, Groq, OmniRoute, local Ollama) plus four key fields in Settings with
+// non-obvious precedence. Anoop's words on 2026-09-02: "it is creating a lot of
+// confusion and i want to avoid confusion." DeepSeek covers every capability
+// this app actually uses — tool calling, streaming, 1M context, image input,
+// automatic prefix caching — so the other four stop being necessary rather
+// than merely being switched off.
+//
+// MODEL: Anoop's explicit pick, asked and confirmed. The vision-exp variant is
+// used for EVERYTHING, not just image turns, because DeepSeek's own pricing
+// table lists it as identical to plain v4-flash on tool calling, JSON output,
+// context length AND price — its only documented limitation is FIM completion,
+// which this app never calls. So there is no cost or capability penalty for
+// running one model everywhere, and one model everywhere is the entire point.
+//
+// THE "exp" TAG IS WHY THE LADDER BELOW IT EXISTS (see provider-chain.js).
+// This app has twice been broken mid-session by a model ID being retired with
+// no notice — Groq deprecated the Llama IDs on 2026-06-17, and Google closed
+// the Gemini 2.5 line to new accounts (a live 404, recorded above). An
+// experimental ID is exactly the kind of thing that disappears that way, so
+// plain deepseek-v4-flash sits directly beneath it as the stable sibling.
+//
+// NO cache_control HERE, DELIBERATELY: that field is Anthropic-only and would
+// be a foreign key on an OpenAI-shaped request. DeepSeek caches automatically
+// by hashing the request prefix, no markers needed. Worth knowing: that also
+// means caching only pays off when the PREFIX is stable, and this app's system
+// prompt currently carries live P&L and timestamps inside it — so cache hits
+// will be rare until that is restructured. Deliberately NOT fixed in the same
+// change as the provider swap (it is a prompt-structure edit, which this
+// repo's CLAUDE.md requires be smoke-tested on its own).
+const DEEPSEEK_MODEL = 'deepseek-v4-flash-vision-exp';
+const DEEPSEEK_HOST = 'api.deepseek.com';
+const DEEPSEEK_PATH = '/chat/completions';
 
 // Normalize message content for the target provider.
 // The renderer constructs Anthropic-style image blocks. Those are valid for
@@ -99,7 +114,6 @@ const OMNIROUTE_MODEL = 'oc/deepseek-v4-flash-free';
 // same client code works across the whole fallback chain.
 function normalizeMessages(messages, provider) {
   if (!Array.isArray(messages)) return messages;
-  if (provider === 'anthropic') return messages;
   return messages.map(m => {
     if (!m || typeof m !== 'object') return m;
     if (Array.isArray(m.content)) {
@@ -121,64 +135,60 @@ function normalizeMessages(messages, provider) {
 // Build the HTTP(S) request for whichever provider. Returns the transport
 // module too so the caller uses http for Ollama/OmniRoute (both local), https
 // for Groq/Gemini.
-function buildRequest(provider, apiKey, payload, omniRouteBase) {
+function buildRequest(provider, apiKey, payload) {
   const body = JSON.stringify(payload);
-  if (provider === 'ollama') {
-    return {
-      mod: http,
-      options: {
-        hostname: OLLAMA_HOST, port: OLLAMA_PORT, path: OLLAMA_PATH, method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-      },
-      body
-    };
-  }
-  if (provider === 'omniroute') {
-    const base = omniRouteBase || { host: '127.0.0.1', port: 20128 };
-    return {
-      mod: http,
-      options: {
-        hostname: base.host, port: base.port, path: OMNIROUTE_PATH, method: 'POST',
-        headers: {
-          'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Content-Length': Buffer.byteLength(body),
-          // 2026-08-07: forces OmniRoute's "stacked" compression pipeline
-          // (RTK -> Caveman, ~78-95% token savings per OmniRoute's own docs)
-          // on every request — Anoop asked to use compression "in a token
-          // optimal way (less)". Per-request header is the HIGHEST-precedence
-          // control OmniRoute exposes (beats dashboard panel defaults and
-          // named profiles), so this guarantees it applies regardless of what
-          // the dashboard's Compression Settings page has configured. The
-          // applied mode echoes back in the response's
-          // X-OmniRoute-Compression header if this ever needs verifying live.
-          'x-omniroute-compression': 'stacked'
-        }
-      },
-      body
-    };
-  }
-  if (provider === 'anthropic') {
-    // 2026-08-12 (task #31): switched from Anthropic's OpenAI-COMPAT endpoint
-    // to the NATIVE /v1/messages API. The compat route worked but cannot do
-    // prompt caching, so every call re-paid full price on ~19.6K tokens of
-    // byte-identical system prompt + tool schemas. Native + a 1h cache TTL
-    // bills repeat calls inside the hour at 0.1x input — a 3-5x difference on
-    // a small prepaid balance.
-    // The OpenAI-shaped payload is translated here, and the native SSE events
-    // are translated BACK to OpenAI shape in the parser below, so this module's
-    // tool loop stays a single implementation shared by every provider.
-    const nativeBody = JSON.stringify(anthropicNative.toAnthropicRequest(payload, { cacheTtl: '1h' }));
+  if (provider === 'deepseek') {
+    // Plain OpenAI shape, Bearer auth — no translation layer, no vendor
+    // headers. That is the reason the OpenAI-compatible endpoint was chosen
+    // over DeepSeek's Anthropic-compatible one: this module's SSE parser and
+    // tool loop already speak this dialect, so the whole anthropic-native.js
+    // translation step drops out of the hot path for every call.
+    //
+    // ── thinking DISABLED — found live 2026-09-02, first real Debate run ────
+    // DeepSeek V4 streams a `reasoning_content` delta (a visible chain of
+    // thought) alongside `content`, and those reasoning tokens are spent from
+    // the SAME max_tokens budget. On a heavy prompt the model can burn the
+    // entire ceiling thinking and emit ZERO content — a 200 OK carrying an
+    // empty reply, which this module treats as a dead model and fails over.
+    //
+    // That is exactly what happened to the Power-of-3 agent on Anoop's first
+    // live Debate: vision-exp spent 15,387 chars reasoning and produced
+    // nothing (finish_reason 'length'), the chain dropped to
+    // deepseek-v4-flash which did the same, and Gemini ended up answering as
+    // PO3 while Jessi, Analysis and the Judge all still said DeepSeek. Only
+    // the per-card provider label made it visible at all.
+    //
+    // Measured against the live API before choosing this fix, same prompt,
+    // max_tokens 4096:
+    //   thinking disabled  ->     0 reasoning,  6657 content, finish 'stop'
+    //   reasoning_effort=low  -> 10451 reasoning, 4648 content, finish 'length'
+    //   reasoning_effort=minimal -> 15307 reasoning, 0 content, finish 'length'
+    // Only disabling it actually resolves the truncation; the effort knobs
+    // reduce thinking without stopping it eating the budget.
+    //
+    // Disabling costs nothing real here: this app DISCARDS reasoning_content
+    // entirely — no parser reads it, no UI shows it — so every reasoning token
+    // was billed as output and thrown away, while tripling latency (36s vs
+    // ~10s) in a live session where Anoop is waiting on a verdict.
+    // To re-enable deliberately, delete this field and raise max_tokens to
+    // ~16000 (verified working); do NOT re-enable without doing both.
+    //
+    // This is the SAME BUG CLASS as the 2026-08-05 fix recorded at max_tokens
+    // above — "too low once the tool-call JSON got large enough ... returning
+    // empty content on an otherwise-200-OK response". Same failure, new cause.
+    const dsPayload = { ...payload, thinking: { type: 'disabled' } };
+    // A ceiling, not a charge — output is billed per token actually generated,
+    // so headroom above the observed ~1.7K-token answer is free insurance
+    // against a long Debate reply truncating mid-sentence.
+    if (!dsPayload.max_tokens || dsPayload.max_tokens < 8192) dsPayload.max_tokens = 8192;
+    const dsBody = JSON.stringify(dsPayload);
     return {
       mod: https,
       options: {
-        hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,                 // native API uses x-api-key, NOT Bearer
-          'anthropic-version': '2023-06-01',
-          'Content-Length': Buffer.byteLength(nativeBody)
-        }
+        hostname: DEEPSEEK_HOST, path: DEEPSEEK_PATH, method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Content-Length': Buffer.byteLength(dsBody) }
       },
-      body: nativeBody
+      body: dsBody
     };
   }
   if (provider === 'gemini') {
@@ -191,17 +201,28 @@ function buildRequest(provider, apiKey, payload, omniRouteBase) {
       body
     };
   }
-  return {
-    mod: https,
-    options: {
-      hostname: GROQ_HOST, path: GROQ_PATH, method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Content-Length': Buffer.byteLength(body) }
-    },
-    body
-  };
+  // 2026-09-02 (Landing 2): this used to fall through to Groq for ANY
+  // unrecognised provider. That silent default is the same class of bug as the
+  // registry drift found earlier the same day — a typo'd or retired provider
+  // name would quietly get answered by a vendor nobody chose. With two
+  // providers left there is no sensible default, so an unknown one is a
+  // programming error and says so.
+  throw new Error(`buildRequest: unknown provider "${provider}" — expected 'deepseek' or 'gemini'`);
 }
 
-const PROVIDER_LABEL = { anthropic: 'Anthropic', groq: 'Groq', gemini: 'Gemini', ollama: 'Ollama (local)', omniroute: 'OmniRoute' };
+const PROVIDER_LABEL = { deepseek: 'DeepSeek', gemini: 'Gemini' };
+
+// Hoisted to module scope 2026-09-02 so a test can actually read them.
+// These two lived inside stream() as locals, which meant the only way to check
+// them was to duplicate the list in the test file — and a duplicated list
+// cannot detect drift, it can only restate it. provider-chain.test.js did
+// exactly that and consequently did NOT catch DeepSeek being absent here while
+// present in provider-chain.js. That gap is silent by construction:
+// pushCandidate() skips an unrecognised provider rather than throwing, so the
+// app would have run happily with a configured DeepSeek key that never served
+// one request. Exported via _debug so the test compares the REAL arrays.
+const VALID_PROVIDERS = Object.freeze(['deepseek', 'gemini']);
+const DEFAULT_MODEL_BY_PROVIDER = Object.freeze({ deepseek: DEEPSEEK_MODEL, gemini: GEMINI_MODEL });
 
 // ── Conversation repair (2026-08-18) ────────────────────────────────────────
 // Every provider this file talks to requires user/assistant turns to
@@ -277,115 +298,33 @@ function loopGiveUpReason({ lapCount, maxLaps }) {
 
 class GroqAgent {
   constructor() {
-    this.apiKey = null;        // Groq (also used for Whisper STT / Orpheus TTS below)
-    this.geminiApiKey = null;  // Google Gemini — separate vendor, separate quota
-    this.omniRouteApiKey = null;
-    this.omniRouteBase = { host: '127.0.0.1', port: 20128 }; // local instance, see buildRequest
-    this._omniRouteHealthy = false;   // true only after a successful health probe
-    this._omniRouteLastCheck = 0;     // Date.now() of last probe attempt
-    this._omniRouteCheckInterval = 30000; // re-probe every 30s
+    this.deepSeekApiKey = null; // DeepSeek — the primary brain (2026-09-02)
+    this.geminiApiKey = null;   // Gemini — break-glass only, see provider-chain.js
   }
 
-  init(apiKey) {
-    this.apiKey = (apiKey || '').trim() || null;
+  // DeepSeek (2026-09-02) — the consolidation target. Same shape as every
+  // other init here: trim, empty-string becomes null so isDeepSeekReady() and
+  // primaryProviderModel() both read a whitespace-only paste as "not set"
+  // rather than sending a Bearer header containing spaces.
+  initDeepSeek(apiKey) {
+    this.deepSeekApiKey = (apiKey || '').trim() || null;
   }
 
   initGemini(apiKey) {
     this.geminiApiKey = (apiKey || '').trim() || null;
   }
 
-  // 2026-08-11: Anthropic as a first-class provider here, so all nine of the
-  // app's AI call sites can run on it via primaryProviderModel() instead of
-  // only handleChat.
-  //
-  // Routed through Anthropic's OpenAI-COMPATIBLE endpoint
-  // (https://api.anthropic.com/v1/chat/completions), which lets it reuse this
-  // module's existing request/SSE/tool-loop pipeline unchanged rather than
-  // needing a hand-written parser for Anthropic's native event stream.
-  //
-  // KNOWN TRADE-OFF, accepted deliberately: the compat layer does NOT support
-  // prompt caching (Anthropic's docs are explicit), and Anthropic labels it
-  // "not a long-term or production-ready solution". So this path pays full
-  // input price on every call, and the 1h cache TTL in claude-agent.js does
-  // NOT apply here. That is affordable at this app's shape — the debate agents
-  // carry no tool schemas, so their context is ~7K tokens, roughly $0.02-0.04
-  // per interaction on Haiku — but it is the reason a NATIVE adapter is still
-  // worth building later (task #31): native gets caching back and is the
-  // supported path.
-  initAnthropic(apiKey) {
-    this.anthropicApiKey = (apiKey || '').trim() || null;
-  }
-
-  // baseUrl (optional): e.g. "http://localhost:20128" — parsed for host/port,
-  // falls back to the 127.0.0.1:20128 default (Anoop's local instance) if
-  // omitted or unparseable.
-  initOmniRoute(apiKey, baseUrl) {
-    this.omniRouteApiKey = (apiKey || '').trim() || null;
-    if (baseUrl) {
-      try {
-        const u = new URL(baseUrl);
-        this.omniRouteBase = { host: u.hostname, port: u.port ? parseInt(u.port, 10) : 80 };
-      } catch {}
-    }
-  }
-
-  // Groq-specific readiness — voice (Whisper/Orpheus) is Groq-only, so this
-  // deliberately still means "Groq usable", not "any provider usable".
-  isReady() { return !!this.apiKey; }
-
   isGeminiReady() { return !!this.geminiApiKey; }
 
-  isOmniRouteReady() { return !!this.omniRouteApiKey && this._omniRouteHealthy; }
-
-  // Probes OmniRoute's health endpoint; caches result for 30s so we don't
-  // hammer it on every chat turn.  Called by server.js before routing a
-  // request through primaryProviderModel().
-  async probeOmniRouteHealth() {
-    if (!this.omniRouteApiKey) { this._omniRouteHealthy = false; return false; }
-    const now = Date.now();
-    if (now - this._omniRouteLastCheck < this._omniRouteCheckInterval) return this._omniRouteHealthy;
-    this._omniRouteLastCheck = now;
-    const base = this.omniRouteBase || { host: '127.0.0.1', port: 20128 };
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000); // 5s timeout
-      const res = await fetch(`http://${base.host}:${base.port}/api/monitoring/health`, {
-        signal: controller.signal
-      });
-      clearTimeout(timer);
-      this._omniRouteHealthy = res.ok;
-    } catch {
-      this._omniRouteHealthy = false;
-    }
-    // Log the TRANSITION, not every probe. This runs every 30s and, when
-    // OmniRoute is not running locally, fails every single time — which on
-    // 2026-08-26 accounted for 425 of 567 lines in the server log, 75% of the
-    // output. That is not a cosmetic problem: the live feed is diagnosed by
-    // reading this log, and the MCP timeouts and panel self-heal messages that
-    // actually mattered were buried in the noise. Same discipline the panel
-    // watchdog already states for itself — a check that logs every minute is a
-    // check nobody reads.
-    //
-    // Behaviour is unchanged: the fallback to Gemini already happens through
-    // _omniRouteHealthy regardless of what is printed.
-    if (this._omniRouteHealthy !== this._omniRouteLastLoggedHealth) {
-      console.log(this._omniRouteHealthy
-        ? '[OmniRoute] health probe recovered — available as primary again'
-        : '[OmniRoute] health probe failed — skipping to Gemini fallback (silenced until it changes)');
-      this._omniRouteLastLoggedHealth = this._omniRouteHealthy;
-    }
-    return this._omniRouteHealthy;
-  }
+  isDeepSeekReady() { return !!this.deepSeekApiKey; }
 
   // Which providers can actually serve a chat turn right now. Ollama needs no
   // key (local), so it's always considered available at this layer — a
   // connection failure surfaces as a normal request error instead.
   keyFor(provider) {
-    if (provider === 'anthropic') return this.anthropicApiKey;
+    if (provider === 'deepseek') return this.deepSeekApiKey;
     if (provider === 'gemini') return this.geminiApiKey;
-    if (provider === 'omniroute') return this.omniRouteApiKey;
-    if (provider === 'ollama') return null;
-    return this.apiKey;
+    return null;
   }
 
   // messages: [{role:'user'|'assistant'|'tool', content, ...}, ...] (no system role in here)
@@ -418,11 +357,14 @@ class GroqAgent {
     const _turnStart = Date.now();
     const _turnLabel = `${messages.length} turns, ${(tools || []).length} tools`;
     console.log(`[groq-agent] turn start — ${_turnLabel}`);
-    const VALID_PROVIDERS = ['anthropic', 'groq', 'gemini', 'ollama', 'omniroute'];
-    const startProvider = VALID_PROVIDERS.includes(opts.provider) ? opts.provider : 'groq';
-    const DEFAULT_MODEL = { groq: GROQ_MODEL, gemini: GEMINI_MODEL, ollama: 'llama3.1:8b', omniroute: OMNIROUTE_MODEL };
+    // Module-scope registry (see the note at its definition): a provider
+    // missing from VALID_PROVIDERS is skipped by pushCandidate() rather than
+    // rejected, so it fails SILENTLY. Any future provider must be added there
+    // AND to provider-chain.js's KNOWN_PROVIDERS.
+    const startProvider = VALID_PROVIDERS.includes(opts.provider) ? opts.provider : 'deepseek';
+    const DEFAULT_MODEL = DEFAULT_MODEL_BY_PROVIDER;
 
-    const missingKey = (p) => p !== 'ollama' && !this.keyFor(p);
+    const missingKey = (p) => !this.keyFor(p);
 
     // ── Model chain ────────────────────────────────────────────────────────────
     // 2026-07-25 (second pass, after a live 404): the previous design had ONE
@@ -450,7 +392,7 @@ class GroqAgent {
 
     if (!chain.length) {
       const label = PROVIDER_LABEL[startProvider] || startProvider;
-      const where = startProvider === 'gemini' ? 'aistudio.google.com/apikey' : 'console.groq.com';
+      const where = startProvider === 'gemini' ? 'aistudio.google.com/apikey' : 'platform.deepseek.com';
       onError && onError(`${label} API key not configured. Add a free key from ${where} in Settings.`);
       return;
     }
@@ -540,7 +482,7 @@ class GroqAgent {
       };
       if (tools && tools.length) { payload.tools = tools; payload.tool_choice = 'auto'; }
 
-      const { mod, options, body } = buildRequest(activeProvider, this.keyFor(activeProvider), payload, this.omniRouteBase);
+      const { mod, options, body } = buildRequest(activeProvider, this.keyFor(activeProvider), payload);
 
       // BUG FIX 2026-07-25 (caught by a local 404-simulation test, not shipped
       // broken): both continuation paths below used to call `resolveReq()` and
@@ -766,10 +708,6 @@ class GroqAgent {
           // separately from the primary that failed before it — otherwise the
           // slow provider's cost would be blamed on whoever eventually answered.
           const callStartedAt = Date.now();
-          // Anthropic addresses content blocks by its own index; OpenAI
-          // addresses tool calls by a separate counter. This carries the
-          // mapping across events for one request. Unused by other providers.
-          const anthropicState = {};
           // Tool calls accumulate by index (Groq/OpenAI stream them incrementally,
           // splitting the JSON arguments string across many delta chunks).
           const toolCallsByIndex = {};
@@ -791,11 +729,13 @@ class GroqAgent {
               // Translate each event into zero or more OpenAI-shaped chunks so
               // everything below this line — including the tool loop — is
               // provider-agnostic and has exactly one implementation.
-              const chunks = activeProvider === 'anthropic'
-                ? anthropicNative.translateEvent(parsed, anthropicState)
-                : [parsed];
-              for (const json of chunks) {
-              const choice = json.choices && json.choices[0];
+              // 2026-09-02 (Landing 2): was a ternary translating Anthropic's
+              // native SSE events into OpenAI shape via anthropic-native.js.
+              // Anthropic is gone, and both remaining providers speak OpenAI
+              // natively, so events pass straight through — the translation
+              // layer and its per-request state object are deleted.
+              const choice = parsed.choices && parsed.choices[0];
+              const json = parsed;
               if (!choice) continue;
               if (choice.finish_reason) finishReason = choice.finish_reason;
               if (json.usage) lastUsage = json.usage;
@@ -822,7 +762,6 @@ class GroqAgent {
                   if (tc.function && tc.function.name) toolCallsByIndex[idx].name = tc.function.name;
                   if (tc.function && tc.function.arguments) toolCallsByIndex[idx].args += tc.function.arguments;
                 }
-              }
               }
             }
           });
@@ -962,157 +901,19 @@ class GroqAgent {
       finishError(e.message);
     }
   }
-
-  // ── Voice mode: STT (Whisper) + TTS (Orpheus) ──────────────────────────────
-  // Added 2026-07-23 for the voice-in/voice-out mode next to the Refresh
-  // button. Deliberately using Groq for BOTH ends — same API key already in
-  // Settings, no second vendor to auth/manage. Checked apilayer.com's
-  // marketplace first: nothing there beats Groq's native Whisper + Orpheus
-  // pairing for this. KNOWN GAP: Orpheus only ships English + Arabic (Saudi)
-  // voices as of this writing — no Hindi/Indian-accented voice exists on
-  // Groq. Defaulting to "autumn" (closest neutral female English voice).
-  // If the accent gap actually matters once Anoop hears it, swapping to a
-  // vendor with en-IN voices (Azure, Google Cloud TTS, ElevenLabs) is a
-  // contained change — only synthesizeSpeech() below needs to move, nothing
-  // upstream of it.
-  async transcribeAudio(audioBuffer, mimeType) {
-    if (!this.apiKey) throw new Error('Groq API key not configured.');
-    const ext = (mimeType || '').includes('mp4') ? 'mp4' : (mimeType || '').includes('ogg') ? 'ogg' : 'webm';
-    const form = new FormData();
-    form.append('file', new Blob([audioBuffer], { type: mimeType || 'audio/webm' }), `voice.${ext}`);
-    form.append('model', 'whisper-large-v3');
-    form.append('response_format', 'json');
-
-    // 2026-07-23 FIX: this call had no timeout — a stalled connection to Groq
-    // hung the whole voice turn forever with no error ever surfacing (found
-    // live: caption stuck on "Sending to Jesse…" indefinitely). AbortController
-    // guarantees a terminal state within 20s either way.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 20000);
-    let res;
-    try {
-      res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${this.apiKey}` },
-        body: form,
-        signal: controller.signal
-      });
-    } catch (e) {
-      if (e.name === 'AbortError') throw new Error('Groq transcription timed out after 20s — network stalled.');
-      throw e;
-    } finally {
-      clearTimeout(timer);
-    }
-    if (!res.ok) {
-      let detail = await res.text().catch(() => '');
-      try { detail = JSON.parse(detail).error.message; } catch {}
-      throw new Error(`Groq transcription error (${res.status}): ${detail}`);
-    }
-    const data = await res.json();
-    return (data.text || '').trim();
-  }
-
-  // OmniRoute/Speechmatics STT (2026-08-07) — same shape as transcribeAudio
-  // above (multipart, OpenAI-compatible /v1/audio/transcriptions), just
-  // pointed at the local OmniRoute instance with the speechmatics/enhanced
-  // model. Model id MUST be the full "provider/model" form — OmniRoute
-  // rejects the short "sm/enhanced" alias on this endpoint with a 400
-  // ("Use format: provider/model"), confirmed by hand before wiring this in.
-  // Caller (server.js) is responsible for falling back to transcribeAudio()
-  // above on any failure — this method does not fall back internally.
-  async transcribeAudioOmniRoute(audioBuffer, mimeType) {
-    if (!this.omniRouteApiKey) throw new Error('OmniRoute API key not configured.');
-    const ext = (mimeType || '').includes('mp4') ? 'mp4' : (mimeType || '').includes('ogg') ? 'ogg' : 'webm';
-    const form = new FormData();
-    form.append('file', new Blob([audioBuffer], { type: mimeType || 'audio/webm' }), `voice.${ext}`);
-    form.append('model', 'speechmatics/enhanced');
-    form.append('response_format', 'json');
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 20000);
-    const base = this.omniRouteBase || { host: '127.0.0.1', port: 20128 };
-    let res;
-    try {
-      res = await fetch(`http://${base.host}:${base.port}/v1/audio/transcriptions`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${this.omniRouteApiKey}` },
-        body: form,
-        signal: controller.signal
-      });
-    } catch (e) {
-      if (e.name === 'AbortError') throw new Error('OmniRoute transcription timed out after 20s — network stalled.');
-      throw e;
-    } finally {
-      clearTimeout(timer);
-    }
-    if (!res.ok) {
-      let detail = await res.text().catch(() => '');
-      try { detail = JSON.parse(detail).error.message; } catch {}
-      throw new Error(`OmniRoute transcription error (${res.status}): ${detail}`);
-    }
-    const data = await res.json();
-    return (data.text || '').trim();
-  }
-
-  // Splits text into <=180-char chunks on sentence boundaries (Orpheus caps
-  // input at 200 chars/request) so a full multi-sentence reply can still be
-  // spoken as one continuous-sounding clip sequence on the client.
-  splitForTTS(text) {
-    const sentences = String(text || '').replace(/\s+/g, ' ').trim().match(/[^.!?]+[.!?]*\s*/g) || [String(text || '')];
-    const chunks = [];
-    let cur = '';
-    for (const s of sentences) {
-      if ((cur + s).length > 180) {
-        if (cur.trim()) chunks.push(cur.trim());
-        cur = s.length > 180 ? s.slice(0, 180) : s; // hard-truncate a single runaway sentence rather than error
-      } else {
-        cur += s;
-      }
-    }
-    if (cur.trim()) chunks.push(cur.trim());
-    return chunks.filter(Boolean);
-  }
-
-  async synthesizeSpeech(text, voice = 'autumn') {
-    if (!this.apiKey) throw new Error('Groq API key not configured.');
-    const chunks = this.splitForTTS(text);
-    const clips = [];
-    for (const chunk of chunks) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 20000);
-      let res;
-      try {
-        res = await fetch('https://api.groq.com/openai/v1/audio/speech', {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: 'canopylabs/orpheus-v1-english',
-            voice,
-            input: chunk,
-            response_format: 'wav'
-          }),
-          signal: controller.signal
-        });
-      } catch (e) {
-        if (e.name === 'AbortError') throw new Error('Groq TTS timed out after 20s — network stalled.');
-        throw e;
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!res.ok) {
-        let detail = await res.text().catch(() => '');
-        try { detail = JSON.parse(detail).error.message; } catch {}
-        throw new Error(`Groq TTS error (${res.status}): ${detail}`);
-      }
-      const buf = Buffer.from(await res.arrayBuffer());
-      clips.push(buf.toString('base64'));
-    }
-    return clips; // array of base64 WAV clips, play sequentially client-side
-  }
 }
 
 module.exports = new GroqAgent();
 // Internal-only accessor for unit tests (app/test/fallback-loop.test.js) —
 // namespaced under _debug rather than exported directly, same pattern as
 // claude-agent.js's _debug, so nothing else in the app depends on it.
-module.exports._debug = { shouldLoopChain, loopGiveUpReason, RETRYABLE_STATUSES, sanitizeConversation, isBlankContent };
+module.exports._debug = { shouldLoopChain, loopGiveUpReason, RETRYABLE_STATUSES, sanitizeConversation, isBlankContent,
+  // Exposed so provider-chain.test.js can cross-check the two registries
+  // against each other instead of against a hand-copied list.
+  VALID_PROVIDERS, DEFAULT_MODEL_BY_PROVIDER, PROVIDER_LABEL,
+  // Exposed 2026-09-02 so the DeepSeek thinking/max_tokens guard is testable.
+  // That bug (reasoning tokens eating the whole budget -> empty reply ->
+  // silent failover to Gemini mid-Debate) was only caught because Anoop
+  // happened to read a provider label on one card. It must not come back
+  // unnoticed a second time.
+  buildRequest };

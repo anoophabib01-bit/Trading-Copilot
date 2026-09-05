@@ -72,22 +72,24 @@ Two independent axes select state:
 - **`tradingMode`** (`standard` | `scalper`) — whether the Scalper overlay is
   active. Independent of `mode`.
 
-## Two AI backends
+## One AI backend  *(consolidated 2026-09-02)*
 
-- **`app/claude-agent.js`** — native Anthropic SDK client (prompt caching,
-  1h TTL). Defines the shared persona building blocks (`EVAL_RULES`,
-  `FUNDED_RULES`, `SHARED_RULES`, `buildSystemPrompt()`) and the TradingView
-  tool schemas (`TV_TOOLS`, `BOOK_TOOLS` → `ALL_TOOLS`) that get *reused* by
-  other agents even when they don't execute through this module directly.
-  Used directly today only by the legacy Telegram chat path.
-- **`app/groq-agent.js`** — the actual execution engine for almost every
-  persona described in `AGENTS.md`. `stream()` builds an ordered
-  multi-provider fallback chain (`app/provider-chain.js`:
-  Anthropic-native → OmniRoute → Gemini → Groq → local Ollama, policy varies
-  by call site), unifies every provider's response into one OpenAI-shaped SSE
-  stream (Anthropic's native events get translated by
-  `app/anthropic-native.js` so prompt caching still works without losing a
-  single tool-loop implementation), and runs the tool-execution loop —
+Every persona in `AGENTS.md` runs on **DeepSeek**
+(`deepseek-v4-flash-vision-exp`). Anthropic, Groq, OmniRoute and local Ollama
+were removed; so were `app/anthropic-native.js` and the `@anthropic-ai/sdk`
+dependency.
+
+- **`app/claude-agent.js`** — prompts and tool schemas ONLY. It defines
+  `EVAL_RULES`, `FUNDED_RULES`, `SHARED_RULES`, `buildSystemPrompt()` and
+  `TV_TOOLS`/`BOOK_TOOLS` → `ALL_TOOLS`, which other agents reuse via `_debug`.
+  It no longer talks to any API and holds no client.
+- **`app/groq-agent.js`** — the actual execution engine for every persona. Its
+  name is now historical: it is the single provider-agnostic transport.
+  `stream()` builds the fail-open chain from `app/provider-chain.js`
+  (`deepseek-v4-flash-vision-exp` → `deepseek-v4-flash` → `gemini-3.5-flash`,
+  Gemini being break-glass only), parses one OpenAI-shaped SSE stream — no
+  translation layer is needed any more, since both remaining providers speak it
+  natively — and runs the tool-execution loop,
   dispatching each tool call to either a custom `toolExecutor` (e.g. the
   Scalper's notebook tools) or straight through to `mcpBridge.callTool(name,
   args)`. `BLOCKED_TOOLS` prevents specific tools from reaching specific
@@ -191,7 +193,7 @@ the one that finally brings the process down.
 | Module | Role |
 |---|---|
 | `session-manager.js` | Session/account state persistence (start/log/read/list) |
-| `telegram-bot.js` | Telegram bridge (`notify()` text, `notifyPhoto()` chart+verdict); also runs its own two-way Telegram chat via `claude-agent.js` |
+| `telegram-bot.js` | Telegram bridge (`notify()` text, `notifyPhoto()` chart+verdict); its two-way chat was repointed onto the shared DeepSeek transport 2026-09-02 and is dormant (no bot token) |
 | `tradovate.js` | Tradovate REST integration — largely superseded by the TradingView broker-panel live feed |
 | `books-index.js` | Offline keyword-chunk search over reference trading books, backs `search_books` for every persona |
 | `edge-tts.js` / `local-tts.js` | Cloud TTS + offline Windows SAPI fallback for voice mode |
@@ -209,7 +211,6 @@ the one that finally brings the process down.
 | `stage-rules.js` | Applies eval/funded stage tightening to `rules.json` values |
 | `post-session-orchestrator.js` | Decides which pattern-check sub-agent personas to dispatch post-session (orchestrator-workers pattern) |
 | `provider-chain.js` | Central LLM-provider routing policy used by every `groqAgent.stream()` call |
-| `anthropic-native.js` | Translates OpenAI-shaped payloads ↔ Anthropic's native `/v1/messages` so caching works through the shared tool loop |
 | `crash-logger.js` | Mirrors console output to rotated log files, loaded first |
 | `account-db.js` | Rebuilds a consolidated account DB/CSV/HTML report from per-slot JSON, offline reporting only |
 | `atomic-write.js` | Crash-safe file writes used throughout |

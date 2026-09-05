@@ -38,11 +38,21 @@ function extract(fromMarker, toMarker, exportNames) {
   return mod.exports;
 }
 
-const { largestPosition } = extract(
-  'function pickField(row, names)', 'function enforceOversizeGuard(rows)', ['pickField', 'largestPosition']);
+// 2026-09-02: the row reader MOVED into oversize-guard.js as netPosition(),
+// because the bug that made the guard useless was in the arithmetic (max per
+// row instead of summed) and arithmetic belongs next to its own tests, not
+// text-extracted out of a 11k-line server. server.js now aliases it, and the
+// delegation is asserted below so the two cannot drift apart again.
+const largestPosition = require('../oversize-guard.js').netPosition;
 const { oversizeConfig } = extract(
-  'function oversizeConfig() {', '// The largest single position on the account.',
+  'function oversizeConfig() {', '// The largest NET position on the account',
   ['oversizeConfig', 'announceOversizeGuard']);
+
+test('server.js does not keep its own copy of the row reader', () => {
+  assert.match(SRC, /const largestPosition = oversizeGuard\.netPosition;/,
+    'a second copy of this arithmetic is how the max-vs-sum bug survived unnoticed');
+  assert.ok(!/^function largestPosition\(/m.test(SRC), 'no local redefinition may shadow the module');
+});
 
 // ── reading the real broker row ────────────────────────────────────────────
 test('THE BUG: a real broker row uses capitalised headers and MUST be read', () => {
@@ -51,7 +61,7 @@ test('THE BUG: a real broker row uses capitalised headers and MUST be read', () 
   const pos = largestPosition([{ Symbol: 'MNQZ6', Side: 'SELL', Qty: '5', 'Avg Fill Price': '23450.25' }]);
   assert.ok(pos, 'a real broker row must not read as flat — that is the silent no-op');
   assert.strictEqual(pos.symbol, 'MNQZ6');
-  assert.strictEqual(pos.side, 'SELL');
+  assert.strictEqual(pos.side, 'SHORT', 'sides are normalised so BUY/LONG and SELL/SHORT are one direction');
   assert.strictEqual(pos.size, 5);
 });
 
@@ -71,6 +81,18 @@ test('an unreadable quantity reads as FLAT, never as a position to act on', () =
     assert.strictEqual(largestPosition([{ Symbol: 'X', Side: 'BUY', Qty: bad }]), null,
       'qty ' + JSON.stringify(bad) + ' must not produce a position');
   }
+});
+
+test('rows of the SAME symbol are summed — the 2026-09-02 fault', () => {
+  // Tradovate renders one row per position. Five 1-lot scale-ins is a 5-lot
+  // position, and reading it as 1 is exactly why the guard was silent while
+  // Anoop held 5 against a cap of 2.
+  const pos = largestPosition([
+    { Symbol: 'MNQU6', Side: 'BUY', Qty: '1' }, { Symbol: 'MNQU6', Side: 'BUY', Qty: '1' },
+    { Symbol: 'MNQU6', Side: 'BUY', Qty: '1' }, { Symbol: 'MNQU6', Side: 'BUY', Qty: '1' },
+    { Symbol: 'MNQU6', Side: 'BUY', Qty: '1' }]);
+  assert.strictEqual(pos.size, 5, 'the old max-per-row reader returned 1 here');
+  assert.strictEqual(pos.rowCount, 5);
 });
 
 test('sizes are compared PER SYMBOL, never summed across instruments', () => {
@@ -126,8 +148,35 @@ test('the guard is called from the position watch, on a read already proven good
   const hook = SRC.indexOf('enforceOversizeGuard(rows)');
   assert.ok(hook > 0, 'the guard must actually be called from server.js');
   const before = SRC.slice(Math.max(0, hook - 1200), hook);
-  assert.match(before, /!Array\.isArray\(result\.positions\)\) return/,
+  assert.match(before, /!Array\.isArray\(result\.positions\)\) \{/,
     'the unreadable-panel guard clause must return BEFORE the oversize guard runs');
+  assert.match(before, /noteOversizePositionRead\(null\);\s*return;/,
+    'an unreadable panel must be REPORTED, not silently returned — that silence is '
+    + 'what let the guard be blind for a whole session on 2026-09-02');
+});
+
+test('every readable poll tells the guard what it saw, so "blind" is knowable', () => {
+  // The fault was never that the guard misbehaved when it ran; it was that
+  // "armed and watching" and "armed and blind" looked identical from outside.
+  assert.match(SRC, /const rows = result\.positions;\s*noteOversizePositionRead\(rows\);/,
+    'the successful read must update the watch state too, or it can never recover from blind');
+  assert.ok(SRC.includes('OVERSIZE GUARD BLIND'), 'the blind alarm must actually say so');
+});
+
+test('the runtime switch cannot silently outlive the session that set it', () => {
+  // Session-only ON PURPOSE: it must not write rules.json, so the configured
+  // default always comes back on restart.
+  const i = SRC.indexOf('function handleOversizeGuardToggle');
+  assert.ok(i > 0, 'the toggle handler must exist');
+  const body = SRC.slice(i, i + 1800);
+  assert.ok(!/writeFileSync\([^)]*rules\.json/.test(body), 'the toggle must not persist to rules.json');
+  assert.match(body, /telegramBot\.notify/, 'turning a live protection off must be announced');
+  assert.match(body, /oversize-guard\.jsonl/, 'and recorded');
+});
+
+test('the integrity protocol asserts on the guard itself, not just its inputs', () => {
+  assert.match(SRC, /obs\.oversizeGuard = Object\.assign\(oversizeGuardStatus\(\)/,
+    'the protocol and the on-screen chip must read the SAME state, or they can disagree');
 });
 
 test('the call is wrapped so a throw cannot kill the position watch', () => {
