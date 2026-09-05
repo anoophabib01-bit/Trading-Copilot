@@ -38,6 +38,32 @@ export function registerTradingTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
+  // 2026-09-02: mounting is not rendering. ka-table only renders BODY ROWS for
+  // the visible sub-tab, so the orders table can be fully mounted (every check
+  // in trading_ensure_panel_ready passes) and still read as zero rows. That
+  // shape is indistinguishable from "no orders today" to a caller, and it cost
+  // two days of trades with no entry/exit price — see refreshOrdersTable.
+  // Borrows the Orders tab for one read, then puts the human's tab back.
+  // Clicks tab controls only; never places or modifies an order.
+  server.tool('trading_refresh_orders_table', "Force the broker panel's Orders table to render its rows by briefly selecting the Orders tab, read it, then restore whichever tab was showing. Use when the orders table reads as empty but a position is open — that combination means the table has not rendered, not that there are no orders. Never places or modifies orders.", {
+    settleMs: z.number().optional().describe('How long to wait for the tab to render before reading, in ms. Default 700.'),
+  }, async ({ settleMs }) => {
+    try { return jsonResult(await core.refreshOrdersTable({ settleMs })); }
+    catch (err) { return jsonResult({ success: false, ok: false, error: err.message }, true); }
+  });
+
+  // 2026-09-02: the positions half. The oversize guard confirms a reduction by
+  // re-reading the positions table; a table that is not re-rendering returns
+  // the pre-order size forever, so a reduction that WORKED looks like one that
+  // did nothing and the guard reports STUCK. Gives it a real read to judge.
+  server.tool('trading_refresh_panel_table', "Force one broker-panel table ('orders' or 'positions') to render its current rows by briefly selecting its tab, read it, then restore whichever tab was showing. Use when a table's contents look stale or empty but the account state says otherwise — a hidden tab does not repaint. Never places or modifies orders.", {
+    table: z.enum(['orders', 'positions']).describe("Which table to force-render."),
+    settleMs: z.number().optional().describe('How long to wait for the tab to render before reading, in ms. Default 700.'),
+  }, async ({ table, settleMs }) => {
+    try { return jsonResult(await core.refreshPanelTable({ table, settleMs })); }
+    catch (err) { return jsonResult({ success: false, ok: false, error: err.message }, true); }
+  });
+
   server.tool('trading_get_account', 'Get everything from the connected broker account in one call: account summary, open positions, and orders. Prefer this over three separate calls when the caller needs the full picture.', {}, async () => {
     try { return jsonResult(await core.getAccount()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }

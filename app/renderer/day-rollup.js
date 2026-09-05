@@ -99,6 +99,49 @@
   // The day summary — byte-compatible with the old csvApply computation.
   // rows: [{t, x, size, pnl, g, flags, side, ep, xp, mp, hold}] (the stored
   // day_trades row shape; grades already applied by gradeTrades).
+  // ── What a row's `pnl` actually MEANS (2026-08-26) ──────────────────────
+  // Anoop, after re-importing yesterday's CSV: "it overread again and
+  // calculated wrong."
+  //
+  // Two writers fill this store and they disagree about `pnl`:
+  //
+  //   CSV import   pnl is GROSS. Commission is subtracted once, here, at day
+  //                level (`gross - contracts * comm`).
+  //   live fold    pnl is a BALANCE DELTA between two flats. The broker has
+  //                ALREADY taken its commission out of that balance, so the
+  //                number is NET before it ever reaches this file.
+  //
+  // Nothing marked which, so rollupDay applied the CSV rule to both and
+  // charged commission a second time on every live-written day. 2026-08-25:
+  // eleven live rows summing to a true net of $314.10 were reported as
+  // $200.10 — $114.00 of commission deducted twice across 60 contracts.
+  //
+  // The same ambiguity is why a CSV row could never tolerance-match its own
+  // live row (see trade-identity.js): the two numbers for one trade differ by
+  // exactly the commission, which is orders of magnitude outside a $0.01
+  // tolerance.
+  //
+  // Fixed by making the row say so. `pnlBasis: 'net'` is stamped by the live
+  // writer; anything else is treated as gross. Rows written before this
+  // existed are inferred from the provenance the live writer has always
+  // stamped (evidence 'fold' / source 'live-fold-only'), so historical days
+  // correct themselves without a migration.
+  function pnlBasisOf(row) {
+    if (!row) return 'gross';
+    if (row.pnlBasis === 'net' || row.pnlBasis === 'gross') return row.pnlBasis;
+    if (row.evidence === 'fold' || row.source === 'live-fold-only') return 'net';
+    return 'gross';
+  }
+
+  // A row's gross P&L, whichever basis it was stored in. Adding the
+  // commission back for a net row is the ONLY way a mixed day (some trades
+  // imported, some live) can produce one coherent gross and one coherent net.
+  function grossOf(row, commPerCt) {
+    const pnl = Number(row && row.pnl) || 0;
+    if (pnlBasisOf(row) !== 'net') return pnl;
+    return pnl + (Number(row.size) || 0) * commPerCt;
+  }
+
   function rollupDay(date, rows, opts) {
     const o = opts || {};
     const comm = typeof o.commPerCt === 'number' ? o.commPerCt : 1.0;
@@ -106,7 +149,8 @@
     const tMode = o.tradingMode || 'standard';
     const day = rows.slice().sort((a, b) => a.t - b.t);
 
-    const gross = day.reduce((a, t) => a + t.pnl, 0);
+    // Normalise every row to gross FIRST, then take commission off once.
+    const gross = day.reduce((a, t) => a + grossOf(t, comm), 0);
     const contracts = day.reduce((a, t) => a + t.size, 0);
     const net = Math.round((gross - contracts * comm) * 100) / 100;
     const maxSize = day.reduce((m, t) => Math.max(m, t.size), 0);
@@ -115,7 +159,10 @@
     const disc = Math.round(day.reduce((a, t) => a + (4 - (t.flags || []).length), 0) / (4 * day.length) * 100);
     const dd = new Date(date + 'T00:00:00');
     const dow = dd.getDay();
-    const pnls = day.map(t => t.pnl);
+    // Per-trade extremes are quoted on the SAME basis as the day's gross, or
+    // a live day's "best trade" would be net while an imported day's is
+    // gross — two numbers that look comparable and are not.
+    const pnls = day.map(t => grossOf(t, comm));
     const wins = pnls.filter(p => p > 0);
     const losses = pnls.filter(p => p < 0);
     const avgWin = wins.length ? wins.reduce((a, b) => a + b, 0) / wins.length : 0;
@@ -128,7 +175,7 @@
     const avgGap = gaps.length ? Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length) : 0;
     const firstThreeMax = Math.max.apply(null, day.slice(0, 3).map(t => t.size));
     let runp = 0, prevSize = 0, sizedUpIntoLoss = false;
-    day.forEach(t => { if (t.size > prevSize && runp < 0) sizedUpIntoLoss = true; prevSize = t.size; runp += t.pnl; });
+    day.forEach(t => { if (t.size > prevSize && runp < 0) sizedUpIntoLoss = true; prevSize = t.size; runp += grossOf(t, comm); });
     let wseq = 0, bigAfterWins = false;
     for (const t of day) {
       if (t.size === maxSize) { bigAfterWins = wseq >= 2; break; }
@@ -137,7 +184,7 @@
     const under5 = holds.filter(hh => hh < 300).length;
     const over15 = holds.filter(hh => hh > 900).length;
     let gbRun = 0, gbPeak = 0;
-    day.forEach(t => { gbRun += t.pnl; if (gbRun > gbPeak) gbPeak = gbRun; });
+    day.forEach(t => { gbRun += grossOf(t, comm); if (gbRun > gbPeak) gbPeak = gbRun; });
     const giveback = Math.round((gbPeak - gbRun) * 100) / 100;
     let flips = 0;
     for (let fi = 1; fi < day.length; fi++) {
@@ -166,5 +213,5 @@
     };
   }
 
-  return { gradeTrades, rollupDay, tradingDayKey, entryMinOf, normalizeSide, DEFAULT_WINDOWS };
+  return { gradeTrades, rollupDay, tradingDayKey, entryMinOf, normalizeSide, pnlBasisOf, grossOf, DEFAULT_WINDOWS };
 });

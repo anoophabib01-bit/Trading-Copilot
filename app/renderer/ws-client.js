@@ -54,6 +54,20 @@
   function handleServerMsg(msg) {
     switch (msg.type) {
 
+      // Lifetime view (2026-08-31): merged record across every slot +
+      // archived account. Read-only; applied to an in-memory overlay only.
+      case 'exit-mark-result':
+        try { if (typeof renderExitMarkResult === 'function') renderExitMarkResult(msg); }
+        catch (e) { console.warn('[exit-mark] render failed:', e.message); }
+        break;
+      case 'exit-drift-data':
+        try { if (typeof renderExitDrift === 'function') renderExitDrift(msg); }
+        catch (e) { console.warn('[exit-drift] render failed:', e.message); }
+        break;
+      case 'lifetime-data':
+        try { if (typeof lifetimeApply === 'function') lifetimeApply(msg.error ? { error: msg.error } : msg.data); }
+        catch (e) { console.warn('[lifetime] apply failed:', e.message); }
+        break;
       case 'config':
         cachedConfig = msg.data || {};
         emit('config:data', cachedConfig);
@@ -258,6 +272,16 @@
         emit('trade:confirmRejected', msg);
         break;
 
+      // 2026-08-23: the server has broadcast this since 2026-08-20 and NOTHING
+      // listened, so a trade row the auto-log refused to write reported into
+      // the void — the exact silent-failure mode that logTrade's own honest
+      // return value was added to prevent. Reachable more often since 7.0 made
+      // writeAtomic failures report too (an Obsidian/Defender handle on the .md
+      // is now normal, because the vault root is the repo).
+      case 'session-log-failed':
+        emit('session:logFailed', msg);
+        break;
+
       // ── Post-Session Analyst ─────────────────────────────────────────────
       case 'post-review-status':
         if (msg.reqId === currentPostReviewReqId) emit('postReview:status', msg.phase);
@@ -353,6 +377,26 @@
         emit('mode:update', msg.mode);
         break;
 
+      // ── Oversize guard (2026-09-02) ──────────────────────────────────────
+      // The server had been broadcasting 'oversize-guard' evidence since
+      // 2026-08-28 and NOTHING here listened, so the only surface for the one
+      // guard that can act on the account unasked was a console line in a
+      // window Anoop never has open. That is why a real 5-lot came and went
+      // with no visible trace.
+      case 'oversize-guard':
+        emit('oversize:event', msg);
+        break;
+
+      case 'oversize-guard-status':
+        emit('oversize:status', msg);
+        break;
+
+      // T1.1 per-trade max-loss tripwire (2026-09-04) — loud on purpose, like the
+      // oversize guard. A blind (P&L unreadable) or breach event must shout.
+      case 'per-trade-stop':
+        emit('pertradestop:event', msg);
+        break;
+
       case 'engulf-monitor-status':
         emit('engulf:monitorStatus', msg);
         break;
@@ -406,6 +450,15 @@
       // 4.3: the server's live-feed writer updated the durable day record
       case 'day-record-updated':
         emit('dayRecord:updated', msg);
+        // 2026-09-02: the exit-drift panel used to learn about a new trade
+        // ONLY from its own 60s poll, so it could show a stale anchor for up
+        // to a minute after a close. This is the last-trade signal — the same
+        // broadcast that wrote the row — so ask for a re-read immediately.
+        // Safe to fire on every close: exit-drift.js still withholds the
+        // verdict inside its post-trade cooldown (COOLING), so this makes the
+        // panel current without turning it into a regret feed.
+        try { if (typeof requestExitDrift === 'function') requestExitDrift(); }
+        catch (e) { console.warn('[exit-drift] refresh-on-trade failed:', e.message); }
         break;
 
       // 5.2/H6: scorecard data + the per-trade attribution gate status
@@ -465,6 +518,14 @@
         emit('tv:mistakePattern', msg);
         break;
 
+      // 2026-09-03: THE LOOP — the pattern-memory agent's reasoned answer to a
+      // REPEAT. Distinct from 'mistake-pattern' above, which is the fast
+      // deterministic detector: this one arrives only when something has
+      // happened before, and carries the recurrence record with it.
+      case 'loop-feedback':
+        emit('loop:feedback', msg);
+        break;
+
       // 2026-08-20: the fast open/close/scale/flip tick (5s positions watch,
       // see server.js's TV_POSITION_WATCH_MS). Arrives BEFORE the fuller
       // tv-broker-account broadcast that follows it — this one says "something
@@ -502,6 +563,17 @@
         emit('bias:note', msg);
         break;
 
+      // 2026-09-02: which side the watchers are looking at, per 1H/4H, plus
+      // the proof it is a live read (bar time, age, armed watcher count).
+      case 'htf-status':
+        emit('htf:status', msg);
+        break;
+
+      // Startup bar-record self-repair outcome.
+      case 'bar-record-repair':
+        emit('bars:repair', msg);
+        break;
+
       case 'session-alert':
         emit('session:alert', msg);
         break;
@@ -526,6 +598,16 @@
       case 'account-db-result':
       case 'journey-list':
       case 'journey-result':
+      // Weekly Report (2026-08-29). Every week-* request answers with this ONE
+      // message type carrying the whole tab state, so the client never has to
+      // merge a partial update into a stale view — and so the tab, the Saturday
+      // markdown and the Telegram push can never disagree about a number.
+      case 'week-report-data':
+        resolvePending(msg.reqId, msg);
+        break;
+
+      // Forensics tab (2026-09-05): one request, one whole-tab payload.
+      case 'forensics-data':
         resolvePending(msg.reqId, msg);
         break;
 
@@ -540,8 +622,50 @@
         }
         break;
 
+      // A finished week was auto-frozen and its note written. Pushed, not
+      // polled, so the nudge arrives even if the Week tab has never been opened.
+      case 'week-ready':
+        if (typeof wkOnWeekReady === 'function') wkOnWeekReady(msg);
+        break;
+
+      case 'health-protocol-report':
+        if (typeof renderHealthProtocol === 'function') renderHealthProtocol(msg);
+        break;
+      case 'feed-protocol-report':
+        if (typeof renderFeedProtocol === 'function') renderFeedProtocol(msg);
+        break;
+      case 'self-repair':
+        // A mismatch the app FIXED, with the evidence of what it did. Anoop
+        // asked for exactly this: not a number that quietly becomes right,
+        // but a visible record that the correction happened.
+        if (typeof renderSelfRepair === 'function') renderSelfRepair(msg);
+        break;
+      case 'shadow-ticket':
+        // The shadow trade ticket — direction, stop/target in dollars AND
+        // ticks, and why the setup was confirmed. Rendered into chat because
+        // that is the surface Anoop actually reads during a session.
+        if (typeof renderShadowTicket === 'function') renderShadowTicket(msg);
+        break;
+      case 'autonomy-status':
+        // Renders the EFFECTIVE mode, not the requested one — see
+        // applyControlUI in app.js for why that distinction is load-bearing.
+        if (typeof applyControlUI === 'function') applyControlUI(msg);
+        break;
       case 'trading-mode':
         if (typeof applyTradingModeUI === 'function') applyTradingModeUI(msg.mode || 'standard');
+        if (msg.reqId) resolvePending(msg.reqId, msg);
+        break;
+
+      // ── Chat archive (2026-09-03) ─────────────────────────────────────────
+      // The ack for one appended batch. chat-archive.js (renderer) keeps the
+      // batch in its outbox until this arrives, so a message is never counted
+      // as archived merely because it was handed to a socket.
+      case 'chat-archive-appended':
+        emit('chatArchive:appended', msg);
+        if (msg.reqId) resolvePending(msg.reqId, msg);
+        break;
+      case 'chat-archive-result':
+        emit('chatArchive:result', msg);
         if (msg.reqId) resolvePending(msg.reqId, msg);
         break;
 
@@ -577,6 +701,31 @@
 
   // ── Public window.api ────────────────────────────────────────────────────────
   window.api = {
+
+    // Fire-and-forget message to the server.
+    //
+    // ADDED 2026-08-26 to fix a bug that had been live since the Standard/
+    // Scalper toggle shipped on 2026-08-01: app.js's switchTradingMode() did
+    // `if (ws && ws.readyState === 1) ws.send(...)`, but `ws` is declared with
+    // `let` INSIDE this IIFE and was never exposed on window. So the reference
+    // threw ReferenceError, the send never happened, AND the line after it
+    // (applyTradingModeUI) never ran — which is why the button did not even
+    // move. The toggle was dead in both directions: it could not tell the
+    // server anything, and it could not show that it had failed.
+    //
+    // The scalper RULES were always real (rules.json scalperRules changes
+    // tradesPerDay, maxHoldSeconds and the daily loss tiers); only the button
+    // was broken. `applyTradingModeUI` is still called from the config
+    // handler above, so the button always rendered the server's actual mode —
+    // which is exactly why this looked like a working toggle that "did
+    // nothing" rather than an obviously broken one.
+    //
+    // Returns true if the message actually went out, so a caller can tell the
+    // difference between "sent" and "socket was down" instead of assuming.
+    send: (obj) => {
+      if (!ws || ws.readyState !== 1) return false;
+      try { ws.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
+    },
 
     // Config
     getConfig: () => {
@@ -827,6 +976,18 @@
     journeyAction: (action, args) => sendRequest(Object.assign({ type: 'journey-action', action }, args || {})).then(r => r),
 
     // Daily Journal: per-account notes + chart screenshots (2026-07-25)
+    // ── Weekly Report (2026-08-29) ──────────────────────────────────────────
+    // All four resolve with the same full 'week-report-data' payload, so a
+    // save re-renders from the server's own recomputation rather than from
+    // what the client hoped it wrote.
+    // Forensics (2026-09-05): MAE/MFE per trade, conditional expectancy,
+    // counterfactuals. Computed entirely server-side; see forensics-report.js.
+    forensics:    ()                    => sendRequest({ type: 'forensics-get' }, 20000),
+    weekReport:   (offset)              => sendRequest({ type: 'week-report-get', offset: offset || 0 }, 20000),
+    weekCommit:   (weekKey, commitment) => sendRequest({ type: 'week-commit-set', weekKey, commitment }, 20000),
+    weekDoctrine: (text)                => sendRequest({ type: 'week-doctrine-set', text }, 20000),
+    weekFreeze:   (weekKey)             => sendRequest({ type: 'week-freeze', weekKey }, 20000),
+
     noteSave: (slotId, date, note) => sendRequest({ type: 'note-save', slotId, date, note }).then(r => r.ok),
     shotSave: (slotId, date, base64, ext) => sendRequest({ type: 'shot-save', slotId, date, base64, ext }).then(r => r.file),
     shotList: (slotId, date)        => sendRequest({ type: 'shot-list', slotId, date }).then(r => r.files || []),
@@ -881,6 +1042,12 @@
     onMcpDisconnected: (cb) => on('mcp:disconnected',  cb),
     onMcpStatus:       (cb) => on('mcp:status',        cb),
     onModeUpdate:      (cb) => on('mode:update',       cb),
+    // Oversize guard: state on demand, and the explicit session switch.
+    getOversizeStatus: () => rawSend({ type: 'oversize-guard-status' }),
+    setOversizeGuard:  (enabled) => rawSend({ type: 'oversize-guard-toggle', enabled: !!enabled }),
+    onOversizeStatus:  (cb) => on('oversize:status',   cb),
+    onOversizeEvent:   (cb) => on('oversize:event',    cb),
+  onPerTradeStopEvent: (cb) => on('pertradestop:event', cb),
     onEngulfSignal:    (cb) => on('engulf:signal',     cb),
     onEngulfMonStatus: (cb) => on('engulf:monitorStatus', cb),
     onEngulfCheck:     (cb) => on('engulf:check',      cb),
@@ -893,6 +1060,8 @@
     // 1.3: Chart Watchers panel
     getWatchers:       ()  => sendRequest({ type: 'watchers-get' }).then(r => r.data),
     onWatchersStatus:  (cb) => on('watchers:status', cb),
+    onHtfStatus:       (cb) => on('htf:status', cb),
+    onBarsRepair:      (cb) => on('bars:repair', cb),
     // 2.3: armed-setup slot + Took it / Passed decisions
     onArmedSetup:          (cb) => on('signal:armedSetup', cb),
     onSignalDecisionResult:(cb) => on('signal:decisionResult', cb),
@@ -914,6 +1083,10 @@
     onTvBrokerAccount: (cb) => on('tv:brokerAccount',   cb),
     onLiveFeedSelfTest: (cb) => on('tv:liveFeedSelfTest', cb),
     onMistakePattern:  (cb) => on('tv:mistakePattern',    cb),
+    onLoopFeedback:    (cb) => on('loop:feedback',        cb),
+    // Ask the Loop to speak now — see server.js's 'loop-run' case for why an
+    // explicit ask bypasses the once-per-day gate but not the repeat bar.
+    runLoop: (opts) => sendRequest(Object.assign({ type: 'loop-run' }, opts || {})),
     onPositionEvent:   (cb) => on('tv:positionEvent',     cb),
     onTradeClosedLive: (cb) => on('tv:tradeClosedLive',   cb),
     onPnlCrossCheck:   (cb) => on('tv:pnlCrossCheck',     cb),
@@ -947,6 +1120,7 @@
     },
     onTradeConfirmResult:   (cb) => on('trade:confirmResult',   cb),
     onTradeConfirmRejected: (cb) => on('trade:confirmRejected', cb),
+    onSessionLogFailed:     (cb) => on('session:logFailed',     cb),
 
     // Rules (rules.json on the server is the single source of truth)
     getRules:  () => sendRequest({ type: 'rules-get' }).then(r => r.data),
@@ -980,6 +1154,18 @@
 
     // Diagnostic — which TTS engines work on this machine, and why not.
     ttsDiagnose: () => sendRequest({ type: 'tts-diagnose' }, 90000),
+
+    // ── Chat archive (2026-09-03) — see app/chat-archive.js ────────────────
+    // Append is fire-and-forget at THIS layer on purpose: the caller owns an
+    // outbox and retries on the ack, so a promise that rejects on a closed
+    // socket would just duplicate bookkeeping that already exists there.
+    // Returns whether the batch actually left the socket.
+    chatArchiveAppend: (rows, batchId) => window.api.send({ type: 'chat-archive-append', rows, batchId }),
+    onChatArchiveAppended: (cb) => on('chatArchive:appended', cb),
+    chatArchiveQuery: (opts) => sendRequest(Object.assign({ type: 'chat-archive-query' }, opts || {}))
+      .then(r => (r && r.error) ? Promise.reject(new Error(r.error)) : (r && r.data)),
+    patternMemoryQuery: (opts) => sendRequest(Object.assign({ type: 'pattern-memory-query' }, opts || {}))
+      .then(r => (r && r.error) ? Promise.reject(new Error(r.error)) : (r && r.data)),
 
     removeAllListeners: () => { Object.keys(listeners).forEach(k => { listeners[k] = []; }); }
   };

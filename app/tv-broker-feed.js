@@ -81,6 +81,16 @@ function freshState() {
     tradeCount: 0,
     maxSize: 0,
     lastLossTs: 0,
+    // 2026-08-28: flat transitions with a ZERO balance delta — no fill
+    // happened, so they are not trades. Counted rather than dropped silently
+    // so the app can show that the guard did something, and how often.
+    phantomFlats: 0,
+    lastPhantomAt: null,
+    // 2026-08-28: consecutive polls showing flat. A close is only folded once
+    // flat has been SEEN TWICE or the broker's round-trip count confirms it —
+    // one empty read of the positions table is not a close.
+    flatConfirmCount: 0,
+    flatFirstSeenAt: null,   // when flat was FIRST observed — the real close time
     trades: [], // {size, pnl, at} for today, oldest first
     // 2026-08-20: how many CLOSED ROUND TRIPS (per the broker's own order
     // history, via reconstructClosedTradesFromOrders) had completed as of the
@@ -88,6 +98,16 @@ function freshState() {
     // when this number has actually moved — see its comment for the live
     // incident that made "a new fill exists" an insufficient guard.
     closedRoundTripsScored: 0,
+    // 2026-08-24: the broker's OWN session P&L, copied verbatim from the
+    // account-summary panel on each poll (see readBrokerPnl at the foot of
+    // this file for why this is the authoritative figure and dayPnl above is
+    // now the fallback). Persisted with the rest of the state so a restart
+    // mid-session shows the real number immediately rather than re-deriving
+    // a partial one from whatever balance it happens to see first.
+    brokerTotalPnl: null,
+    brokerOpenPnl: null,
+    brokerNetLiq: null,
+    brokerPnlAt: null,
   };
 }
 
@@ -112,6 +132,81 @@ function parseBalance(raw) {
  *   the backstop branch for what that degrades to.
  * @returns {object} next state (new object — prevState is never mutated)
  */
+// ── Direction and prices on a folded trade (2026-08-25) ─────────────────────
+// Anoop: "also the side has not been mentioned check with it too! was the
+// trade long or short?"
+//
+// Every live-written row had side/ep/xp/mp null, so the Journal showed "—"
+// for direction on a whole day of trading. That was never a data-availability
+// problem — it was two halves of the same trade never being introduced:
+//
+//   the FOLD knows the exact $ P&L (a balance delta at flat) and nothing else;
+//   the WALK (analyzeOrderWalk) knows side, entry price, exit price, size and
+//   both timestamps — read straight off the broker's own order rows — but
+//   deliberately refuses to compute $ (see its header: no per-contract
+//   multiplier it trusts, and a guessed dollar figure LOOKS trustworthy).
+//
+// server.js already computed the walk every poll to get its round-trip COUNT,
+// then threw the records themselves away. Joining them gives a complete row
+// with no new inference anywhere: every field still comes from the source
+// that actually observed it.
+//
+// STRICTLY GATED. The join is only sound when this poll's balance delta and
+// exactly one walk round trip describe the same close:
+//   - the walk must be trustworthy this poll (server.js passes null when it
+//     is desynced or dropped rows — the same gate its count already uses);
+//   - the count must have advanced by EXACTLY 1. If two round trips closed
+//     inside one poll interval, the single balance delta spans both and
+//     there is no one side to attach — stamping either one would assert a
+//     direction for a P&L that is not that trade's.
+// When the gate fails the row is written exactly as before: null side, no
+// prices. Missing stays missing rather than becoming a plausible guess.
+function walkDetailFor(snap, prevScored, closedRoundTrips) {
+  const records = Array.isArray(snap.closedRoundTripRecords) ? snap.closedRoundTripRecords : null;
+  if (!records || closedRoundTrips === null) return null;
+  if (closedRoundTrips - prevScored !== 1) return null;
+  const rt = records[closedRoundTrips - 1];
+  if (!rt || (rt.side !== 'buy' && rt.side !== 'sell')) return null;
+  const d = {
+    // The row vocabulary is LONG/SHORT everywhere in this app (day_trades,
+    // MAE/MFE, the tolerance identity); the broker's word is buy/sell. Same
+    // translation day-rollup.js's normalizeSide does, and for the same
+    // reason — a raw 'BUY' beside a historical 'LONG' silently reads as a
+    // short to MAE/MFE and can never tolerance-match its own CSV row.
+    side: rt.side === 'buy' ? 'LONG' : 'SHORT',
+  };
+  if (Number.isFinite(rt.entryPrice)) d.entryPrice = rt.entryPrice;
+  if (Number.isFinite(rt.exitPrice)) d.exitPrice = rt.exitPrice;
+  if (Number.isFinite(rt.entryAt)) d.entryAt = rt.entryAt;
+  if (Number.isFinite(rt.exitAt)) d.exitAt = rt.exitAt;
+  if (Number.isFinite(rt.entryAt) && Number.isFinite(rt.exitAt) && rt.exitAt >= rt.entryAt) {
+    d.holdSec = Math.round((rt.exitAt - rt.entryAt) / 1000);
+  }
+  // The walk's size is the PEAK position between open and close — the same
+  // number the fold's sizeSeenThisTrade is trying to observe, but recovered
+  // from order rows rather than from catching a poll mid-trade. It is the
+  // only way a poll-aliased scalp (opened and closed inside one 10s
+  // interval) gets a real size instead of the 0 "not observed" sentinel.
+  if (Number.isFinite(rt.size) && rt.size > 0) d.walkSize = rt.size;
+  return d;
+}
+
+// Merge walk detail onto a trade record the fold is about to push. Never
+// overwrites the fold's own P&L or observed size — those are the fold's to
+// know. `walkSize` is applied ONLY where size was genuinely unobserved (0).
+function applyWalkDetail(rec, detail) {
+  if (!detail) return rec;
+  const { walkSize, ...fields } = detail;
+  const out = Object.assign({}, rec, fields);
+  if (!(out.size > 0) && walkSize > 0) {
+    out.size = walkSize;
+    // The row is no longer size-unknown, so the sentinel that told every
+    // size-rule consumer "0 means not observed" must go with it.
+    delete out.inferred;
+  }
+  return out;
+}
+
 function fold(prevState, snap) {
   const nowMs = snap.nowMs;
   const dayKeyMs = istDayStartMs(nowMs);
@@ -121,6 +216,14 @@ function fold(prevState, snap) {
   const balance = typeof snap.balance === 'number' && Number.isFinite(snap.balance) ? snap.balance : null;
   const openSize = Number(snap.openSize) || 0;
   const closedRoundTrips = Number.isFinite(snap.closedRoundTrips) ? snap.closedRoundTrips : null;
+  // 2026-09-02: carried on the state so effectiveTradeCount can tell a walk
+  // figure that is CURRENT from one that is merely the last it ever had. Left
+  // untouched (rather than defaulted to false) when the caller does not supply
+  // it, so an older caller cannot silently mark a healthy walk as stale.
+  // Read the baseline ONCE, here, before any branch advances it — walkDetailFor
+  // needs the count as it stood at the start of this poll to tell "one round
+  // trip closed" from "two did".
+  const scoredBefore = Number.isFinite(carrying.closedRoundTripsScored) ? carrying.closedRoundTripsScored : 0;
   // A state persisted before this field existed (or restored mid-day) has no
   // baseline. Adopt the CURRENT round-trip count rather than 0 — adopting 0
   // would make every round trip already completed today look "new" and fire
@@ -129,6 +232,36 @@ function fold(prevState, snap) {
   if (!Number.isFinite(st.closedRoundTripsScored)) {
     st.closedRoundTripsScored = closedRoundTrips === null ? 0 : closedRoundTrips;
   }
+  // Recorded on EVERY poll, before any early return, so the flag can never
+  // describe an older poll than the number it qualifies.
+  if (snap.walkTrusted !== undefined) st.walkTrusted = !!snap.walkTrusted;
+
+  // 2026-08-24: capture the broker's own session P&L FIRST, before any
+  // branch below can return early. The first-poll branch returns without
+  // scoring, and on a restart that is the poll whose number matters most —
+  // it is the one that replaces a stale -$154.20 with the real +$399.70.
+  // These are recorded, never folded into dayPnl: the balance-delta
+  // arithmetic below stays exactly as it was so per-trade attribution and
+  // every existing test remain untouched. Precedence between the two lives
+  // in effectiveDayPnl(), not here.
+  const brokerTotalPnl = typeof snap.brokerTotalPnl === 'number' && Number.isFinite(snap.brokerTotalPnl) ? snap.brokerTotalPnl : null;
+  const brokerOpenPnl = typeof snap.brokerOpenPnl === 'number' && Number.isFinite(snap.brokerOpenPnl) ? snap.brokerOpenPnl : null;
+  const brokerNetLiq = typeof snap.brokerNetLiq === 'number' && Number.isFinite(snap.brokerNetLiq) ? snap.brokerNetLiq : null;
+  if (brokerTotalPnl !== null) {
+    st.brokerTotalPnl = brokerTotalPnl;
+    st.brokerOpenPnl = brokerOpenPnl;
+    st.brokerPnlAt = nowMs;
+  }
+  // Net Liq is stored independently of the P&L columns: it is readable even
+  // on a poll where the P&L columns are not, and it is the account figure he
+  // reconciles against his statement.
+  if (brokerNetLiq !== null) st.brokerNetLiq = brokerNetLiq;
+  const brokerHeaderBalance = typeof snap.brokerHeaderBalance === 'number' && Number.isFinite(snap.brokerHeaderBalance) ? snap.brokerHeaderBalance : null;
+  if (brokerHeaderBalance !== null) st.brokerHeaderBalance = brokerHeaderBalance;
+  if (typeof snap.brokerSummaryStale === 'boolean') st.brokerSummaryStale = snap.brokerSummaryStale;
+  // An unreadable summary this poll must NOT blank a good reading from the
+  // last one — effectiveDayPnl() ages it out on its own timer instead, so a
+  // single flaky read degrades to "slightly stale" rather than to "no number".
 
   if (!snap.isFlat) st.sizeSeenThisTrade = Math.max(st.sizeSeenThisTrade, openSize);
 
@@ -147,14 +280,85 @@ function fold(prevState, snap) {
     return st;
   }
 
+  // ── ONE EMPTY READ IS NOT A CLOSE (2026-08-28) ───────────────────────────
+  // The positions table reading empty for a single poll is indistinguishable
+  // from a genuine close, and the fold treated both as one. Live consequence
+  // on 2026-08-28: a real LONG 29652.75 -> 29682.75 was open from 19:10:04 to
+  // 19:14:43, and a blip at 19:12:49 folded a SECOND trade mid-flight. The
+  // enrich path then back-filled that phantom row's prices from the order
+  // walk, so it only became recognisable as a duplicate AFTER the merge that
+  // would have caught it had already run. Protocol 2 kept repairing it and the
+  // writer kept re-creating it.
+  //
+  // The zero-delta guard cannot catch this one: the balance HAD moved, so the
+  // delta was non-zero. What was missing is proof that the position actually
+  // closed.
+  //
+  // Two independent proofs are accepted, and either is enough:
+  //   1. PERSISTENCE — flat observed on two consecutive polls. A one-poll
+  //      blink is not a close.
+  //   2. EVIDENCE — the broker's own closed-round-trip count moved. That is
+  //      the order history confirming a round trip completed, and it is
+  //      trusted immediately because it is not an inference.
+  //
+  // Requiring BOTH would lose a real trade whenever the order table lagged;
+  // requiring NEITHER is what produced the phantom. Either-or is the only
+  // combination that is neither blind nor deaf.
+  const roundTripMoved = closedRoundTrips !== null && closedRoundTrips > st.closedRoundTripsScored;
+  if (st.wasFlat === false && snap.isFlat === true && balance !== null
+      && !roundTripMoved && (st.flatConfirmCount || 0) < 1) {
+    // First flat sighting with no corroboration. Hold: do NOT fold, do NOT
+    // move the baseline, and do NOT flip wasFlat — so if the next poll shows
+    // the position still open, this was a blink and nothing happened.
+    st.flatConfirmCount = (st.flatConfirmCount || 0) + 1;
+    // Remember WHEN flat was first seen. The trade closed then, not when the
+    // next poll happened to confirm it — stamping the confirmation time would
+    // push every close ~10s late and misreport hold times and gaps.
+    if (st.flatFirstSeenAt == null) st.flatFirstSeenAt = nowMs;
+    return st;
+  }
+  if (!snap.isFlat) { st.flatConfirmCount = 0; st.flatFirstSeenAt = null; }
+
   if (st.wasFlat === false && snap.isFlat === true && balance !== null) {
     const pnl = balance - st.balanceAtLastFlat;
     const size = st.sizeSeenThisTrade;
-    st.trades.push({ size, pnl, at: nowMs });
+    // The close happened when flat was FIRST seen, not at this confirming poll.
+    const closedAt = st.flatFirstSeenAt != null ? st.flatFirstSeenAt : nowMs;
+    st.flatConfirmCount = 0;
+    st.flatFirstSeenAt = null;
+
+    // ── ZERO-DELTA GUARD (2026-08-28) ─────────────────────────────────────
+    // A closed trade ALWAYS moves the balance, because commission always
+    // applies — the fold's P&L is a balance delta, so it is net by
+    // construction. A delta of exactly zero therefore means no fill happened:
+    // the positions table read empty for a poll and then repopulated, which
+    // registers as a not-flat -> flat transition with no money behind it.
+    //
+    // Found live: Anoop took ONE trade on 2026-08-28 and the fold held two —
+    // {size 1, pnl 1.10} and a phantom {size 1, pnl 0} three minutes later.
+    // That phantom was the whole cause of "2/10 trades" against one real
+    // trade, of the LIVE FEED MISMATCH banner (broker order history 0 round
+    // trips vs tracker 2), and of the day-record SELF-HEAL firing every poll
+    // forever trying to write a trade that must not exist.
+    //
+    // Counted, never silently dropped: `phantomFlats` is the evidence that
+    // this happened, and the UI reports it rather than the number simply
+    // being quietly right. A guard whose work is invisible is indistinguish-
+    // able from a guard that is not running.
+    if (pnl === 0) {
+      st.phantomFlats = (st.phantomFlats || 0) + 1;
+      st.lastPhantomAt = closedAt;
+      st.balanceAtLastFlat = balance;
+      st.sizeSeenThisTrade = 0;
+      st.wasFlat = true;
+      return st;
+    }
+
+    st.trades.push(applyWalkDetail({ size, pnl, at: closedAt }, walkDetailFor(snap, scoredBefore, closedRoundTrips)));
     st.dayPnl += pnl;
     st.tradeCount += 1;
     st.maxSize = Math.max(st.maxSize, size);
-    if (pnl < 0) st.lastLossTs = nowMs;
+    if (pnl < 0) st.lastLossTs = closedAt;
     st.balanceAtLastFlat = balance;
     st.sizeSeenThisTrade = 0;
     // This round trip is now accounted for — advance the baseline so the
@@ -188,7 +392,9 @@ function fold(prevState, snap) {
     // On a flip we DID observe the position that just closed, so its size is
     // known; only the poll-aliased case is genuinely unobserved.
     const size = st.sizeSeenThisTrade;
-    st.trades.push(size > 0 ? { size, pnl, at: nowMs } : { size: 0, pnl, at: nowMs, inferred: true });
+    st.trades.push(applyWalkDetail(
+      size > 0 ? { size, pnl, at: nowMs } : { size: 0, pnl, at: nowMs, inferred: true },
+      walkDetailFor(snap, scoredBefore, closedRoundTrips)));
     st.dayPnl += pnl;
     st.tradeCount += 1;
     if (size > 0) st.maxSize = Math.max(st.maxSize, size);
@@ -271,7 +477,30 @@ function fold(prevState, snap) {
     // which silently lets him trade past the cap), but it is marked so the
     // count can be shown as provisional and enforced as advisory rather than
     // hard-locking a live session on a number we cannot stand behind.
-    st.trades.push({ size: 0, pnl, at: nowMs, inferred: true, evidence: 'degraded' });
+    //
+    // 2026-08-24 — THE PHANTOM-TRADE FIX. This branch's entire justification
+    // was "refusing to score loses the P&L", and that is no longer true: the
+    // broker publishes its own session P&L (readBrokerPnl / effectiveDayPnl),
+    // so when we have that number, nothing is lost by declining to invent a
+    // trade here. What IS lost by scoring one is the trade COUNT, and that
+    // is what stopped a real session — 2026-08-24 recorded 15 trades against
+    // a real 7, of which these 8 phantoms were the whole difference, and
+    // Now.md read "15 / 5" while he was deciding his next entry.
+    //
+    // So: re-anchor (never leave a stale baseline behind), but do not push a
+    // trade, WHEN the broker's own P&L is in hand. When it is not, fall
+    // through to the pre-existing behaviour unchanged — under-counting is
+    // the worse failure while the day total depends on this fold, because it
+    // silently lets him trade past the cap. The condition is exactly
+    // "is the headline number independent of this branch yet".
+    if (brokerTotalPnl !== null) {
+      st.balanceAtLastFlat = balance;
+      if (closedRoundTrips !== null) st.closedRoundTripsScored = closedRoundTrips;
+      st.wasFlat = snap.isFlat;
+      return st;
+    }
+    st.trades.push(applyWalkDetail({ size: 0, pnl, at: nowMs, inferred: true, evidence: 'degraded' },
+      walkDetailFor(snap, scoredBefore, closedRoundTrips)));
     st.dayPnl += pnl;
     st.tradeCount += 1;
     if (pnl < 0) st.lastLossTs = nowMs;
@@ -388,9 +617,376 @@ function parseISTTimestamp(str) {
 // `netBySymbol` lets the caller cross-check the walk against the real
 // positions panel: if the walk thinks a symbol is still open while the broker
 // says flat, the walk is desynced and its count must NOT be trusted.
-function analyzeOrderWalk(orders, dayKeyMs) {
+
+// ── Repairing rows that were written before their direction was known ───────
+// 2026-08-25, Anoop: "the side coloume is still empty and does not tell me
+// which side have i taken the trade long or short. how can you solve it. if i
+// have side information live then i can jude which side have i taken more
+// trade and if it was as per my plan of Higher time frame."
+//
+// The walk-join added earlier the same day fixes this GOING FORWARD — the
+// fold stamps side/prices on each trade as it books it. It does nothing for
+// rows already on disk, and today's eleven were all written by the old code.
+// "Restart and it will be right tomorrow" is not an answer to a question
+// about today, and the same gap reopens after any crash, any poll where the
+// orders table was unreadable, and every row ever written before this week.
+//
+// The order history does not expire when the process does. This is a REPAIR,
+// not a re-import: it fills in blanks on rows that already exist and never
+// adds, removes, reorders, or re-prices anything. P&L is untouched — that is
+// the fold's, measured from the balance, and the walk has no dollars to offer
+// (see analyzeOrderWalk's header).
+//
+// MATCHING. A stored row is joined to a walk round trip when their EXIT times
+// agree within a tolerance and their sizes do not contradict. Exit time is
+// the right key because the fold books a trade at the poll that observed the
+// close, which can lag the broker's own fill stamp by up to a poll interval;
+// entry time on a fold row is often just the same value copied.
+//
+// AMBIGUITY IS REFUSED, NOT GUESSED. If two round trips fall inside the
+// window for one row, or one round trip is the best match for two rows, both
+// are left alone. A wrong direction is worse than a blank one here: he is
+// asking this question specifically to check his fills against his
+// higher-timeframe plan, and a confidently wrong LONG would corrupt exactly
+// the judgement he wants to make.
+const ENRICH_EXIT_TOLERANCE_MS = 120000;
+
+// ── Which folded trades never made it into the day record (2026-08-26) ─────
+// Anoop: "it is not showing how is trades are done for the day."
+//
+// The fold had today's trade (tradeCount 1, pnl -203). day_trades.json had no
+// rows for the day at all. The writer that bridges them runs ONCE, on the poll
+// where tradeCount increases — so any of these loses the trade permanently:
+//
+//   - the server restarts after the fold persisted the trade (the count is
+//     restored, so on the next poll it is no longer INCREASING and the
+//     transition can never fire again);
+//   - that single poll throws anywhere downstream of the fold;
+//   - the order-walk join returns no records for it.
+//
+// A one-shot write with no retry is the wrong shape for a durable record. This
+// is the reconciliation half: given the fold's trades and the rows already on
+// disk, say which are missing, so the caller can write them on ANY later poll.
+//
+// Matching is (entry-time, P&L-in-cents). The day record's `t` is
+// entryAt when the walk supplied one and the close time otherwise, so both
+// are tried — a trade that gained an entry time after the row was first
+// written must not be re-added as a second copy.
+// How long after the real exit the balance fold can take to notice flat.
+// Today's live example: exit 12:52:37, fold stamped 12:59:53 — about 7 min.
+const SELFHEAL_MATCH_WINDOW_MS = 20 * 60 * 1000;
+
+/**
+ * Which folded trades are genuinely absent from the day's stored rows.
+ *
+ * ── THE DUPLICATION BUG THIS FIXES (2026-08-28) ──────────────────────────
+ * This matched on `pnl-in-cents @ timestamp`. The same closed trade reaches
+ * the day record by two routes that AGREE ON NEITHER FIELD:
+ *
+ *   walk-joined row : GROSS P&L, stamped at the real fill exit
+ *   folded trade    : NET P&L,   stamped when the fold noticed flat
+ *
+ * Gross and net differ by exactly the commission, and the two timestamps are
+ * minutes apart, so a trade already written by the walk never matched and was
+ * "healed" in a second time. On 2026-08-28 Anoop took ONE trade and the store
+ * held three rows; 2026-08-26 and 08-27 are mixed the same way.
+ *
+ * The two routes DO agree on size, on being the same flat event a few minutes
+ * apart, and on the arithmetic between their P&Ls: gross - net == size ×
+ * round-turn commission. Matching on those three is what makes a duplicate
+ * recognisable. P&L equality is kept as a fast path so exact re-writes still
+ * match when the routes happen to agree.
+ *
+ * Deliberately conservative in the SAFE direction: a false "already present"
+ * loses a trade from the record, so a candidate must match on size AND be
+ * inside the window AND have a P&L that is either equal or commission-apart.
+ * Anything else is still reported missing and written.
+ *
+ * @param {number} opts.commissionPerContractPerSide from rules.json — never hardcoded
+ */
+function missingFromDayRows(foldTrades, rows, opts) {
+  const o = opts || {};
+  const commSide = Number.isFinite(o.commissionPerContractPerSide) ? o.commissionPerContractPerSide : null;
+  const windowMs = Number.isFinite(o.windowMs) ? o.windowMs : SELFHEAL_MATCH_WINDOW_MS;
+  const list = Array.isArray(foldTrades) ? foldTrades : [];
+  const stored = (Array.isArray(rows) ? rows : []).filter(r => r && Number.isFinite(r.pnl));
+
+  // Fast path: exact P&L at an exact timestamp, mapped to the ROW INDEX so it
+  // can be claimed. A plain Set here was a real bug — two folded trades with
+  // the same size and P&L minutes apart both matched the single stored row,
+  // so the second was silently declared already-present and LOST. One stored
+  // row can only ever account for one folded trade.
+  const exact = new Map();
+  stored.forEach((r, i) => {
+    const cents = Math.round(r.pnl * 100);
+    if (Number.isFinite(r.t) && !exact.has(cents + '@' + r.t)) exact.set(cents + '@' + r.t, i);
+    if (Number.isFinite(r.x) && !exact.has(cents + '@' + r.x)) exact.set(cents + '@' + r.x, i);
+  });
+
+  const claimed = new Set();
+
+  return list.filter(t => {
+    // Same guards writeLiveTradeToDayRecord applies — reporting a trade as
+    // "missing" that it will then refuse to write would loop every poll.
+    if (!t || t.pnlUnknown === true) return false;
+    if (!Number.isFinite(t.pnl) || t.at == null) return false;
+
+    // ── SIZE-0 FOLD ENTRIES ARE FRAGMENTS, NOT TRADES (2026-08-28) ────────
+    // `size` here is sizeSeenThisTrade — the largest position the fold ever
+    // OBSERVED open during the trade. Zero means every poll of that trade
+    // either read flat or read a position whose quantity could not be parsed:
+    // the fold saw a balance move but never saw a position behind it.
+    //
+    // Live on 2026-08-28: the fold held nine entries for about five real
+    // trades, and every spurious one had size 0 —
+    //   19:10:09 size 0 -$0.45 · 19:12:49 size 0 +$39.10 · 19:18:39 size 0
+    //   -$13.00 · 19:30:48 size 0 -$11.45
+    // — while the real trades were 3 lots (+$174.30), 2 lots (-$140.80) and
+    // 1 lot (-$153.90), each already recorded from the ORDER WALK with fill
+    // prices. The fragments were partial balance deltas of trades the walk had
+    // already captured whole.
+    //
+    // They are excluded from being WRITTEN AS ROWS, not deleted: the fold's
+    // dayPnl still sums every delta, so the day's P&L is unaffected. This only
+    // stops a fragment from becoming a row that competes with the real one —
+    // which is what made Protocol 2 clean the file and the self-heal refill it
+    // on a loop.
+    //
+    // Safe direction: a size-0 entry can never be matched to a row by size, so
+    // it could only ever be written as a NEW row — never merged. Suppressing
+    // it therefore cannot lose a trade the walk recorded, and a trade the walk
+    // did NOT record still arrives with a real observed size.
+    // EXPLICITLY zero, not merely absent. `size: 0` means the fold ran and
+    // observed no position; `size` missing means the field was never recorded
+    // at all — an older state shape, or a caller that does not track it. Those
+    // are different facts, and treating the second as the first would suppress
+    // real trades whose size simply is not known. Production fold entries
+    // always carry an explicit size, so the guard still catches every real
+    // fragment.
+    if (t.size != null && Math.abs(Number(t.size)) === 0) return false;
+
+    const cents = Math.round(t.pnl * 100);
+    for (const key of [cents + '@' + t.at,
+                       Number.isFinite(t.entryAt) ? cents + '@' + t.entryAt : null]) {
+      if (!key || !exact.has(key)) continue;
+      const idx = exact.get(key);
+      if (claimed.has(idx)) continue;      // that row is already spoken for
+      claimed.add(idx);
+      return false;
+    }
+
+    // Cross-route match: same size, same flat event, P&L equal or exactly
+    // commission apart.
+    const tSize = Math.abs(Number(t.size) || 0);
+    const foldAt = Number(t.at);
+    for (let i = 0; i < stored.length; i++) {
+      if (claimed.has(i)) continue;
+      const r = stored[i];
+      const rSize = Math.abs(Number(r.size) || 0);
+      if (!tSize || !rSize || tSize !== rSize) continue;
+
+      const rExit = Number.isFinite(r.x) ? r.x : r.t;
+      const rEntry = Number.isFinite(r.t) ? r.t : rExit;
+      if (!Number.isFinite(rExit)) continue;
+      // The fold notices flat AT or AFTER the exit. A small negative
+      // tolerance absorbs clock skew between the two reads.
+      const dt = foldAt - rExit;
+      const inWindow = (dt >= -60000 && dt <= windowMs)
+        || (Number.isFinite(t.entryAt) && Math.abs(Number(t.entryAt) - rEntry) <= windowMs);
+      if (!inWindow) continue;
+
+      const samePnl = Math.abs(Number(r.pnl) - Number(t.pnl)) < 0.01;
+      let commissionApart = false;
+      if (commSide != null) {
+        const expected = tSize * commSide * 2;
+        // Either row may be the gross one, so compare the absolute gap.
+        commissionApart = Math.abs(Math.abs(Number(r.pnl) - Number(t.pnl)) - expected) < 0.02;
+      }
+      if (samePnl || commissionApart) { claimed.add(i); return false; }
+    }
+    return true;
+  });
+}
+
+// ── Merging a closed trade into the day's rows (2026-08-28) ────────────────
+// writeLiveTradeToDayRecord deduped on `t|x|pnl-cents|size`. Putting P&L in a
+// row's IDENTITY is the bug: P&L is a VALUE of a trade, and it is precisely
+// the field the two routes disagree on. The walk route reports GROSS at the
+// real fill times; the fold route reports NET minutes later. Same trade, two
+// fingerprints, two rows.
+//
+// Identity is the flat event: when it opened, when it closed, how big it was.
+// This matches on that, falls back to the same cross-route test
+// missingFromDayRows uses, and MERGES rather than appending — so the surviving
+// row keeps the walk's prices AND a single net P&L.
+//
+// Returns { rows, action } where action is 'inserted' | 'merged'.
+function mergeTradeRow(existingRows, newRow, opts) {
+  const o = opts || {};
+  const commSide = Number.isFinite(o.commissionPerContractPerSide) ? o.commissionPerContractPerSide : null;
+  const windowMs = Number.isFinite(o.windowMs) ? o.windowMs : SELFHEAL_MATCH_WINDOW_MS;
+  const rows = (Array.isArray(existingRows) ? existingRows : []).slice();
+  if (!newRow) return { rows, action: 'skipped' };
+
+  const nSize = Math.abs(Number(newRow.size) || 0);
+  const nExit = Number.isFinite(newRow.x) ? newRow.x : newRow.t;
+  const nEntry = Number.isFinite(newRow.t) ? newRow.t : nExit;
+
+  let hit = -1;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r) continue;
+    const rSize = Math.abs(Number(r.size) || 0);
+    if (!nSize || !rSize || nSize !== rSize) continue;
+    const rExit = Number.isFinite(r.x) ? r.x : r.t;
+    const rEntry = Number.isFinite(r.t) ? r.t : rExit;
+
+    // Same flat event: identical stamps (the common case — a re-read of the
+    // same walk trade), or the two routes' stamps a few minutes apart.
+    const sameStamps = rEntry === nEntry && rExit === nExit;
+    const nearby = Number.isFinite(rExit) && Number.isFinite(nExit)
+      && Math.abs(nExit - rExit) <= windowMs;
+    if (!sameStamps && !nearby) continue;
+
+    if (sameStamps) { hit = i; break; }
+
+    // SAME FILL PRICES = SAME TRADE. The strongest signal available, and
+    // stronger than any P&L test: two rows quoting the same side, the same
+    // entry and the same exit for the same size ARE the same trade, whatever
+    // P&L each happens to be carrying. Added after the guard went in and the
+    // store still held two rows for one trade — SHORT 29611 -> 29609.5 twice,
+    // one stamped $0.00 and one $1.10, because the walk route writes a stale
+    // P&L that is neither equal to nor commission-apart from the real one.
+    // GUARDED: identical prices alone is not enough. Two genuinely separate
+    // trades could share a size, an entry and an exit, and merging those would
+    // LOSE one — the dangerous direction. So this only fires when at least one
+    // of the two rows carries a P&L that CONTRADICTS ITS OWN PRICES, which is
+    // the signature of the stale-P&L duplicate and cannot be true of a real,
+    // self-consistent row. My own earlier test caught the unguarded version
+    // merging two legitimate scale-outs.
+    const samePrices = r.side && newRow.side
+      && String(r.side).toUpperCase() === String(newRow.side).toUpperCase()
+      && Number(r.ep) === Number(newRow.ep)
+      && Number(r.xp) === Number(newRow.xp);
+    if (samePrices && commSide != null) {
+      const pv = Number.isFinite(o.pointValue) ? o.pointValue : 2;
+      const dir = String(r.side).toUpperCase() === 'LONG' ? 1 : -1;
+      const expectedNet = Math.round(((Number(r.xp) - Number(r.ep)) * dir * nSize * pv - nSize * commSide * 2) * 100) / 100;
+      const aStale = Math.abs(Number(r.pnl) - expectedNet) > 0.02;
+      const bStale = Math.abs(Number(newRow.pnl) - expectedNet) > 0.02;
+      // Both self-consistent => two real trades that happen to look alike.
+      if (aStale || bStale) { hit = i; break; }
+    }
+
+    // Cross-route: P&L equal, or exactly size x round-turn commission apart.
+    const gap = Math.abs(Number(r.pnl) - Number(newRow.pnl));
+    const samePnl = gap < 0.01;
+    const commissionApart = commSide != null && Math.abs(gap - nSize * commSide * 2) < 0.02;
+    if (samePnl || commissionApart) { hit = i; break; }
+  }
+
+  if (hit < 0) { rows.push(newRow); return { rows, action: 'inserted' }; }
+
+  // MERGE. Prices and real fill stamps come from whichever row has them; the
+  // surviving P&L is the NET one. When one side is gross and the other net,
+  // the smaller magnitude in the profitable direction is the net figure —
+  // derived explicitly from the commission rather than guessed.
+  const a = rows[hit], b = newRow;
+  const withPrices = (b.ep != null && b.xp != null) ? b : ((a.ep != null && a.xp != null) ? a : null);
+  let pnl = Number.isFinite(b.pnl) ? b.pnl : a.pnl;
+  if (commSide != null && Number.isFinite(a.pnl) && Number.isFinite(b.pnl)) {
+    const gap = Math.abs(a.pnl - b.pnl);
+    if (Math.abs(gap - nSize * commSide * 2) < 0.02) {
+      // One is gross, one is net. Net is the one closer to zero from above:
+      // net = gross - commission, so net < gross always.
+      pnl = Math.min(a.pnl, b.pnl);
+    }
+  }
+  // A row that knows its own fill prices should not carry a P&L that
+  // contradicts them. Recompute gross from the prices and net it — the same
+  // rule the 2026-08-28 migration applied to history, so live rows and
+  // migrated rows are produced by identical arithmetic. Falls back to the
+  // chosen pnl when prices are absent.
+  const mEp = withPrices ? Number(withPrices.ep) : NaN;
+  const mXp = withPrices ? Number(withPrices.xp) : NaN;
+  const mSide = String((withPrices && withPrices.side) || b.side || a.side || '').toUpperCase();
+  if (commSide != null && Number.isFinite(mEp) && Number.isFinite(mXp) && nSize && (mSide === 'LONG' || mSide === 'SHORT')) {
+    const dir = mSide === 'LONG' ? 1 : -1;
+    const gross = (mXp - mEp) * dir * nSize * (Number.isFinite(o.pointValue) ? o.pointValue : 2);
+    pnl = Math.round((gross - nSize * commSide * 2) * 100) / 100;
+  }
+
+  rows[hit] = Object.assign({}, a, b, {
+    pnl,
+    side: (withPrices && withPrices.side) || b.side || a.side || null,
+    ep: withPrices ? withPrices.ep : (b.ep != null ? b.ep : a.ep),
+    xp: withPrices ? withPrices.xp : (b.xp != null ? b.xp : a.xp),
+    t: withPrices ? withPrices.t : a.t,
+    x: withPrices ? withPrices.x : a.x,
+    hold: (withPrices && withPrices.hold != null) ? withPrices.hold : (a.hold != null ? a.hold : b.hold),
+  });
+  return { rows, action: 'merged' };
+}
+
+function enrichRowsFromWalk(rows, walkClosed, opts) {
+  const o = opts || {};
+  const tol = Number.isFinite(o.toleranceMs) ? o.toleranceMs : ENRICH_EXIT_TOLERANCE_MS;
+  if (!Array.isArray(rows) || !Array.isArray(walkClosed) || !rows.length || !walkClosed.length) {
+    return { rows: Array.isArray(rows) ? rows : [], filled: 0, ambiguous: 0 };
+  }
+  const usable = walkClosed.filter(rt => rt && Number.isFinite(rt.exitAt)
+    && (rt.side === 'buy' || rt.side === 'sell'));
+  const claimed = new Set();
+  let filled = 0, ambiguous = 0;
+
+  const out = rows.map(row => {
+    // Only rows that are actually missing direction. A row that already knows
+    // its side (a CSV import, or a post-fix live row) is never second-guessed.
+    if (!row || row.side) return row;
+    const exit = Number.isFinite(row.x) ? row.x : row.t;
+    if (!Number.isFinite(exit)) return row;
+
+    const near = usable
+      .map((rt, i) => ({ rt, i, d: Math.abs(rt.exitAt - exit) }))
+      .filter(c => c.d <= tol)
+      // A size that is known on both sides and disagrees is a different trade.
+      // Size 0 on the stored row means "not observed", so it excludes nothing.
+      .filter(c => !(Number(row.size) > 0 && Number(c.rt.size) > 0 && Number(row.size) !== Number(c.rt.size)))
+      .filter(c => !claimed.has(c.i))
+      .sort((a, b) => a.d - b.d);
+
+    if (!near.length) return row;
+    // Two candidates equally close in time is genuinely ambiguous. Only a
+    // clear winner is accepted; ties are reported and skipped.
+    if (near.length > 1 && near[1].d === near[0].d) { ambiguous++; return row; }
+
+    const rt = near[0].rt;
+    claimed.add(near[0].i);
+    filled++;
+    const side = rt.side === 'buy' ? 'LONG' : 'SHORT';
+    const next = Object.assign({}, row, { side: side });
+    if (Number.isFinite(rt.entryPrice) && row.ep == null) next.ep = rt.entryPrice;
+    if (Number.isFinite(rt.exitPrice) && row.xp == null) next.xp = rt.exitPrice;
+    if (next.ep != null && next.xp != null && row.mp == null) {
+      // A short profits when price falls, so its move is entry - exit. Same
+      // sign convention as csvApply's mp and server.js's dirSign.
+      next.mp = Math.round((side === 'LONG' ? next.xp - next.ep : next.ep - next.xp) * 100) / 100;
+    }
+    if (!(Number(next.size) > 0) && Number(rt.size) > 0) next.size = rt.size;
+    if (!(Number(next.hold) > 0) && Number.isFinite(rt.entryAt) && Number.isFinite(rt.exitAt)
+        && rt.exitAt >= rt.entryAt) {
+      next.hold = Math.round((rt.exitAt - rt.entryAt) / 1000);
+    }
+    return next;
+  });
+
+  return { rows: out, filled, ambiguous };
+}
+
+function analyzeOrderWalk(orders, dayKeyMs, openingBySymbol) {
   const empty = { closed: [], netBySymbol: {}, droppedRows: 0 };
   if (!Array.isArray(orders) || dayKeyMs == null) return empty;
+  const opening = openingBySymbol && typeof openingBySymbol === 'object' ? openingBySymbol : null;
   const parsed = orders
     .filter(isFilledOrderRow)
     .map(o => ({
@@ -411,9 +1007,23 @@ function analyzeOrderWalk(orders, dayKeyMs) {
   const bySymbol = {};
   const closed = [];
   for (const o of filled) {
-    const st = bySymbol[o.symbol] || (bySymbol[o.symbol] = { qty: 0, entry: null, peakQty: 0 });
+    // 2026-09-02: the walk starts each symbol at 0 because the window starts at
+    // midnight IST — which silently ASSERTS the account was flat at midnight.
+    // A position carried across that boundary makes the assertion false and the
+    // walk runs permanently offset, so it never returns to zero and every later
+    // round trip in that symbol is refused. See reconcileOpeningPositions.
+    const st = bySymbol[o.symbol]
+      || (bySymbol[o.symbol] = {
+        qty: (opening && Number.isFinite(opening[o.symbol])) ? opening[o.symbol] : 0,
+        entry: null, peakQty: 0,
+        // 2026-09-03: volume-weighted price accumulators. See the block above
+        // the closed.push below for why a single fill's price is not the
+        // trade's price.
+        entryQty: 0, entryNotional: 0, exitQty: 0, exitNotional: 0
+      });
     const before = st.qty;
-    const after = before + (o.side === 'buy' ? o.qty : -o.qty);
+    const delta = (o.side === 'buy' ? o.qty : -o.qty);
+    const after = before + delta;
     // A close is "returned to flat" OR "crossed through flat" — the latter is
     // a reversal, which closes the old position and opens a new one on the
     // same fill.
@@ -439,16 +1049,63 @@ function analyzeOrderWalk(orders, dayKeyMs) {
     if (before === 0) {
       st.entry = o;
       st.peakQty = Math.abs(after);
+      st.entryQty = o.qty;
+      st.entryNotional = o.price * o.qty;
+      st.exitQty = 0;
+      st.exitNotional = 0;
     } else if (!crossed) {
       st.peakQty = Math.max(st.peakQty, Math.abs(after));
+      // A fill that moves the position further from flat is part of the ENTRY;
+      // one that moves it toward flat is part of the EXIT. Before 2026-09-03
+      // neither was accumulated and a partial exit simply vanished.
+      if (Math.sign(delta) === Math.sign(before)) {
+        st.entryQty += o.qty;
+        st.entryNotional += o.price * o.qty;
+      } else {
+        st.exitQty += o.qty;
+        st.exitNotional += o.price * o.qty;
+      }
     }
     if (crossed && st.entry) {
+      // ── VOLUME-WEIGHTED PRICES (2026-09-03) ──────────────────────────────
+      // This walk only emits on a return to (or through) flat, so a round trip
+      // can be built from many fills. entryPrice used to be the FIRST fill's
+      // price and exitPrice the LAST fill's price — each one fill out of
+      // however many, with the trade's full `size` attached to it.
+      //
+      // Caught live on 2026-09-03 against Anoop's own Tradovate statement.
+      // A 4-lot long entered at 29283 was exited in two 2-lot fills, 29280.75
+      // then 29283.75. The walk reported "4 lots, 29283 -> 29283.75", implying
+      // +$6.00 gross; the real gross was -$6.00. That row then fed
+      // mergeTradeRow, whose "a row must not contradict its own prices" repair
+      // recomputed P&L FROM those prices and overwrote the balance-derived
+      // -$13.60 with -$1.60 on every poll. missingFromDayRows compares P&L, saw
+      // a $12.00 gap where only a $7.60 commission gap is tolerated, and
+      // declared the trade missing again — 683 times in one afternoon, each
+      // one re-writing the wrong number. The day P&L stayed wrong the whole
+      // time and nothing could converge, because the price it was all derived
+      // from was never the trade's price.
+      //
+      // The size fix for exactly these shapes went in on 2026-08-21 (st.peakQty
+      // — see the note above); the PRICE half of the same bug was missed.
+      //
+      // On a reversal only the part of this fill that closes the old leg
+      // belongs to this exit; the residual opens the next leg and is credited
+      // to it below.
+      const closingQty = Math.min(o.qty, Math.abs(before));
+      const exitQty = st.exitQty + closingQty;
+      const exitNotional = st.exitNotional + o.price * closingQty;
+      // Round only to kill float noise. NOT to a tick: a genuine VWAP of an
+      // uneven split legitimately falls between ticks, and snapping it would
+      // put the error straight back.
+      const vwap = (notional, qty, fallback) =>
+        (qty > 0 ? Math.round((notional / qty) * 1e6) / 1e6 : fallback);
       closed.push({
         symbol: o.symbol,
         side: st.entry.side,
         size: st.peakQty,
-        entryPrice: st.entry.price,
-        exitPrice: o.price,
+        entryPrice: vwap(st.entryNotional, st.entryQty, st.entry.price),
+        exitPrice: vwap(exitNotional, exitQty, o.price),
         entryAt: st.entry.at,
         exitAt: o.at,
         // 2026-08-20 (found in review): `at` is the field every consumer of
@@ -470,6 +1127,11 @@ function analyzeOrderWalk(orders, dayKeyMs) {
       // large the new position already is at the moment it was opened.
       st.entry = after === 0 ? null : o;
       st.peakQty = after === 0 ? 0 : Math.abs(after);
+      // The residual is the new leg's opening fill, at this fill's price.
+      st.entryQty = after === 0 ? 0 : Math.abs(after);
+      st.entryNotional = after === 0 ? 0 : o.price * Math.abs(after);
+      st.exitQty = 0;
+      st.exitNotional = 0;
     }
     st.qty = after;
   }
@@ -479,6 +1141,83 @@ function analyzeOrderWalk(orders, dayKeyMs) {
     if (st.qty !== 0) netBySymbol[symbol] = st.qty;
   }
   return { closed, netBySymbol, droppedRows };
+}
+
+/**
+ * ── WHAT POSITION DID THE DAY OPEN WITH? (2026-09-02) ──────────────────────
+ *
+ * analyzeOrderWalk starts every symbol at zero because its window starts at
+ * midnight IST. That is not a neutral default — it ASSERTS the account was flat
+ * at midnight. When a position was carried across that boundary the assertion is
+ * false, the walk runs permanently offset, its net never returns to zero, and
+ * isWalkDesynced then correctly refuses it. Correctly, but expensively: ONE
+ * unmatched contract disables the walk for EVERY symbol, which is how a single
+ * stray lot took down trade counts, exit prices and trade direction for a whole
+ * session.
+ *
+ * Live on 2026-09-02: `WALK NET: MNQU6 -1 | PANEL: (panel shows flat)` — the walk
+ * booked one more sell than buy across 44 order rows and 11 round trips.
+ *
+ * THE INFERENCE. The positions panel is ground truth for what is open RIGHT NOW.
+ * The walk's residual is what it believes is open. The difference between them is
+ * exactly the position the walk never saw opened — i.e. what the day opened with.
+ * So: opening = panelNow - walkResidual, per symbol.
+ *
+ * ── WHY THIS IS NOT JUST PAPERING OVER A DATA GAP ──────────────────────────
+ * A residual has two possible causes and this only legitimately fixes one:
+ *   (a) a position carried across midnight IST — the opening offset is REAL and
+ *       recovering it is simply correct;
+ *   (b) a fill row that has scrolled out of the Orders table — the offset is a
+ *       missing row, and seeding it hides a genuine gap.
+ * They are indistinguishable from the table alone. So this deliberately does NOT
+ * claim verification: it returns the offsets AND `assumed: true`, the caller
+ * re-walks and must confirm the result actually reconciles, and the recovered
+ * count is reported as recovered rather than as walked-and-proven.
+ *
+ * BOUNDED ON PURPOSE. A large residual is far more likely to be a broken read
+ * than an overnight hold, and seeding a large offset would manufacture round
+ * trips wholesale. Above `maxOffset` it refuses and leaves the existing desync
+ * refusal in place — the safe direction, and the one this codebase already takes
+ * everywhere it cannot prove a number.
+ *
+ * PURE. Unit-tested in test/tv-broker-feed.test.js.
+ */
+function reconcileOpeningPositions(netBySymbol, positionRows, opts) {
+  const maxOffset = (opts && Number.isFinite(opts.maxOffset)) ? opts.maxOffset : 5;
+  const panel = {};
+  if (Array.isArray(positionRows)) {
+    for (const p of positionRows) {
+      if (!p || typeof p !== 'object') continue;
+      const sym = String(p.Symbol || '').trim();
+      if (!sym) continue;
+      const q = Number(String(p.Qty == null ? '' : p.Qty).replace(/[^0-9.\-]/g, ''));
+      if (!Number.isFinite(q) || q === 0) continue;
+      // The panel reports size and side separately; the walk speaks signed.
+      const short = /sell|short/i.test(String(p.Side || ''));
+      panel[sym] = short ? -Math.abs(q) : Math.abs(q);
+    }
+  }
+  const walk = netBySymbol || {};
+  const symbols = new Set([...Object.keys(walk), ...Object.keys(panel)]);
+  const offsets = {};
+  let any = false;
+  for (const sym of symbols) {
+    const w = Number.isFinite(walk[sym]) ? walk[sym] : 0;
+    const p = Number.isFinite(panel[sym]) ? panel[sym] : 0;
+    const off = p - w;
+    if (off === 0) continue;
+    if (Math.abs(off) > maxOffset) {
+      return { ok: false, offsets: null, assumed: true,
+        reason: 'residual of ' + off + ' on ' + sym + ' exceeds the ' + maxOffset
+          + '-lot ceiling — far likelier a broken order-table read than an overnight hold, so the walk stays refused.' };
+    }
+    offsets[sym] = off;
+    any = true;
+  }
+  if (!any) return { ok: false, offsets: null, assumed: false, reason: 'walk already agrees with the panel — nothing to reconcile.' };
+  return { ok: true, offsets, assumed: true,
+    reason: 'inferred the position each symbol opened the IST day with: '
+      + Object.entries(offsets).map(e => e[0] + ' ' + (e[1] > 0 ? '+' : '') + e[1]).join(', ') };
 }
 
 // Back-compat wrapper: the backfill only ever wanted the closed round trips.
@@ -600,4 +1339,246 @@ function isStateSchemaStale(saved) {
   return Number(saved.schemaVersion) !== STATE_SCHEMA_VERSION;
 }
 
-module.exports = { fold, freshState, parseBalance, istDayStartMs, reconstructClosedTradesFromOrders, analyzeOrderWalk, isWalkDesynced, parseISTTimestamp, isFilledOrderRow, isStateSchemaStale, STATE_SCHEMA_VERSION, expectedPnlFromFills, pointValueFor, contractRoot };
+module.exports = {
+  SELFHEAL_MATCH_WINDOW_MS,
+  mergeTradeRow, fold, freshState, walkDetailFor, applyWalkDetail, enrichRowsFromWalk, missingFromDayRows, ENRICH_EXIT_TOLERANCE_MS, parseBalance, istDayStartMs, reconstructClosedTradesFromOrders, analyzeOrderWalk, isWalkDesynced, parseISTTimestamp, isFilledOrderRow, isStateSchemaStale, STATE_SCHEMA_VERSION, expectedPnlFromFills, pointValueFor, contractRoot };
+
+// ── The broker's OWN P&L figures (2026-08-24) ───────────────────────────────
+// WHY THIS EXISTS — the bug it fixes, in Anoop's own numbers. On 2026-08-24
+// the broker's Accounts panel read DOLLAR TOTAL P L = +$399.70, flat, open
+// P&L $0.00. sessions/Now.md, driven by fold()'s dayPnl, read -$154.20. A
+// $553.90 gap, on the first day the rest of the live surface actually worked,
+// and he sized his next trade off the wrong one.
+//
+// The gap is not a rounding or a fee problem — it is STRUCTURAL to the
+// balance-delta method, in two independent ways:
+//
+//   1. THE ANCHOR IS THE FIRST POLL, NOT THE SESSION START. fold() sets
+//      balanceAtLastFlat on the first readable poll of the day and can only
+//      ever report the delta from THAT moment. Every round trip that closed
+//      before this server instance started polling (or while the panel was
+//      unreadable) is outside the window by construction. The order-history
+//      backfill recovers the COUNT of those trades but deliberately never
+//      their $ P&L. So "Day P&L" was really "P&L since the app happened to
+//      start", displayed under a label that claims otherwise.
+//   2. THE RE-ANCHOR BRANCH DISCARDS DELTAS. When balance moves while flat
+//      with no corroborating fill, fold() silently re-anchors and drops that
+//      delta on the floor (correctly — see that branch's 2026-08-19 comment
+//      about balance drift fabricating 20 trades). Each drop is permanent and
+//      one-directional, so dayPnl walks away from the truth over a session.
+//
+// Neither is fixable inside the fold, because the information simply is not
+// in the balance series. It IS, however, sitting in the DOM already:
+// tradingview-mcp's getAccountSummary() reads
+// table[data-name="TRADOVATE.summary.accountSummary-table"] into
+// `summary.detail` — with "Total P/L" and "Open P/L" columns — and app code
+// has been throwing that object away since it was written, using only
+// summary.header.balance.
+//
+// CONFIRMED AGAINST TRADOVATE'S OWN DOCS (support.tradovate.com, "Accounts
+// Module - Tradovate Web" and "Positions Module - Tradovate Web", read
+// 2026-08-24):
+//   Dollar Total P&L  "Combined realized and unrealized P&L for the current session."
+//   Dollar Open P&L   "Profit and loss from currently open positions."
+//   Realized P/L      "Realized profit or loss from closed trades during the current session."
+// So Total minus Open is realized-this-session, and Total is the number the
+// prop firm's own drawdown / auto-liq distance is computed from. That makes
+// Total the correct input to the loss tiers, not merely a prettier display:
+// it moves tick-by-tick with an OPEN position, which is precisely the "lag"
+// being reported — fold()'s dayPnl cannot move until the position returns to
+// flat, so a trade running -$300 against him showed as no change at all.
+//
+// SESSION BOUNDARY, stated rather than glossed: these are the BROKER's
+// session (CME, 17:00 CT rollover), not this codebase's IST midnight day key.
+// For Anoop's actual trading window (~17:00-21:00 IST) both boundaries fall
+// far outside it, so they agree in practice — and where they disagree, the
+// broker's is the one the daily-loss-limit is actually enforced on, which is
+// the boundary a guardrail should be measuring against anyway.
+//
+// Returns nulls rather than throwing or guessing: an unreadable summary must
+// degrade to the fold, never to a fabricated number.
+function readBrokerPnl(summary) {
+  const detail = summary && summary.detail;
+  if (!detail || typeof detail !== 'object') {
+    return { totalPnl: null, openPnl: null, realizedPnl: null, readable: false };
+  }
+  // Match each column by NORMALIZED name rather than an exact literal: the
+  // panel has shipped both "Total P/L" and "Total P&L" wording across the
+  // Tradovate web app and TradingView's broker integration, and a header
+  // rename must degrade to the fold, not silently read as zero.
+  const pick = (...wants) => {
+    for (const [k, v] of Object.entries(detail)) {
+      const norm = String(k).toLowerCase().replace(/[^a-z]/g, '');
+      if (wants.includes(norm)) {
+        const n = parseBalance(typeof v === 'string' ? v : String(v == null ? '' : v));
+        if (n !== null) return n;
+      }
+    }
+    return null;
+  };
+  const totalPnl = pick('totalpl', 'dollartotalpl', 'totalpandl');
+  const openPnl = pick('openpl', 'dollaropenpl', 'openpandl');
+  // 2026-08-24 (Anoop, same session): the BALANCE was wrong too, and for the
+  // same reason — it came from the account-header strip, not from this table.
+  // Read live while flat, the header strip said 51,219.30 for both Balance
+  // and Equity while this table's Net Liq said 51,211.50, and the broker's
+  // own EQUITY column said 51,211.50. The header strip is the one that
+  // drifts (see fold()'s 2026-08-19 comment: it moved four times in 12
+  // seconds with no position open, while Equity stayed constant). Net Liq is
+  // what the account panel shows him and what the prop firm's drawdown and
+  // auto-liq distances are computed against, so it is what we display.
+  const netLiq = pick('netliq', 'netliquidation', 'netliqvalue');
+  // 2026-08-24, CORRECTION to the note above — found the same evening against
+  // the broker's own Performance export. The header strip is NOT the
+  // unreliable one; the SUMMARY TABLE is the one that freezes. Two readings 70
+  // minutes apart returned Total P/L 399.70 and Net Liq 51,211.50 to the cent
+  // while the header balance moved 51,219.30 -> 51,270.90 and real trading
+  // happened in between. The header figure reconciles EXACTLY with Tradovate's
+  // own 6-day export across 239 contracts at 0.95/side; the summary table was
+  // $59.40 behind. So the header is live and the table lags.
+  //
+  // We cannot tell staleness from the table alone — a frozen value re-reads
+  // as a perfectly fresh-looking number every poll, which is why the age guard
+  // in effectiveDayPnl() is not sufficient on its own. But the two figures
+  // describe the same account, so when they disagree by more than rounding,
+  // the lagging one is provably stale. That disagreement is the detector.
+  const headerBalance = summary && summary.header ? parseBalance(summary.header.balance) : null;
+  const stale = headerBalance !== null && netLiq !== null && Math.abs(headerBalance - netLiq) > 1;
+  return {
+    totalPnl,
+    openPnl,
+    netLiq,
+    headerBalance,
+    stale,
+    // Realized is DERIVED, never picked from a third column, so it can never
+    // disagree with the two numbers shown beside it.
+    realizedPnl: (totalPnl !== null && openPnl !== null) ? totalPnl - openPnl : null,
+    readable: totalPnl !== null,
+  };
+}
+
+// How stale a broker P&L reading may be before we stop trusting it. The poll
+// runs every 10s (server.js's TV_BROKER_POLL_MS); three missed polls means the
+// panel has gone quiet and the number is no longer "live" in any sense a
+// person would accept while deciding size.
+const BROKER_PNL_MAX_AGE_MS = 35000;
+
+/**
+ * The day P&L the app should DISPLAY and ENFORCE ON, and where it came from.
+ *
+ * Precedence is deliberate and one-way: the broker's own figure wins whenever
+ * it is fresh and readable, because it is the account's actual state rather
+ * than a reconstruction of it. The fold is the FALLBACK, not a peer — a
+ * silent alternation between two sources that disagree by hundreds of dollars
+ * is the failure being fixed here, so `source` travels with the number
+ * everywhere and callers are expected to show it.
+ *
+ * `drift` is the fold's disagreement with the broker's realized figure when
+ * both exist. Diagnostic, never enforcement: a large drift means the fold has
+ * a gap (a pre-poll trade, a discarded re-anchor) — which no longer affects
+ * the headline number, but is worth seeing rather than burying.
+ */
+function effectiveDayPnl(state, nowMs) {
+  const st = state || {};
+  const at = typeof st.brokerPnlAt === 'number' ? st.brokerPnlAt : null;
+  const fresh = at !== null && typeof nowMs === 'number' ? (nowMs - at) <= BROKER_PNL_MAX_AGE_MS : false;
+  const total = typeof st.brokerTotalPnl === 'number' ? st.brokerTotalPnl : null;
+  const open = typeof st.brokerOpenPnl === 'number' ? st.brokerOpenPnl : null;
+  const foldValue = typeof st.dayPnl === 'number' ? st.dayPnl : null;
+  const realized = (total !== null && open !== null) ? total - open : null;
+  if (total !== null && fresh) {
+    return {
+      value: total,
+      source: 'broker',
+      realized,
+      open,
+      foldValue,
+      drift: (realized !== null && foldValue !== null) ? foldValue - realized : null,
+      // Not "did we read it recently" (we always do) but "has the table
+      // fallen behind the account it describes" — see readBrokerPnl.
+      stale: st.brokerSummaryStale === true,
+      // How far behind, in dollars, when we can tell. This is the amount the
+      // displayed day P&L is understating by.
+      staleBy: (st.brokerSummaryStale === true && typeof st.brokerHeaderBalance === 'number' && typeof st.brokerNetLiq === 'number')
+        ? st.brokerHeaderBalance - st.brokerNetLiq : null,
+    };
+  }
+  return {
+    value: foldValue,
+    source: 'fold',
+    realized: foldValue,
+    open: null,
+    foldValue,
+    drift: null,
+    // Distinguishes "the broker figure went stale" from "we never had one":
+    // the first is a feed problem worth surfacing, the second is just startup.
+    stale: total !== null && !fresh,
+  };
+}
+
+/**
+ * The trade count the app should DISPLAY and ENFORCE ON.
+ *
+ * WHY THIS IS NOT state.tradeCount — 2026-08-24, same incident as
+ * readBrokerPnl above. The persisted state read tradeCount 15 while
+ * closedRoundTripsScored (the broker's own order-history round-trip walk)
+ * read 7, and Now.md showed "15 / 5" — over the daily cap, on 7 real trades.
+ * Of the 15 recorded, exactly 8 carried evidence:'degraded', meaning they
+ * were scored by the fill-EDGE branch alone. That branch cannot tell an entry
+ * fill from an exit fill; it is the same rule that produced the "9/3 — DONE"
+ * lockout on 2026-08-20, still reachable whenever the order walk is dark or
+ * desynced (which it evidently was for much of 2026-08-24).
+ *
+ * So: count the CORROBORATED trades — every one scored by an observed flat
+ * transition or by the round-trip walk advancing — and take the higher of
+ * that and the walk's own count. The max() is what keeps this from failing in
+ * the permissive direction: if the walk went dark while a genuine trade
+ * closed, the corroborated tally still carries it; if the fold missed a close
+ * the walk saw, the walk's number wins.
+ */
+function effectiveTradeCount(state) {
+  const st = state || {};
+  const trades = Array.isArray(st.trades) ? st.trades : [];
+  const corroborated = trades.filter(t => !(t && t.evidence === 'degraded')).length;
+  const walk = Number.isFinite(st.closedRoundTripsScored) ? st.closedRoundTripsScored : 0;
+  const degraded = trades.length - corroborated;
+  // ── IS THE WALK HALF OF THIS max() STILL CURRENT? (2026-09-02) ───────────
+  // closedRoundTripsScored is NOT cleared when the walk goes dark — by design,
+  // because clearing it would make every round trip already completed today
+  // look new. The cost is that the last figure the walk ever produced keeps
+  // winning the max() indefinitely once the walk desyncs.
+  //
+  // Live today: walk 11, corroborated 5, and the UI hard-locked at "10 trades
+  // — cap 10. Done." while the SAME walk was being refused for round-trip
+  // counting, for trade direction, and for exit prices on every poll. The
+  // number the cap enforced on was the one piece of that walk nothing had
+  // marked as untrusted.
+  //
+  // The value is deliberately UNCHANGED — this does not quietly lower his
+  // count, which would fail in the permissive direction on a live-money
+  // account. It reports that the walk figure is stale so the caller can
+  // present the count as provisional instead of final. Same doctrine as
+  // week-rollup's disagreeDays: surface the disagreement, never silently pick.
+  const walkStale = st.walkTrusted === false && walk > corroborated;
+  return {
+    value: Math.max(corroborated, walk),
+    rawFoldCount: typeof st.tradeCount === 'number' ? st.tradeCount : trades.length,
+    degraded,
+    corroborated,
+    walkCount: walk,
+    walkStale,
+    // 'verified' only when nothing rests on the fill edge. Callers keep
+    // treating a degraded count as advisory rather than a hard lock — this
+    // removes the phantom trades from the number, it does not claim the
+    // remainder is beyond doubt.
+    // A stale walk figure is degraded evidence for the same reason: the number
+    // it is carrying was true of a walk the app no longer trusts.
+    evidence: (degraded > 0 || walkStale) ? 'degraded' : 'verified',
+  };
+}
+
+module.exports.readBrokerPnl = readBrokerPnl;
+module.exports.effectiveDayPnl = effectiveDayPnl;
+module.exports.effectiveTradeCount = effectiveTradeCount;
+module.exports.reconcileOpeningPositions = reconcileOpeningPositions;
+module.exports.BROKER_PNL_MAX_AGE_MS = BROKER_PNL_MAX_AGE_MS;

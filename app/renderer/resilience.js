@@ -218,19 +218,41 @@
   window.addEventListener('pagehide',     function () { safe(persist, 'persist-unload'); });
 
   // ── 5. RESTORE ON LOAD ────────────────────────────────────────────────────
-  // Repaints the saved transcript into the message list and restores
-  // state.messages so the model keeps full context after a reload/crash.
-  function restore() {
+  // Two separate jobs that used to be one function, split 2026-09-04:
+  //
+  //   restoreContext() — puts the saved turns back into state.messages so the
+  //     model keeps context after a reload. ALWAYS runs. This array is the
+  //     model context and app.js caps it at 40 turns on purpose.
+  //
+  //   repaint() — repaints those turns into the visible pane. Runs only when
+  //     nothing better has claimed the pane. chat-restore.js claims it and
+  //     paints from DATA/chat_archive/ instead, which is the complete record:
+  //     all roles, all days, not a 40-turn user/assistant extract. Anoop
+  //     could not see yesterday's replies because this repaint was the only
+  //     history the pane had. See chat-restore.js's header.
+  //
+  // repaint() stays as the fallback, and chat-restore.js calls it by name if
+  // the archive cannot answer — a degraded 40-turn view beats a blank chat.
+  function restoreContext() {
     safe(function () {
       const stored = readStored();
       if (!stored || !stored.messages.length) return;
       if (!hasState()) return;
       if (Array.isArray(window.state.messages) && window.state.messages.length) return; // already has content
-
       window.state.messages = stored.messages.slice();
+    }, 'restore-context');
+  }
+
+  let repainted = false;
+  function repaint() {
+    safe(function () {
+      if (repainted) return;              // never paint the same history twice
+      const stored = readStored();
+      if (!stored || !stored.messages.length) return;
 
       const msgs = document.getElementById('messages');
       if (!msgs) return;
+      repainted = true;
 
       const esc = (typeof window.escHtml === 'function')
         ? window.escHtml
@@ -239,6 +261,12 @@
 
       const banner = document.createElement('div');
       banner.className = 'msg assistant';
+      // data-replay marks a row that is a REPAINT of something already said,
+      // not something newly said. chat-archive.js (renderer) skips these, so
+      // reloading the page does not append the whole conversation to the
+      // permanent archive a second time under fresh ids. Added 2026-09-03
+      // with the archive; without it every reload would duplicate history.
+      banner.dataset.replay = '1';
       const when = stored.savedAt ? new Date(stored.savedAt).toLocaleString() : 'earlier';
       banner.innerHTML = '<div class="debate-status-pill" style="border-color:#22c55e;color:#22c55e;">↻ Restored ' +
         stored.messages.length + ' messages from ' + when + '</div>';
@@ -247,6 +275,7 @@
       stored.messages.forEach(function (m) {
         const d = document.createElement('div');
         d.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+        d.dataset.replay = '1';   // see the banner comment above
         const body = m.role === 'user' ? esc(m.content || '') : md(m.content || '');
         d.innerHTML = '<div class="msg-bubble">' + body + '</div>';
         msgs.appendChild(d);
@@ -258,8 +287,26 @@
       });
 
       if (typeof window.scrollToBottom === 'function') window.scrollToBottom();
-      console.info('[resilience] restored', stored.messages.length, 'messages');
-    }, 'restore');
+      console.info('[resilience] repainted', stored.messages.length, 'messages');
+    }, 'repaint');
+  }
+
+  // Exposed so chat-restore.js can hand the pane back when the archive query
+  // fails. Named, not anonymous, because that handoff is the failure path
+  // that keeps a blank chat off the screen.
+  window.__resilienceRepaint = repaint;
+
+  function restore() {
+    restoreContext();
+    // chat-restore.js sets this flag synchronously at parse time (it loads
+    // first) and clears it once the archive has painted or handed back. It is
+    // the only reason to skip: without it, both would paint and the last 40
+    // turns would appear twice.
+    if (window.__chatArchiveRestorePending) {
+      console.info('[resilience] pane claimed by chat-restore.js — context restored, repaint deferred');
+      return;
+    }
+    repaint();
   }
 
   // Run after app.js's own DOMContentLoaded work has set up state.

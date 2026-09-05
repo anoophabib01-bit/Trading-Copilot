@@ -1,0 +1,12 @@
+'use strict';
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const { shouldStopOut } = require('../per-trade-stop');
+test('at the cap stops', () => { assert.equal(shouldStopOut({ unrealisedUsd: -300, perTradeMaxLoss: 300, size: 2 }).stop, true); });
+test('past the cap stops', () => { assert.equal(shouldStopOut({ unrealisedUsd: -301, perTradeMaxLoss: 300, size: 2 }).stop, true); assert.equal(shouldStopOut({ unrealisedUsd: -1718, perTradeMaxLoss: 300, size: 20 }).stop, true); });
+test('inside the cap holds', () => { assert.equal(shouldStopOut({ unrealisedUsd: -299, perTradeMaxLoss: 300, size: 2 }).stop, false); });
+test('positive P&L holds', () => { assert.equal(shouldStopOut({ unrealisedUsd: 100, perTradeMaxLoss: 300, size: 2 }).stop, false); });
+test('unreadable P&L is never stop:false', () => { for (const v of [null, undefined, NaN, '']) { assert.notEqual(shouldStopOut({ unrealisedUsd: v, perTradeMaxLoss: 300, size: 2 }).stop, false); } });
+test('size 0 means no position', () => { const r = shouldStopOut({ unrealisedUsd: -400, perTradeMaxLoss: 300, size: 0 }); assert.equal(r.stop, false); assert.match(r.reason, /no open position/); });
+test('missing/null cap is explicit', () => { for (const v of [null, undefined]) { const r = shouldStopOut({ unrealisedUsd: -400, perTradeMaxLoss: v, size: 2 }); assert.equal(r.stop, false); assert.match(r.reason, /no usable/); } });
+test('cap of 0 is not configured', () => { assert.equal(shouldStopOut({ unrealisedUsd: -400, perTradeMaxLoss: 0, size: 2 }).stop, false); });

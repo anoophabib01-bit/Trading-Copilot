@@ -79,7 +79,16 @@ function dayAdherence(ck, trades, rules) {
   const cfg = rules.biasAdherence || {};
   const minTrades = cfg.minTradesToJudge != null ? cfg.minTradesToJudge : 2;
   const rec = directionOfRecord(ck);
-  const list = Array.isArray(trades) ? trades.filter(t => t && t.side) : [];
+  const all = Array.isArray(trades) ? trades.filter(Boolean) : [];
+  const list = all.filter(t => t.side);
+  // ── Rows with no side are COUNTED, not just dropped (2026-08-31) ────────
+  // Dropping them silently is how a real violation vanished: on 2026-08-31
+  // the broker feed lost trade-level detail and wrote balance-move rows with
+  // side:null, so a day of 2 LONG / 8 SHORT against a declared LONG bias and
+  // a 75% target filtered down to zero judgeable trades and reported nothing
+  // at all. Nothing reads as compliance. A rule that cannot be measured must
+  // say so out loud — see trust-protocol.js check T3.
+  const unknownSide = all.length - list.length;
 
   const aligned = list.filter(t => rec.dir && t.side === rec.dir);
   const counter = list.filter(t => rec.dir && t.side !== rec.dir);
@@ -100,6 +109,11 @@ function dayAdherence(ck, trades, rules) {
     adherencePct: pct,
     // Not enough trades to call it a pattern — one counter-trend scratch on a
     // 1-trade day is not "0% adherence", it is noise.
+    // How many rows could not be judged at all, and whether that is the
+    // whole day. A caller must be able to tell "he complied" from "we could
+    // not tell", which `adherencePct: null` alone does not distinguish.
+    unknownSide: unknownSide,
+    unknownSideAll: all.length > 0 && list.length === 0,
     judged: rec.dir != null && total >= minTrades,
     counterTrades: counter
   };

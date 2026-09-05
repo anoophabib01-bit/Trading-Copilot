@@ -1,7 +1,7 @@
 'use strict';
 /**
  * token-usage-report.js — reads DATA/token-usage.jsonl (written by
- * call-logger.js, one line per real Claude API call) and prints real
+ * call-logger.js, one line per real API call) and prints real
  * calls/session and calls/day numbers, so CONFIG.ESTIMATED_CALLS_PER_SESSION
  * and CONFIG.ESTIMATED_SESSIONS_PER_MONTH in token-audit.js can be measured
  * instead of guessed.
@@ -98,8 +98,16 @@ function main() {
     console.log('  or no calls have run since it was enabled. Re-run after a live session.\n');
   } else {
     const hitRate = entries.length ? (callsWithCacheRead / entries.length) * 100 : 0;
-    console.log(`  Cache write tokens: ${totalCacheWrite.toLocaleString()}  (first call per cache window, costs 1.25x base input)`);
-    console.log(`  Cache read tokens:  ${totalCacheRead.toLocaleString()}  (repeat calls, costs 0.1x base input — a 90% discount)`);
+    // 2026-09-02: these two counters are Anthropic-shaped
+    // (cache_creation_input_tokens / cache_read_input_tokens). DeepSeek does
+    // not report them, so on the current provider they read 0 — that is the
+    // API being silent, NOT evidence that caching is off.
+    console.log(`  Cache write tokens: ${totalCacheWrite.toLocaleString()}  (Anthropic-only counter — DeepSeek does not report this)`);
+    console.log(`  Cache read tokens:  ${totalCacheRead.toLocaleString()}  (Anthropic-only counter — DeepSeek does not report this)`);
+    console.log(`  NOTE: DeepSeek caches automatically by hashing the request prefix, with no`);
+    console.log(`        markers and no usage counters. Cache hits bill at ~$0.007/Mtok vs $0.22`);
+    console.log(`        on a miss. This app's system prompt currently embeds live P&L and`);
+    console.log(`        timestamps, so the prefix changes every turn and hits are rare.`);
     console.log(`  Calls with a cache hit: ${callsWithCacheRead}/${entries.length} (${hitRate.toFixed(0)}%)`);
     if (avgGapMin != null) {
       console.log(`  Avg gap between calls in a session: ${avgGapMin.toFixed(1)} min (${withinTtlPct.toFixed(0)}% of gaps ≤ ${CACHE_TTL_MIN}min cache TTL)`);

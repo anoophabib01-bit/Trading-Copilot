@@ -124,3 +124,112 @@ test('APPLY: empty/garbage inputs are safe', () => {
   assert.equal(mergeCsvIntoStored([{ t: 1, x: 2, size: 1, pnl: 1 }], [], FP).length, 1);
   assert.equal(mergeCsvIntoStored([{ t: 1, x: 2, size: 1, pnl: 1 }], []).length, 1, 'default fp when none supplied');
 });
+
+// ── size 0 means "not observed", not "zero contracts" (2026-08-24) ──────────
+// Anoop asked, before importing: "if I reconcile while the live feed is
+// active, it shouldn't copy trades again." It did. tv-broker-feed.js records
+// a poll-aliased round trip with size 0 + inferred:true because it never saw
+// the position open — a sentinel, not a quantity. isSameTrade compared it
+// literally, so it could never match the CSV's real size and the same trade
+// survived the merge twice: doubled contracts, doubled gross, and doubled the
+// size-cap/revenge counts the guardrail enforces on.
+const fpKey = r => r.t + '|' + r.x + '|' + Math.round(r.pnl * 100) + '|' + r.size;
+
+test('a live row with unobserved size (0) still matches its CSV counterpart', () => {
+  const live = { t: 1000, x: 2000, pnl: 20.5, size: 0, side: 'buy', inferred: true };
+  const csv = { t: 1001, x: 2030, pnl: 20.5, size: 1, side: 'buy' };
+  assert.equal(isSameTrade(csv, live), true);
+});
+
+test('reconciling does not duplicate a trade the fold recorded with size 0', () => {
+  const stored = [{ t: 1000, x: 2000, pnl: 20.5, size: 0, side: 'buy', src: 'live-fold-only', inferred: true }];
+  const incoming = [{ t: 1001, x: 2030, pnl: 20.5, size: 1, side: 'buy' }];
+  const merged = mergeCsvIntoStored(stored, incoming, fpKey);
+  assert.equal(merged.length, 1, 'the same trade must not survive the merge twice');
+  assert.equal(merged[0].size, 1, "the CSV's real size replaces the unobserved 0");
+  assert.equal(merged[0].src, 'live-fold-only', 'live provenance survives the reconciliation');
+});
+
+test('two genuinely different sizes are still a mismatch', () => {
+  const live = { t: 1000, x: 2000, pnl: 20.5, size: 2, side: 'buy' };
+  const csv = { t: 1001, x: 2030, pnl: 20.5, size: 3, side: 'buy' };
+  assert.equal(isSameTrade(csv, live), false, 'the wildcard must apply ONLY to an unobserved size');
+});
+
+test('re-importing the same CSV over CSV-written rows replaces, never appends', () => {
+  const stored = [
+    { t: 1000, x: 2000, pnl: 20.5, size: 1, side: 'buy' },
+    { t: 3000, x: 4000, pnl: -12.0, size: 2, side: 'sell' },
+  ];
+  const merged = mergeCsvIntoStored(stored, stored.map(r => Object.assign({}, r)), fpKey);
+  assert.equal(merged.length, 2);
+});
+
+// ── Gross vs net: the duplication mechanism (2026-08-26) ───────────────────
+// Anoop after re-importing a day the live feed had already recorded: "it
+// overread again and calculated wrong ... it should overlap excisiting with
+// new information."
+const LIVE_NET = { t: 1000, x: 1000, size: 2, pnl: -2.80, pnlBasis: 'net' };
+const CSV_GROSS = { t: 900, x: 1000, size: 2, pnl: 1.00, side: 'LONG' };
+const RATE = { commPerContract: 0.95 };
+
+test('a live NET row matches its own CSV GROSS row once the rate is known', () => {
+  // They differ by exactly the round turn: 2 lots x $0.95 x 2 sides = $3.80,
+  // which is 380x the $0.01 tolerance. Before this they could never match, so
+  // the importer kept both and doubled the trade.
+  assert.strictEqual(isSameTrade(CSV_GROSS, LIVE_NET, RATE), true);
+});
+
+test('without a rate it still matches, erring toward a merge not a duplicate', () => {
+  // A missed match costs one line in a reconcile report. A false duplicate
+  // corrupts contracts, gross, and the size-cap counts the guardrail enforces.
+  assert.strictEqual(isSameTrade(CSV_GROSS, LIVE_NET, {}), true);
+});
+
+test('the widened tolerance does NOT swallow a genuinely different trade', () => {
+  const other = { t: 900, x: 1000, size: 2, pnl: 500, side: 'LONG' };
+  assert.strictEqual(isSameTrade(other, LIVE_NET, RATE), false);
+  assert.strictEqual(isSameTrade(other, LIVE_NET, {}), false);
+});
+
+test('two rows on the SAME basis keep the strict $0.01 tolerance', () => {
+  const a = { t: 900, x: 1000, size: 2, pnl: 100.00 };
+  const b = { t: 1000, x: 1000, size: 2, pnl: 100.50 };
+  assert.strictEqual(isSameTrade(a, b, RATE), false, 'both gross — 50c apart is a different trade');
+});
+
+test('pnlBasisOf: explicit stamp wins, provenance is the fallback', () => {
+  const TI = require('../renderer/trade-identity.js');
+  assert.strictEqual(TI.pnlBasisOf({ pnlBasis: 'net' }), 'net');
+  assert.strictEqual(TI.pnlBasisOf({ pnlBasis: 'gross', evidence: 'fold' }), 'gross');
+  assert.strictEqual(TI.pnlBasisOf({ evidence: 'fold' }), 'net');
+  assert.strictEqual(TI.pnlBasisOf({ source: 'live-fold-only' }), 'net');
+  assert.strictEqual(TI.pnlBasisOf({}), 'gross');
+  assert.strictEqual(TI.pnlBasisOf(null), 'gross');
+});
+
+test('mergeCsvIntoStored: re-importing a live-written day adds NO copies', () => {
+  const TI = require('../renderer/trade-identity.js');
+  const fp = r => r.t + '|' + r.x + '|' + Math.round(r.pnl * 100) + '|' + r.size;
+  const merged = TI.mergeCsvIntoStored([LIVE_NET], [CSV_GROSS], fp, RATE);
+  assert.strictEqual(merged.length, 1, 'one trade must stay one trade');
+  // The CSV wins the VALUE — it is the broker's own official export, with the
+  // side and prices the fold never saw. What matters is that the basis label
+  // follows the value: a gross number must not inherit the live row's 'net'
+  // stamp, or the rollup would add commission back to it and inflate the day.
+  assert.strictEqual(merged[0].pnl, 1.00);
+  assert.strictEqual(merged[0].pnlBasis, 'gross');
+  assert.strictEqual(merged[0].side, 'LONG');
+});
+
+test('day-rollup and trade-identity agree on what a row basis is', () => {
+  // Two copies of this rule exist by design (load-order independence). They
+  // must never drift, or a row counted as net by one and gross by the other
+  // produces a day total that reconciles against nothing.
+  const TI = require('../renderer/trade-identity.js');
+  const DR = require('../renderer/day-rollup.js');
+  [{ pnlBasis: 'net' }, { pnlBasis: 'gross' }, { evidence: 'fold' },
+   { source: 'live-fold-only' }, {}, null].forEach(row => {
+    assert.strictEqual(TI.pnlBasisOf(row), DR.pnlBasisOf(row), JSON.stringify(row));
+  });
+});

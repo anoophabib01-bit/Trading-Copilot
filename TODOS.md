@@ -1,5 +1,128 @@
 # TODOS
 
+## Autonomy modes — Phase 0 BUILT 2026-08-29 (all modes still disabled)
+
+Full design + locked decisions: `AUTONOMY_MODES_SPEC.md`. Anoop asked to finish
+the MYSELF/SHADOW/CONTROL modes properly, all disabled until complete, because
+the half-built version "created confusion when i was trading live".
+
+**The finding that drove this:** SHADOW had never scored a single order in its
+entire life, and it was structural, not a resolver bug. `dshV2.shadowSizes` was
+`[4,6]`; at `perTradeMaxLoss` $300 and MNQ $2/pt that allows a 37.5pt / 25pt
+stop, while real Playbook B stops measure a 48.3pt median (range 38.8-72.8, see
+`app/scripts/risk-dist.js`). Every setup was stamped `blocked:risk-too-big` and
+excluded from the resolver, so `shadow-outcomes.jsonl` was never created and the
+CONTROL gate read "0 resolved trades" forever. Sizes are now `[2]` and all 6
+measured setups record.
+
+**Shipped:** `app/autonomy-modes.js` (new, per-mode config; its `riskCapUsd()`
+always returns the TIGHTER of {mode cap, global} so a config edit can only
+narrow risk); ASSIST as a 4th rung in `autonomy-gate.js`; per-mode enable flags
+in `rules.json` `autonomyModes`; silent shadow; per-playbook evidence
+(`evaluateAutonomy()` no longer hardcodes `'B'`) so autonomy is granted PER
+PLAYBOOK; CONTROL's $200 risk-cap filter on evidence; resolver moved off the
+CDP hot path (15-min, skips during sessions).
+
+**Locked decisions:** ASSIST accepted as the 4th rung; shadow pinned at 2
+contracts; CONTROL $200/trade + $200/day with MANUAL re-arm; CONTROL trades
+A + B + LTF-ENGULF.
+
+**Two bugs found by the new tests:** `Number(null)` is 0 and 0 passes every risk
+cap, so an order with an uncomputable risk was treated as the safest in the file
+— once in `checkOrderRisk`, once in the evidence filter. Both fixed.
+
+**Not live-verified — nothing has run.** `autonomyEnabled` is still `false` and
+every per-mode flag is `false`, so the UI renders only the YOU button and
+nothing records. 1267/1267 app tests pass (31 new).
+
+**Next:** Phase 1 is `exit-policy.js` — one pure module shared by `backtest.js`,
+the shadow resolver and the live path. Nothing manages an open position today,
+which is why "enter AND exit with profits" is still half unbuilt. Then ASSIST
+(Phase 2), then CONTROL (Phase 3). Honest timeline: ~1 confirmed setup/day
+measured, so the gate's 40-resolved-trade bar is ~8 trading weeks away and the
+clock has not started.
+
+## BUILT 2026-08-28 — auto-flatten on oversize (`oversize-guard.js`). ARMED. Read the ONE CAVEAT below.
+
+Anoop: *"Since you have access to my orders can close when I oversize? add this to todo list and we will look into the possibilities."*
+
+> **BUILT AND ARMED THE SAME DAY**, at his explicit instruction after oversize
+> cost him 72% of his 50K drawdown in one session (day net -$1,436.20, of which
+> -$1,147.70 came from the two trades over the 2-lot cap; the size-5 short alone
+> was -$1,322.00). The five questions below were put to him and answered:
+> **reduce to the cap** (not flatten), **two consecutive confirming reads**,
+> **arm live immediately** (no shadow period). Decision logic is pure and lives
+> in `oversize-guard.js` (17 tests); the enforcement path is
+> `enforceOversizeGuard()` in `server.js`, hooked into the position watch on the
+> SAME read that proves the panel is readable, so it can never act on a failed
+> read. Config: `rules.json` `oversizeGuard`; `enabled:false` disarms. Every
+> action appends to `DATA/protocols/oversize-guard.jsonl` and pushes to Telegram.
+>
+> **THE ONE CAVEAT — which launcher he uses decides whether it has hands.**
+> `trading_place_market_order` is only REGISTERED by tradingview-mcp when
+> `TV_ALLOW_LIVE_ORDERS=1`, which ONLY `START CO-PILOT (LIVE ORDERS).bat` sets.
+> That gate is his own standing decision and was NOT loosened. So:
+>   * `START CO-PILOT.bat` → **ALARM-ONLY**. It detects the breach correctly and
+>     shouts (console + Telegram + UI), but cannot close anything. He closes it.
+>   * `START CO-PILOT (LIVE ORDERS).bat` → **REDUCE**. It sends the reducing order.
+> The guard now resolves this at boot (`announceOversizeGuard()`) and states which
+> mode it is in, rather than discovering it mid-breach — and in alarm-only mode it
+> returns BEFORE attempting an order that was never going to land, so the message
+> that matters is not buried in an "unknown tool" stack trace.
+> Pinned by `test/oversize-wiring.test.js`.
+
+The original design questions and reasoning are kept below, because they are
+what the built behaviour was chosen against.
+
+**Technically possible today.** `handleTradeConfirm` already reaches
+`trading_place_market_order` through the MCP bridge, and the live position
+watch reads open size every 5s. Closing a position is the same mechanism as
+opening one. Nothing about the plumbing blocks this.
+
+**What makes it a bigger step than it looks.** Every guard in this app to date
+is advisory or blocking — it refuses to help you do something. This would be
+the first that ACTS ON THE ACCOUNT WITHOUT ASKING, and the failure mode
+inverts: a wrong "size is fine" costs nothing, a wrong "size is too big"
+market-closes a good trade at whatever the book is showing.
+
+**The specific reason to be careful, from this week's evidence.** Position
+SIZE is exactly the field that has proven least reliable:
+- 2026-08-28: the fold recorded four entries with `size: 0` while real
+  positions of 1, 2, 3 and 5 lots were open — the quantity was simply not
+  readable on those polls (`sizeSeenThisTrade` never moved off zero).
+- The orders table has repeatedly read empty while a position was open
+  (`[tv-broker] orders table read as empty while a position is open`).
+- An unreadable positions table is indistinguishable from a flat account,
+  which is the bug that made the fold miss trades entirely.
+A rule that flattens on `size > cap` and reads size wrongly is a rule that
+flattens at random. Any design has to start from "how do we know the size we
+just read is real?", not from "what do we do when it is too big?".
+
+**What already exists and should be reused rather than rebuilt.**
+- `trade-confirm-rules.js` — the no-override size gate on the ORDER path.
+- The `[trade-confirm-shadow]` line already logs *"would BLOCK a 4-size trade
+  right now: size-up after a loss"*. There is already a shadow judgement being
+  made every poll; it just has no hands.
+- `autonomy-gate.js` — three-state control with an evidence bar, currently
+  hard-disabled via `rules.json` `autonomyEnabled:false` at Anoop's request.
+  An auto-flatten is autonomy and belongs behind that same gate, not beside it.
+
+**Questions to settle before any code.**
+1. Trigger: entry size over `sizeCap`, or total open contracts over
+   `contractsPerDay`, or both? They fail differently.
+2. Flatten ALL, or reduce to the cap? Reducing keeps the thesis alive and is
+   the smaller intervention; flattening is simpler to reason about.
+3. How many consecutive confirming reads before acting? (The
+   flat-confirmation work of 2026-08-28 says one read is never enough.)
+4. Does it act during news/illiquidity, where a market close is most expensive?
+5. What is the manual override, and is there one at all?
+
+**Suggested first step: SHADOW it.** Record every flatten it *would* have
+fired, with the size it read and the size the broker actually held, and see how
+often the two disagree before it is ever allowed to touch an order. That is the
+same route the CONTROL toggle takes, and it costs nothing to run.
+
+
 ## Replay verification against a REAL day — 2026-08-20 reconciled exactly, and a real size bug found
 
 Anoop supplied ground truth this session: Tradeify's own P&L calendar (-$264.10 for 2026-08-20, "11 trades") and the raw Tradovate fill export (11 buy/sell-matched rows). Both independent of this codebase, both far stronger evidence than anything available before.

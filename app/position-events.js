@@ -46,10 +46,25 @@ function indexBySymbol(rows) {
   for (const raw of rows) {
     const r = normalizeRow(raw);
     if (!r || r.qty === 0) continue; // a zero-qty row is not an open position
-    // Same symbol twice in one read shouldn't happen, but if it does, the
-    // larger quantity is the safer one to report (never under-state size).
+    // SAME SYMBOL TWICE IS THE NORMAL CASE, not an anomaly (fixed 2026-09-02).
+    // Tradovate's grid carries a Position ID column and renders one row PER
+    // POSITION, so scaling into 5 lots one at a time produces five rows of 1.
+    // This used to keep the LARGER row, with the comment "never under-state
+    // size" — true when comparing two readings of one position, false when the
+    // rows ARE the position: five 1-lot rows reported `1`, and that is the
+    // number that reached the session log, the fold and the oversize guard on
+    // the day Anoop actually held 5.
+    //
+    // Summed per side. A symbol showing both directions is a hedge whose net
+    // direction cannot be named from the rows alone, so the side is left blank
+    // rather than guessed — callers describe it, they do not trade on it.
     const prev = out.get(r.symbol);
-    if (!prev || r.qty > prev.qty) out.set(r.symbol, r);
+    if (!prev) { out.set(r.symbol, r); continue; }
+    out.set(r.symbol, {
+      symbol: r.symbol,
+      side: prev.side === r.side ? prev.side : '',
+      qty: prev.qty + r.qty,
+    });
   }
   return out;
 }

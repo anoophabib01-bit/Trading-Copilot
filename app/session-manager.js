@@ -65,8 +65,14 @@ function startSession(date, { balance, floor, buffer, bias, keyLevel, goNoGo, re
 - Rule focus:
 `;
 
-  atomicWrite.writeAtomic(p, content, 'utf8');
-  return { path: p, existed: false };
+  // 2026-08-23: same silent-write hole as logTrade — see its comment. A
+  // failure here matters more than it looks: logTrade only builds this
+  // template when the file is ABSENT, so a silently-failed startSession
+  // leaves a note with no trades-table header and every later logTrade for
+  // that day returns {ok:false}.
+  const w = atomicWrite.writeAtomic(p, content, 'utf8');
+  if (!w.ok) return { path: p, existed: false, ok: false, reason: 'write failed: ' + (w.error || 'unknown') };
+  return { path: p, existed: false, ok: true };
 }
 
 function logTrade(date, trade) {
@@ -80,11 +86,14 @@ function logTrade(date, trade) {
 
   let content = fs.readFileSync(p, 'utf8');
 
-  // Count existing trade rows
-  const rows = (content.match(/^\|\s*\d+\s*\|/gm) || []);
-  const num = rows.length + 1;
+  // 2026-08-23 BUG FIX (found by review, never observed live). This counted
+  // `^| <digits> |` across the WHOLE file with /gm, not just the trades
+  // table. Any other line in the note matching that shape — a second table,
+  // a pasted log line, an event row — inflated every subsequent trade number
+  // silently. Scoped to the contiguous row block under the table header.
+  const num = countTradeRows(content) + 1;
 
-  const row = `| ${num} | ${trade.time || new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false })} | ${trade.direction || '?'} | ${trade.entry || '?'} | ${trade.stop || '?'} | ${trade.target || '?'} | ${trade.exit || '-'} | ${trade.pnl !== undefined ? '$' + trade.pnl : '-'} | ${trade.breakTaken ? 'Yes' : 'No'} | ${trade.notes || ''} |`;
+  const row = formatTradeRow(num, trade);
 
   // 2026-08-20 BUG FIX (found in review, two defects in one line). The old
   // implementation was:
@@ -111,8 +120,62 @@ function logTrade(date, trade) {
     return { ok: false, written: false, path: p, reason: 'trade table header not found — session file may have been hand-edited' };
   }
 
-  atomicWrite.writeAtomic(p, next, 'utf8');
+  // 2026-08-23 BUG FIX (found by review). The return value was discarded and
+  // {ok:true} returned unconditionally. writeAtomic reports {ok:false} only
+  // when BOTH the atomic rename and the plain-write fallback throw — on
+  // Windows that is what an Obsidian / OneDrive / Defender handle on the .md
+  // produces as EPERM/EBUSY. The 2026-08-20 fix below made the regex-miss
+  // failure honest and left this one silent, so a trade could be dropped
+  // while the caller was told it was written.
+  const w = atomicWrite.writeAtomic(p, next, 'utf8');
+  if (!w.ok) {
+    return { ok: false, written: false, path: p, reason: 'write failed: ' + (w.error || 'unknown') };
+  }
   return { ok: true, written: true, num, path: p };
+}
+
+// The pure row formatter, extracted 2026-08-23 so the breakTaken fix below is
+// testable without the hardcoded SESSIONS_DIR (same extract-the-decision
+// pattern as insertTradeRow). `nowTimeStr` is injected so tests are
+// deterministic; production leaves it undefined and gets the IST clock.
+//
+// 2026-08-23 BUG FIX (found by review, visible in every auto-logged row on
+// disk). The break cell was `trade.breakTaken ? 'Yes' : 'No'`, so an
+// UNOBSERVED value rendered as 'No' — asserting a discipline failure that was
+// never measured, in the one column the post-session review grades compliance
+// on. The live feed never sets breakTaken, so every auto-logged row carried a
+// false compliance record. Unknown is now '?', matching the convention the
+// other unobserved fields in this same row already use.
+function formatTradeRow(num, trade, nowTimeStr) {
+  const t = trade || {};
+  const time = t.time || nowTimeStr ||
+    new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
+  const breakCell = (t.breakTaken === undefined || t.breakTaken === null)
+    ? '?'
+    : (t.breakTaken ? 'Yes' : 'No');
+  return `| ${num} | ${time} | ${t.direction || '?'} | ${t.entry || '?'} | ${t.stop || '?'} | ${t.target || '?'} | ${t.exit || '-'} | ${t.pnl !== undefined ? '$' + t.pnl : '-'} | ${breakCell} | ${t.notes || ''} |`;
+}
+
+// The pure half of the row count, exported for the same reason insertTradeRow
+// is: testable without the hardcoded SESSIONS_DIR. Counts only the numbered
+// rows in the contiguous block under the trades-table header — never the
+// whole file. Returns 0 when the table cannot be located, which makes the
+// caller's next row number 1 rather than an arbitrary file-wide tally.
+function countTradeRows(content) {
+  if (typeof content !== 'string') return 0;
+  const header = content.match(/^\| # \| Time.*\n\|[-|: \t]+\n/m);
+  if (!header) return 0;
+  let at = header.index + header[0].length;
+  let n = 0;
+  for (;;) {
+    const nl = content.indexOf('\n', at);
+    const line = content.slice(at, nl === -1 ? content.length : nl);
+    if (!line.startsWith('|')) break;
+    if (/^\|\s*\d+\s*\|/.test(line)) n++;
+    if (nl === -1) break;
+    at = nl + 1;
+  }
+  return n;
 }
 
 // The pure half of logTrade, exported so the insert position and the
@@ -157,8 +220,9 @@ function updateVerdict(date, { compliance, patterns, best, worst, fix, nextBias,
   if (nextLevel) content = content.replace(/- Level to watch:\s*$/, `- Level to watch: ${nextLevel}`);
   if (nextFocus) content = content.replace(/- Rule focus:\s*$/, `- Rule focus: ${nextFocus}`);
 
-  atomicWrite.writeAtomic(p, content, 'utf8');
-  return true;
+  // 2026-08-23: same silent-write hole as logTrade — see its comment.
+  const w = atomicWrite.writeAtomic(p, content, 'utf8');
+  return !!w.ok;
 }
 
 function readSession(date) {
@@ -177,4 +241,4 @@ function listSessions() {
     .slice(0, 30);
 }
 
-module.exports = { startSession, logTrade, insertTradeRow, updateVerdict, readSession, listSessions, todayStr, sessionPath, SESSIONS_DIR };
+module.exports = { startSession, logTrade, insertTradeRow, countTradeRows, formatTradeRow, updateVerdict, readSession, listSessions, todayStr, sessionPath, SESSIONS_DIR };

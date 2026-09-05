@@ -100,7 +100,32 @@ function applyStageRules(rules, stage) {
     if (!rules || typeof rules !== 'object') return rules;
     const out = Object.assign({}, rules);
     const block = rules.stageRules && rules.stageRules[stage];
-    if (!block || typeof block !== 'object') return out;
+    if (!block || typeof block !== 'object') {
+      // ── FAIL CLOSED (2026-09-05) ─────────────────────────────────────────
+      // A missing stageRules block, a malformed one, or an unrecognised stage
+      // used to return the base rules untouched. That WAS safe while the base
+      // sizeCap was 2 — the base was effectively the funded ruleset, so any
+      // failure of this layer landed on the tightest number in the file.
+      //
+      // On 2026-09-04 the base became Anoop's adjustable 2..6 dial (currently
+      // 4), and that assumption silently inverted: the same three failures now
+      // hand back 4 while he is on a FUNDED account, where his own record says
+      // every size except 2 loses money (-$1,717 over 31 trades).
+      //
+      // So when the stage cannot be resolved, size clamps DOWN to the tightest
+      // value the file can still be trusted to state: the funded block's own
+      // cap when it is readable, else the hard floor. Nothing else is touched —
+      // this narrows exactly the one rule that can end the account, and the
+      // three fail-safe tests in stage-rules.test.js pin it.
+      const fundedCap = rules.stageRules
+        && rules.stageRules.funded
+        && isNum(rules.stageRules.funded.sizeCap)
+        ? rules.stageRules.funded.sizeCap
+        : SIZE_CAP_HARD_MIN;
+      const safest = Math.min(isNum(out.sizeCap) ? out.sizeCap : SIZE_CAP_HARD_MAX, fundedCap);
+      if (isNum(safest)) out.sizeCap = safest;
+      return out;
+    }
 
     const clamp = stage === 'funded';
 
@@ -130,4 +155,68 @@ function applyStageRules(rules, stage) {
   }
 }
 
-module.exports = { applyStageRules, TIGHTEN_BY_MIN, TIGHTEN_BY_MAX, NESTED };
+// ── User-adjustable size cap, hard-bounded (2026-09-04) ─────────────────────
+// Anoop: "the size guard is too small or off which was the reason for account
+// to blow up so make size changeable from 2 minimum to 6 as maximum size so
+// that i always use it and not go beyond 6 size. i can handle 6 but yesterday
+// i took 20 size which was unacceptable."
+//
+// I OWE HIM THE DISAGREEMENT, because it is his own data: rules.json's
+// _sizeCap_comment records the cap being cut from 6 to 2 on 2026-07-28 after
+// the 150K breach, and stageRules.funded records every funded size except 2
+// losing money — 1c -$345, 3c -$437, 4c -$103, 5-6c -$384, 7c+ -$449,
+// -$1,717 across 31 trades. A cap of 6 is looser than what that evidence
+// supports.
+//
+// It is still the right change, for a reason the evidence does not cover: a
+// limit he routes around is worth nothing. He went to 20 against a cap of 2.
+// A cap of 6 that he actually trades inside is a smaller number than 20 every
+// day of the week, and the ceiling below is what makes 20 impossible rather
+// than merely discouraged.
+//
+// TWO SEPARATE THINGS, deliberately:
+//   sizeCap    — what he has chosen today. His to move, inside the bounds.
+//   HARD_MAX   — what he can never choose. Not his to move from the UI.
+// The ceiling is applied in getActiveRules() AFTER every other layer, so no
+// stage block, scalper overlay, hand-edit of rules.json or rules-set message
+// can produce an effective cap above it. That is the whole point: the old cap
+// was enforced by agreement, and agreement is what failed.
+const SIZE_CAP_HARD_MIN = 2;
+const SIZE_CAP_HARD_MAX = 6;
+
+function sizeCapBounds(rules) {
+  const r = rules || {};
+  let lo = isNum(r.sizeCapMin) ? r.sizeCapMin : SIZE_CAP_HARD_MIN;
+  let hi = isNum(r.sizeCapMax) ? r.sizeCapMax : SIZE_CAP_HARD_MAX;
+  // rules.json may tighten the range but never widen it past the hard bounds.
+  lo = Math.max(SIZE_CAP_HARD_MIN, Math.floor(lo));
+  hi = Math.min(SIZE_CAP_HARD_MAX, Math.floor(hi));
+  if (hi < lo) hi = lo;
+  return { min: lo, max: hi };
+}
+
+/** Clamp a requested cap into the allowed range. Non-numeric input returns
+ *  the minimum, never the maximum — a garbled message must fail SAFE. */
+function clampSizeCap(want, rules) {
+  const b = sizeCapBounds(rules);
+  const n = Math.floor(Number(want));
+  if (!isFinite(n)) return b.min;
+  return Math.min(b.max, Math.max(b.min, n));
+}
+
+/** The ceiling nothing may exceed. Applied last, to the merged ruleset. */
+function enforceSizeCapCeiling(rules) {
+  if (!rules || typeof rules !== 'object') return rules;
+  const b = sizeCapBounds(rules);
+  if (isNum(rules.sizeCap) && rules.sizeCap <= b.max) return rules;
+  const out = Object.assign({}, rules);
+  out.sizeCapCeilingApplied = isNum(rules.sizeCap) ? rules.sizeCap : null;
+  out.sizeCap = isNum(rules.sizeCap) ? b.max : b.min;
+  return out;
+}
+
+module.exports = {
+  applyStageRules, TIGHTEN_BY_MIN, TIGHTEN_BY_MAX, NESTED,
+  clampSizeCap, sizeCapBounds, enforceSizeCapCeiling,
+  SIZE_CAP_HARD_MIN, SIZE_CAP_HARD_MAX
+};

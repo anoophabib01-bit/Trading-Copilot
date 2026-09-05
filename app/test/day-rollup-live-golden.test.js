@@ -51,18 +51,27 @@ test('LIVE GOLDEN: real stored days reproduce byte-identically', { skip: !findDa
       // whether the 15-min cooldown was loss-only (scalper) or after every
       // trade (standard). maxHoldSeconds is set out of range so the scalper
       // pass never invents a hold-exceeded flag the stored row cannot have.
+      // 2026-08-25: the commission rate is a THIRD historical dimension. Every
+      // stored day drifted on `pnl` and nothing else once the per-side rate was
+      // corrected 0.59 -> 0.95 (round turn 1.18 -> 1.90); a rate pinned at 1.0
+      // meant a day written under any other rate could never reproduce, so the
+      // test failed for a reason that was not drift in the extraction it exists
+      // to guard. 1.0 is the pre-rules.json default.
+      for (const comm of [1.90, 1.18, 1.0]) {
       for (const lossOnly of [false, true]) {
         for (let cap = 1; cap <= 8; cap++) {
           const mode = lossOnly ? 'scalper' : (sum.tradingMode || 'standard');
           const opts = { tradingMode: mode, cooldownAfterLossOnly: lossOnly, maxHoldSeconds: Infinity, sessionWindowsIST: WINS, sizeCapCsv: cap };
           const graded = gradeTrades(rows.map(r => ({ entryMs: r.t, exitMs: r.x, entryMin: null, holdSec: r.hold, size: r.size, pnl: r.pnl })), opts);
           const gDiffs = rows.filter((r, i) => JSON.stringify(r.flags) !== JSON.stringify(graded[i].flags) || r.g !== graded[i].g).length;
-          const out = rollupDay(sum.date, rows, { commPerCt: 1.0, sizeCapCsv: cap, tradingMode: mode });
+          const out = rollupDay(sum.date, rows, { commPerCt: comm, sizeCapCsv: cap, tradingMode: mode });
           const rollDiffs = Object.keys(sum).filter(k => JSON.stringify(out[k]) !== JSON.stringify(sum[k]));
           if (gDiffs === 0 && rollDiffs.length === 0) { dayPassed = true; break; }
-          if (!best || rollDiffs.length + gDiffs < best.diffs.length + best.gDiffs) best = { cap, lossOnly, diffs: rollDiffs, gDiffs };
+          if (!best || rollDiffs.length + gDiffs < best.diffs.length + best.gDiffs) best = { cap, lossOnly, comm, diffs: rollDiffs, gDiffs };
         }
         if (dayPassed) break;
+      }
+      if (dayPassed) break;
       }
       if (dayPassed) { passed++; console.log('  live-golden PASS: ' + slot + ' ' + sum.date); }
       else {

@@ -73,3 +73,63 @@ test('garbage input never throws inside the live poll', () => {
   assert.equal(insertTradeRow(BLANK, null), null);
   assert.equal(insertTradeRow(undefined, undefined), null);
 });
+
+// ── 2026-08-23 review fixes ───────────────────────────────────────────────
+// Three defects found by the /autoplan review of task 7.1, all pre-existing
+// and all visible in sessions/2026-08-21.md on disk.
+const { countTradeRows, formatTradeRow } = require('../session-manager.js');
+
+const TABLE = (rows) => `# Session — 2026-08-23
+
+## Trades
+| # | Time (IST) | Direction | Entry | Stop | Target | Exit | P&L | 15m break? | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+${rows}
+## Session Verdict
+- System compliance:
+`;
+
+test('breakTaken: unobserved renders "?" — never a false compliance record', () => {
+  // The live feed never sets breakTaken. The old code rendered undefined as
+  // 'No', asserting a discipline failure that was never measured, in the one
+  // column the post-session review grades compliance on.
+  const row = formatTradeRow(1, { pnl: 11.6 }, '12:57:19');
+  assert.match(row, /\| \? \|/, 'undefined breakTaken must render "?"');
+  assert.doesNotMatch(row, /\| No \|/, 'undefined breakTaken must NOT render "No"');
+});
+
+test('breakTaken: an explicit false still renders "No"', () => {
+  // The fix must not swallow a real observation — only an absent one.
+  assert.match(formatTradeRow(1, { breakTaken: false }, '12:00:00'), /\| No \|/);
+  assert.match(formatTradeRow(1, { breakTaken: true }, '12:00:00'), /\| Yes \|/);
+});
+
+test('formatTradeRow tolerates a null/absent trade without throwing', () => {
+  assert.doesNotThrow(() => formatTradeRow(1, null, '12:00:00'));
+  assert.doesNotThrow(() => formatTradeRow(1, undefined, '12:00:00'));
+});
+
+test('countTradeRows counts only rows inside the trades table', () => {
+  assert.equal(countTradeRows(TABLE('')), 0);
+  assert.equal(countTradeRows(TABLE(rowN(1, 'a') + '\n')), 1);
+  assert.equal(countTradeRows(TABLE(rowN(1, 'a') + '\n' + rowN(2, 'b') + '\n')), 2);
+});
+
+test('countTradeRows ignores a numbered-row lookalike elsewhere in the file', () => {
+  // The old `content.match(/^\|\s*\d+\s*\|/gm)` counted the WHOLE file, so any
+  // other pipe-digit-pipe line — a second table, a pasted log line, a future
+  // event row — silently inflated every subsequent trade number.
+  const withDecoy = TABLE(rowN(1, 'real') + '\n') + `
+## Some other section
+| 7 | this is not a trade row |
+| 8 | neither is this |
+`;
+  assert.equal(countTradeRows(withDecoy), 1, 'only the real table row counts');
+});
+
+test('countTradeRows returns 0 when the table header is missing', () => {
+  // Must not fall back to a file-wide tally when the table cannot be found.
+  assert.equal(countTradeRows('# Session\n\n| 4 | stray |\n'), 0);
+  assert.equal(countTradeRows(''), 0);
+  assert.equal(countTradeRows(null), 0);
+});

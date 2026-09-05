@@ -57,7 +57,7 @@
  * a real non-zero-P&L closed trade — do not assume it is solved until
  * re-verified against a real trade.
  */
-import { evaluate } from '../connection.js';
+import { getClient, evaluate } from '../connection.js';
 
 // ── Order-label verification (2026-08-17, extracted after a real bug) ──────
 // The submit button's OWN label ("Buy 1 MNQU6 MARKET") is the single source
@@ -687,6 +687,164 @@ export function bottomPanelStateJS() {
 `;
 }
 
+
+// ── Opening the broker panel, robustly (2026-08-26) ─────────────────────────
+// Anoop, shipping this to clients: "issue with live feed again, what is
+// permanent fix? repair & recheck does not work again."
+//
+// expandBottomPanelJS below only ever looked INSIDE
+// [class*="layout__area--bottom"] and clicked the first labelled button in its
+// tab strip. Two ways that finds nothing, both of which end the session with a
+// dark feed and a message telling the human to go clicking:
+//
+//   1. The bottom area is not in the layout AT ALL. When the trading panel is
+//      fully closed (not merely collapsed) TradingView removes the container,
+//      so `root` is null and the opener returns "bottom panel container not
+//      found" without trying anything else.
+//   2. The tab strip exists but its buttons are unlabelled, off-screen, or the
+//      hashed class names moved. Every selector here is a wildcard match on a
+//      third-party app's generated class names — they WILL move.
+//
+// So: several independent strategies, each verified by re-reading the panel
+// state, stopping at the first that works. They are ordered cheapest-and-
+// most-proven first, and every one is a no-op when the panel is already open,
+// so running this on a healthy app cannot close anything.
+export function openBrokerPanelJS() {
+  return `
+(function() {
+  var tried = [];
+  function panelState() {
+    var r = document.querySelector('${BOTTOM_PANEL_SEL}');
+    if (!r) return { present: false, collapsed: null, height: 0 };
+    return {
+      present: true,
+      collapsed: !!r.querySelector('[class*="collapsed-"]') || r.clientHeight < 80,
+      height: r.clientHeight
+    };
+  }
+  function isOpen(st) { return st.present && st.collapsed === false; }
+  function visible(el) {
+    if (!el || el.offsetParent === null) return false;
+    var b = el.getBoundingClientRect();
+    return b.width > 0 && b.height > 0;
+  }
+  function label(el) {
+    return (((el.innerText || el.textContent || '') + ' ' +
+             (el.getAttribute('aria-label') || '') + ' ' +
+             (el.getAttribute('title') || '') + ' ' +
+             (el.getAttribute('data-name') || '')) + '').trim();
+  }
+
+  var before = panelState();
+  if (isOpen(before)) return { ok: true, already: true, strategy: null, before: before, after: before, tried: tried };
+
+  function attempt(name, fn) {
+    if (isOpen(panelState())) return true;
+    var detail = null;
+    try { detail = fn(); } catch (e) { detail = 'threw: ' + e.message; }
+    tried.push({ strategy: name, detail: detail });
+    return false;   // caller re-checks after a settle delay
+  }
+
+  // S1 — the original: the broker-name tab inside the bottom panel's own tab
+  // strip. This is the one that has actually worked in the field, so it stays
+  // first; everything below is a fallback for when the container is missing.
+  attempt('bottom-tabbar-button', function() {
+    var root = document.querySelector('${BOTTOM_PANEL_SEL}');
+    if (!root) return 'no bottom panel container';
+    var btns = Array.prototype.slice.call(root.querySelectorAll('[class*="tabbar-"] button'));
+    for (var i = 0; i < btns.length; i++) {
+      var b = btns[i], tx = label(b);
+      if (!tx || tx.length > 40) continue;
+      if (/menuButton/.test((b.className || '') + '')) continue;
+      if (!visible(b)) continue;
+      b.click();
+      return 'clicked "' + tx + '"';
+    }
+    return 'no labelled visible button in the tab strip';
+  });
+
+  // S2 — the bottom STATUS BAR toggle. When the panel is fully closed the
+  // container is gone, so the only remaining control lives in TradingView's
+  // bottom toolbar. Matched on accessible text rather than a hashed class,
+  // which is the part most likely to survive a TradingView release.
+  attempt('bottom-toolbar-toggle', function() {
+    var bar = document.querySelector('[class*="bottom-widgetbar"], [class*="widgetbar-"], [class*="bottomWidgetBar"], footer');
+    var scope = bar || document.body;
+    var cands = Array.prototype.slice.call(scope.querySelectorAll('button, [role="button"], [data-name]'));
+    for (var i = 0; i < cands.length; i++) {
+      var el = cands[i], tx = label(el);
+      if (!visible(el)) continue;
+      if (/trading\\s*panel|order\\s*panel|broker|tradovate|paper\\s*trading/i.test(tx)) {
+        el.click();
+        return 'clicked "' + tx.slice(0, 40) + '"';
+      }
+    }
+    return 'no trading-panel toggle found in the bottom toolbar';
+  });
+
+  // S3 — anything anywhere that names the broker and looks clickable. Last
+  // DOM resort, deliberately narrow on text so it cannot click a chart tool.
+  attempt('document-wide-broker-control', function() {
+    var cands = Array.prototype.slice.call(
+      document.querySelectorAll('button, [role="tab"], [role="button"]'));
+    for (var i = 0; i < cands.length; i++) {
+      var el = cands[i], tx = label(el);
+      if (!tx || tx.length > 40 || !visible(el)) continue;
+      if (/^(tradovate|paper trading|trading panel)$/i.test(tx.trim())) {
+        el.click();
+        return 'clicked "' + tx.trim() + '"';
+      }
+    }
+    return 'no broker-named control anywhere in the document';
+  });
+
+  return { ok: false, already: false, before: before, after: panelState(), tried: tried };
+})()
+`;
+}
+
+// Everything the opener can see, for when it still fails. A repair that cannot
+// explain itself is a support ticket; this turns the next occurrence into
+// something diagnosable from a log instead of a screenshot.
+export function panelDiagnosticsJS() {
+  return `
+(function() {
+  function label(el) {
+    return (((el.innerText || el.textContent || '') + ' ' +
+             (el.getAttribute('aria-label') || '') + ' ' +
+             (el.getAttribute('data-name') || '')) + '').replace(/\\s+/g, ' ').trim().slice(0, 60);
+  }
+  var root = document.querySelector('${BOTTOM_PANEL_SEL}');
+  var out = {
+    url: location.href,
+    bottomAreaPresent: !!root,
+    bottomAreaHeight: root ? root.clientHeight : 0,
+    bottomAreaClasses: root ? (root.className + '').slice(0, 200) : null,
+    tabbarButtons: [],
+    bottomBarControls: [],
+    brokerNamedControls: []
+  };
+  if (root) {
+    out.tabbarButtons = Array.prototype.slice
+      .call(root.querySelectorAll('[class*="tabbar-"] button'))
+      .slice(0, 12).map(function(b) { return { text: label(b), visible: b.offsetParent !== null }; });
+  }
+  var bar = document.querySelector('[class*="bottom-widgetbar"], [class*="widgetbar-"], footer');
+  if (bar) {
+    out.bottomBarControls = Array.prototype.slice
+      .call(bar.querySelectorAll('button, [role="button"], [data-name]'))
+      .slice(0, 20).map(function(b) { return { text: label(b), visible: b.offsetParent !== null }; });
+  }
+  out.brokerNamedControls = Array.prototype.slice
+    .call(document.querySelectorAll('button, [role="tab"], [role="button"]'))
+    .filter(function(el) { return /tradovate|paper trading|trading panel|broker/i.test(label(el)); })
+    .slice(0, 12).map(function(b) { return { text: label(b), visible: b.offsetParent !== null }; });
+  return out;
+})()
+`;
+}
+
 // Expands the bottom panel by clicking the broker-name tab in its tab strip.
 // That button is a toggle: clicking it while collapsed expands it. We only
 // ever click it after confirming the panel IS collapsed, so it can never be
@@ -786,16 +944,52 @@ export async function ensurePanelTablesMounted({ want, requireExpanded = true } 
     return {
       success: true, alreadyMounted: true, missing: [], recovered: [],
       stillMissing: [], expanded: null, clicks: [], panelBefore, panelAfter: panelBefore,
+      diagnostics: null,
     };
   }
 
-  // STEP 1 — expand the bottom panel. This is the actual fix in essentially
+  // STEP 1 — open the bottom panel. This is the actual fix in essentially
   // every observed case: it both mounts tables that were never rendered and
   // guarantees the ones already there are being kept current.
+  //
+  // 2026-08-26: runs whenever the panel is not demonstrably OPEN, not only
+  // when it is present-and-collapsed. A panel that is fully closed has no
+  // container at all, so `panelBefore.present` is false — and the old guard
+  // skipped the repair entirely in exactly the case that needs it most,
+  // which is how "auto-repair could not do it" was reached with no repair
+  // ever attempted. Each strategy inside openBrokerPanelJS is a no-op when
+  // the panel is already open, so widening this cannot close anything.
   let expanded = null;
-  if (panelBefore && panelBefore.present && panelBefore.collapsed) {
-    expanded = await evaluate(expandBottomPanelJS());
-    await new Promise((r) => setTimeout(r, 700)); // let the panel render its tables
+  const panelNotOpen = !panelBefore || !panelBefore.present || panelBefore.collapsed !== false;
+  if (panelNotOpen) {
+    expanded = await evaluate(openBrokerPanelJS());
+    await new Promise((r) => setTimeout(r, 900)); // let the panel render its tables
+
+    // STEP 1b — KEYBOARD FALLBACK. Every strategy above matches a
+    // third-party app's DOM; when TradingView reshuffles its markup they all
+    // miss at once. Alt+T is TradingView's own Trading Panel toggle and goes
+    // through the app's shortcut handler rather than our selectors, so it is
+    // the one route that does not depend on class names we do not own.
+    //
+    // Strictly gated on the panel still not being open, because this IS a
+    // toggle: firing it against an open panel would close the thing we are
+    // trying to open.
+    const afterDom = await evaluate(bottomPanelStateJS());
+    const stillShut = !afterDom || !afterDom.present || afterDom.collapsed !== false;
+    if (stillShut) {
+      try {
+        const c = await getClient();
+        await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 1, key: 't', code: 'KeyT', windowsVirtualKeyCode: 84 });
+        await c.Input.dispatchKeyEvent({ type: 'keyUp', modifiers: 1, key: 't', code: 'KeyT', windowsVirtualKeyCode: 84 });
+        await new Promise((r) => setTimeout(r, 900));
+        const afterKey = await evaluate(bottomPanelStateJS());
+        expanded = Object.assign({}, expanded || {}, {
+          keyboardFallback: { tried: true, opened: !!(afterKey && afterKey.present && afterKey.collapsed === false) },
+        });
+      } catch (e) {
+        expanded = Object.assign({}, expanded || {}, { keyboardFallback: { tried: true, error: e.message } });
+      }
+    }
   }
 
   let after = await evaluate(mountedTablesJS());
@@ -821,6 +1015,15 @@ export async function ensurePanelTablesMounted({ want, requireExpanded = true } 
   }
 
   const recovered = missing.filter((k) => stillMissing.indexOf(k) === -1);
+
+  // 2026-08-26: when repair genuinely could not do it, dump what the opener
+  // could see. Without this the only evidence is a screenshot of a red box,
+  // and the selectors this depends on live in someone else's app — the next
+  // break needs to be diagnosable from a log, not reproduced live.
+  let diagnostics = null;
+  if (stillMissing.length) {
+    try { diagnostics = await evaluate(panelDiagnosticsJS()); } catch (e) { diagnostics = { error: e.message }; }
+  }
 
   // Restore the sub-tab the human had selected — cosmetic only, and
   // deliberately non-fatal: failing to restore a tab must never turn a
@@ -848,5 +1051,132 @@ export async function ensurePanelTablesMounted({ want, requireExpanded = true } 
     restored,
     panelBefore,
     panelAfter,
+    // 2026-08-26: what the opener could see when it still failed. Null on
+    // success — a healthy repair should not carry a DOM dump around.
+    diagnostics,
   };
+}
+
+// ── Forcing ONE table to actually render its rows (2026-09-02) ──────────────
+//
+// A THIRD failure mode, distinct from the two above and invisible to both.
+//
+//   collapsed panel  -> the table is not in the DOM at all      (fixed 2026-08-23)
+//   tab never opened -> the table is not in the DOM at all      (fixed 2026-09-01, summary)
+//   tab not SHOWING  -> the table IS in the DOM, with ZERO ROWS  <- this
+//
+// ensurePanelTablesMounted answers "is `table[data-name$=orders-table]` in the
+// document", and for this fault the answer is YES. The <table> is mounted, its
+// <thead> is correct, and its <tbody> is empty because ka-table only renders
+// body rows for the visible tab. Every presence check passes while the read
+// returns nothing.
+//
+// WHAT IT COST. app/server.js flags `ordersTableSuspect` on exactly this shape
+// (orders empty while a position is open) and then degrades: the order-history
+// walk is dropped, `closedRoundTrips` goes null, and every close falls to the
+// balance-delta fold — which knows the money and nothing else. Those rows are
+// written with `xp: null`, so from 2026-09-01 the app had no exit price for any
+// trade, and the post-exit drift panel sat anchored on 2026-08-31's 29406.5 for
+// two days while reporting it as current.
+//
+// WHY IT CLICKS AND THEN CLICKS BACK. Only the showing tab renders rows, so all
+// three cannot be live at once — there is no arrangement of the panel that
+// makes this go away. The read therefore borrows the tab: select Orders, let it
+// render, read it, put his tab back. Restoration is NOT cosmetic here (unlike
+// ensurePanelTablesMounted's, which is): leaving Orders selected would silently
+// stop the positions table from updating, and a stale positions table reads as
+// FLAT — the exact corruption the 2026-08-23 note calls out as worse than a
+// visible failure. So the tab always goes back, including on the throw path.
+//
+// DELIBERATELY NOT CALLED ON EVERY POLL. The panel visibly flickers, and at the
+// 10s account cadence that is unusable. Callers fire it when the answer matters
+// and not otherwise (app/server.js: on the suspect shape, under panel-repair.js's
+// cooldown/ceiling/escalation budget). It never re-collapses the panel and it
+// never touches the order ticket — same safety contract as everything above.
+//
+// Returns the FRESH read plus what it did, so a caller that gets `ok: false`
+// can keep its existing refuse-to-trust behaviour rather than acting on a table
+// it has no evidence rendered.
+// 2026-09-02 (same day, second fault): POSITIONS has the identical problem and
+// it is the more dangerous of the two. The oversize guard sends a reducing
+// order, then re-reads the positions table to confirm the position shrank. With
+// that table not re-rendering, the confirmation read returns the PRE-ORDER size
+// forever — so a reduction that actually worked looks like one that did nothing,
+// the guard hits its "one outstanding reduction at a time" refusal, and reports
+// STUCK. That happened twice on 2026-09-02 (11:56 and 12:30) and ended with the
+// guard switched off for the session, leaving size unenforced against a broker
+// ceiling of 40 micros and a cap of 2.
+//
+// The guard's refusal is CORRECT and stays exactly as it is — a stale read is
+// precisely when it must not send more (six reductions on a stale read flipped a
+// long to a short on 2026-08-31). What was wrong is the EVIDENCE it refuses on.
+// This gives it a genuinely re-rendered read to judge, so STUCK means the
+// position really did not move rather than the DOM not repainting.
+const REFRESHABLE = {
+  orders: { dataName: 'TRADOVATE.orders-table', tabText: TAB_TEXT.orders },
+  positions: { dataName: 'TRADOVATE.positions-table', tabText: TAB_TEXT.positions },
+};
+
+export async function refreshPanelTable({ table = 'orders', settleMs = 700 } = {}) {
+  const spec = REFRESHABLE[table];
+  if (!spec) return { ok: false, error: 'unknown table: ' + table };
+  const before = await readTable(spec.dataName);
+  const mounted = await evaluate(mountedTablesJS());
+
+  // The panel must be open first — with it collapsed there is no tab to click
+  // and no rows to render. Reuses the proven opener rather than a second one.
+  const panel = await evaluate(bottomPanelStateJS());
+  let opened = null;
+  if (!panel || !panel.present || panel.collapsed !== false) {
+    opened = await evaluate(openBrokerPanelJS());
+    await new Promise((r) => setTimeout(r, 900));
+  }
+
+  let click = null;
+  let restored = null;
+  let after = before;
+  try {
+    click = await evaluate(clickPanelTabJS(spec.tabText));
+    if (click && click.ok) {
+      await new Promise((r) => setTimeout(r, settleMs));
+      after = await readTable(spec.dataName);
+    }
+  } finally {
+    // ALWAYS, even if the read above threw. A tab left on Orders freezes the
+    // positions table, and a frozen positions table reads as flat.
+    if (click && click.ok && click.prevActive) {
+      try {
+        const r = await evaluate(clickPanelTabJS([click.prevActive]));
+        restored = !!(r && r.ok);
+      } catch (e) { restored = false; }
+    }
+  }
+
+  const rows = after.rows.map((r) => r.row);
+  return {
+    // ok means: the tab was clicked AND the table now shows either real rows
+    // or TradingView's explicit "no data" placeholder. An empty table with no
+    // placeholder is the unrendered shape again — not evidence of zero orders.
+    ok: !!(click && click.ok) && (rows.length > 0 || !!after.emptyStateText),
+    table,
+    mountedBefore: mounted ? mounted[table] : null,
+    rowsBefore: before.rows.length,
+    rowsAfter: rows.length,
+    emptyStateText: after.emptyStateText,
+    opened,
+    click,
+    restoredTab: click && click.prevActive ? click.prevActive : null,
+    restored,
+    rows,
+    // Kept under its original name so the orders callers written earlier today
+    // keep working unchanged.
+    orders: table === 'orders' ? rows : undefined,
+    positions: table === 'positions' ? rows : undefined,
+  };
+}
+
+// The original orders-only entry point, now a thin wrapper. Callers added on
+// 2026-09-02 use this name and there is no reason to churn them.
+export async function refreshOrdersTable(opts = {}) {
+  return refreshPanelTable(Object.assign({}, opts, { table: 'orders' }));
 }

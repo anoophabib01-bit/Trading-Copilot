@@ -232,3 +232,25 @@ test('REGRESSION: declared LONG, took only profitable SHORTs — the most extrem
   assert.strictEqual(BT.readVerdict(d), 'UNTESTED');
   assert.strictEqual(BT.quadrantFor(d, RULES), BT.QUADRANT.GOT_AWAY_WITH_IT);
 });
+
+test('rows with no side are counted, not silently dropped', () => {
+  // The 2026-08-31 shape: broker feed lost trade-level detail, so every row
+  // carried side:null. Filtering them away left zero judgeable trades and the
+  // day reported nothing — indistinguishable from a clean day.
+  const ck = { date: '2026-08-31', bias: 'Bullish', h4: 'Bullish', h1: 'Bullish' };
+  const out = BT.dayAdherence(ck, [
+    { pnl: -61.4, side: null }, { pnl: -1.5, side: null },
+  ], {});
+  assert.strictEqual(out.unknownSide, 2);
+  assert.strictEqual(out.unknownSideAll, true);
+  assert.strictEqual(out.total, 0, 'still nothing judgeable...');
+  assert.notStrictEqual(out.unknownSide, 0, '...but the reason is now visible');
+});
+
+test('a fully-sided day reports unknownSide 0', () => {
+  const ck = { date: '2026-08-31', bias: 'Bullish', h4: 'Bullish', h1: 'Bullish' };
+  const out = BT.dayAdherence(ck, [{ pnl: 5, side: 'LONG' }, { pnl: -2, side: 'SHORT' }], {});
+  assert.strictEqual(out.unknownSide, 0);
+  assert.strictEqual(out.unknownSideAll, false);
+  assert.strictEqual(out.total, 2);
+});

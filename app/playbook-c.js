@@ -34,10 +34,58 @@
 //      already encodes. See the long note on requirement 5 for why the naive
 //      reading of this rule is self-contradictory.
 
-const PBC_PIVOT_LEG = 2;        // bars each side for a confirmed fractal pivot
+// findPivots and its two constants moved to detectors.js on 2026-09-01 so the
+// HTF gate (which sits above every playbook and must not import one) reads
+// structure through the SAME definition this file does. Imported under the
+// original PBC_* names so the rest of this file is untouched, and so the
+// tolerance findPivots collapses pivots on stays identical to the one the
+// retest/sweep checks below compare against.
+const {
+  findPivots,
+  PIVOT_LEG: PBC_PIVOT_LEG,   // bars each side for a confirmed fractal pivot
+  LEVEL_TOL: PBC_LEVEL_TOL,   // 0.05% — same tolerance getSwingLevels dedupes on
+} = require('./detectors');
+
+// ── WHICH FAILURES ARE A VETO, AND WHICH ARE ONLY EVIDENCE (2026-09-03) ────
+// Anoop: "playbook A should be active in both direction and should intimate me
+// when any engulfing in any direction takes place after which i will decide
+// manually which side should i take the entry at."
+//
+// That splits this function's nine rejection reasons into two genuinely
+// different kinds, which until now were returned identically and therefore
+// treated identically by the caller:
+//
+//   SHAPE   — requirements 1 and 2. These are the DEFINITION of an engulfing
+//             candle: the colour flip, taking out both extremes, the body
+//             covering the body. A candle failing one of these is not "a
+//             disqualified engulfing", it is not an engulfing at all, and
+//             reporting it as one would make the alert a lie. Still a veto.
+//
+//   CONTEXT — requirements 3, 4 and 5: structure, swing location, resting
+//             liquidity. These answer "is this a good place to take it",
+//             which is precisely the judgment Anoop has just taken back. They
+//             remain COMPUTED and are attached to the alert verbatim, so he
+//             sees "against a bearish 15M structure" or "mid-range entry" and
+//             decides — instead of never learning the candle existed.
+//
+//   DATA    — not enough bars to judge at all. Neither a pass nor a rejection;
+//             the caller must be able to tell "the app could not look" from
+//             "the app looked and said no", which is this module's oldest rule.
+//
+// `valid` keeps its exact old meaning — the full Playbook A setup, all five
+// requirements — because Playbook B, the debate trigger and every stored
+// signal row still read it that way. `stage` is additive: it tells a caller
+// that wants to alert on more than the strict setup WHICH bar was hit. Nothing
+// that ignores `stage` changes behaviour.
+const STAGE = {
+  DATA: 'data',
+  SHAPE: 'shape',
+  CONTEXT: 'context',
+  OK: 'ok',
+};
+
 const PBC_PIVOT_WINDOW = 5;     // "is this the local extreme" window
 const PBC_LIQ_LOOKBACK = 10;    // how far back a sweep still counts as recent
-const PBC_LEVEL_TOL = 0.0005;   // 0.05% — same tolerance getSwingLevels dedupes on
 const PBC_HISTORY_BARS = 40;    // bars the caller should fetch (5 is not enough)
 
 // Drop the still-forming candle.
@@ -66,33 +114,6 @@ function dropFormingBar(bars, tfCode) {
   return (startSec + minutes * 60 > nowSec) ? bars.slice(0, -1) : bars;
 }
 
-// Confirmed fractal pivots WITH their bar index. server.js's getSwingLevels()
-// returns prices only, which is enough for the SFP level pool but not for
-// reading structure (which needs to know the ORDER pivots occurred in).
-//
-// Strict on the left, inclusive on the right, is the standard way to
-// disambiguate a plateau. Without it, two adjacent bars sharing the same high
-// BOTH register as pivots, the structure check then compares two equal prices,
-// `h2 > h1` is false, and every flat-topped move is misread as "mixed/ranging".
-// Equal highs are common in futures, so this mattered immediately in testing.
-// Near-equal consecutive pivots are then collapsed to one (the later).
-function findPivots(bars, leg = PBC_PIVOT_LEG) {
-  const highs = [], lows = [];
-  for (let i = leg; i < bars.length - leg; i++) {
-    const left = bars.slice(i - leg, i);
-    const right = bars.slice(i + 1, i + leg + 1);
-    if (left.every(b => bars[i].high > b.high) && right.every(b => bars[i].high >= b.high)) {
-      highs.push({ i, price: bars[i].high });
-    }
-    if (left.every(b => bars[i].low < b.low) && right.every(b => bars[i].low <= b.low)) {
-      lows.push({ i, price: bars[i].low });
-    }
-  }
-  const collapse = (arr) => arr.filter((p, k) =>
-    k === arr.length - 1 || Math.abs(arr[k + 1].price - p.price) / p.price >= PBC_LEVEL_TOL);
-  return { pivotHighs: collapse(highs), pivotLows: collapse(lows) };
-}
-
 // Returns { valid, reason, structure }.
 //
 // `reason` is surfaced in the UI on rejection rather than swallowed — seeing
@@ -103,9 +124,30 @@ function findPivots(bars, leg = PBC_PIVOT_LEG) {
 // PBC_HISTORY_BARS deep — the 5-bar market_multi_tf feed cannot support a
 // structure read, so the caller needs getFullBars().
 // `pdhpdl` is server.js's getPDHPDL() result, or null.
-function validateEngulfPlaybookC(bars, direction, pdhpdl) {
+// `htfStructure` (added 2026-09-01) — 'bullish' | 'bearish' | null.
+// 2026-09-03: this is now the 15M read, not the 1H one. See htf-alignment.js.
+//
+// Anoop, 2026-09-03: "The structure HH-HL/LL-LH is read in one hour — change
+// it to 15 mins which should agree with 1hr not 4hr."
+//
+// Requirement 3 below is exactly that HH-HL / LL-LH read, and until now it was
+// computed from `bars` — the TRIGGER timeframe's own candles. On the 15M
+// watcher that was right by accident. On the 1H, 30M and 5M watchers it was
+// reading structure off a chart he does not read structure on, producing a
+// "trend" that flips several times an hour and admitting setups his rules
+// disqualify.
+//
+// Pass the 15M structure (from htf-alignment.readHTF) and requirement 3 is
+// judged against THAT instead. Omit it and the old local-pivot behaviour
+// stands, so nothing that has not been migrated changes underneath itself.
+//
+// The pivots are still computed either way: requirements 4 and 5 (swing
+// location and resting liquidity) are genuinely local to the trigger
+// timeframe — WHERE in this chart's own swing the candle sits, and which of
+// this chart's own levels have been taken. Only the structure verdict moves.
+function validateEngulfPlaybookC(bars, direction, pdhpdl, htfStructure) {
   if (!Array.isArray(bars) || bars.length < PBC_PIVOT_LEG * 2 + PBC_PIVOT_WINDOW) {
-    return { valid: false, reason: 'not enough bar history for a structure read', structure: 'unknown' };
+    return { valid: false, stage: STAGE.DATA, reason: 'not enough bar history for a structure read', structure: 'unknown' };
   }
   const n = bars.length;
   const engulf = bars[n - 1];
@@ -116,13 +158,22 @@ function validateEngulfPlaybookC(bars, direction, pdhpdl) {
   // Re-verified here rather than trusted from the caller, so this function is
   // valid on its own terms and testable in isolation.
   if (bull && !(prev.close < prev.open && engulf.close > engulf.open)) {
-    return { valid: false, reason: 'not a bullish colour flip', structure: 'n/a' };
+    return { valid: false, stage: STAGE.SHAPE, reason: 'not a bullish colour flip', structure: 'n/a' };
   }
   if (!bull && !(prev.close > prev.open && engulf.close < engulf.open)) {
-    return { valid: false, reason: 'not a bearish colour flip', structure: 'n/a' };
+    return { valid: false, stage: STAGE.SHAPE, reason: 'not a bearish colour flip', structure: 'n/a' };
   }
   if (!(engulf.high >= prev.high && engulf.low <= prev.low)) {
-    return { valid: false, reason: 'does not take out BOTH the high and low of the previous candle', structure: 'n/a' };
+    return { valid: false, stage: STAGE.SHAPE, reason: 'does not take out BOTH the high and low of the previous candle', structure: 'n/a' };
+  }
+  // 2026-08-27: body engulf, checked separately because range engulf does not
+  // imply it — a long-wicked indecision candle can straddle both extremes of
+  // the previous bar with its own body sitting inside that bar's body. See
+  // detectors.js's bodyEngulfs() note.
+  const pTop = Math.max(prev.open, prev.close), pBot = Math.min(prev.open, prev.close);
+  const eTop = Math.max(engulf.open, engulf.close), eBot = Math.min(engulf.open, engulf.close);
+  if (!(eTop >= pTop && eBot <= pBot)) {
+    return { valid: false, stage: STAGE.SHAPE, reason: 'body does not fully engulf the previous candle body (wicks only)', structure: 'n/a' };
   }
 
   // Pivots computed on everything EXCEPT the engulfing candle and the one it
@@ -132,19 +183,29 @@ function validateEngulfPlaybookC(bars, direction, pdhpdl) {
 
   // ── Requirement 3: HH-HL (bullish) / LL-LH (bearish) ──────────────────────
   if (pivotHighs.length < 2 || pivotLows.length < 2) {
-    return { valid: false, reason: 'fewer than 2 confirmed pivots each side — structure unknown', structure: 'unknown' };
+    return { valid: false, stage: STAGE.CONTEXT, reason: 'fewer than 2 confirmed pivots each side — structure unknown', structure: 'unknown' };
   }
   const h1 = pivotHighs[pivotHighs.length - 2].price, h2 = pivotHighs[pivotHighs.length - 1].price;
   const l1 = pivotLows[pivotLows.length - 2].price,  l2 = pivotLows[pivotLows.length - 1].price;
-  const isHHHL = h2 > h1 && l2 > l1;
-  const isLLLH = h2 < h1 && l2 < l1;
-  const structure = isHHHL ? 'HH-HL' : isLLLH ? 'LL-LH' : 'mixed/ranging';
+  const localHHHL = h2 > h1 && l2 > l1;
+  const localLLLH = h2 < h1 && l2 < l1;
+  const localStructure = localHHHL ? 'HH-HL' : localLLLH ? 'LL-LH' : 'mixed/ranging';
+
+  // Structure comes from the 15M when the caller supplies it, per the rule
+  // above. The label records WHICH read decided, so a rejection can be argued
+  // with later rather than merely believed.
+  const useHtf = htfStructure === 'bullish' || htfStructure === 'bearish';
+  const isHHHL = useHtf ? htfStructure === 'bullish' : localHHHL;
+  const isLLLH = useHtf ? htfStructure === 'bearish' : localLLLH;
+  const structure = useHtf
+    ? (htfStructure === 'bullish' ? 'HH-HL (15M)' : 'LL-LH (15M)')
+    : localStructure;
 
   if (bull && !isHHHL) {
-    return { valid: false, reason: `bullish engulfing needs an HH-HL structure, found ${structure}`, structure };
+    return { valid: false, stage: STAGE.CONTEXT, reason: `bullish engulfing needs an HH-HL structure, found ${structure}`, structure };
   }
   if (!bull && !isLLLH) {
-    return { valid: false, reason: `bearish engulfing needs an LL-LH structure, found ${structure}`, structure };
+    return { valid: false, stage: STAGE.CONTEXT, reason: `bearish engulfing needs an LL-LH structure, found ${structure}`, structure };
   }
 
   // ── Requirement 4: forms AT a swing low (bullish) / swing high (bearish) ──
@@ -153,13 +214,13 @@ function validateEngulfPlaybookC(bars, direction, pdhpdl) {
     const isLocalLow = engulf.low === Math.min(...windowBars.map(b => b.low));
     const retestsPivot = pivotLows.some(p => Math.abs(p.price - engulf.low) / p.price < PBC_LEVEL_TOL);
     if (!isLocalLow && !retestsPivot) {
-      return { valid: false, reason: 'not at a swing low — mid-range entry', structure };
+      return { valid: false, stage: STAGE.CONTEXT, reason: 'not at a swing low — mid-range entry', structure };
     }
   } else {
     const isLocalHigh = engulf.high === Math.max(...windowBars.map(b => b.high));
     const retestsPivot = pivotHighs.some(p => Math.abs(p.price - engulf.high) / p.price < PBC_LEVEL_TOL);
     if (!isLocalHigh && !retestsPivot) {
-      return { valid: false, reason: 'not at a swing high — mid-range entry', structure };
+      return { valid: false, stage: STAGE.CONTEXT, reason: 'not at a swing high — mid-range entry', structure };
     }
   }
 
@@ -187,7 +248,7 @@ function validateEngulfPlaybookC(bars, direction, pdhpdl) {
     const maxHigh = Math.max(...liqWindow.map(b => b.high));
     const swept = levels.find(lv => maxHigh > lv * (1 + PBC_LEVEL_TOL) && engulf.close < lv);
     if (swept !== undefined) {
-      return { valid: false, reason: `buy-side liquidity at ${swept.toFixed(2)} already swept and rejected — too late for a bullish engulfing`, structure };
+      return { valid: false, stage: STAGE.CONTEXT, reason: `buy-side liquidity at ${swept.toFixed(2)} already swept and rejected — too late for a bullish engulfing`, structure };
     }
   } else {
     const levels = [
@@ -197,20 +258,58 @@ function validateEngulfPlaybookC(bars, direction, pdhpdl) {
     const minLow = Math.min(...liqWindow.map(b => b.low));
     const swept = levels.find(lv => minLow < lv * (1 - PBC_LEVEL_TOL) && engulf.close > lv);
     if (swept !== undefined) {
-      return { valid: false, reason: `sell-side liquidity at ${swept.toFixed(2)} already swept and rejected — too late for a bearish engulfing`, structure };
+      return { valid: false, stage: STAGE.CONTEXT, reason: `sell-side liquidity at ${swept.toFixed(2)} already swept and rejected — too late for a bearish engulfing`, structure };
     }
   }
 
   return {
     valid: true,
+    stage: STAGE.OK,
     reason: `valid ${structure} ${bull ? 'swing-low' : 'swing-high'} engulfing, liquidity intact`,
     structure
   };
 }
 
+// ── Key levels the engulfing candle actually interacted with ────────────────
+// 2026-08-27. Purpose is Anoop's manual re-check, not an extra gate: the alert
+// should say WHERE the candle formed so he can pull the chart up and judge it
+// himself. Nothing here can reject a signal — it only annotates one.
+//
+// "Interacted with" is deliberately the candle's own RANGE, not a proximity
+// radius around its close. If price traded through the level during that
+// candle, the level is relevant; if it merely sits 20 points away untouched,
+// it is not, and saying otherwise would put a level in every single alert and
+// train him to ignore the line. A small tolerance band is added on top of the
+// range so a level the wick stopped one tick short of still counts.
+const PBC_NEAR_LEVEL_TOL = 0.0005;  // 0.05% — same band getSwingLevels dedupes on
+
+function nearbyKeyLevels(bar, levels, tolPct = PBC_NEAR_LEVEL_TOL) {
+  if (!bar || !Array.isArray(levels)) return [];
+  const out = [];
+  for (const lv of levels) {
+    if (!lv || typeof lv.price !== 'number' || !Number.isFinite(lv.price) || lv.price <= 0) continue;
+    const band = lv.price * tolPct;
+    if (bar.low - band <= lv.price && lv.price <= bar.high + band) {
+      out.push({ name: lv.name, price: lv.price, dist: Math.abs(lv.price - bar.close) });
+    }
+  }
+  // Nearest to the close first — that is the one the candle finished against.
+  out.sort((a, b) => a.dist - b.dist);
+  // Deduped by price: PDL and a swing low can be the same line to the tick, and
+  // naming it twice reads as two confluences when there is one.
+  const seen = [];
+  return out.filter(l => {
+    if (seen.some(p => Math.abs(p - l.price) / l.price < tolPct)) return false;
+    seen.push(l.price); return true;
+  }).slice(0, 3);
+}
+
 module.exports = {
+  nearbyKeyLevels,
+  PBC_NEAR_LEVEL_TOL,
   dropFormingBar,
   findPivots,
   validateEngulfPlaybookC,
+  STAGE,
   PBC_HISTORY_BARS
 };

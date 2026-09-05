@@ -14,7 +14,19 @@
   'use strict';
 
   const PLAYBOOKS = ['A', 'B', 'C', 'PO3'];
-  const ARMING = new Set(['engulf-fire', 'fvg-fire', 'playbook-b-confirm']);
+  // 'engulf-alert' added 2026-09-03. Playbook A now alerts on every closed
+  // engulfing in both directions and only ARMS the ones that pass the full
+  // check, so the two live under different event names (see server.js's
+  // checkEngulfingSignal for why the name is what every consumer keys on).
+  //
+  // It belongs in ARMING here — and NOT in signal-outcome.js or signal-join.js
+  // — because this bucket already splits the two: `fired` counts what the app
+  // told him about, `valid` counts what passed. Leaving alerts out would make
+  // the scorecard report 2 fires on a day he was shown 12, which is the panel
+  // understating the app to the person checking whether the app is working.
+  // A trade can still only be BACKED by a real armed setup; that is
+  // signal-join's ARMING_EVENTS, which deliberately does not list this.
+  const ARMING = new Set(['engulf-fire', 'engulf-alert', 'fvg-fire', 'playbook-b-confirm']);
 
   function freshBucket() {
     return { fired: 0, valid: 0, rejected: 0, taken: 0, passed: 0, ignored: 0, wins: 0, losses: 0, grossWon: 0, grossLost: 0, net: 0, winPct: null, avgR: null };
