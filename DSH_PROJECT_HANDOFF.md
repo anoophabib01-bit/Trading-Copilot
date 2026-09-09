@@ -253,6 +253,62 @@ it's safe to `taskkill /F /IM node.exe` before doing hand-repair on live data.
 
 ---
 
+## 8.5 What shipped after the questionnaire — 2026-09-10, my actual last day
+
+Everything below is **uncommitted** (`git status --short`: `app/server.js`, `renderer/app.js`,
+`renderer/index.html`, `renderer/styles.css`, `renderer/ws-client.js`, `rules.json`,
+`test/stage-rules.test.js`). Suite: **1928/1928, 0 fail**, checked right before writing this.
+Commit it as its own batch, separate from the G-queue — it's unrelated work, done after that
+queue was already merged.
+
+**TradingView kill switch.** A real, physical barrier against himself, not a data toggle — Anoop
+was explicit about this after I built the wrong first version: *"i want you to close the
+tradingview app so that i do not take anymore trades after clicking on kill tradingview app."*
+Button sits beside `⇄ Account` in the titlebar. Clicking Kill does two things together:
+`mcpBridge.stop()` AND force-closes `TradingView.exe` itself (same process name/command the
+launcher's own `ensure-tradingview.ps1` already trusts). Restore relaunches TradingView through
+that same script (must carry `--remote-debugging-port`, or CDP can never attach — see
+`CLAUDE.md`'s own warning on this) before reattaching. Does not touch Tradovate or any position —
+the confirm dialog says this plainly, and also says the one real cost: he loses his in-app view of
+an open position while it's closed. **Every kill/restore is auto-logged into the Journal tab** —
+same per-day `notes__<slot>` store the mood/plan/mistake fields already use, a new
+`note.tvKillEvents` array, server-written only so it can't be edited away. Read
+`server.js`'s `handleTvKill`/`handleTvRestore`/`logTvKillEvent` (search `tv-kill-switch`) — the
+comments there explain each design choice in more depth than this paragraph can.
+
+**Session benchmarks raised, traced to their real source first.** Anoop asked to raise "the
+benchmark" from 5 to 10 (trades) and −$300 to −$400 (day stop). Before touching anything I traced
+both through the actual render chain rather than guessing which field a screenshot's number came
+from — worth internalizing as the METHOD, not just the result:
+- `tradesPerSession`/`tradesPerDay`: root `rules.json` AND `scalperRules` both raised 5→10. The
+  account runs `tradingMode: "scalper"` — `scalperRules.tradesPerDay` was already 10;
+  `scalperRules.tradesPerSession` was the one field still sitting at 5, and it's what the
+  `'N/lim TRADES — DONE'` HUD line actually reads.
+- The day stop was **not** in `rules.json` at all — it was a hardcoded `300` default in
+  `renderer/app.js`'s `ACCOUNT_PROFILES`, overridable via `~/.mnq-copilot-config.json`'s
+  `evalDayStop` field (the same field the Settings panel's own "Eval day stop" input writes to).
+  Set that config field to `400` directly — zero code change, reused existing infrastructure
+  rather than editing a hardcoded literal.
+- **Explicitly did NOT touch** the separate sleep/nap-based halving rule (`bodyReduced()` →
+  `Math.ceil(tradesPerDay/2)`) that can independently produce the same "5" on a poor-sleep day. If
+  he sees 5 again on a day he slept badly, that's a different, deliberate mechanism working
+  correctly — don't "fix" it without him asking for that specifically.
+- Three tests in `stage-rules.test.js` broke on the rules.json change (they hardcoded the old `5`).
+  Fixed by tracing the correct NEW value per test (funded's own tighter `tradesPerDay: 6` clamps
+  the new base of 10 down to 6, not 10 — read the comments I left on each assertion), never by
+  deleting or loosening an assertion to make it pass.
+
+**One live-feed self-test blip, diagnosed and NOT reproduced.** Anoop reported "4/5 checks
+passed" in the titlebar; by the time I queried the same test live it was back to 5/5. Told him
+honestly I couldn't identify which of the 5 named checks failed from that state, named the
+historically flakiest one (`Broker panel / live feed` — the one G2/G3 exist because of), and told
+him to click the "click to re-check" text itself the next time it drops, which fires an immediate
+re-run and surfaces the failing check's `detail` string before it self-heals. If he brings you a
+named failing check, `server.js`'s `runLiveFeedSelfTest()` (search `live-feed-self-test`) has all
+five checks' exact logic — read the one he names before touching anything.
+
+---
+
 ## 9. Standing instructions
 
 1. Read `HANDOVER.md`, `ARCHITECTURE.md`, `AGENTS.md`, `CLAUDE.md`, then `DSH_START_HERE.md`, then

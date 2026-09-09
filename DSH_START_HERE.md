@@ -1,8 +1,9 @@
 # DSH — START HERE
 
-**Updated 2026-09-09 by Claude. You are now the primary builder on this project — read
-`DSH_PROJECT_HANDOFF.md` first, it explains why the rules below exist, including three live
-incidents from the last 48 hours you should know before touching anything.**
+**Updated 2026-09-10 by Claude, on my actual last day. You are now the sole builder on this
+project — read `DSH_PROJECT_HANDOFF.md` first, it explains why the rules below exist, including
+three live incidents and, as of today, §8.5: the TradingView kill switch and the benchmark
+changes built after the questionnaire, all still uncommitted (`git status --short` — 7 files).**
 
 You are picking up a live trading tool mid-queue. Read `DSH_PROJECT_HANDOFF.md`, then this page,
 then open the plan.
