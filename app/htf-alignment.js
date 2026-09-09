@@ -214,7 +214,8 @@ function readHTF(bars15m, bars1h) {
  * @param {object} htf        result of readHTF()
  * @param {string} direction  the setup's direction
  */
-function checkSetup(htf, direction) {
+function checkSetup(htf, direction, unclearPolicy) {
+  const policy = unclearPolicy || 'refuse';
   const setup = dirOf(direction);
   const h = htf || {};
   const base = {
@@ -227,8 +228,40 @@ function checkSetup(htf, direction) {
     // carried through so the caller can attach it to the signal without
     // re-reading the higher timeframe and risking a different answer
     confirmation: h.confirmation || null,
+    // G4: marks a 15M-UNCLEAR trade that was ALLOWED by an explicit policy,
+    // so the shadow row can never be mistaken for a clean-bias setup.
+    htfConfirmation: null,
   };
-  if (!h.ok || !h.bias) return base;          // gate never opened
+  if (!h.ok || !h.bias) {
+    // Gate never opened on the 15M. G4: an UNCLEAR 15M may be relaxed per-policy
+    // (shadow-only C-ADX), but a direction mismatch is NEVER relaxed under any
+    // policy value — "refuse-unless-1h-clean" only admits a setup whose side the
+    // 1H cleanly agrees with, and only when the 15M was merely unclear.
+    if (h.reason === REASONS.UNCLEAR_15M) {
+      if (policy === 'refuse-unless-1h-clean') {
+        const s1 = h.structure1h;
+        if (s1 === 'bullish' || s1 === 'bearish') {
+          if (setup === s1) {
+            base.allowed = true;
+            base.reason = REASONS.OK;
+            base.bias = s1;                 // the 1H is the only clean read
+            base.htfConfirmation = 'unclear';
+            return base;
+          }
+          base.reason = REASONS.SETUP_DISAGREES;  // 1H clean but the OTHER way
+          return base;
+        }
+        return base;  // 1H unclear or unavailable -> refuse
+      }
+      if (policy === 'alert-unlabelled') {
+        base.allowed = true;
+        base.reason = REASONS.OK;
+        base.htfConfirmation = 'unclear';
+        return base;
+      }
+    }
+    return base;
+  }
   if (setup !== h.bias) {
     base.reason = REASONS.SETUP_DISAGREES;
     return base;

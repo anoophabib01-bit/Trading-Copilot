@@ -269,6 +269,24 @@ function setupId(playbookId, setup) {
   }
 }
 
+// ── riskGate — the shared risk ceiling, G8/G11 ────────────────────────────
+// Was declared inside backtest.js; moved here so the LIVE path and the backtest
+// price a setup with the SAME two ceilings. Returns {ok, riskUsd} or
+// {ok:false, code:'risk-too-small'|'risk-too-big', reason}. Pure — every number
+// comes from rules.json via the caller.
+function riskGate(plan, rules, contracts, pointValue) {
+  const minPts = (rules && rules.playbooks && rules.playbooks.minRiskPoints) || 0;
+  const maxUsd = (rules && rules.perTradeMaxLoss) || Infinity;
+  const riskUsd = plan.riskPoints * pointValue * contracts;
+  if (minPts && plan.riskPoints < minPts) {
+    return { ok: false, code: 'risk-too-small', reason: `stop is only ${plan.riskPoints.toFixed(2)}pt (min ${minPts}) — raid and displacement are likely the same bar` };
+  }
+  if (riskUsd > maxUsd) {
+    return { ok: false, code: 'risk-too-big', reason: `${plan.riskPoints.toFixed(2)}pt = $${riskUsd.toFixed(0)} risk at ${contracts} contracts, over the $${maxUsd} per-trade max loss` };
+  }
+  return { ok: true, riskUsd };
+}
+
 // ── planEntry — where the trade actually is ────────────────────────────────
 // Returns { plannable:true, entry, stop, target, riskPoints, requiresFill,
 // fillWindowBars, stopSource } or { plannable:false, reason }.
@@ -283,7 +301,7 @@ function setupId(playbookId, setup) {
 // `setup` fields by playbook:
 //   A / LTF-ENGULF : { direction, bar:{open,high,low,close,time} }
 //   B              : { direction, gapLow, gapHigh, wick, level }
-function planEntry(playbookId, setup, rules) {
+function planEntry(playbookId, setup, rules, risk) {
   const cfg = Object.assign({}, SPEC_DEFAULTS, (rules && rules.playbooks) || {});
   const pb = getPlaybook(playbookId);
   if (!pb) return { plannable: false, reason: `unknown playbook "${playbookId}"` };
@@ -352,9 +370,19 @@ function planEntry(playbookId, setup, rules) {
     return { plannable: false, reason: `stop is not beyond entry (entry ${entry}, stop ${stop}) — refusing to return a plan` };
   }
 
+  // G11: minRiskPoints is a HARD refusal for Playbook B — a 3.00pt stop means the
+  // raid candle and the displacement FVG candle are the same bar, so there is no
+  // displacement leg and it is not the playbook. Surfaced by the caller, not
+  // silently swallowed.
+  const minPts = (rules && rules.playbooks && rules.playbooks.minRiskPoints) || 0;
+  if (playbookId === 'B' && minPts && riskPoints < minPts) {
+    return { plannable: false, riskPoints, riskTooSmall: true,
+      reason: `risk ${riskPoints.toFixed(2)}pt under minRiskPoints ${minPts} — raid and displacement are likely the same bar` };
+  }
+
   const target = bull ? entry + riskPoints * rr : entry - riskPoints * rr;
 
-  return {
+  const out = {
     plannable: true,
     playbook: pb.id,
     direction: bull ? 'BULLISH' : 'BEARISH',
@@ -367,6 +395,21 @@ function planEntry(playbookId, setup, rules) {
     requiresFill,
     fillWindowBars,
   };
+
+  // G8: flag, do not skip. riskUsd is computed only when the caller supplies the
+  // traded size + point value; `riskBlocked` flags an over-cap setup without
+  // refusing it (a hard skip would stop arming ~1/3 of A and 3/4 of B and break
+  // forward-test comparability).
+  if (risk && Number.isFinite(risk.contracts) && Number.isFinite(risk.pointValue)) {
+    const riskUsd = riskPoints * risk.pointValue * risk.contracts;
+    const maxUsd = (rules && rules.perTradeMaxLoss) || Infinity;
+    out.riskUsd = riskUsd;
+    out.riskBlocked = riskUsd > maxUsd ? 'over-per-trade-max' : null;
+  } else {
+    out.riskUsd = null;
+    out.riskBlocked = null;
+  }
+  return out;
 }
 
-module.exports = { PLAYBOOKS, PLAYBOOK_ALIASES, SPEC_DEFAULTS, getPlaybook, canonicalId, planEntry, setupId };
+module.exports = { PLAYBOOKS, PLAYBOOK_ALIASES, SPEC_DEFAULTS, getPlaybook, canonicalId, planEntry, setupId, riskGate };

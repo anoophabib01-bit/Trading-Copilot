@@ -97,6 +97,9 @@ function buildStatus(o) {
   const dataAgeMinutes = (nowMs != null && lastBarMs != null)
     ? Math.max(0, Math.round((nowMs - lastBarMs) / 60000)) : null;
   const stale = dataAgeMinutes != null && dataAgeMinutes > staleAfter;
+  // G16: default CONNECTED unless explicitly told false — a caller that does
+  // not pass tvConnected (tests, older call sites) must not read as "feed down".
+  const tvConnected = opts.tvConnected === false ? false : true;
 
   const ok = !!(htf && htf.ok);
   const st = {
@@ -114,7 +117,12 @@ function buildStatus(o) {
     atIST: istHHMM(nowMs),
     dataAgeMinutes,
     stale,
+      tvConnected,
     side: sideWord(ok ? htf.bias : null),
+    // G20: how many bars the read actually used — a short response must not read
+    // like a full window.
+    bars15mUsed: htf ? (htf.bars15mUsed != null ? htf.bars15mUsed : null) : null,
+    bars1hUsed: htf ? (htf.bars1hUsed != null ? htf.bars1hUsed : null) : null,
   };
   st.headline = buildHeadline(st);
   st.evidence = buildEvidence(st);
@@ -124,6 +132,7 @@ function buildStatus(o) {
 // The short form — the UI chip. One glance: which way, and is it trustworthy.
 function buildHeadline(st) {
   if (st.stale) return 'HTF STALE — ' + st.side + ' (' + ageText(st.dataAgeMinutes) + ')';
+  if (st.tvConnected === false) return 'HTF FEED DOWN — TradingView disconnected';
   if (!st.ok) return 'HTF NO BIAS — B and C held, A alerts unlabelled';
   const conf = st.confirmation === 'confirmed' ? '1H confirms'
     : st.confirmation === 'disagrees' ? '1H disagrees'
@@ -140,6 +149,14 @@ function buildEvidence(st) {
   const parts = [];
 
   if (st.stale) {
+  if (st.tvConnected === false) {
+    parts.push('HTF ' + when + ' — FEED DOWN. TradingView is disconnected; no bias read is current.');
+    parts.push('The newest 15M bar the watchers have is ' + (st.barCloseIST || 'unknown')
+      + ' IST (' + ageText(st.dataAgeMinutes) + ').');
+    parts.push('Playbook B and Playbook C (ADX) are held until the feed returns.');
+    return parts.join(' ');
+  }
+
     // Leads with the problem. A stale read that opens with the bias would be
     // read as the bias, and the staleness is the more important fact.
     parts.push('HTF ' + when + ' — STALE READ, do not trust this side.');
@@ -166,7 +183,12 @@ function buildEvidence(st) {
 
   parts.push(watcherText(st));
   if (st.barCloseIST && !st.stale) {
-    parts.push('Read from 15M bars up to ' + st.barCloseIST + ' IST ('
+    // G20: below the requested 40 bars the read is degraded and must say so — a
+    // starved window and a full one produce identical output otherwise.
+    const readNote = (st.bars15mUsed != null && st.bars15mUsed < 40)
+      ? 'read from ' + st.bars15mUsed + ' of 40 requested 15M bars — degraded'
+      : 'Read from 15M bars';
+    parts.push(readNote + ' up to ' + st.barCloseIST + ' IST ('
       + ageText(st.dataAgeMinutes) + ') — check that candle against your chart.');
   }
   return parts.join(' ');

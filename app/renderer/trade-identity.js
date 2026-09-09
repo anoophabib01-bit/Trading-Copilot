@@ -37,6 +37,25 @@
   // doubles contracts, gross, and the size-cap counts the guardrail enforces.
   const MIXED_BASIS_TOLERANCE = 60;
 
+  // G26: whether a row's size is a BEST-EFFORT fold observation rather than a
+  // verified fill count. The live fold's sizeSeenThisTrade is the largest
+  // position it happened to observe between polls, so it can be a PARTIAL read
+  // of a larger CSV fill (2026-09-09: the fold saw 1 lot, the CSV had 2). A
+  // verified size — a CSV row, or the order walk's own fill count — is never a
+  // wildcard. Shared by the CSV importer (isSameTrade) and the live-feed
+  // self-heal (mergeTradeRow / missingFromDayRows) so the two surfaces cannot
+  // disagree about what "not fully observed" means.
+  function sizeIsBestEffort(row) {
+    if (!row) return true;                             // unknown row → wildcard
+    const s = Number(row.size);
+    if (!Number.isFinite(s) || s === 0) return true;   // size 0 = never observed
+    return row.pnlBasis === 'net'                       // live fold rows are net-basis
+      || row.evidence === 'fold'
+      || row.source === 'live-fold-only'
+      || row.inferred === true
+      || row.evidence === 'degraded';
+  }
+
   function isSameTrade(csvRow, liveRow, opts) {
     const o = opts || {};
     const exitTol = typeof o.exitToleranceMs === 'number' ? o.exitToleranceMs : EXIT_TOLERANCE_MS;
@@ -55,7 +74,10 @@
     // still a genuine mismatch and still rejected.
     const lSize = Number(liveRow.size) || 0;
     const cSize = Number(csvRow.size) || 0;
-    if (lSize && cSize && lSize !== cSize) return false;
+    // G26: reject a size mismatch ONLY when both sides are VERIFIED. A
+    // best-effort size (size 0, or a fold row's partial read) is a wildcard —
+    // see sizeIsBestEffort above.
+    if (!sizeIsBestEffort(liveRow) && !sizeIsBestEffort(csvRow) && lSize !== cSize) return false;
     const ls = String(liveRow.side || '').toLowerCase();
     const cs = String(csvRow.side || '').toLowerCase();
     if (ls && cs && ls !== cs) return false; // a missing side on either side matches anything
@@ -189,5 +211,5 @@
     return Array.from(map.values()).sort((a, b) => a.t - b.t);
   }
 
-  return { isSameTrade, matchCsvToLive, mergeCsvIntoStored, pnlBasisOf, EXIT_TOLERANCE_MS, PNL_TOLERANCE, MIXED_BASIS_TOLERANCE };
+  return { isSameTrade, matchCsvToLive, mergeCsvIntoStored, pnlBasisOf, sizeIsBestEffort, EXIT_TOLERANCE_MS, PNL_TOLERANCE, MIXED_BASIS_TOLERANCE };
 });

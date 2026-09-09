@@ -274,3 +274,42 @@ test('scalper never holds longer than normal, in either stage', () => {
       `${stage}: scalper hold ceiling must be the tighter one`);
   }
 });
+
+// ── The Cap control must never raise the FUNDED cap (2026-09-08) ─────────────
+// Anoop was asked directly on 2026-09-05 and said "No, funded stays at 2". The
+// file was changed. At 21:05 the same day a nudge of the titlebar Cap control
+// put it straight back to 4, because the rules-set handler forced BOTH stage
+// blocks to the dial value. He was never told, and the funded block is not
+// shown anywhere in the UI.
+//
+// This reproduces the handler's own logic (server.js `case 'rules-set'`) rather
+// than importing it — server.js starts a live server on require. If that
+// handler is ever rewritten to touch the funded block again, this fails.
+test('the size dial moves EVAL only — funded is never raised by the UI', () => {
+  const chosen = 6;
+  const next = JSON.parse(JSON.stringify(RULES));
+  next.stageRules.funded.sizeCap = 2;
+
+  // …the handler, as it must behave:
+  const cap = SR.clampSizeCap(chosen, next);
+  next.sizeCap = cap;
+  if (next.stageRules && next.stageRules.eval) next.stageRules.eval.sizeCap = cap;
+  // (and deliberately NOTHING for funded)
+
+  assert.strictEqual(next.stageRules.funded.sizeCap, 2, 'the dial must not rewrite the funded block');
+  assert.strictEqual(SR.applyStageRules(next, 'funded').sizeCap, 2,
+    'funded clamps by MIN, so his dial may lower funded but never raise it');
+  assert.strictEqual(SR.applyStageRules(next, 'eval').sizeCap, cap, 'eval follows the dial');
+});
+
+test('the dial CAN still tighten funded below its own block value', () => {
+  // The ratchet is one-way, not frozen: turning the dial down to 2 while the
+  // funded block says 4 must give 2, or "tighten everything now" would silently
+  // not apply to the account that matters most.
+  const next = JSON.parse(JSON.stringify(RULES));
+  next.stageRules.funded.sizeCap = 4;
+  const cap = SR.clampSizeCap(2, next);
+  next.sizeCap = cap;
+  if (next.stageRules && next.stageRules.eval) next.stageRules.eval.sizeCap = cap;
+  assert.strictEqual(SR.applyStageRules(next, 'funded').sizeCap, 2, 'min(dial 2, funded 4) = 2');
+});

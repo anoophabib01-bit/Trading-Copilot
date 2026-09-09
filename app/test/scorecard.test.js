@@ -70,3 +70,18 @@ test('engulf-alert counts as fired but never as valid', () => {
   assert.equal(s.byPlaybook.A.fired, 3, 'he was shown three candles');
   assert.equal(s.byPlaybook.A.valid, 1, 'only one was a full Playbook A setup');
 });
+
+// G6: an HTF-gate block is a HELD count, never merged into `rejected`, and
+// C-ADX / FVG-ONLY rows are no longer dropped by the playbook filter.
+test('htf-reject counts as held; C-ADX and FVG-ONLY are counted', () => {
+  const s = computeScorecard([], [
+    { event: 'htf-reject', playbook: 'C-ADX', valid: false },
+    { event: 'htf-reject', playbook: 'C-ADX', valid: false },
+    { event: 'fvg-fire', playbook: 'FVG-ONLY', valid: true },
+    { event: 'playbook-c-reject', playbook: 'C', valid: false },
+  ]);
+  assert.equal(s.byPlaybook['C-ADX'].htfBlocked, 2, 'two C-ADX blocks are held');
+  assert.equal(s.byPlaybook['C-ADX'].fired, 0, 'a block is not a fire');
+  assert.equal(s.byPlaybook['FVG-ONLY'].fired, 1, 'FVG-ONLY is no longer dropped');
+  assert.equal(s.byPlaybook.C.rejected, 1, 'rejected stays the engulf-validity filter');
+});

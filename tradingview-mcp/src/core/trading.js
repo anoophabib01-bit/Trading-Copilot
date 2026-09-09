@@ -150,6 +150,7 @@ export async function getPositions() {
   const t = await readTable('TRADOVATE.positions-table');
   return {
     success: t.found,
+      visible: !!t.visible,
     count: t.rows.length,
     empty: t.rows.length === 0,
     emptyStateText: t.emptyStateText,

@@ -29,6 +29,40 @@ test('allows a size within cap/floor with no other violations', () => {
   assert.equal(r.reason, null);
 });
 
+// ── G9: stop-distance risk on the live order path ──────────────────────────
+test('G9: a 400-pt stop at 2 contracts is refused (over per-trade cap)', () => {
+  const r = checkTradeAllowed(RULES, 'funded', [], 2, null, {
+    side: 'buy', stopPrice: 100, lastPrice: 500, pointValue: 2, riskCapUsd: 300,
+  });
+  assert.equal(r.allowed, false);
+  assert.match(r.reason, /risks \$1600/);
+  assert.match(r.reason, /over the \$300/);
+});
+
+test('G9: a buy stop on the wrong side (at/above entry) is refused', () => {
+  const r = checkTradeAllowed(RULES, 'funded', [], 2, null, {
+    side: 'buy', stopPrice: 500, lastPrice: 400, pointValue: 2, riskCapUsd: 300,
+  });
+  assert.equal(r.allowed, false);
+  assert.match(r.reason, /wrong side/);
+});
+
+test('G9: a stopless ticket is refused', () => {
+  const r = checkTradeAllowed(RULES, 'funded', [], 2, null, {
+    side: 'buy', stopPrice: null, lastPrice: 400, pointValue: 2, riskCapUsd: 300,
+  });
+  assert.equal(r.allowed, false);
+  assert.match(r.reason, /no stop supplied/);
+});
+
+test('G9: an in-cap, right-side stop is allowed', () => {
+  const r = checkTradeAllowed(RULES, 'funded', [], 2, null, {
+    side: 'buy', stopPrice: 390, lastPrice: 400, pointValue: 2, riskCapUsd: 300,
+  });
+  // 10pt * $2 * 2 = $40 risk
+  assert.equal(r.allowed, true);
+});
+
 test('rejects once tradesPerDay is already hit', () => {
   const trades = Array.from({ length: 5 }, () => ({ size: 2, pnl: 50 }));
   const r = checkTradeAllowed(RULES, 'funded', trades, 2);

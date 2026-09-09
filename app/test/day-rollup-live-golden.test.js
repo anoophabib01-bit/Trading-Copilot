@@ -57,7 +57,9 @@ test('LIVE GOLDEN: real stored days reproduce byte-identically', { skip: !findDa
       // meant a day written under any other rate could never reproduce, so the
       // test failed for a reason that was not drift in the extraction it exists
       // to guard. 1.0 is the pre-rules.json default.
-      for (const comm of [1.90, 1.18, 1.0]) {
+      // G23: a day now carries its own rate (commPerCt) — prefer it. The sweep is
+      // the fallback for legacy rows written before the field existed.
+      for (const comm of (sum.commPerCt != null ? [sum.commPerCt] : [1.90, 1.18, 1.0])) {
       for (const lossOnly of [false, true]) {
         for (let cap = 1; cap <= 8; cap++) {
           const mode = lossOnly ? 'scalper' : (sum.tradingMode || 'standard');

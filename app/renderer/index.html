@@ -286,6 +286,10 @@
              Same eval-only/funded-only classes _renderMode() already toggles
              everywhere else in this panel — no new JS needed, these show/hide
              automatically with the account's stage. -->
+        <!-- 2026-09-07: names the slot these two buttons will act on. Both
+             call acctSlot() (the OPEN account), and with two 50k/eval slots
+             in the list the panel gave no way to tell which one that was. -->
+        <div id="acct-action-scope" class="acct-action-scope" style="font-size:11px;opacity:.65;margin-top:8px;"></div>
         <div class="eval-only acct-action-row" style="display:none;">
           <button class="gate-status-btn gate-status-breach" onclick="accountBreached(event)" title="Mark THIS open account breached — archives its data and resets it fresh">Eval breached</button>
           <button class="gate-status-btn gate-status-clear" onclick="accountClearedToFunded(event)" title="Mark THIS open account's eval cleared — moves it to FUNDED with a clean slate">Cleared → Funded</button>
@@ -492,6 +496,7 @@
       <div class="rtab active" data-tab="analysis" onclick="switchTab('analysis')">Analysis</div>
       <div class="rtab" data-tab="checklist" onclick="switchTab('checklist')">Checklist</div>
       <div class="rtab" data-tab="journal"  onclick="switchTab('journal')">Journal</div>
+      <div class="rtab" data-tab="brief" onclick="switchTab('brief')" title="Pre-New-York-session brief: overnight range, gaps, sudden moves in MNQ and MGC, cross-market context and scheduled event risk. Describes the tape only — no direction, no setup">Brief</div>
       <div class="rtab" data-tab="forensics" onclick="switchTab('forensics')" title="MAE/MFE per trade, time in trade, entry vs session range, what price did after you exited — plus expectancy per tag and counterfactuals on your real trades">Forensics</div>
       <div class="rtab" data-tab="week" onclick="switchTab('week')" title="The whole week: calendar, where the money went, mistakes and positives, and next week's commitment">Week</div>
       <div class="rtab" data-tab="insights" onclick="switchTab('insights')">Insights</div>
@@ -533,8 +538,9 @@
         <div class="analysis-block">
           <div class="block-title">Framework Steps</div>
           <div class="step-grid">
-            <div class="step-row"><div class="step-num" id="step-1-num">1</div><span class="step-label">4H bias</span><span class="step-value" id="step-1-val">—</span></div>
-            <div class="step-row"><div class="step-num" id="step-2-num">2</div><span class="step-label">1H aligns</span><span class="step-value" id="step-2-val">—</span></div>
+            <div class="step-row"><div class="step-num" id="step-0-num">0</div><span class="step-label">15M gate</span><span class="step-value" id="step-0-val">—</span></div>
+            <div class="step-row"><div class="step-num" id="step-1-num">1</div><span class="step-label">4H bias (reference)</span><span class="step-value" id="step-1-val">—</span></div>
+            <div class="step-row"><div class="step-num" id="step-2-num">2</div><span class="step-label">1H (evidence)</span><span class="step-value" id="step-2-val">—</span></div>
             <div class="step-row"><div class="step-num" id="step-3-num">3</div><span class="step-label">Zone reaction</span><span class="step-value" id="step-3-val">—</span></div>
             <div class="step-row"><div class="step-num" id="step-4-num">4</div><span class="step-label">Trigger candle</span><span class="step-value" id="step-4-val">—</span></div>
           </div>
@@ -1023,6 +1029,12 @@
           <div id="ck-fwNote" style="font-size:10px;color:var(--text-dim)">Tap each step as you complete top-down analysis</div>
         </div>
 
+        <!-- G14.RISK DECISION (2026-09-08): Framework Steps now names the 15M
+             gate as step 0, but this pre-trade CHECKLIST stays Anoop's manual
+             4H/Daily read ON PURPOSE. It is NOT migrated to the 15M-gate
+             doctrine, ck_history.json is NOT touched, and bias-tracker.js's
+             adherence matrix still grades on ck.bias/ck.h4/ck.h1. Whether the
+             checklist itself should move is a separate call for Anoop. -->
         <div class="analysis-block" id="ck-block-htf">
           <div class="block-title">HTF Alignment</div>
           <div class="ck-chk-list">
@@ -1181,6 +1193,23 @@
         <div id="forensics-body"><div class="no-trades">Open to load trade forensics.</div></div>
       </div>
 
+      <div id="tab-brief" style="display:none;padding:12px;">
+        <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+          <div style="font-weight:700;font-size:15px;">Market Brief</div>
+          <div id="brief-clock" style="opacity:.65;font-size:12px;"></div>
+          <button id="brief-tog-combined" onclick="briefSetView('combined')"
+                  style="font-size:11px;padding:3px 10px;cursor:pointer;">MNQ + MGC</button>
+          <button id="brief-tog-gold" onclick="briefSetView('gold')"
+                  style="font-size:11px;padding:3px 10px;cursor:pointer;">Gold only</button>
+          <div style="flex:1"></div>
+          <button id="brief-refresh" onclick="briefRefresh()"
+                  style="font-size:11px;padding:3px 10px;cursor:pointer;">Refresh</button>
+        </div>
+        <div id="brief-body" style="font-size:13px;line-height:1.55;">
+          <div style="opacity:.6">Open this tab to build the brief…</div>
+        </div>
+      </div>
+
       <div id="tab-week" style="display:none;padding:12px;">
         <div id="week-body"><div class="no-trades">Open this on a weekend to review the week.</div></div>
       </div>
@@ -1306,6 +1335,12 @@
     </div>
 
     <div class="settings-subhead">Telegram Bot</div>
+    <!-- G18: Telegram is hard-disabled (TELEGRAM_ENABLED=false, Anoop 2026-09-04).
+         The note makes that legible so a token typed here never looks like it will
+         send. The fields stay for record only. -->
+    <div class="settings-field" style="color:var(--text-dim);font-size:11px;margin-bottom:6px">
+      Telegram is disabled (your decision, 2026-09-04). The token fields below are kept for the record and do not send anything.
+    </div>
     <div class="settings-field">
       <label>Telegram Bot Token</label>
       <input type="password" id="settings-telegram-token" placeholder="from @BotFather" autocomplete="off">

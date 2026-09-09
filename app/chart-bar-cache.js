@@ -127,7 +127,11 @@ class ChartBarCache {
     const key = this._key(symbol, tfCode);
     const e = this._entries.get(key);
     if (e && !isStale(e, tfCode, this._now()) && e.count >= count) return false;
-    this._entries.set(key, { value: Array.isArray(value) ? value.slice() : value, count, at: this._now() });
+    // G20: a short response must be keyed by what it ACTUALLY holds, not what was
+    // requested — otherwise a 26-bar response claims to be a full-count entry and
+    // a later full-window request is silently served short.
+    const effectiveCount = Array.isArray(value) ? Math.min(count, value.length) : count;
+    this._entries.set(key, { value: Array.isArray(value) ? value.slice() : value, count: effectiveCount, at: this._now() });
     this.stats.sets++;
     return true;
   }

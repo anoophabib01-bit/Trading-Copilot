@@ -12,7 +12,7 @@ const row = (stats, over) => cadxWatcherRow(Object.assign({
 test('a healthy idle monitor says it is watching, and says nothing more', () => {
   const r = row({ lastCheckAt: T0 - 5000, lastStatus: 'no-signal', bars: 1179, signals: 0 });
   assert.strictEqual(r.health, 'healthy');
-  assert.match(r.detail, /no setup on the last closed 30M bar/);
+  assert.match(r.detail, /no setup on the last closed bar/);
   assert.match(r.detail, /1179 bars/);
   assert.match(r.detail, /0 signals this run/, 'zero is the expected reading and must be shown');
 });

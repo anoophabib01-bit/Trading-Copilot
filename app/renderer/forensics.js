@@ -108,8 +108,11 @@ function fxTradeTable(rows) {
   }
   let h = '<div class="fx-scroll"><table class="fx-tbl"><thead><tr>'
     + '<th>Day</th><th>In</th><th>Side</th><th class="num">Size</th><th class="num">P&amp;L</th>'
-    + '<th class="num">Hold</th><th class="num">MAE</th><th class="num">MFE</th><th class="num">MFE/MAE</th>'
-    + '<th class="num">Entry in range</th><th class="num">Left on table</th>'
+    + '<th class="num">Hold</th>'
+    + '<th class="num">MAE <span class="fx-unit">pts</span></th><th class="num">MAE <span class="fx-unit">$</span></th>'
+    + '<th class="num">MFE <span class="fx-unit">pts</span></th><th class="num">MFE <span class="fx-unit">$</span></th>'
+    + '<th class="num">MFE/MAE</th>'
+    + '<th class="num">Entry in range</th><th class="num">Left on table <span class="fx-unit">pts</span></th>'
     + '<th>Playbook</th><th>Session</th><th>Tags</th>'
     + '</tr></thead><tbody>';
   for (const r of shown) {
@@ -121,17 +124,19 @@ function fxTradeTable(rows) {
     h += '<tr>'
       + '<td>' + fxEsc(r.day || '') + '</td>'
       + '<td>' + fxClock(r.entryAt) + '</td>'
-      + '<td>' + fxEsc(r.side || '&mdash;') + '</td>'
+      + '<td>' + (r.side ? fxEsc(r.side) : '<span class="fx-na">&mdash;</span>') + '</td>'
       + '<td class="num">' + (r.size == null ? '&mdash;' : r.size) + '</td>'
       + '<td class="num">' + fxMoney(r.pnl) + '</td>'
       + '<td class="num">' + fxHold(r.holdSec) + '</td>'
       + '<td class="num">' + fxNum(r.mae, 1, r.forensicsReason) + '</td>'
+      + '<td class="num">' + fxMoney(r.maeUsd) + '</td>'
       + '<td class="num">' + fxNum(r.mfe, 1, r.forensicsReason) + '</td>'
+      + '<td class="num">' + fxMoney(r.mfeUsd) + '</td>'
       + '<td class="num">' + fxNum(r.edgeRatio, 2, r.forensicsReason) + '</td>'
       + '<td class="num">' + fxPct(r.entryPctOfRange) + '</td>'
       + '<td class="num">' + fxNum(r.post30LeftOnTable, 1, r.post30Reason) + '</td>'
-      + '<td>' + fxEsc(r.playbook || '&mdash;') + '</td>'
-      + '<td>' + fxEsc(r.session || '&mdash;') + '</td>'
+      + '<td>' + (r.playbook ? fxEsc(r.playbook) : '<span class="fx-na">&mdash;</span>') + '</td>'
+      + '<td>' + (r.session ? fxEsc(r.session) : '<span class="fx-na">&mdash;</span>') + '</td>'
       + '<td class="fx-tags">' + tags.map((t) => '<span>' + fxEsc(t) + '</span>').join('') + '</td>'
       + '</tr>';
   }

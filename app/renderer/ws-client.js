@@ -569,6 +569,12 @@
         emit('htf:status', msg);
         break;
 
+      // G6: an HTF-gate block (Playbook B / C-ADX held). Broadcast for years,
+      // rendered nowhere — this routes it to a HELD status row.
+      case 'htf-reject':
+        emit('htf:reject', msg);
+        break;
+
       // Startup bar-record self-repair outcome.
       case 'bar-record-repair':
         emit('bars:repair', msg);
@@ -608,6 +614,15 @@
 
       // Forensics tab (2026-09-05): one request, one whole-tab payload.
       case 'forensics-data':
+        resolvePending(msg.reqId, msg);
+        break;
+
+      // Market Brief tab (2026-09-06): same one-request/one-payload shape.
+      case 'brief-data':
+        resolvePending(msg.reqId, msg);
+        break;
+
+      case 'gold-brief-data':
         resolvePending(msg.reqId, msg);
         break;
 
@@ -983,6 +998,11 @@
     // Forensics (2026-09-05): MAE/MFE per trade, conditional expectancy,
     // counterfactuals. Computed entirely server-side; see forensics-report.js.
     forensics:    ()                    => sendRequest({ type: 'forensics-get' }, 20000),
+    // 150s, not the usual 20s: a COLD brief spawns the Yahoo CLI six times over
+    // 60 days of 5m bars. The server caches for 10 minutes, so only the first
+    // call after a restart actually waits this long.
+    marketBrief:  (refresh)             => sendRequest({ type: 'brief-get', refresh: !!refresh }, 150000),
+    goldBrief:    (refresh)             => sendRequest({ type: 'gold-brief-get', refresh: !!refresh }, 150000),
     weekReport:   (offset)              => sendRequest({ type: 'week-report-get', offset: offset || 0 }, 20000),
     weekCommit:   (weekKey, commitment) => sendRequest({ type: 'week-commit-set', weekKey, commitment }, 20000),
     weekDoctrine: (text)                => sendRequest({ type: 'week-doctrine-set', text }, 20000),
@@ -1061,6 +1081,7 @@
     getWatchers:       ()  => sendRequest({ type: 'watchers-get' }).then(r => r.data),
     onWatchersStatus:  (cb) => on('watchers:status', cb),
     onHtfStatus:       (cb) => on('htf:status', cb),
+    onHtfReject:       (cb) => on('htf:reject', cb),
     onBarsRepair:      (cb) => on('bars:repair', cb),
     // 2.3: armed-setup slot + Took it / Passed decisions
     onArmedSetup:          (cb) => on('signal:armedSetup', cb),

@@ -28,7 +28,7 @@ const drawdownGuard = require('./drawdown-guard'); // T4.1 headroom gate (pure d
  * @param {number} requestedQty  size of the hypothetical trade being evaluated
  * @returns {{allowed:boolean, reason:string|null}}
  */
-function checkTradeAllowed(rules, stage, todayTrades, requestedQty, account) {
+function checkTradeAllowed(rules, stage, todayTrades, requestedQty, account, risk) {
   const r = rules || {};
   const trades = Array.isArray(todayTrades) ? todayTrades : [];
   const qty = Number(requestedQty);
@@ -45,6 +45,39 @@ function checkTradeAllowed(rules, stage, todayTrades, requestedQty, account) {
   const sizeFloor = typeof r.sizeFloor === 'number' ? r.sizeFloor : 0;
   if (qty < sizeFloor) {
     return { allowed: false, reason: `size ${qty} is under sizeFloor ${sizeFloor}` };
+  }
+
+  // G9: stop-distance risk. This is the only path that places a real order, so it
+  // must refuse a stop so far away that the loss at this size exceeds the
+  // per-trade cap. `risk.riskCapUsd` is the tighter of {mode cap, perTradeMaxLoss}
+  // (the caller computes it via autonomyModes.riskCapUsd) — never looser than the
+  // account rule. A missing stopPrice/lastPrice/pointValue skips the check rather
+  // than guessing (the caller must refuse a stopless ticket separately).
+  if (risk) {
+    const stop = risk.stopPrice != null ? Number(risk.stopPrice) : NaN;
+    const last = risk.lastPrice != null ? Number(risk.lastPrice) : NaN;
+    const pv = risk.pointValue != null ? Number(risk.pointValue) : NaN;
+    const cap = risk.riskCapUsd != null ? Number(risk.riskCapUsd) : NaN;
+    const side = risk.side || null;
+    // A stopless ticket is refused — a naked market order on the only live-order
+    // path is exactly what this check exists to prevent.
+    if (!Number.isFinite(stop)) {
+      return { allowed: false, reason: 'no stop supplied — a stopless ticket is refused on the live order path' };
+    }
+    if (!Number.isFinite(last) || !Number.isFinite(pv) || pv <= 0 || !Number.isFinite(cap)) {
+      return { allowed: false, reason: 'cannot price stop risk (missing entry price / point value / cap) — refusing rather than guessing' };
+    }
+    if (side === 'buy' && stop >= last) {
+      return { allowed: false, reason: `buy stop ${stop} is at or above entry ${last} — wrong side` };
+    }
+    if (side === 'sell' && stop <= last) {
+      return { allowed: false, reason: `sell stop ${stop} is at or below entry ${last} — wrong side` };
+    }
+    const distance = Math.abs(last - stop);
+    const riskUsd = distance * pv * qty;
+    if (riskUsd > cap) {
+      return { allowed: false, reason: `stop ${distance.toFixed(2)}pt away risks $${riskUsd.toFixed(0)} at ${qty} contract(s), over the $${cap} per-trade cap` };
+    }
   }
 
   // 2026-08-21 (Anoop's D1/D2): the trade COUNT only hard-blocks when every

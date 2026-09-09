@@ -1,4 +1,7 @@
 'use strict';
+// G26: size wildcard shared with the CSV importer — a best-effort fold size
+// (sizeSeenThisTrade) is a wildcard, a verified fill count is not. One copy.
+const { sizeIsBestEffort } = require('./renderer/trade-identity.js');
 // ── TradingView-broker live-feed aggregator (2026-08-17) ────────────────────
 // Turns raw pollTVBrokerAccount() snapshots into the guardrail's live state:
 // per-trade size/pnl, running day P&L, trade count, max size, last-loss time.
@@ -783,7 +786,13 @@ function missingFromDayRows(foldTrades, rows, opts) {
       if (claimed.has(i)) continue;
       const r = stored[i];
       const rSize = Math.abs(Number(r.size) || 0);
-      if (!tSize || !rSize || tSize !== rSize) continue;
+      const sizeExact = tSize && rSize && tSize === rSize;
+      // G26: a size MISMATCH is not itself a refusal — the fold's size is
+      // sizeSeenThisTrade (best-effort, can be a partial read of a larger CSV
+      // fill). Only a size-0 (never observed) row is skipped here; the strong
+      // samePrices identity below still fires at any size, and the weak P&L
+      // match is gated on sizeExact further down.
+      if (!tSize || !rSize) continue;
 
       const rExit = Number.isFinite(r.x) ? r.x : r.t;
       const rEntry = Number.isFinite(r.t) ? r.t : rExit;
@@ -795,6 +804,18 @@ function missingFromDayRows(foldTrades, rows, opts) {
         || (Number.isFinite(t.entryAt) && Math.abs(Number(t.entryAt) - rEntry) <= windowMs);
       if (!inWindow) continue;
 
+      // G26: same fill prices identify the same trade EVEN AT DIFFERENT SIZES —
+      // the live fold's best-effort size can be a partial read of a larger CSV
+      // fill. Only fires when both rows carry prices.
+      const samePrices = t.entryPrice != null && t.exitPrice != null
+        && Number(r.ep) === Number(t.entryPrice)
+        && Number(r.xp) === Number(t.exitPrice);
+      if (samePrices) { claimed.add(i); return false; }
+
+      // Cross-route P&L match is the WEAK one — it still requires exact size,
+      // because equal P&L across different sizes is the dangerous direction
+      // (two genuine trades that happen to share a P&L).
+      if (!sizeExact) continue;
       const samePnl = Math.abs(Number(r.pnl) - Number(t.pnl)) < 0.01;
       let commissionApart = false;
       if (commSide != null) {
@@ -837,7 +858,15 @@ function mergeTradeRow(existingRows, newRow, opts) {
     const r = rows[i];
     if (!r) continue;
     const rSize = Math.abs(Number(r.size) || 0);
-    if (!nSize || !rSize || nSize !== rSize) continue;
+    const sizeExact = nSize && rSize && nSize === rSize;
+    // G26: a size mismatch is a refusal ONLY when both sides carry a VERIFIED
+    // size. The live fold's sizeSeenThisTrade is best-effort — a partial read
+    // of a larger CSV fill — so a best-effort size is a wildcard, the same rule
+    // sizeIsBestEffort applies on the CSV-import side. A size-0 row (never
+    // observed) is skipped exactly as before.
+    const sizeWild = sizeIsBestEffort(newRow) || sizeIsBestEffort(r);
+    if (!nSize || !rSize) continue;
+    if (!sizeExact && !sizeWild) continue;
     const rExit = Number.isFinite(r.x) ? r.x : r.t;
     const rEntry = Number.isFinite(r.t) ? r.t : rExit;
 
@@ -868,6 +897,11 @@ function mergeTradeRow(existingRows, newRow, opts) {
       && String(r.side).toUpperCase() === String(newRow.side).toUpperCase()
       && Number(r.ep) === Number(newRow.ep)
       && Number(r.xp) === Number(newRow.xp);
+    // G26: when one side's size is best-effort, identical fill prices ARE the
+    // same trade — the size mismatch is a partial read, not a second trade.
+    // (The stale-P&L guard below is for the SAME-size case and cannot apply
+    // across sizes.)
+    if (samePrices && sizeWild) { hit = i; break; }
     if (samePrices && commSide != null) {
       const pv = Number.isFinite(o.pointValue) ? o.pointValue : 2;
       const dir = String(r.side).toUpperCase() === 'LONG' ? 1 : -1;
@@ -879,6 +913,11 @@ function mergeTradeRow(existingRows, newRow, opts) {
     }
 
     // Cross-route: P&L equal, or exactly size x round-turn commission apart.
+    // G26: this WEAK match is the only one that still requires exact size —
+    // equal P&L across different sizes is the dangerous direction (two genuine
+    // trades that happen to share a P&L), so a size mismatch falls through here
+    // and inserts rather than merging.
+    if (!sizeExact) continue;
     const gap = Math.abs(Number(r.pnl) - Number(newRow.pnl));
     const samePnl = gap < 0.01;
     const commissionApart = commSide != null && Math.abs(gap - nSize * commSide * 2) < 0.02;

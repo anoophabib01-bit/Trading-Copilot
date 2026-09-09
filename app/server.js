@@ -126,6 +126,27 @@ const autonomyStore = require('./autonomy-store');
 const shadowRecorder = require('./shadow-recorder'); // Playbook C engulfing validity + shared closed-bar helper — unit-tested
 const tradeConfirmDedup = require('./trade-confirm-dedup'); // Phase 2b: double-submit/idempotency guard — unit-tested
 
+
+// ── Contract specs (G10, 2026-09-08) ────────────────────────────────────────
+// Point value / tick size must come from rules.json, never from a hardcoded
+// multiplier. Unknown symbols REFUSE — an uncomputable risk is never small.
+function contractSpecFor(symbol) {
+  const rules = getActiveRules();
+  const contracts = (rules && rules.contracts) || {};
+  const s = String(symbol || '').toUpperCase();
+  const root = s.indexOf('MGC') !== -1 || s.indexOf('GC') !== -1 ? 'MGC'
+    : s.indexOf('MNQ') !== -1 ? 'MNQ' : null;
+  if (!root || !contracts[root]) return null;
+  return { pointValue: Number(contracts[root].pointValue), tickSize: Number(contracts[root].tickSize) };
+}
+function requireContractSpec(symbol) {
+  const spec = contractSpecFor(symbol);
+  if (!spec || !Number.isFinite(spec.pointValue) || spec.pointValue <= 0) {
+    throw new Error('unknown contract symbol for risk pricing: ' + String(symbol || '?'));
+  }
+  return spec;
+}
+
 // 2026-08-27: overridable so a second instance can be started on a spare port
 // to VERIFY a change without killing the live one. Defaults to 7433, so the
 // launcher and every doc are unaffected. This existed as a hardcoded literal,
@@ -951,6 +972,77 @@ function sendForensicsReport(ws, reqId) {
   }
 }
 
+// ── Market Brief (2026-09-06) ─────────────────────────────────────
+// Surfaces cli/market-brief.js in the UI. Anoop, 2026-09-06: "i want market
+// brief before newyork session and if any important event or any sudden
+// movement in both instrument and all information related to it."
+//
+// THREE THINGS THIS DELIBERATELY DOES:
+//
+//  1. REQUIRES LAZILY, INSIDE A TRY. cli/ is a separate folder driving external
+//     binaries. If it is missing, moved, or throws on load, that must degrade
+//     this one tab — not take down a process that is also running the monitors,
+//     Jessi and the broker feed. Same reasoning as the crash guards at the top
+//     of this file.
+//
+//  2. CACHES. Building a brief costs ~6 CLI invocations and 30-60s (60 days of
+//     5m bars for two instruments, plus context symbols). Without a cache every
+//     tab switch would respawn all of it. `refresh: true` forces a rebuild.
+//
+//  3. NEVER PARTIALLY ANSWERS. One request, one whole-tab payload — the same
+//     shape Week and Forensics use, so the panel can never merge a fresh number
+//     into a stale view.
+//
+// The brief is READ-ONLY and carries no direction. There is no path from here
+// to handleTradeConfirm and there must not be one.
+let _briefCache = { at: 0, data: null };
+const BRIEF_TTL_MS = 10 * 60 * 1000;
+
+async function sendMarketBrief(ws, reqId, forceRefresh) {
+  try {
+    const fresh = Date.now() - _briefCache.at < BRIEF_TTL_MS;
+    if (_briefCache.data && fresh && !forceRefresh) {
+      send(ws, { type: 'brief-data', reqId: reqId, brief: _briefCache.data,
+                 cached: true, ageMs: Date.now() - _briefCache.at });
+      return;
+    }
+    const mb = require('../cli/market-brief');
+    const brief = await mb.buildBrief();
+    _briefCache = { at: Date.now(), data: brief };
+    send(ws, { type: 'brief-data', reqId: reqId, brief: brief, cached: false, ageMs: 0 });
+  } catch (e) {
+    console.error('[brief] failed:', e && e.message);
+    send(ws, { type: 'brief-data', reqId: reqId, brief: null,
+               error: (e && e.message) || 'brief failed' });
+  }
+}
+
+// Gold brief (2026-09-07). Anoop: "a second brief for MGC". Same cache
+// discipline and same lazy-require-inside-try as sendMarketBrief above — see
+// that function's header for why both matter. Cached separately from the
+// combined brief because the two hit different symbol sets and one being warm
+// says nothing about the other.
+let _goldCache = { at: 0, data: null };
+
+async function sendGoldBrief(ws, reqId, forceRefresh) {
+  try {
+    const fresh = Date.now() - _goldCache.at < BRIEF_TTL_MS;
+    if (_goldCache.data && fresh && !forceRefresh) {
+      send(ws, { type: 'gold-brief-data', reqId: reqId, brief: _goldCache.data,
+                 cached: true, ageMs: Date.now() - _goldCache.at });
+      return;
+    }
+    const gb = require('../cli/gold-brief');
+    const brief = await gb.buildGoldBrief();
+    _goldCache = { at: Date.now(), data: brief };
+    send(ws, { type: 'gold-brief-data', reqId: reqId, brief: brief, cached: false, ageMs: 0 });
+  } catch (e) {
+    console.error('[gold-brief] failed:', e && e.message);
+    send(ws, { type: 'gold-brief-data', reqId: reqId, brief: null,
+               error: (e && e.message) || 'gold brief failed' });
+  }
+}
+
 function sendWeekReport(ws, reqId, offset, extra) {
   try {
     const payload = buildWeekPayload(offset);
@@ -1395,6 +1487,15 @@ wss.on('connection', (ws) => {
         sendForensicsReport(ws, msg.reqId);
         break;
 
+      // ── Market Brief tab (2026-09-06) ────────────────────────────────────
+      case 'brief-get':
+        sendMarketBrief(ws, msg.reqId, msg.refresh);
+        break;
+
+      case 'gold-brief-get':
+        sendGoldBrief(ws, msg.reqId, msg.refresh);
+        break;
+
       case 'week-report-get':
         sendWeekReport(ws, msg.reqId, msg.offset);
         break;
@@ -1540,11 +1641,28 @@ wss.on('connection', (ws) => {
             _next.sizeCap = _cap;
             // The stage blocks own contract size (stage is applied LAST and
             // eval PERMITS to exactly its block value), so a top-level write
-            // alone would be overwritten on the very next read. His chosen cap
-            // applies to whichever account is open, so both blocks follow it.
+            // alone would be overwritten on the very next read. EVAL therefore
+            // follows his dial.
+            //
+            // ── FUNDED DOES NOT (2026-09-08) ──────────────────────────────
+            // It used to. That single line made Anoop's own decision
+            // structurally unrepresentable: on 2026-09-05 he was asked directly
+            // and said "No, funded stays at 2", the file was changed, and the
+            // very next nudge of the titlebar Cap control at 21:05 silently put
+            // it back to 4 — because this handler forced both blocks to the
+            // same number. He was never told; nothing in the UI shows the
+            // funded block at all.
+            //
+            // Funded is the account that pays out and the one where his own
+            // record says every size except 2 loses money (-$1,717 over 31
+            // trades). The stage layer exists precisely so funded can be
+            // TIGHTER than whatever else is going on — funded clamps by min, so
+            // leaving its block alone means his dial can lower funded but never
+            // raise it. Raising the funded cap is a deliberate edit to
+            // rules.json, not a side effect of a button he presses to change
+            // the eval cap.
             if (_next.stageRules) {
               if (_next.stageRules.eval) _next.stageRules.eval.sizeCap = _cap;
-              if (_next.stageRules.funded) _next.stageRules.funded.sizeCap = _cap;
             }
             if (_cap !== Math.floor(Number(msg.data.sizeCap))) {
               console.warn('[rules] sizeCap request ' + msg.data.sizeCap + ' clamped to ' + _cap);
@@ -4477,7 +4595,11 @@ let autoDebateReqCounter = 0;
 // itself while still on the secondary symbol (see that function's 2026-08-19
 // pre-gathering change). Kept in one place so the two can never drift apart.
 function buildAutoDebateQuestion(phaseInfo) {
-  return `Automated check (not typed by Anoop): ${phaseInfo.symLabel || 'the instrument'} just moved from ${phaseInfo.from || 'ACCUMULATION'} to ${phaseInfo.phase} on the 15m at ${phaseInfo.time} IST (1H bias: ${phaseInfo.biasLabel || 'unknown'}). Is this a valid entry right now?`;
+  const h = phaseInfo.htf;
+  const gateNote = h
+    ? ` 15M gate: ${h.ok ? (h.bias || '?').toUpperCase() : 'NO BIAS'} (15M ${h.structure15m || '?'} / 1H ${h.structure1h || '?'}).`
+    : '';
+  return `Automated check (not typed by Anoop): ${phaseInfo.symLabel || 'the instrument'} just moved from ${phaseInfo.from || 'ACCUMULATION'} to ${phaseInfo.phase} on the 15m at ${phaseInfo.time} IST (1H bias: ${phaseInfo.biasLabel || 'unknown'}).${gateNote} Is this a valid entry right now?`;
 }
 
 function autoTriggerDebate(phaseInfo, preGathered) {
@@ -4652,7 +4774,9 @@ async function checkPo3Phase() {
         console.log('[PO3 MONITOR][' + symLabel + '] ' + (prev || 'none') + ' -> ' + res.phase + ' | ' + res.reason);
 
         // 2.1: ledger the phase change (UNCLEAR is a gate block → valid:false).
-        ledgerSignal({ event: 'po3-phase-change', playbook: 'PO3', tf: '15', direction: bias ? bias.direction : null, structure: res.reason + (res.detail ? ' | ' + res.detail : ''), valid: res.phase !== 'UNCLEAR', rejectReason: res.phase === 'UNCLEAR' ? res.reason : null });
+        // G22: from/to make the debate-trigger rate countable from disk — the row
+        // previously carried no transition, so that number could not be recovered.
+        ledgerSignal({ event: 'po3-phase-change', playbook: 'PO3', tf: '15', direction: bias ? bias.direction : null, from: prev, to: res.phase, structure: res.reason + (res.detail ? ' | ' + res.detail : ''), valid: res.phase !== 'UNCLEAR', rejectReason: res.phase === 'UNCLEAR' ? res.reason : null });
 
         // 2026-08-17: auto-trigger the expensive Debate only on the one
         // transition that actually matters — LEAVING accumulation. Staying in
@@ -4661,7 +4785,11 @@ async function checkPo3Phase() {
         // is always a WAIT, so there is nothing new to check by re-running the
         // debate while still in it.
         if (prev === 'ACCUMULATION' && (res.phase === 'MANIPULATION' || res.phase === 'DISTRIBUTION')) {
-          autoTriggerDebate({ from: prev, phase: res.phase, symLabel, biasLabel, time: istTime, message: msg });
+          // G22: attach the 15M gate read as EVIDENCE so the Judge sees the same
+          // structure every other surface uses. po3TrendRead stays the decider.
+          let _htf = null;
+          try { _htf = await readHTFNow(); } catch (e) {}
+          autoTriggerDebate({ from: prev, phase: res.phase, symLabel, biasLabel, time: istTime, message: msg, htf: _htf });
         }
       }
     }
@@ -6339,7 +6467,14 @@ async function checkEngulfingSignal(key) {
         // shadow machine order and pushes a $-denominated ticket into the chat,
         // and neither should happen for a candle he was merely told about.
         if (isFullSetup) {
-          armSetup({ playbook: 'A', tfCode: cfg.tfCode, tfLabel: cfg.label, direction, message: signalMessage });
+          armSetup({
+              playbook: 'A', tfCode: cfg.tfCode, tfLabel: cfg.label, direction,
+              bar: engulfBar, barTime: engulfBar ? engulfBar.time : null,
+              entryRef: engulfBar ? engulfBar.close : null,
+              setupId: engulfBar ? playbookSpec.setupId(specId, { direction, barTime: engulfBar.time, entryRef: engulfBar.close }) : null,
+              structure: pbc ? pbc.structure : null,
+              message: signalMessage,
+            });
         }
         // 3.3: a FULL Playbook A setup convenes the debate — see
         // playbookAFullyAligned above for why this one did NOT follow the
@@ -7158,7 +7293,32 @@ async function checkSFPSignal(key) {
             // it there would suppress the "NOT a trade yet" context line that
             // is genuinely useful to see either way.
             const bGate = await htfGate('B', cfg.tfCode, mon.pending.direction);
-            if (!bGate.allowed) { mon.pending = null; return; }
+            if (!bGate.allowed) {
+              // G5: a block is NOT a discard. Keep the pending raid alive to its
+              // expiresAt so the gate re-evaluates on the next closed bar, and emit
+              // the block on the SAME channel the raid used — a silent discard is
+              // indistinguishable from "nothing detected". Direction blocks are
+              // NEVER relaxed; only the unclear case can opt to alert-only.
+              const _rules = getActiveRules();
+              const _mode = (_rules.playbooks && _rules.playbooks.htfUnclearMode) || 'block';
+              const _directionBlock = bGate.reason === 'setup-against-htf-bias';
+              mon.pending.blockCount = (mon.pending.blockCount || 0) + 1;
+              broadcast({
+                type: 'sfp-signal',
+                tf: key, tfLabel: cfg.label,
+                direction: mon.pending.direction, level: mon.pending.level,
+                held: true, gateReason: bGate.reason,
+                structure15m: bGate.structure15m, structure1h: bGate.structure1h,
+                retryCount: mon.pending.blockCount,
+                message: 'Playbook B held on ' + cfg.label + ' — displacement arrived but ' + htfAlignment.explain(bGate) + ' (retry ' + mon.pending.blockCount + '). Not cancelled.',
+              });
+              console.log('SFP BLOCKED [' + cfg.label + ']: ' + htfAlignment.explain(bGate) + ' (retry ' + mon.pending.blockCount + ')');
+              if (_mode === 'alert-only' && !_directionBlock) {
+                // opt-in: an unclear read alerts but does not block — fall through to confirm.
+              } else {
+                return; // keep mon.pending — do NOT null it
+              }
+            }
             // The gate is above EVERY playbook, so demoting the 4H from veto
             // to evidence (2026-09-01) loosened B by the same ~6.7x it
             // loosened A. B therefore has to state the same evidence — a
@@ -7197,6 +7357,11 @@ async function checkSFPSignal(key) {
               entry: bPlan.plannable ? bPlan.entry : null,
               stop: bPlan.plannable ? bPlan.stop : null,
               setupId: playbookSpec.setupId('B', bSetup),
+              // G5: how many bars this confirm was HELD before the gate cleared.
+              // Without it, a raid that confirms on bar N is indistinguishable from
+              // one that confirmed on bar N+2 — and the forward test stops being
+              // comparable across the change.
+              retryCount: mon.pending.blockCount || 0,
             });
             // 2026-09-01: `wick` added. It was already captured in
             // mon.pending and already used for bSetup/bPlan above, so the
@@ -8169,7 +8334,13 @@ function buildWatchersStatus() {
     // red = still stale after the watchdog's one automatic restart.
     let health = 'stopped';
     if (tvDown) health = 'tv-offline';
-    else if (mon.running && mon.lastCheck && Date.now() - new Date(mon.lastCheck).getTime() > 3 * e.intervalMs) health = mon.restartAttempted ? 'red' : 'amber';
+    else if (mon.running && mon.lastCheck) {
+      const age = Date.now() - new Date(mon.lastCheck).getTime();
+      const WATCHER_SETTLE_MS = 30 * 1000;  // G17: a slow poll's compute+write time
+      if (age > 3 * e.intervalMs) health = mon.restartAttempted ? 'red' : 'amber';  // restart threshold stays 3x
+      else if (age > 2 * e.intervalMs + WATCHER_SETTLE_MS) health = 'amber';          // a close has provably been missed
+      else health = 'healthy';
+    }
     else if (mon.running) health = 'healthy';
     return { id: e.id, label: e.label, running: !!mon.running, health, lastCheck: mon.lastCheck || null, lastError: mon.lastError || null };
   });
@@ -8189,7 +8360,8 @@ function buildWatchersStatus() {
       tvDown,
       nowMs: Date.now(),
       intervalMs: CADX_INTERVAL_MS,
-      minBars: CADX_MIN_BARS
+      minBars: CADX_MIN_BARS,
+      tfLabel: (getActiveRules().playbookCAdx && getActiveRules().playbookCAdx.tfLabel) || '1H'
     }));
   } catch (e) {
     console.warn('[c-adx] watcher row failed:', e.message);
@@ -8882,6 +9054,8 @@ function shadowRecordMachineOrder(plan, extra) {
     const mode = currentAutonomyMode();
     const sizes = autonomyModes.sizesFor(rules, mode);
     const base = shadowMarketContext();
+      // G10: per-symbol point value from rules.json; unknown symbol refuses.
+      const contractSpec = requireContractSpec(base.symbol || (extra && extra.symbol) || (plan && plan.symbol));
     // The cap in force for THIS mode — the tighter of the mode's own cap and
     // the global perTradeMaxLoss. CONTROL runs at $200 rather than $300 so its
     // $200 daily ceiling is a real ceiling instead of a limit a single stop-out
@@ -8890,7 +9064,7 @@ function shadowRecordMachineOrder(plan, extra) {
     for (const contracts of sizes) {
       const row = shadowRecorder.buildMachineOrder(
         Object.assign({}, plan, extra || {}),
-        Object.assign({}, base, { contracts, pointValue: 2, tickSize: 0.25, why: (extra && extra.why) || [] })
+        Object.assign({}, base, { contracts, pointValue: contractSpec.pointValue, tickSize: contractSpec.tickSize, why: (extra && extra.why) || [] })
       );
       // PRODUCTION FIX 2026-08-26: the first real shadow order recorded a
       // 79.5-point stop as $636 of risk at 4c and $954 at 6c, against a $300
@@ -9055,7 +9229,10 @@ async function resolveShadowOrders() {
         if (!sim) continue;
 
         const comm = (rules.commissionPerContractPerSide || 0.95) * 2 * (o.contracts || 1);
-        const netUsd = sim.filled ? (sim.points * 2 * (o.contracts || 1) - comm) : 0;
+        // G10: point value from the contracts block, never a hardcoded $2/pt.
+        const _pvSpec = requireContractSpec(o.symbol || 'MNQ');
+        const _pvUsd = _pvSpec ? _pvSpec.pointValue : null;
+        const netUsd = sim.filled && _pvUsd != null ? (sim.points * _pvUsd * (o.contracts || 1) - comm) : 0;
         autonomyStore.recordOutcome(DATA_DIR, resolveMode, {
           id: o.id, day: o.day, playbook: o.playbook, contracts: o.contracts,
           outcome: sim.outcome, netUsd: Math.round(netUsd * 100) / 100, bars: sim.bars,
@@ -9380,6 +9557,26 @@ async function cadxCheckOnce() {
     + ' close ' + sig.bar.close + ' > priorHigh ' + sig.priorHigh
     + ' | ADX ' + sig.adx + ' +DI ' + sig.plusDI + ' -DI ' + sig.minusDI);
 
+  // G19: C-ADX has written ZERO fire rows — only htf-reject (76 of 76). Ledger
+  // the fire so its block rate finally has a denominator. planEntry returns the
+  // real entry/stop, so the row carries a real anchor.
+  let _cadxPlan = null;
+  try {
+    _cadxPlan = playbookSpec.planEntry('C-ADX', { direction: 'BULLISH', bar: sig.bar, barTime: sig.barTime, entryRef: sig.entryRef }, getActiveRules());
+  } catch (e) {}
+  ledgerSignal({
+    event: 'c-adx-fire',
+    playbook: 'C-ADX', tf: cadxTf, direction: 'BULLISH',
+    setupId: playbookSpec.setupId('C-ADX', { direction: 'BULLISH', barTime: sig.barTime, entryRef: sig.entryRef }),
+    entry: _cadxPlan && _cadxPlan.plannable ? _cadxPlan.entry : null,
+    stop: _cadxPlan && _cadxPlan.plannable ? _cadxPlan.stop : null,
+    adx: sig.adx, plusDI: sig.plusDI, minusDI: sig.minusDI,
+    htfBias: cadxGate.bias,
+    structure15m: cadxGate.structure15m,
+    structure1h: cadxGate.structure1h,
+    htfConfirmation: cadxGate.htfConfirmation != null ? cadxGate.htfConfirmation : cadxGate.confirmation,
+  });
+
   armSetup({
     playbook: 'C-ADX',
     direction: 'BULLISH',
@@ -9392,7 +9589,7 @@ async function cadxCheckOnce() {
     htfBias: cadxGate.bias,
     structure15m: cadxGate.structure15m,
     structure1h: cadxGate.structure1h,
-    htfConfirmation: cadxGate.confirmation,
+    htfConfirmation: cadxGate.htfConfirmation != null ? cadxGate.htfConfirmation : cadxGate.confirmation,
     message: 'Playbook C (ADX) — ADX ' + sig.adx + ' >= ' + sig.adxMin
       + ', +DI > -DI, close ' + sig.bar.close + ' broke the prior ' + sig.lookback + '-bar high ' + sig.priorHigh
       + ' — ' + htfAlignment.confirmationNote(cadxGate),
@@ -9450,6 +9647,10 @@ let htfCache = { at: 0, value: null };
 // able to say WHICH candle produced the bias — a status that reports only the
 // side is unfalsifiable, and an unfalsifiable status is not evidence.
 let htfLastBarMs = null;
+// G7: per-(playbook,tf,direction) last blocked bar time, so an HTF block is
+// ledgered once per bar instead of once per 60s tick. The gate result is still
+// returned every tick so watcher rows keep refreshing.
+const htfBlockedBarTimes = {};
 
 async function readHTFNow() {
   if (htfCache.value && Date.now() - htfCache.at < HTF_CACHE_MS) return htfCache.value;
@@ -9463,15 +9664,20 @@ async function readHTFNow() {
   // includes a half-built candle changes its mind several times inside one
   // bar, which is the same repaint the engulf watchers already guard against.
   const closed15m = playbookC.dropFormingBar(bars15m, '15');
-  const res = htfAlignment.readHTF(closed15m, playbookC.dropFormingBar(bars1h, '60'));
+  const closed1h = playbookC.dropFormingBar(bars1h, '60');
+  const res = htfAlignment.readHTF(closed15m, closed1h);
   // Stamped from the bar itself, never from the wall clock: if the feed stalls,
   // the READ keeps happening on schedule and only the bar time stops moving.
   // Recording Date.now() here would make a dead feed look permanently fresh.
   const newest = closed15m.length ? closed15m[closed15m.length - 1] : null;
   const t = newest ? (newest.time != null ? newest.time : newest.t) : null;
-  htfLastBarMs = t == null ? null : (t > 1e12 ? t : t * 1000);
-  htfCache = { at: Date.now(), value: res };
-  return res;
+  // G16: only advance on a SUCCESSFUL read. A failed read must not null the last known good bar time.
+      if (t != null) htfLastBarMs = (t > 1e12 ? t : t * 1000);
+  // G15: lastBarMs travels on the read so htfGate can price staleness. G20:
+  // bars15mUsed/bars1hUsed travel too so the evidence line can name degradation.
+  const withBar = Object.assign({}, res, { lastBarMs: htfLastBarMs, bars15mUsed: closed15m.length, bars1hUsed: closed1h.length });
+  htfCache = { at: Date.now(), value: withBar };
+  return withBar;
 }
 
 // ── The hourly HTF evidence (2026-09-02) ──────────────────────────────────
@@ -9490,10 +9696,13 @@ async function publishHtfStatus(trigger, toChat) {
   const status = htfStatus.buildStatus({
     htf: read,
     watchers: Object.keys(ENGULF_TFS).map(function (k) {
-      return { label: ENGULF_TFS[k].label, running: !!(engulfMonitors[k] && engulfMonitors[k].running) };
+      // G17: a watcher whose chart feed is down must not report "armed" — the
+      // hourly line and the Chart Watchers panel can never disagree about coverage.
+      return { label: ENGULF_TFS[k].label, running: !!(engulfMonitors[k] && engulfMonitors[k].running && mcpBridge.ready && mcpBridge.tvConnected) };
     }),
     lastBarMs: htfLastBarMs,
     nowMs: Date.now(),
+      tvConnected: !!(mcpBridge.ready && mcpBridge.tvConnected),
   });
   broadcast(Object.assign({ type: 'htf-status', trigger: trigger, toChat: !!toChat }, status));
   if (toChat) console.log('[htf] ' + status.evidence);
@@ -9506,23 +9715,58 @@ async function publishHtfStatus(trigger, toChat) {
   return status;
 }
 
+// G4: per-playbook policy for an UNCLEAR 15M read. 'refuse' is the default and
+// the only value Playbook A and B may ever resolve to (rules.json sets them so);
+// C-ADX is shadow-only and may opt to 'refuse-unless-1h-clean'. Absent block ->
+// 'refuse' (byte-identical to today).
+function htfUnclearPolicyFor(playbook) {
+  try {
+    const rules = getActiveRules();
+    const p = rules && rules.playbooks && rules.playbooks.htf && rules.playbooks.htf.unclearPolicy;
+    if (p) return p[playbook] || p._default || 'refuse';
+  } catch (e) {}
+  return 'refuse';
+}
+
 // Gate one setup. Returns the check result; the caller logs and returns on a
 // refusal. Rejections are LEDGERED, not swallowed — how often the gate blocks
 // each playbook is the measurement that says whether it is set correctly, and
 // a filter nobody can audit is a filter nobody trusts.
 async function htfGate(playbook, tfCode, direction) {
   const read = await readHTFNow();
-  const gate = htfAlignment.checkSetup(read, direction);
+  const gate = htfAlignment.checkSetup(read, direction, htfUnclearPolicyFor(playbook));
+  // G15: a read of unbounded age must not open or close the gate. A stale read
+  // is a DISTINCT refusal reason, and age/staleness ride every ledgered row.
+  const _lastBar = read && Number.isFinite(read.lastBarMs) ? read.lastBarMs : null;
+  const _ageMin = _lastBar != null ? Math.max(0, (Date.now() - _lastBar) / 60000) : null;
+  const _htfStale = _ageMin != null && _ageMin > htfStatus.STALE_AFTER_MINUTES;
+  if (_htfStale) { gate.allowed = false; gate.reason = 'htf-stale'; }
   if (!gate.allowed) {
     // `structure` stays the DECIDING timeframe's read, as it always has — it
     // was the 1H before 2026-09-03 and is the 15M after. Rows carry
     // structure15m/structure1h explicitly alongside it so a reader of the
     // ledger never has to date a row to know which chart produced the verdict.
+      // G7: one ledger row + one broadcast per blocked BAR, not per tick.
+      const blockKey = String(playbook) + '|' + String(tfCode) + '|' + String(direction || '').toUpperCase();
+      const blockBar = htfLastBarMs || null;
+      const alreadyLogged = htfBlockedBarTimes[blockKey] === blockBar;
+        let rejectSetupId = null;
+      if (!alreadyLogged) {
+        htfBlockedBarTimes[blockKey] = blockBar;
+        rejectSetupId = playbookSpec.setupId(playbook, { direction, barTime: blockBar, entryRef: null });
+      } else {
+        return gate;
+      }
+
     ledgerSignal({
       event: 'htf-reject', playbook, tf: tfCode, direction, valid: false,
-      rejectReason: gate.reason, structure: gate.structure15m,
+      setupId: rejectSetupId, rejectReason: gate.reason, structure: gate.structure15m,
       structure15m: gate.structure15m, structure1h: gate.structure1h,
       htfBias: gate.bias,
+      htfAgeMinutes: _ageMin != null ? Math.round(_ageMin) : null,
+      htfStale: _htfStale,
+      bars15mUsed: read && read.bars15mUsed != null ? read.bars15mUsed : null,
+      bars1hUsed: read && read.bars1hUsed != null ? read.bars1hUsed : null,
     });
     console.log('HTF GATE [' + playbook + ' ' + tfCode + ']: ' + htfAlignment.explain(gate));
     broadcast({
@@ -9556,6 +9800,15 @@ function armSetup(fields) {
       { direction: fields.direction, gapLow: fields.gapLow, gapHigh: fields.gapHigh,
         level: fields.level, barTime: fields.barTime, entryRef: fields.entryRef });
     const why = shadowConfirmReasons(fields, plan);
+    // G11: an under-minRiskPoints Playbook B setup is REFUSED and surfaced as its
+    // own ledger event — never silently swallowed by the shadow-order early-return.
+    if (plan && plan.plannable === false && plan.riskTooSmall) {
+      ledgerSignal({
+        event: 'playbook-b-risk-too-small',
+        playbook: fields.playbook, tf: fields.tfCode, direction: fields.direction,
+        setupId: sid, riskPoints: plan.riskPoints, reason: plan.reason,
+      });
+    }
     shadowRecordMachineOrder(plan, { playbook: fields.playbook, tf: fields.tfCode, setupId: sid, why });
     // Push the ticket into the app chat — Anoop's request: direction, stop and
     // target in BOTH dollars and ticks, plus why it was confirmed. A signal
@@ -9774,10 +10027,32 @@ function computeLiveForensics(row, symbol) {
   return out;
 }
 
+// G25 FIX (2026-09-09): the reconciliation check below runs on EVERY re-roll of
+// the day record — i.e. once per live trade write, and again on every replay of
+// the same day. A day that is genuinely out of reconciliation is out of it
+// PERMANENTLY until a CSV corrects it, so an unguarded broadcast repeats the
+// identical "SELF-REPAIR — daily-reconcile" line forever and buries the chat.
+// Anoop saw eleven of them stacked in one session.
+//
+// Same discipline as G7's per-bar dedup: keep announcing a CHANGE, never a
+// steady state. The key is the slot+day, the value is a signature of the
+// numbers — so a disagreement that MOVES (a new trade lands, the gap widens)
+// still speaks up, while a gap that just sits there says it once.
+const _reconAnnounced = {};
+
 function writeLiveTradeToDayRecord(record) {
   try {
     if (!record || record.pnlUnknown) return 'skipped: pnlUnknown';
     if (!(Number.isFinite(record.pnl) && record.at != null)) return 'skipped: unscoreable';
+    // G24: a phantom is a property of the ROW — no size, or no entry/exit price.
+    // A real round trip has all three; a row missing one is unverifiable and must
+    // not reach day_trades. The counter derives from the rows rejected here, so it
+    // can never disagree with the number of phantoms actually on disk.
+    if (!(record.size > 0) || record.entryPrice == null || record.exitPrice == null) {
+      try { if (tvBrokerFeedState) tvBrokerFeedState.phantomFlats = (tvBrokerFeedState.phantomFlats || 0) + 1; } catch (e) {}
+      console.warn('[day-record] phantom row rejected (no size/prices): ' + JSON.stringify({ size: record.size, entryPrice: record.entryPrice, exitPrice: record.exitPrice, pnl: record.pnl }));
+      return 'skipped: phantom (no size or entry/exit price)';
+    }
     const slot = jessiBucketKey(loadConfig());
     const dayKey = dayRollup.tradingDayKey(record.at);
     const rules = getActiveRules();
@@ -9883,7 +10158,7 @@ function writeLiveTradeToDayRecord(record) {
     const existingRows = Array.isArray(dtStore[dayKey]) ? dtStore[dayKey] : [];
     const mergeRes = tvBrokerFeed.mergeTradeRow(existingRows, row, {
       commissionPerContractPerSide: rules.commissionPerContractPerSide,
-      pointValue: 2,   // MNQ — verified, point-value-verify.js
+      pointValue: requireContractSpec(record.symbol || record.Symbol || chartSymbolCache.symbol).pointValue,
     });
     if (mergeRes.action === 'merged') {
       console.log('[day-record] merged into an existing row for the same trade (no duplicate written)');
@@ -9947,6 +10222,40 @@ function writeLiveTradeToDayRecord(record) {
     }
     broadcast({ type: 'day-record-updated', slot, date: dayKey, rows: dayRows, sum, ledgerEntry });
     console.log(`[day-record] live trade → ${dayKey}: ${row.size} ${row.side || '?'} pnl ${row.pnl} (evidence ${row.evidence || 'fold'}) → day net ${sum.pnl}`);
+    // G25: reconcile the feed against the stored day on every re-roll (a proxy for
+    // the rollover). Reports a disagreement, never rewrites — a broker CSV through
+    // csvApply stays the only authoritative correction. Report-only, never blocks.
+    try {
+      const _feed = tvBrokerFeedState || {};
+      const _dayTradesSum = Math.round(dayRows.reduce((a, t) => a + (Number(t.pnl) || 0), 0) * 100) / 100;
+      const _rec = feedProtocol.dailyReconciliationCheck({
+        dayPnl: _feed.dayPnl,
+        dayTradesSum: _dayTradesSum,
+        grHistoryPnl: sum.pnl,
+        tradeCount: _feed.tradeCount,
+        tradesLength: Array.isArray(_feed.trades) ? _feed.trades.length : null,
+        phantomFlats: _feed.phantomFlats || 0,
+        threshold: rules.dailyReconcileToleranceUsd != null ? Number(rules.dailyReconcileToleranceUsd) : undefined,
+      });
+      // Announce a CHANGE, not a steady state — see _reconAnnounced above.
+      const _recKey = String(slot) + '|' + String(dayKey);
+      const _recSig = _rec.verdict === 'fail'
+        ? [Math.round((_feed.dayPnl || 0) * 100), Math.round(_dayTradesSum * 100),
+           Math.round((sum.pnl || 0) * 100), _feed.tradeCount,
+           Array.isArray(_feed.trades) ? _feed.trades.length : -1].join(':')
+        : 'ok';
+      if (_rec.verdict === 'fail') {
+        if (_reconAnnounced[_recKey] !== _recSig) {
+          _reconAnnounced[_recKey] = _recSig;
+          console.warn('[day-record] reconciliation FAILED: ' + _rec.impact);
+          broadcast({ type: 'self-repair', kind: 'daily-reconcile', evidence: _rec.evidence, impact: _rec.impact });
+        }
+      } else if (_reconAnnounced[_recKey] && _reconAnnounced[_recKey] !== 'ok') {
+        // It came back into agreement — worth exactly one line, then silence.
+        _reconAnnounced[_recKey] = 'ok';
+        console.log('[day-record] reconciliation RECOVERED for ' + _recKey);
+      }
+    } catch (e) { /* reconciliation is report-only; never block the trade record */ }
     // 2026-09-03: the pattern ledger is derived from the records this function
     // just wrote, so this is the earliest moment the episode exists. Both the
     // per-trade flags and the freshly re-rolled day (gr_history above) are on
@@ -11624,6 +11933,11 @@ async function pollTVPositions() {
     // to drop the GLOBAL timeout to 5-10s; that would cut short chart timeframe
     // switches, which legitimately take 8-15s and can leave the chart on the
     // wrong timeframe if aborted. The budget belongs per caller, not per lock.
+      // 2026-09-08 REVERTED: a 5s forced broker-tab refresh caused visible flicker.
+      // The original read is restored below to avoid tab interruptions.
+      
+      
+      
     const raw = await withBrokerLock(() => mcpBridge.callTool('trading_get_positions', {}, POSITION_READ_TIMEOUT_MS),
       { priority: 'high', timeoutMs: POSITION_READ_TIMEOUT_MS });
     const text = (raw && raw.content) ? raw.content.map(c => c.text || '').join('') : null;
@@ -11641,7 +11955,13 @@ async function pollTVPositions() {
       return;
     }
 
-    const rows = result.positions;
+    const rendered = Array.isArray(result.positions)
+        && (result.positions.length > 0 || !!result.emptyStateText);
+      if (!rendered) {
+        noteOversizePositionRead(null);
+        return;
+      }
+      const rows = result.positions;
     noteOversizePositionRead(rows);
     // OVERSIZE GUARD — runs on the SAME read that proves the panel is
     // readable, so it can never act on a failed read (the guard clause above
@@ -11741,7 +12061,7 @@ let liveFeedSelfTestTimer = null;
 async function runLiveFeedSelfTest() {
   const failures = [];
   let passed = 0;
-  const total = 4;
+  const total = 5;
   // 2026-08-23: per-step results, so the UI can show three NAMED lines with
   // their own pass/fail instead of one collapsed string. Anoop asked for the
   // 3-step check to be visible in the app; a single sentence that says '2/3'
@@ -11754,6 +12074,10 @@ async function runLiveFeedSelfTest() {
     // startup protocol to check"). Two facts in one line: can the Forensics
     // payload be BUILT at all, and does the 1m archive it measures from exist.
     { key: 'forensics', label: 'Trade forensics',     ok: false, detail: '' },
+    // 2026-09-08 (Anoop: "the size guard did not do its job ... it is also part
+    // of the protocol to check but still it did not do its job"). The protocol
+    // DID check the guard was armed. Armed was never the question.
+    { key: 'sizeguard', label: 'Size guard can act',  ok: false, detail: '' },
   ];
 
   // Check 1: CDP reachable — already tracked continuously by mcpBridge, this
@@ -11777,7 +12101,14 @@ async function runLiveFeedSelfTest() {
     const raw = await withBrokerLock(() => mcpBridge.callTool('trading_get_account', {}));
     const text = (raw && raw.content) ? raw.content.map(c => c.text || '').join('') : null;
     const result = text ? JSON.parse(text) : null;
-    const positionsOk = !!(result && result.positions && result.positions.success);
+    let positionsOk = !!(result && result.positions && result.positions.success);
+      // 2026-09-08 (G2): "readable" must mean RENDERED for positions too.
+      // A mounted-but-hidden Positions table returns success:true with zero rows
+      // and no emptyStateText — indistinguishable from flat except by this test.
+      const positionsRows = (result && result.positions && result.positions.positions || []).length;
+      const positionsEmptyState = !!(result && result.positions && result.positions.emptyStateText);
+      const positionsRendered = positionsOk && (positionsRows > 0 || positionsEmptyState);
+      positionsOk = positionsRendered;
     // ── "READABLE" HAS TO MEAN RENDERED (2026-09-02) ────────────────────────
     // `orders.success` is `t.found` — the <table> exists in the DOM. It is TRUE
     // for a table with an empty <tbody>, which is exactly the shape ka-table
@@ -11963,6 +12294,46 @@ async function runLiveFeedSelfTest() {
   } catch (e) {
     failures.push('Forensics: payload failed to build — ' + e.message);
     checks[3].detail = 'build error: ' + e.message;
+  }
+
+  // ── Check 5: the size guard can actually ACT (2026-09-08) ────────────────
+  // The old protocol asked "is the guard armed?" and the answer was yes on the
+  // day it let 8, 10, 12 and 20 lots through against a cap of 4. Armed was
+  // true. Able was not: every reduce threw `side control button not found`
+  // because TradingView's order ticket was not rendered, and the badge went on
+  // saying ARMED because a failed action changed nothing a human could see.
+  //
+  // So this check asks the question that was actually load-bearing — CAN IT
+  // ACT — and it is deliberately three different failures, because each one
+  // ends with size unenforced:
+  //   - turned off / disabled outright
+  //   - alarm-only (no live-order launcher) — it will shout and nothing else
+  //   - it TRIED and the order did not go (the 2026-09-08 case)
+  try {
+    const gs = oversizeGuardStatus();
+    if (gs.mode === 'failed') {
+      const f = gs.lastActionFailed || {};
+      failures.push('Size guard: TRIED TO REDUCE AND FAILED — ' + (f.error || 'order not submitted') + '. Size is NOT enforced.');
+      checks[4].detail = 'saw ' + (f.size != null ? f.size + ' lots' : 'an oversize') + ' over cap ' + gs.sizeCap
+        + ' and could not reduce it: ' + (f.error || 'order not submitted');
+    } else if (gs.mode === 'off') {
+      failures.push('Size guard: OFF — nothing is enforcing contract size');
+      checks[4].detail = gs.userDisabled ? 'turned off for this session' : 'disabled in rules.json';
+    } else if (gs.mode === 'alarm-only') {
+      failures.push('Size guard: ALARM-ONLY — it can detect an oversize but cannot close it');
+      checks[4].detail = 'live orders not enabled this session — launch via "START CO-PILOT (LIVE ORDERS).bat" to let it reduce';
+    } else if (gs.mode === 'blind') {
+      failures.push('Size guard: BLIND — the positions table is unreadable, an oversize cannot even be seen');
+      checks[4].detail = (gs.blindReads || 0) + ' consecutive unreadable position reads';
+    } else {
+      passed++;
+      checks[4].ok = true;
+      checks[4].detail = 'armed and able to reduce to ' + gs.sizeCap
+        + (gs.lastSeenSize != null ? ' — last read ' + gs.lastSeenSize + ' lot(s)' : '');
+    }
+  } catch (e) {
+    failures.push('Size guard: status could not be read — ' + e.message);
+    checks[4].detail = 'status error: ' + e.message;
   }
 
   const resultMsg = { type: 'live-feed-self-test', passed, total, failures, checks, at: Date.now() };
@@ -12193,7 +12564,10 @@ async function applyFeedRectification(action) {
           const side = String(r.side || '').toUpperCase();
           if (!sz || !Number.isFinite(ep) || !Number.isFinite(xp) || (side !== 'LONG' && side !== 'SHORT')) return null;
           const dir = side === 'LONG' ? 1 : -1;
-          const net = (xp - ep) * dir * sz * 2 - sz * comm * 2;
+          // G10: point value from the contracts block, never a hardcoded $2/pt.
+          const _pvSpec = requireContractSpec(r.symbol || 'MNQ');
+          if (!_pvSpec) return null; // refuse rather than default on an unknown symbol
+          const net = (xp - ep) * dir * sz * _pvSpec.pointValue - sz * comm * 2;
           return Math.abs(Number(r.pnl) - net) < 0.02;
         };
         const keep = [];
@@ -13076,7 +13450,14 @@ function oversizeGuardStatus() {
     // The three-state summary the UI badge renders. Deliberately distinguishes
     // "cannot act" from "off": alarm-only is a REAL protection (it shouts) and
     // must not be shown as if the guard were disabled.
-    mode: !armed ? 'off' : (blind ? 'blind' : (cfg.canAct ? 'armed' : 'alarm-only')),
+    // 'failed' sits ABOVE 'armed': a guard that tried and could not act is not
+    // armed in any sense Anoop can use, and saying so is the whole point (see
+    // the 2026-09-08 note at the failure site).
+    mode: !armed ? 'off'
+      : (blind ? 'blind'
+        : (oversizeWatch.lastActionFailed ? 'failed'
+          : (cfg.canAct ? 'armed' : 'alarm-only'))),
+    lastActionFailed: oversizeWatch.lastActionFailed || null,
     blind,
     blindReads: oversizeWatch.blindReads,
     blindSince: oversizeWatch.blindSince,
@@ -13436,6 +13817,13 @@ function enforceOversizeGuard(rows) {
     evidence.result = { success: false, error: 'live orders not enabled this session (TV_ALLOW_LIVE_ORDERS not set at launch)' };
     evidence.durationMs = Date.now() - started;
     oversizeInFlight = false;
+      // No order was (or could be) sent, so do not leave the outstanding-
+      // reduction latch set. Keeping sentQty here would make the guard report
+      // STUCK forever after a mere alarm-only detection — a false "I sent a
+      // reducing order" state. Cooldown and daily cap remain consumed so this
+      // cannot turn into a tight retry loop.
+      oversizeState = Object.assign({}, oversizeState, { sentQty: 0, sizeAtLastAction: null, stale: false });
+      saveOversizeState();
     console.error('[oversize] OVERSIZE DETECTED (' + pos.size + ' on ' + pos.symbol
       + ', cap ' + cfg.sizeCap + ') but this session CANNOT act — CLOSE ' + verdict.reduceBy
       + ' CONTRACTS YOURSELF.');
@@ -13495,6 +13883,40 @@ function enforceOversizeGuard(rows) {
     } finally {
       oversizeInFlight = false;
       evidence.durationMs = Date.now() - started;
+      // If the order was never submitted, there is no outstanding reduction to
+      // wait on — clear the latch so a later poll can retry after cooldown.
+      // Only an actually-submitted order may leave sentQty set until the
+      // position is seen to shrink.
+      if (!evidence.submitted) {
+        oversizeState = Object.assign({}, oversizeState, { sentQty: 0, sizeAtLastAction: null, stale: false });
+        saveOversizeState();
+        // ── 2026-09-08: A FAILED ATTEMPT MUST CHANGE WHAT THE BADGE SAYS ─────
+        // On 2026-09-08 the guard did its job right up to the last step: it
+        // saw 8 lots against a cap of 4, decided SELL 4, and called the order
+        // gateway — which threw `side control button not found:
+        // side-control-sell`, because TradingView's order ticket was not
+        // rendered. It logged the failure to oversize-guard.jsonl, broadcast an
+        // evidence event and sent a Telegram message to a bot with no token.
+        //
+        // The badge kept saying "Size guard: ARMED · cap 4". So from where
+        // Anoop was sitting, a guard that had just PROVED it could not act was
+        // indistinguishable from one standing watch — and 10, 12 and 8-lot
+        // trades followed on the same day.
+        //
+        // Detection was never the problem. Being told is. This records the
+        // failure so the badge, the self-test and the status payload all report
+        // "CANNOT REDUCE" instead of "ARMED". Cleared only by a submit that
+        // actually succeeds, or by the IST day rollover.
+        oversizeWatch.lastActionFailed = {
+          at: Date.now(),
+          error: (evidence.result && evidence.result.error) || 'order was not submitted',
+          size: pos.size,
+          symbol: pos.symbol,
+          wanted: verdict.reduceBy,
+        };
+      } else {
+        oversizeWatch.lastActionFailed = null;
+      }
       try {
         const dir = path.join(DATA_DIR, 'protocols');
         fs.mkdirSync(dir, { recursive: true });
@@ -13728,7 +14150,27 @@ async function handleTradeConfirm(ws, msg) {
     // real orders. currentAccountRisk() returns null when the balance or floor
     // cannot be read, and the gate then skips as before rather than guessing.
     const accountRisk = currentAccountRisk();
-    const check = tradeConfirmRules.checkTradeAllowed(rules, currentMode, tvBrokerFeedState.trades, qtyNum, accountRisk);
+    // G9: price the stop distance against the per-trade cap BEFORE the order.
+    // quote_get is a READ, fetched OUTSIDE withChartLock (the one critical
+    // section that must not lengthen around a read); pointValue resolves from the
+    // contracts block; riskCapUsd is the tighter of {mode cap, perTradeMaxLoss}.
+    // A stopless or unpricable ticket is refused by checkTradeAllowed, not guessed.
+    let lastPrice = null;
+    try {
+      const q = await mcpBridge.callTool('quote_get', {});
+      const lp = q && (q.lastPrice != null ? q.lastPrice : q.last);
+      if (lp != null) { const n = Number(lp); if (Number.isFinite(n)) lastPrice = n; }
+    } catch (e) { /* lastPrice stays null → refused, not guessed */ }
+    const _riskCap = autonomyModes.riskCapUsd(rules, currentAutonomyMode());
+    const _pvSpec = requireContractSpec(symbol || chartSymbolCache.symbol);
+    const _riskParam = {
+      side: sideNorm,
+      stopPrice: stopPrice != null ? Number(stopPrice) : null,
+      lastPrice,
+      pointValue: _pvSpec ? _pvSpec.pointValue : null,
+      riskCapUsd: _riskCap,
+    };
+    const check = tradeConfirmRules.checkTradeAllowed(rules, currentMode, tvBrokerFeedState.trades, qtyNum, accountRisk, _riskParam);
     if (!check.allowed) {
       console.log(`[trade-confirm] BLOCKED requestId=${requestId}: ${check.reason}`);
       rejectTicket(ws, requestId, check.reason);
@@ -13961,6 +14403,11 @@ httpServer.listen(PORT, '127.0.0.1', async () => {
   // sites during a live-trading week. To re-enable: flip TELEGRAM_ENABLED to
   // true. Nothing else needs to change.
   const TELEGRAM_ENABLED = false;
+  // G18: make the deadness LEGIBLE instead of silent. 24 notify/notifyPhoto call
+  // sites are no-ops while this is false — including the oversize-guard BLIND
+  // alarm and the live-feed / system-health protocol alarms, the two that
+  // genuinely need an answer. Not re-enabled: Anoop's 2026-09-04 decision stands.
+  console.log('[telegram] TELEGRAM_ENABLED=false — 24 notify/notifyPhoto call sites are silent no-ops (incl. the oversize BLIND alarm and the live-feed/system-health protocol alarms).');
   try {
     if (TELEGRAM_ENABLED) telegramBot.start({
       loadConfig,

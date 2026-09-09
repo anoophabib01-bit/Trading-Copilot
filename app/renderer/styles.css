@@ -3108,6 +3108,7 @@ html.theme-dark .analysis-block { padding: 14px; margin-bottom: 14px; }
 #oversize-chip.og-armed      { color: var(--green);  border-color: color-mix(in srgb, var(--green) 45%, transparent); }
 #oversize-chip.og-alarm-only { color: var(--amber);  border-color: color-mix(in srgb, var(--amber) 45%, transparent); }
 #oversize-chip.og-blind,
+#oversize-chip.og-failed,
 #oversize-chip.og-stuck      { color: var(--red);    border-color: color-mix(in srgb, var(--red) 55%, transparent);
                                animation: og-pulse 1.6s ease-in-out infinite; }
 #oversize-chip.og-off        { color: var(--text-dim); border-style: dashed; }
@@ -3192,3 +3193,7 @@ html.theme-dark .analysis-block { padding: 14px; margin-bottom: 14px; }
 .fx-cf-meta { font-size:10.5px; color:var(--text-dim); line-height:1.5; }
 .fx-cf-why  { font-size:10.5px; color:var(--text-dim); line-height:1.5; font-style:italic; }
 .fx-built { font-size:10.5px; color:var(--text-dim); margin-top:6px; }
+/* Unit label in a Forensics column header. POINTS and DOLLARS sit side by side
+   in this table and a bare number in the wrong column is a real misread — the
+   header carries the unit so the cell never has to. */
+.fx-unit { color: var(--text-dim); font-weight: 400; font-size: 9.5px; }

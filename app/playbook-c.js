@@ -281,7 +281,9 @@ function validateEngulfPlaybookC(bars, direction, pdhpdl, htfStructure) {
 // it is not, and saying otherwise would put a level in every single alert and
 // train him to ignore the line. A small tolerance band is added on top of the
 // range so a level the wick stopped one tick short of still counts.
-const PBC_NEAR_LEVEL_TOL = 0.0005;  // 0.05% — same band getSwingLevels dedupes on
+// G21: alias the imported LEVEL_TOL (PBC_LEVEL_TOL) — no second literal. A
+// change to the tolerance in detectors.js must reach every copy.
+const PBC_NEAR_LEVEL_TOL = PBC_LEVEL_TOL;
 
 function nearbyKeyLevels(bar, levels, tolPct = PBC_NEAR_LEVEL_TOL) {
   if (!bar || !Array.isArray(levels)) return [];

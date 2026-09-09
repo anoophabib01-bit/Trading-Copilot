@@ -13,7 +13,10 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  const PLAYBOOKS = ['A', 'B', 'C', 'PO3'];
+  // G6: C-ADX and FVG-ONLY were being dropped by the playbook filter alone
+  // (124 of 514 historical rows = 24.1%). Counting them does not merge them
+  // into `rejected` — that bucket stays the engulf-validity filter.
+  const PLAYBOOKS = ['A', 'B', 'C', 'C-ADX', 'PO3', 'FVG-ONLY'];
   // 'engulf-alert' added 2026-09-03. Playbook A now alerts on every closed
   // engulfing in both directions and only ARMS the ones that pass the full
   // check, so the two live under different event names (see server.js's
@@ -29,7 +32,7 @@
   const ARMING = new Set(['engulf-fire', 'engulf-alert', 'fvg-fire', 'playbook-b-confirm']);
 
   function freshBucket() {
-    return { fired: 0, valid: 0, rejected: 0, taken: 0, passed: 0, ignored: 0, wins: 0, losses: 0, grossWon: 0, grossLost: 0, net: 0, winPct: null, avgR: null };
+    return { fired: 0, valid: 0, rejected: 0, htfBlocked: 0, taken: 0, passed: 0, ignored: 0, wins: 0, losses: 0, grossWon: 0, grossLost: 0, net: 0, winPct: null, avgR: null };
   }
 
   function computeScorecard(rows, signals) {
@@ -40,6 +43,9 @@
     for (const s of sigs) {
       if (!s || !s.playbook || !byPlaybook[s.playbook]) continue;
       const b = byPlaybook[s.playbook];
+      // G6: a setup HELD by the HTF gate is a distinct count — never folded into
+      // `rejected`, which means the engulf-validity filter.
+      if (s.event === 'htf-reject') { b.htfBlocked++; continue; }
       if (s.event === 'playbook-c-reject') { b.rejected++; continue; }
       if (s.event === 'signal-decision') {
         if (s.decision === 'took') b.taken++;

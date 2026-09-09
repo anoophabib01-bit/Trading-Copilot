@@ -162,6 +162,27 @@ function evaluate(obs, rules) {
         rectify: unrendered ? 'render-orders-table' : null,
         evidence: pr,
       }));
+
+    // ── 3b. Positions table mounted-but-unrendered (G2, 2026-09-08) ─────────
+    // Symmetric to 3a: an open position is not required to detect a hidden
+    // Positions tab. A mounted positions table that renders ZERO rows and has
+    // no "There are no open positions" placeholder is not proof of a flat
+    // account — it is proof the table has not repainted.
+    if (o.panelRows) {
+      const pr = o.panelRows;
+      const positionsUnrendered = pr.openPositions === 0 && !pr.positionsEmptyState;
+      const positionsKnowable = pr.openPositions != null && pr.positionsEmptyState != null;
+      checks.push(check('panel-positions', 'Broker Positions table RENDERING',
+        !positionsKnowable ? 'unknown' : (positionsUnrendered ? 'fail' : 'pass'), {
+          severity: SEV.CRITICAL,
+          impact: positionsUnrendered
+            ? 'The positions table is mounted but rendering NO rows and no empty-state placeholder — an open position would be read as FLAT. Oversize and per-trade-stop guards are blind.'
+            : null,
+          rectify: positionsUnrendered ? 'render-positions-table' : null,
+          evidence: pr,
+        }));
+    }
+
   }
 
   // ── 3c. Did today's trades actually keep their prices? ───────────────────
@@ -435,4 +456,44 @@ function summarise(checks) {
   };
 }
 
-module.exports = { evaluate, findDuplicateRows, summarise, SEV, EXPECTED_SPACING_MIN };
+// ── G25: daily reconciliation (2026-09-08) ────────────────────────────────
+// The three P&L stores must agree, and the feed's own tradeCount must equal
+// trades.length minus the phantoms it rejected. Same doctrine as week-rollup's
+// disagreeDays: REPORT the disagreement, never pick a winner, and csvApply stays
+// the only authoritative correction. Pure — the runner gathers, this decides.
+function dailyReconciliationCheck(obs) {
+  const o = obs || {};
+  const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const dayPnl = n(o.dayPnl), dayTradesSum = n(o.dayTradesSum), grHistoryPnl = n(o.grHistoryPnl);
+  const tradeCount = n(o.tradeCount), tradesLength = n(o.tradesLength);
+  const phantomFlats = n(o.phantomFlats) || 0;
+  const tolerance = n(o.threshold) != null ? o.threshold : 0.02;
+  const evidence = { dayPnl, dayTradesSum, grHistoryPnl, tradeCount, tradesLength, phantomFlats };
+
+  // Internal consistency first: tradeCount must equal trades.length minus phantoms.
+  if (tradeCount != null && tradesLength != null) {
+    const expected = tradesLength - phantomFlats;
+    if (Math.abs(tradeCount - expected) > 0.5) {
+      return check('daily-count', 'Broker feed count vs row count', 'fail', {
+        severity: SEV.CRITICAL,
+        impact: `tradeCount ${tradeCount} does not equal ${tradesLength} rows minus ${phantomFlats} rejected phantom(s) (${expected}) — the per-day cap is counting a wrong number.`,
+        evidence,
+      });
+    }
+  }
+
+  // Three-way P&L: feed dayPnl vs day_trades row sum vs gr_history pnl.
+  const vals = [dayPnl, dayTradesSum, grHistoryPnl].filter((v) => v != null);
+  const spread = vals.length ? Math.max.apply(null, vals) - Math.min.apply(null, vals) : 0;
+  if (vals.length >= 2 && spread > tolerance) {
+    return check('daily-pnl', 'Daily P&L across three stores', 'fail', {
+      severity: SEV.CRITICAL,
+      impact: `the three P&L stores disagree by $${spread.toFixed(2)} — feed ${dayPnl}, day_trades sum ${dayTradesSum}, gr_history ${grHistoryPnl}. Reported, not auto-corrected; a broker CSV through csvApply is the only fix.`,
+      evidence,
+    });
+  }
+
+  return check('daily-reconcile', 'Daily P&L and count reconcile', 'pass', { severity: SEV.INFO, evidence });
+}
+
+module.exports = { evaluate, findDuplicateRows, summarise, dailyReconciliationCheck, SEV, EXPECTED_SPACING_MIN };

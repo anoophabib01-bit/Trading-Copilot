@@ -5,7 +5,7 @@
 // only if it catches these, so they are the tests.
 const test = require('node:test');
 const assert = require('node:assert');
-const { evaluate, findDuplicateRows, SEV } = require('../feed-protocol.js');
+const { evaluate, findDuplicateRows, dailyReconciliationCheck, SEV } = require('../feed-protocol.js');
 
 const RULES = { commissionPerContractPerSide: 0.95 };
 const healthy = () => ({
@@ -361,4 +361,43 @@ test('a fast queue passes on both measures', () => {
     lockDepth: { brokerNow: 1, brokerMax: 3, brokerMaxWaitMs: 900, warnAt: 4, warnWaitMs: 8000 },
   });
   assert.equal(evaluate(obs, RULES).checks.find(x => x.key === 'lock-queue').verdict, 'pass');
+});
+
+// ── G25: daily reconciliation (2026-09-08) ─────────────────────────────────
+// The three P&L stores must agree, and the feed's tradeCount must equal
+// trades.length minus rejected phantoms. Report, never rewrite.
+test('G25: agreeing stores reconcile and make no noise', () => {
+  const c = dailyReconciliationCheck({
+    dayPnl: -231.12, dayTradesSum: -231.12, grHistoryPnl: -231.12,
+    tradeCount: 13, tradesLength: 13, phantomFlats: 0,
+  });
+  assert.strictEqual(c.verdict, 'pass');
+});
+
+test('G25: the three P&L stores disagreeing is reported, never averaged', () => {
+  const c = dailyReconciliationCheck({
+    dayPnl: -231.12, dayTradesSum: -378.88, grHistoryPnl: -231.12,
+    tradeCount: 13, tradesLength: 13, phantomFlats: 0,
+  });
+  assert.strictEqual(c.verdict, 'fail');
+  assert.strictEqual(c.severity, SEV.CRITICAL);
+  assert.match(c.impact, /disagree by \$147\.76/);
+  assert.match(c.impact, /csvApply is the only fix/);
+});
+
+test('G25: tradeCount vs trades.length-minus-phantoms mismatch is detected', () => {
+  const c = dailyReconciliationCheck({
+    dayPnl: 0, dayTradesSum: 0, grHistoryPnl: 0,
+    tradeCount: 13, tradesLength: 16, phantomFlats: 0,
+  });
+  assert.strictEqual(c.verdict, 'fail');
+  assert.strictEqual(c.key, 'daily-count');
+});
+
+test('G25: the check REPORTS and never rewrites — no rectify action', () => {
+  const c = dailyReconciliationCheck({
+    dayPnl: -231.12, dayTradesSum: -378.88, grHistoryPnl: -231.12,
+    tradeCount: 13, tradesLength: 13, phantomFlats: 0,
+  });
+  assert.strictEqual(c.rectify, null, 'reconciliation is report-only; csvApply stays the correction');
 });

@@ -65,7 +65,8 @@ const state = {
   news: null,
   newsWasBlackout: false,
   hasApiKey: false,
-  mechanical: { dailyTrend: null, hourTrend: null, aligned: null, price: null, keyLevel: null, at: null }
+  mechanical: { dailyTrend: null, hourTrend: null, aligned: null, price: null, keyLevel: null, at: null },
+  htf: null
 };
 
 // Expose state on window for renderer/resilience.js (the crash-recovery +
@@ -2428,7 +2429,7 @@ function setupWsEvents() {
         (info.from ? '<div style="font-size:0.72rem;opacity:.7;margin-bottom:4px">' + escHtml(info.from) + ' → ' + escHtml(phase) + ' · ' + escHtml(info.time || '') + ' IST</div>' : '') +
         '<div style="font-size:0.78rem;line-height:1.5">' + escHtml(info.reason || '') + '</div>' +
         (info.detail ? '<div style="font-size:0.75rem;margin-top:4px;opacity:.85"><b>' + escHtml(info.detail) + '</b></div>' : '') +
-        '<div style="font-size:0.72rem;margin-top:5px;opacity:.7">4H bias: ' + escHtml(info.biasLabel || '—') +
+        '<div style="font-size:0.72rem;margin-top:5px;opacity:.7">1H bias: ' + escHtml(info.biasLabel || '—') +
           (info.rangeLow != null ? ' · opening range ' + info.rangeLow + '–' + info.rangeHigh : '') +
           (info.sweptTo != null ? ' · swept ' + info.sweptTo : '') + '</div>' +
       '</div>';
@@ -2745,6 +2746,7 @@ window.api.onPerTradeStopEvent(m => handlePerTradeStopEvent(m));
   // from the server (watchers-status), never what this client last requested.
   if (window.api.onHtfStatus) {
     window.api.onHtfStatus(msg => {
+      state.htf = msg;   // G12: the 15M gate broadcast, consumed by the GO/NO-GO badge
       renderHtfStatus(msg);
       renderEngulfSideBand(msg);
       // The hourly line goes in the chat as well as the chip. `toChat` is set
@@ -2754,6 +2756,14 @@ window.api.onPerTradeStopEvent(m => handlePerTradeStopEvent(m));
       if (msg && msg.toChat && typeof addSystemMessage === 'function') {
         addSystemMessage(msg.evidence);
       }
+    });
+  }
+  // G6: a held setup (HTF-gate block) becomes a HELD status row.
+  if (window.api.onHtfReject) {
+    window.api.onHtfReject(msg => {
+      const key = [msg && msg.playbook, msg && msg.tf, (msg && msg.direction || '').toUpperCase()].join('|');
+      _htfHeldRows[key] = msg;
+      renderChartWatchers(_lastWatchersStatus);
     });
   }
   if (window.api.onBarsRepair) {
@@ -3570,8 +3580,31 @@ function _renderMode(mode) {
     if (prof && prof.notOpened) statusNote = ' (not opened yet)';
     else if (prof && prof.blown) statusNote = ' (BLOWN — historical reference only)';
     else if (prof && prof.placeholder) statusNote = ' (terms unconfirmed)';
+    // 2026-09-07 (Anoop): "i just started a new apex account but the green
+    // confirm takes me to the same one... usually end up mixing data of one
+    // evals into two". The title said only "$50K EVAL ACCOUNT" — but there
+    // are FIVE slots and two of them are 50k/eval, so the header was
+    // ambiguous exactly where it mattered, and the two action buttons under
+    // it ("Eval breached" / "Cleared -> Funded") act on acctSlot(), i.e.
+    // whichever slot is OPEN, without ever naming it. Name the slot in both
+    // places so an action can never land on an account he did not mean.
+    const _slot = (typeof acctSlot === 'function') ? acctSlot() : null;
+    const _slotName = (_slot && (_slot.name || _slot.id)) || '';
     document.getElementById('account-section-title').textContent =
-      `${sizeLabel} ${mode === 'eval' ? 'Eval' : 'Funded'} Account${statusNote}`;
+      `${_slotName ? _slotName + ' — ' : ''}${sizeLabel} ${mode === 'eval' ? 'Eval' : 'Funded'} Account${statusNote}`;
+
+    // Same for the two terminal-action buttons in this panel: they are the
+    // only controls here that REWRITE an account's history, so they say which
+    // account they will rewrite.
+    if (_slotName) {
+      document.querySelectorAll('.acct-action-row .gate-status-btn').forEach(btn => {
+        const base = btn.dataset.baseLabel || (btn.dataset.baseLabel = btn.textContent.trim());
+        btn.textContent = base;
+        btn.title = `${base} — acts on "${_slotName}" (${sizeLabel} ${mode.toUpperCase()}), the account currently open. Switch accounts with the account picker first if this is not the one you mean.`;
+      });
+      const _sub = document.getElementById('acct-action-scope');
+      if (_sub) _sub.textContent = `These act on: ${_slotName}`;
+    }
   }
 
   const tlabel = document.getElementById('trade-limit-label');
@@ -6205,11 +6238,27 @@ function renderEngulfSideBand(msg) {
 // 1.3: Chart Watchers panel — renders the server's watchers-status snapshot.
 // 1.4: health states — healthy 🟢 / amber 🟡 (stale, restart attempted) /
 // red 🔴 (still stale after restart) / tv-offline ⚪ / stopped ⚪.
+// G6: HTF-gate blocks are rendered as HELD status rows below the watcher rows.
+// Idempotent, last-value-wins — keyed by (playbook|tf|direction) so 30 identical
+// blocks for the same setup render ONE row, never a chat-style append.
+const _htfHeldRows = {};
+let _lastWatchersStatus = null;
+function heldRowsHtml() {
+  const keys = Object.keys(_htfHeldRows);
+  if (!keys.length) return '';
+  return keys.map(function (k) {
+    const m = _htfHeldRows[k];
+    const label = (m && m.playbook) ? m.playbook : 'setup';
+    const text = (m && m.text) ? m.text : (label + ' held by the HTF gate');
+    return '<div class="watcher-row htf-held-row"><span>🚫</span><span>HELD</span><span class="stat-label">' + escHtml(text) + '</span></div>';
+  }).join('');
+}
 function renderChartWatchers(data) {
   const panel = document.getElementById('chart-watchers-panel');
   const note = document.getElementById('chart-watchers-note');
   if (!panel) return;
   const d = (data && typeof data === 'object') ? data : { tvConnected: false, rows: [] };
+  _lastWatchersStatus = d;
   if (!d.tvConnected) {
     if (note) note.textContent = 'TradingView not connected — watchers arm on reconnect.';
     panel.innerHTML = '<div class="watcher-row"><span>⚪</span><span>watchers idle until TradingView connects</span></div>';
@@ -6238,6 +6287,8 @@ function renderChartWatchers(data) {
     const text = r.detail ? r.detail : stateText;
     return '<div class="watcher-row"' + errAttr + '><span>' + dot + '</span><span>' + escHtml(r.label || r.id) + '</span><span class="stat-label">' + escHtml(text) + '</span></div>';
   }).join('');
+  // G6: append HELD rows (HTF-gate blocks) so they survive a watcher re-render.
+  panel.innerHTML += heldRowsHtml();
 }
 
 // 2.3: armed-setup card — the server's single live-setup slot. Two buttons:
@@ -6837,7 +6888,11 @@ function announceBiasChange(dir, m) {
   const bars = m && m.dailyBars ? `${m.dailyBars} bars` : 'bar count unknown';
   const grade = (m && m.dailyLabel) ? m.dailyLabel : to;
   const score = (m && typeof m.dailyScore === 'number') ? `, score ${m.dailyScore}` : '';
-  addSystemMessage(`BIAS CHANGED: ${from} → ${to} — 4H mechanical read now ${grade}${score} (${bars}), held ${BIAS_CONFIRM_READS} reads. No AI in this read; nothing has been executed.`);
+  // G13: the 4H is a REFERENCE read — it does not gate the watchers. Name the
+  // 15M gate's current side so the two surfaces can never silently disagree.
+  const gateSide = (state.htf && state.htf.ok && state.htf.side)
+    ? ` The 15M gate that holds Playbook B and C-ADX currently reads ${state.htf.side}.` : '';
+  addSystemMessage(`BIAS CHANGED (4H reference read — this does NOT gate the watchers): ${from} → ${to} — now ${grade}${score} (${bars}), held ${BIAS_CONFIRM_READS} reads.${gateSide} No AI in this read; nothing has been executed.`);
 
   // A single soft rising two-note cue — deliberately NOT either existing
   // alarm: tvAudio's descending tone means TradingView disconnected, and the
@@ -6884,6 +6939,17 @@ function updateFrameworkSteps() {
     el.textContent = text;
     el.className = 'step-value' + (cls ? ' ' + cls : '');
   };
+
+  // Step 0 — the 15M gate (G14). The read that DECIDES whether Playbook B and
+  // C-ADX may fire. Steps 1 and 2 are reference/evidence only.
+  const h = state.htf;
+  if (h) {
+    const side = !h.ok ? 'NO BIAS' : (h.side || h.bias || '—');
+    const cls = !h.ok ? '' : (h.bias === 'bullish' ? 'bull' : (h.bias === 'bearish' ? 'bear' : ''));
+    set('step-0-val', (h.stale ? 'STALE · ' : '') + side, cls);
+  } else {
+    set('step-0-val', '—', '');
+  }
 
   // Step 1 — 4H bias (was Daily until 2026-09-05; the wire field is still
   // named dailyTrend/dailyLabel for backward compat). Shows strength (STRONG/WEAK/NEUTRAL), not just
@@ -7040,6 +7106,18 @@ function computeMechanicalGoNogo() {
   if (breakActive) softReasons.push('15-min break timer active');
   if (newsBlackout) softReasons.push('News blackout active');
   if (notAligned) softReasons.push(`4H/1H bias not aligned (${m.dailyTrend}/${m.hourTrend})`);
+
+  // G12: the 15M gate that holds Playbook B and C-ADX, reported as a SOFT reason.
+  // It never flips GO→NO-GO on its own — it only names why the badge sits at
+  // PENDING while the deciding gate is shut or inverted.
+  if (state.htf) {
+    if (!state.htf.ok) {
+      softReasons.push('15M gate: NO BIAS — Playbook B and C-ADX are held');
+    } else if (state.htf.bias && m && m.dailyTrend && state.htf.bias !== m.dailyTrend) {
+      softReasons.push('15M gate ' + (state.htf.side || state.htf.bias).toUpperCase() + ' — opposite the 4H panel (' + m.dailyTrend + ')');
+    }
+    if (state.htf.stale) softReasons.push('15M gate read is stale (reported for awareness)');
+  }
 
   if (hardReasons.length) {
     setGoNogo('nogo', hardReasons);
@@ -7654,6 +7732,7 @@ function switchTab(tabId) {
     return;
   }
   if (tabId === 'align') { if (typeof mindSetKind === 'function') mindSetKind('state'); renderAlignment(); }
+  if (tabId === 'brief') renderBrief();
   if (tabId === 'cost') renderCost();
   if (tabId === 'journal') renderJournal();
   // Weekly Report (2026-08-29). Guarded by typeof because week-report.js loads
@@ -10205,12 +10284,16 @@ function insPlaybookScorecardBlock() {
   const s = Scorecard.computeScorecard(rows, signals);
   const fmt = n => n == null ? '—' : (n < 0 ? '-$' + Math.abs(n).toFixed(2) : '$' + n.toFixed(2));
   const pct = n => n == null ? '—' : n + '%';
-  const row = b => '<tr><td>' + escHtml(b.name) + '</td><td>' + b.fired + '</td><td>' + b.valid + '</td><td>' + b.rejected + '</td><td>' + b.taken + '</td><td>' + b.passed + '</td><td>' + b.ignored + '</td><td>' + pct(b.winPct) + '</td><td>' + b.avgR + '</td><td>' + fmt(b.net) + '</td></tr>';
+  // G6: `htfBlocked` is its own column — a setup HELD by the HTF gate is not
+  // the same thing as one REJECTED by the engulf-validity filter.
+  const row = b => '<tr><td>' + escHtml(b.name) + '</td><td>' + b.fired + '</td><td>' + b.valid + '</td><td>' + b.rejected + '</td><td>' + b.htfBlocked + '</td><td>' + b.taken + '</td><td>' + b.passed + '</td><td>' + b.ignored + '</td><td>' + pct(b.winPct) + '</td><td>' + b.avgR + '</td><td>' + fmt(b.net) + '</td></tr>';
   let h = '<div class="analysis-block"><div class="block-title">Per-playbook scorecard (today, live feed)</div>';
-  h += '<table style="width:100%;font-size:11px;border-collapse:collapse;"><tr><th>Playbook</th><th>Fired</th><th>Valid</th><th>Rejected</th><th>Taken</th><th>Passed</th><th>Ignored</th><th>Win%</th><th>Avg R</th><th>Net</th></tr>';
-  h += row({ name: 'A', fired: s.byPlaybook.A.fired, valid: s.byPlaybook.A.valid, rejected: s.byPlaybook.A.rejected, taken: s.byPlaybook.A.taken, passed: s.byPlaybook.A.passed, ignored: s.byPlaybook.A.ignored, winPct: s.byPlaybook.A.winPct, avgR: s.byPlaybook.A.avgR, net: s.byPlaybook.A.net });
-  h += row({ name: 'B', fired: s.byPlaybook.B.fired, valid: s.byPlaybook.B.valid, rejected: s.byPlaybook.B.rejected, taken: s.byPlaybook.B.taken, passed: s.byPlaybook.B.passed, ignored: s.byPlaybook.B.ignored, winPct: s.byPlaybook.B.winPct, avgR: s.byPlaybook.B.avgR, net: s.byPlaybook.B.net });
-  h += row({ name: 'C', fired: s.byPlaybook.C.fired, valid: s.byPlaybook.C.valid, rejected: s.byPlaybook.C.rejected, taken: s.byPlaybook.C.taken, passed: s.byPlaybook.C.passed, ignored: s.byPlaybook.C.ignored, winPct: s.byPlaybook.C.winPct, avgR: s.byPlaybook.C.avgR, net: s.byPlaybook.C.net });
+  h += '<table style="width:100%;font-size:11px;border-collapse:collapse;"><tr><th>Playbook</th><th>Fired</th><th>Valid</th><th>Rejected</th><th>Held</th><th>Taken</th><th>Passed</th><th>Ignored</th><th>Win%</th><th>Avg R</th><th>Net</th></tr>';
+  h += row({ name: 'A', fired: s.byPlaybook.A.fired, valid: s.byPlaybook.A.valid, rejected: s.byPlaybook.A.rejected, htfBlocked: s.byPlaybook.A.htfBlocked, taken: s.byPlaybook.A.taken, passed: s.byPlaybook.A.passed, ignored: s.byPlaybook.A.ignored, winPct: s.byPlaybook.A.winPct, avgR: s.byPlaybook.A.avgR, net: s.byPlaybook.A.net });
+  h += row({ name: 'B', fired: s.byPlaybook.B.fired, valid: s.byPlaybook.B.valid, rejected: s.byPlaybook.B.rejected, htfBlocked: s.byPlaybook.B.htfBlocked, taken: s.byPlaybook.B.taken, passed: s.byPlaybook.B.passed, ignored: s.byPlaybook.B.ignored, winPct: s.byPlaybook.B.winPct, avgR: s.byPlaybook.B.avgR, net: s.byPlaybook.B.net });
+  h += row({ name: 'C', fired: s.byPlaybook.C.fired, valid: s.byPlaybook.C.valid, rejected: s.byPlaybook.C.rejected, htfBlocked: s.byPlaybook.C.htfBlocked, taken: s.byPlaybook.C.taken, passed: s.byPlaybook.C.passed, ignored: s.byPlaybook.C.ignored, winPct: s.byPlaybook.C.winPct, avgR: s.byPlaybook.C.avgR, net: s.byPlaybook.C.net });
+  h += row({ name: 'C-ADX', fired: s.byPlaybook['C-ADX'].fired, valid: s.byPlaybook['C-ADX'].valid, rejected: s.byPlaybook['C-ADX'].rejected, htfBlocked: s.byPlaybook['C-ADX'].htfBlocked, taken: s.byPlaybook['C-ADX'].taken, passed: s.byPlaybook['C-ADX'].passed, ignored: s.byPlaybook['C-ADX'].ignored, winPct: s.byPlaybook['C-ADX'].winPct, avgR: s.byPlaybook['C-ADX'].avgR, net: s.byPlaybook['C-ADX'].net });
+  h += row({ name: 'FVG-ONLY', fired: s.byPlaybook['FVG-ONLY'].fired, valid: s.byPlaybook['FVG-ONLY'].valid, rejected: s.byPlaybook['FVG-ONLY'].rejected, htfBlocked: s.byPlaybook['FVG-ONLY'].htfBlocked, taken: s.byPlaybook['FVG-ONLY'].taken, passed: s.byPlaybook['FVG-ONLY'].passed, ignored: s.byPlaybook['FVG-ONLY'].ignored, winPct: s.byPlaybook['FVG-ONLY'].winPct, avgR: s.byPlaybook['FVG-ONLY'].avgR, net: s.byPlaybook['FVG-ONLY'].net });
   h += '</table>';
   const wPct = (s.backed.wins + s.backed.losses) ? Math.round(s.backed.wins / (s.backed.wins + s.backed.losses) * 100) + '%' : '—';
   const fPct = (s.freestyle.wins + s.freestyle.losses) ? Math.round(s.freestyle.wins / (s.freestyle.wins + s.freestyle.losses) * 100) + '%' : '—';
@@ -12596,7 +12679,7 @@ function renderOversizeChip(status, note) {
   if (status) oversizeStatus = status;
   const st = oversizeStatus;
 
-  chip.classList.remove('og-armed', 'og-alarm-only', 'og-blind', 'og-off', 'og-stuck');
+  chip.classList.remove('og-armed', 'og-alarm-only', 'og-blind', 'og-off', 'og-stuck', 'og-failed');
   if (!st) {
     text.textContent = 'Size guard: unknown';
     chip.title = 'No status received from the server yet.';
@@ -12623,6 +12706,24 @@ function renderOversizeChip(status, note) {
   const ageSec = st.lastReadAgeMs == null ? null : Math.round(st.lastReadAgeMs / 1000);
 
   switch (st.mode) {
+    // 2026-09-08: the guard tried to reduce and the order did NOT go. Ranked
+    // immediately below `stuck` because the instruction is the same — he has to
+    // act himself — and because a green ARMED badge over a proven-unable guard
+    // is what let 10, 12 and 8-lot trades follow the first failure that day.
+    case 'failed': {
+      chip.classList.add('og-failed');
+      const f = st.lastActionFailed || {};
+      text.textContent = 'Size guard: CANNOT REDUCE — close the excess yourself';
+      chip.title = 'It SAW ' + (f.size != null ? f.size + ' lots' : 'an oversize') + ' over the cap of '
+        + cap + ' and tried to sell ' + (f.wanted != null ? f.wanted : 'the excess')
+        + ', but the order did not go: ' + (f.error || 'unknown error') + '. '
+        + (String(f.error || '').indexOf('side control button') !== -1
+          ? 'That error means TradingView\'s ORDER TICKET is not open, so there is no buy/sell control '
+            + 'to click. Open the trading panel on the chart and the guard can act again. '
+          : '')
+        + 'Detection is still running; enforcement is not. Click to turn OFF for this session.';
+      break;
+    }
     case 'armed':
       chip.classList.add('og-armed');
       text.textContent = 'Size guard: ARMED · cap ' + cap + ' · ' + seen;
@@ -12723,4 +12824,311 @@ function handleOversizeEvent(ev) {
   // fires when he is ALREADY oversized, and a klaxon would make the guard
   // something he mutes. The words carry the urgency; the sound turns his head.
   try { tvAudio.playSignal(); } catch (e) {}
+}
+
+// ── Market Brief tab (2026-09-06) ──────────────────────────────────────────
+// Anoop: "i want market brief before newyork session and if any important
+// event or any sudden movement in both instrument and all information related
+// to it."
+//
+// Rendered ON TAB OPEN rather than pushed on a timer. That is deliberate: a
+// panel refreshed in the background while hidden is exactly the hidden-tab
+// staleness this app has already been bitten by. The server caches for ten
+// minutes, so opening the tab is cheap and always shows something the server
+// just recomputed.
+//
+// PRESENTATION ONLY. Every number here was computed server-side in
+// cli/market-brief.js. This function must never derive a figure of its own,
+// and there is deliberately nothing here that renders a direction — the brief
+// has no bullish/bearish field to render.
+let _briefBusy = false;
+
+function briefEsc(v) {
+  return String(v == null ? '' : v).replace(/[&<>"]/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+  });
+}
+
+// A percentile is only worth emphasising at the tails. Mid-range values are
+// dimmed so the eye lands on the two or three figures that are actually
+// unusual rather than reading ten equally-weighted numbers.
+function briefPct(p) {
+  if (p == null) return '';
+  var strong = p >= 80 || p <= 15;
+  return '<span style="opacity:' + (strong ? '1' : '.55') + ';'
+    + (strong ? 'font-weight:600;' : '') + '">[' + Number(p) + 'th pct]</span>';
+}
+
+// Numeric slots are coerced, not just trusted. Every figure below is produced
+// by round() in cli/market-brief.js and is already a Number — but this makes
+// that a property of the RENDERER rather than an assumption about the server,
+// so a future change upstream cannot turn a numeric slot into a markup slot.
+// briefEsc() covers every string slot; between them nothing reaches innerHTML
+// unchecked.
+function briefNum(v) {
+  var n = Number(v);
+  return Number.isFinite(n) ? String(n) : '';
+}
+
+
+// ── Shared brief panels (2026-09-07) ───────────────────────────────────────
+// Extracted from renderBrief() when the Gold view was added. Both views draw
+// MGC's gap, overnight range and sudden moves through THESE functions, so the
+// two briefs cannot render the same bar differently. Adding a third view means
+// composing these, not copying them.
+
+// Event risk goes first in every view. UNKNOWN is amber, not neutral — an
+// unreachable calendar must never look like a clear one.
+function briefEventRiskPanel(er) {
+  er = er || {};
+  var colour = er.status === 'BLACKOUT' ? '#c0392b'
+    : er.status === 'UNKNOWN' ? '#b8860b' : '#1e8449';
+  return '<div style="border-left:3px solid ' + colour + ';padding:6px 10px;margin-bottom:14px;">'
+    + '<div style="font-weight:700;">EVENT RISK · ' + briefEsc(er.status || '?') + '</div>'
+    + '<div style="opacity:.8;font-size:12px;margin-top:2px;">' + briefEsc(er.note || '') + '</div>'
+    + (er.windows && er.windows.length
+      ? '<div style="margin-top:5px;font-size:12px;opacity:.75;">'
+        + er.windows.map(function (w) {
+          return 'tier ' + briefNum(w.tier) + ' · <b>' + briefEsc(w.key) + '</b> ' + briefEsc(w.at);
+        }).join('<br>') + '</div>'
+      : '')
+    + '</div>';
+}
+
+function briefInstrumentsPanel(instruments) {
+  var H = [];
+  instruments = instruments || [];
+  for (var n = 0; n < instruments.length; n++) {
+    var i = instruments[n];
+    if (!i.ok) {
+      H.push('<div style="margin-bottom:12px;"><b>' + briefEsc(i.label)
+        + '</b> — unavailable: ' + briefEsc(i.error) + '</div>');
+      continue;
+    }
+    var g = i.gap || {};
+    H.push('<div style="margin-bottom:14px;padding-bottom:10px;'
+      + 'border-bottom:1px solid rgba(128,128,128,.2);">');
+    H.push('<div style="font-weight:700;font-size:14px;">' + briefEsc(i.label)
+      + ' <span style="opacity:.6;font-weight:400;">' + briefEsc(i.name) + '</span>'
+      + '<span style="float:right;font-variant-numeric:tabular-nums;">'
+      + briefNum(i.last.price) + '</span></div>');
+    if (i.gap) {
+      H.push('<div style="margin-top:4px;">Gap <b>' + (g.pts > 0 ? '+' : '') + briefNum(g.pts)
+        + '</b> pts · ' + (g.pct > 0 ? '+' : '') + briefNum(g.pct) + '% · $' + briefNum(g.usd)
+        + '/contract ' + briefPct(g.percentile) + '</div>');
+    }
+    if (i.priorRTH) {
+      H.push('<div style="opacity:.8;">Prior RTH ' + briefEsc(i.priorRTH.day)
+        + ' — H ' + briefNum(i.priorRTH.h) + ' · L ' + briefNum(i.priorRTH.l)
+        + ' · C ' + briefNum(i.priorRTH.c) + ' · range ' + briefNum(i.priorRTH.range) + '</div>');
+    }
+    if (i.overnight) {
+      H.push('<div style="opacity:.8;">Overnight — H ' + briefNum(i.overnight.h)
+        + ' · L ' + briefNum(i.overnight.l) + ' · range ' + briefNum(i.overnight.range)
+        + ' ' + briefPct(i.overnight.rangePct)
+        + ' · price ' + briefNum(i.overnight.posInRange) + '% up the range</div>');
+    }
+    if (i.sudden && i.sudden.length) {
+      H.push('<div style="margin-top:4px;">Sudden moves — <b>' + i.sudden.length
+        + '</b> bar(s) beyond 3σ</div>');
+      var top = i.sudden.slice(0, 3);
+      for (var k = 0; k < top.length; k++) {
+        var sm = top[k];
+        H.push('<div style="opacity:.75;font-size:12px;margin-left:10px;">'
+          + (sm.move > 0 ? '+' : '') + briefNum(sm.move) + ' pts · ' + briefNum(sm.z) + 'σ · $'
+          + briefNum(sm.usd) + ' · ' + briefEsc(sm.at) + '</div>');
+      }
+    } else {
+      H.push('<div style="opacity:.6;">Sudden moves — none beyond 3σ</div>');
+    }
+    H.push('</div>');
+  }
+  return H.join('');
+}
+
+function briefContextPanel(ctx, heading) {
+  ctx = ctx || [];
+  if (!ctx.length) return '';
+  var H = ['<div style="margin-bottom:12px;">'
+    + '<div style="font-weight:700;margin-bottom:4px;">' + briefEsc(heading || 'Context') + '</div>'];
+  for (var c1 = 0; c1 < ctx.length; c1++) {
+    var c = ctx[c1];
+    if (!c.ok) {
+      H.push('<div style="opacity:.5;">' + briefEsc(c.label) + ' — unavailable</div>');
+      continue;
+    }
+    H.push('<div style="font-variant-numeric:tabular-nums;opacity:.85;">'
+      + '<span style="display:inline-block;width:46px;font-weight:600;">'
+      + briefEsc(c.label) + '</span>'
+      + '<span style="display:inline-block;width:82px;">' + briefNum(c.last) + '</span>'
+      + '<span style="display:inline-block;width:70px;">'
+      + (c.chgPct > 0 ? '+' : '') + briefNum(c.chgPct) + '%</span>'
+      + briefPct(c.percentile)
+      + ' <span style="opacity:.6;font-size:12px;">' + briefEsc(c.why) + '</span></div>');
+  }
+  H.push('</div>');
+  return H.join('');
+}
+
+function briefAlertsPanel(alerts) {
+  var H = ['<div style="font-weight:700;margin-bottom:4px;">Alerts</div>'];
+  if (!alerts || !alerts.length) {
+    H.push('<div style="opacity:.6;">None — overnight was unremarkable on every '
+      + 'measure checked.</div>');
+    return H.join('');
+  }
+  for (var a1 = 0; a1 < alerts.length; a1++) {
+    var a = alerts[a1];
+    var col = a.level === 'high' ? '#c0392b' : a.level === 'error' ? '#7f8c8d' : '#b8860b';
+    H.push('<div style="margin-bottom:4px;"><span style="color:' + col
+      + ';font-weight:700;font-size:11px;">'
+      + briefEsc(String(a.level).toUpperCase()) + '</span> <b>'
+      + briefEsc(a.instrument) + '</b> — ' + briefEsc(a.text) + '</div>');
+  }
+  return H.join('');
+}
+
+async function renderBrief(force) {
+  var body = document.getElementById('brief-body');
+  var clock = document.getElementById('brief-clock');
+  if (!body) return;
+  if (_briefBusy) return;
+  _briefBusy = true;
+
+  body.innerHTML = '<div style="opacity:.6">Building brief… a cold build spawns the '
+    + 'Yahoo CLI a few times and can take up to a minute.</div>';
+
+  try {
+    var res = await window.api.marketBrief(!!force);
+    if (!res || !res.brief) {
+      body.innerHTML = '<div style="color:#c0392b">Brief unavailable: '
+        + briefEsc((res && res.error) || 'no data') + '</div>'
+        + '<div style="opacity:.6;margin-top:6px;font-size:12px;">Check '
+        + '<code>cli/cli-paths.json</code> and that '
+        + '<code>yahoo-finance-pp-cli.exe</code> still exists.</div>';
+      return;
+    }
+    var b = res.brief;
+
+    if (clock) {
+      clock.textContent = b.now.at
+        + (b.now.minutesToOpen === 0
+          ? '  ·  NY session OPEN'
+          : '  ·  NY open in ' + Math.floor(b.now.minutesToOpen / 60) + 'h '
+            + (b.now.minutesToOpen % 60) + 'm')
+        + (res.cached ? '  ·  cached ' + Math.round(res.ageMs / 60000) + 'm ago' : '');
+    }
+
+    var H = [briefEventRiskPanel(b.eventRisk)];
+    H.push(briefInstrumentsPanel(b.instruments));
+    H.push(briefContextPanel(b.context, 'Context'));
+    H.push(briefAlertsPanel(b.alerts));
+    H.push('<div style="margin-top:14px;opacity:.5;font-size:11px;line-height:1.5;">'
+      + 'Yahoo Finance /v8 chart, delayed. Percentiles are against this instrument’s '
+      + 'own recent sessions. Alerts are reasons for caution only — no direction is '
+      + 'expressed anywhere above, by design.</div>');
+
+    body.innerHTML = H.join('');
+  } catch (e) {
+    body.innerHTML = '<div style="color:#c0392b">Brief failed: '
+      + briefEsc(e && e.message) + '</div>';
+  } finally {
+    _briefBusy = false;
+  }
+}
+
+// ── Gold view (2026-09-07) ─────────────────────────────────────────────────
+// Anoop: "a second brief for MGC". Rendered as a VIEW inside the existing
+// Brief tab rather than a fifteenth tab — the strip is already 14 wide and a
+// second tab for the same kind of content would push it onto two lines, which
+// is the exact problem that got the duplicate Lessons tab removed in September.
+//
+// The two views share renderBriefPayload() below, so MGC's gap, overnight
+// range and sudden moves are drawn by ONE piece of code in both views and
+// cannot disagree about the same bar. Only the gold-specific extras — the
+// gold/silver ratio panel — are additional.
+var _briefView = 'combined';
+
+function briefSetView(view) {
+  _briefView = view === 'gold' ? 'gold' : 'combined';
+  var c = document.getElementById('brief-tog-combined');
+  var g = document.getElementById('brief-tog-gold');
+  if (c) c.style.fontWeight = _briefView === 'combined' ? '700' : '400';
+  if (g) g.style.fontWeight = _briefView === 'gold' ? '700' : '400';
+  if (_briefView === 'gold') renderGoldBrief(); else renderBrief();
+}
+
+function briefRefresh() {
+  if (_briefView === 'gold') renderGoldBrief(true); else renderBrief(true);
+}
+
+// The gold/silver ratio panel. Stated as a value plus its own percentile and
+// z-score — deliberately NOT as "gold is cheap/rich versus silver". That would
+// be a directional call, and this tab has none by design.
+function briefRatioPanel(r) {
+  if (!r) return '';
+  if (!r.ok) {
+    return '<div style="margin-bottom:14px;opacity:.6;">Gold/silver ratio unavailable: '
+      + briefEsc(r.error) + '</div>';
+  }
+  return '<div style="margin-bottom:14px;padding:8px 10px;'
+    + 'border:1px solid rgba(128,128,128,.25);border-radius:4px;">'
+    + '<div style="font-weight:700;">GOLD / SILVER RATIO</div>'
+    + '<div style="margin-top:3px;font-variant-numeric:tabular-nums;">'
+    + '<b>' + briefNum(r.ratio) + '</b> '
+    + '<span style="opacity:.7;">(MGC ' + briefNum(r.mgcPrice)
+    + ' / SI ' + briefNum(r.silverPrice) + ')</span> '
+    + briefPct(r.percentile)
+    + ' <span style="opacity:.7;">' + briefNum(r.zVsRecent) + 'σ vs its own recent mean</span>'
+    + '</div>'
+    + '<div style="opacity:.55;font-size:11px;margin-top:4px;">'
+    + briefEsc(r.note) + '</div></div>';
+}
+
+async function renderGoldBrief(force) {
+  var body = document.getElementById('brief-body');
+  var clock = document.getElementById('brief-clock');
+  if (!body) return;
+  if (_briefBusy) return;
+  _briefBusy = true;
+
+  body.innerHTML = '<div style="opacity:.6">Building gold brief… a cold build spawns the '
+    + 'Yahoo CLI several times and can take up to a minute.</div>';
+
+  try {
+    var res = await window.api.goldBrief(!!force);
+    if (!res || !res.brief) {
+      body.innerHTML = '<div style="color:#c0392b">Gold brief unavailable: '
+        + briefEsc((res && res.error) || 'no data') + '</div>';
+      return;
+    }
+    var b = res.brief;
+
+    if (clock) {
+      clock.textContent = b.now.at
+        + (b.now.minutesToOpen === 0
+          ? '  ·  NY session OPEN'
+          : '  ·  NY open in ' + Math.floor(b.now.minutesToOpen / 60) + 'h '
+            + (b.now.minutesToOpen % 60) + 'm')
+        + (res.cached ? '  ·  cached ' + Math.round(res.ageMs / 60000) + 'm ago' : '');
+    }
+
+    var H = [briefEventRiskPanel(b.eventRisk)];
+    H.push(briefInstrumentsPanel(b.instruments));
+    H.push(briefRatioPanel(b.ratio));
+    H.push(briefContextPanel(b.context, 'Gold drivers'));
+    H.push(briefAlertsPanel(b.alerts));
+    H.push('<div style="margin-top:14px;opacity:.5;font-size:11px;line-height:1.5;">'
+      + 'Yahoo Finance /v8 chart, delayed. <b>TIP is a real-yield proxy: price UP = real '
+      + 'yields DOWN = gold-bullish</b> — the opposite sign convention from DXY and 10Y in '
+      + 'the MNQ + MGC view. Percentiles are against each series’ own recent history. '
+      + 'No direction is expressed anywhere above, by design.</div>');
+
+    body.innerHTML = H.join('');
+  } catch (e) {
+    body.innerHTML = '<div style="color:#c0392b">Gold brief failed: '
+      + briefEsc(e && e.message) + '</div>';
+  } finally {
+    _briefBusy = false;
+  }
 }

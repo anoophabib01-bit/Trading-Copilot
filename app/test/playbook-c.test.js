@@ -1,7 +1,8 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { dropFormingBar, findPivots, validateEngulfPlaybookC, STAGE } = require('../playbook-c.js');
+const { dropFormingBar, findPivots, validateEngulfPlaybookC, STAGE, PBC_NEAR_LEVEL_TOL } = require('../playbook-c.js');
+const detectors = require('../detectors.js');
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 const B = (o, h, l, c) => ({ time: 0, open: o, high: h, low: l, close: c });
@@ -317,4 +318,10 @@ test('every rejection carries a stage — an untagged one would silently alert',
     assert.ok(Object.values(STAGE).includes(r.stage),
       'unstaged result: ' + JSON.stringify(r));
   }
+});
+
+// ── G21: LEVEL_TOL has ONE declaration ─────────────────────────────────────
+test('G21: detectors and playbook-c resolve to the SAME tolerance, never two copies', () => {
+  assert.strictEqual(detectors.LEVEL_TOL, 0.0005, 'the value is unchanged by this task');
+  assert.strictEqual(PBC_NEAR_LEVEL_TOL, detectors.LEVEL_TOL, 'playbook-c aliases detectors.LEVEL_TOL');
 });

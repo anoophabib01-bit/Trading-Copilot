@@ -101,7 +101,13 @@ function classifyTrendFromBars(bars) {
 // them under its old PBC_* names, so the tolerance findPivots collapses on and
 // the tolerance Playbook C's retest checks use can never drift apart.
 const PIVOT_LEG = 2;         // bars each side for a confirmed fractal pivot
-const LEVEL_TOL = 0.0005;    // 0.05% — same tolerance getSwingLevels dedupes on
+// LEVEL_TOL = 0.05%. At the last cached 15M close (29,569.25) that is ~14.8 MNQ
+// points ≈ $29.57/contract — 1.85× rules.json's own minRiskPoints (8) and 4.9×
+// stopBufferPoints (3). Calibrated on the 1H and INHERITED by the 15M. Do NOT
+// change the value without re-running the structure-classifier sweep: the
+// tolerance response is non-monotonic (0.0004 → 73.8%, 0.0005 → 70.6%,
+// 0.0006 → 73.0%) and the dataset cannot support tuning it.
+const LEVEL_TOL = 0.0005;
 
 // Confirmed fractal pivots WITH their bar index. getSwingLevels() returns
 // prices only, which is enough for the SFP level pool but not for reading
@@ -184,7 +190,7 @@ function getSwingLevels(bars) {
     const out = [];
     for (let i = arr.length - 1; i >= 0 && out.length < 3; i--) {
       const v = arr[i];
-      if (!out.some(o => Math.abs(o - v) / v < 0.0005)) out.push(v);
+      if (!out.some(o => Math.abs(o - v) / v < LEVEL_TOL)) out.push(v);
     }
     return out;
   };

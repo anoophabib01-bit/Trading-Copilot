@@ -97,18 +97,8 @@ const DEFAULT_SLIPPAGE_POINTS = 0.5;
 //     because "the live monitor confirms Playbook B on bars where the raid
 //     and the displacement coincide" is a finding about the DETECTOR that
 //     the numbers must not bury.
-function riskGate(plan, rules, contracts, pointValue) {
-  const minPts = (rules && rules.playbooks && rules.playbooks.minRiskPoints) || 0;
-  const maxUsd = (rules && rules.perTradeMaxLoss) || Infinity;
-  const riskUsd = plan.riskPoints * pointValue * contracts;
-  if (minPts && plan.riskPoints < minPts) {
-    return { ok: false, code: 'risk-too-small', reason: `stop is only ${plan.riskPoints.toFixed(2)}pt (min ${minPts}) — raid and displacement are likely the same bar` };
-  }
-  if (riskUsd > maxUsd) {
-    return { ok: false, code: 'risk-too-big', reason: `${plan.riskPoints.toFixed(2)}pt = $${riskUsd.toFixed(0)} risk at ${contracts} contracts, over the $${maxUsd} per-trade max loss` };
-  }
-  return { ok: true, riskUsd };
-}
+// riskGate moved to playbook-spec.js (G8/G11) so the live path and the backtest
+// price a setup with the SAME two ceilings. Call spec.riskGate below.
 
 // Align a higher-timeframe bar series to a given moment WITHOUT looking into
 // the future. Returns only HTF bars that had already CLOSED at `atSec`.
@@ -278,7 +268,7 @@ function runEngulfPlaybook(playbookId, entryBars, htfBars, rules, opts) {
     const plan = spec.planEntry(playbookId, setup, rules);
     if (!plan.plannable) { rejects.push({ time: bar.time, direction: engulf.direction, reason: 'unplannable: ' + plan.reason, structure: pbc.structure }); continue; }
 
-    const gate = riskGate(plan, rules, contracts, pointValue);
+    const gate = spec.riskGate(plan, rules, contracts, pointValue);
     if (!gate.ok) { blocked.push({ time: bar.time, direction: engulf.direction, code: gate.code, reason: gate.reason }); continue; }
 
     const sim = simulateTrade(plan, entryBars, i, { horizonBars: horizon, slippagePoints: o.slippagePoints, flattenByISTMinutes: (rules && rules.flattenByISTMinutes) });
@@ -337,7 +327,7 @@ function runPlaybookB(entryBars, rules, opts) {
     const plan = spec.planEntry('B', setup, rules);
     if (!plan.plannable) continue;
 
-    const gate = riskGate(plan, rules, contracts, pointValue);
+    const gate = spec.riskGate(plan, rules, contracts, pointValue);
     if (!gate.ok) { blocked.push({ time: bar.time, direction: setup.direction, code: gate.code, reason: gate.reason }); continue; }
 
     const sim = simulateTrade(plan, entryBars, i, { horizonBars: horizon, slippagePoints: o.slippagePoints, flattenByISTMinutes: (rules && rules.flattenByISTMinutes) });

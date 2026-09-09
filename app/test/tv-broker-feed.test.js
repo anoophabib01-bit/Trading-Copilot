@@ -1217,6 +1217,15 @@ test('missingFromDayRows: unreadable rows on disk do not hide a real trade', () 
     assert.equal(tvFeed.missingFromDayRows([foldTrade({ pnlUnknown: true })], [], OPTS).length, 0);
     assert.equal(tvFeed.missingFromDayRows([foldTrade({ pnl: NaN })], [], OPTS).length, 0);
   });
+
+  test('G26: a fold trade at a partial size matches a larger stored row on fill prices', () => {
+    // Fold saw 1 lot of a 2-lot fill. Identical entry/exit prices + same flat
+    // window => the SAME trade; reporting it missing would rewrite a duplicate
+    // on every poll — the 2026-09-09 incident.
+    const stored2 = walkRow({ size: 2, pnl: 6.00, ep: 29611, xp: 29609.5 });
+    const foldPartial = foldTrade({ size: 1, pnl: 4.10, entryPrice: 29611, exitPrice: 29609.5 });
+    assert.equal(tvFeed.missingFromDayRows([foldPartial], [stored2], OPTS).length, 0);
+  });
 }
 
 // ── mergeTradeRow: identity is the flat event, never the P&L (2026-08-28) ──
@@ -1276,6 +1285,24 @@ test('missingFromDayRows: unreadable rows on disk do not hide a real trade', () 
 
   test('a null row is skipped rather than throwing', () => {
     assert.strictEqual(tvFeed.mergeTradeRow([walk()], null, OPTS).action, 'skipped');
+  });
+
+  test('G26: a best-effort fold size merges with a larger verified row on identical fill prices', () => {
+    // The fold observed 1 lot of a 2-lot fill (partial read). Same flat window,
+    // same fill prices, only the size differs — that is the SAME trade, not two.
+    const verified2 = walk({ size: 2, pnl: 6.00 });
+    const foldPartial = foldRow({ pnlBasis: 'net', side: 'SHORT', ep: 29611, xp: 29609.5, pnl: 4.10 });
+    const r = tvFeed.mergeTradeRow([verified2], foldPartial, OPTS);
+    assert.strictEqual(r.action, 'merged');
+    assert.strictEqual(r.rows.length, 1);
+  });
+
+  test('G26: two VERIFIED rows of different size are still never merged (regression)', () => {
+    // Same stamps and prices, but BOTH sizes are verified fill counts — a
+    // 1-lot and a 4-lot are two real trades, exactly as before this fix.
+    const a = walk({ size: 1, pnlBasis: 'gross' });
+    const b = walk({ size: 4, pnlBasis: 'gross' });
+    assert.strictEqual(tvFeed.mergeTradeRow([a], b, OPTS).action, 'inserted');
   });
 }
 

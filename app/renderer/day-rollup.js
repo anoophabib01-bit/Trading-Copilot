@@ -209,7 +209,10 @@
       bigAfterWins: bigAfterWins, under5: under5, over15: over15, wins: wins.length,
       losses: losses.length, peak: Math.round(gbPeak), giveback: giveback,
       flips: flips, maxConsecLoss: maxConsec, tradedPast3Losses: tradedPast3Losses,
-      tradingMode: tMode, holdExceeded: holdExceeded
+      tradingMode: tMode, holdExceeded: holdExceeded,
+      // G23: stamp the rate the day was computed under, so a later rate change can
+      // never silently re-price a stored day. Commission is per-era, not global.
+      commPerCt: comm
     };
   }
 

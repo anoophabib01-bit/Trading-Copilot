@@ -58,6 +58,47 @@ test('every playbook has ordered, numbered steps', () => {
   }
 });
 
+// ── G8/G11: risk is priced at plan time, and minRiskPoints is a hard refusal for B ──
+const RULES_MIN = { playbooks: { stopBufferPoints: 3, targetR: 2, minRiskPoints: 8 }, perTradeMaxLoss: 300 };
+
+test('G8: a 117-pt A setup at 2 contracts is flagged over-per-trade-max, still plannable', () => {
+  const plan = planEntry('A', { direction: 'BULLISH', bar: bar(100, 200, 6, 120) }, RULES, { contracts: 2, pointValue: 2 });
+  assert.equal(plan.plannable, true);
+  assert.equal(plan.riskPoints, 117);
+  assert.equal(plan.riskUsd, 468);
+  assert.equal(plan.riskBlocked, 'over-per-trade-max');
+});
+
+test('G8: without a risk param, riskUsd/riskBlocked are null (not guessed)', () => {
+  const plan = planEntry('A', { direction: 'BULLISH', bar: bar(100, 200, 6, 120) }, RULES);
+  assert.equal(plan.plannable, true);
+  assert.equal(plan.riskUsd, null);
+  assert.equal(plan.riskBlocked, null);
+});
+
+test('G8: an in-cap setup is not blocked', () => {
+  const plan = planEntry('A', { direction: 'BULLISH', bar: bar(100, 110, 90, 108) }, RULES, { contracts: 2, pointValue: 2 });
+  // riskPoints = 108 - (90-3) = 21; 21 * 2 * 2 = 84 < 300
+  assert.equal(plan.riskUsd, 84);
+  assert.equal(plan.riskBlocked, null);
+});
+
+test('G11: a 3-pt B stop under minRiskPoints is a hard refusal, surfaced as riskTooSmall', () => {
+  const plan = planEntry('B', { direction: 'BULLISH', gapLow: 100, gapHigh: 101, wick: 101, level: 101 }, RULES_MIN);
+  assert.equal(plan.plannable, false);
+  assert.equal(plan.riskTooSmall, true);
+  assert.match(plan.reason, /under minRiskPoints 8/);
+});
+
+test('riskGate lives in playbook-spec (single module) and prices both ceilings', () => {
+  const { riskGate } = require('../playbook-spec.js');
+  const plan = { riskPoints: 117 };
+  assert.equal(riskGate(plan, RULES, 2, 2).ok, false);
+  assert.equal(riskGate(plan, RULES, 2, 2).code, 'risk-too-big');
+  assert.equal(riskGate({ riskPoints: 3 }, RULES_MIN, 2, 2).code, 'risk-too-small');
+  assert.equal(riskGate({ riskPoints: 20 }, RULES, 2, 2).riskUsd, 80);
+});
+
 // ── Entry geometry ──────────────────────────────────────────────────────────
 test('engulf entry is the trigger bar close; stop is beyond its extreme', () => {
   const r = planEntry('A', { direction: 'BULLISH', bar: bar(100, 110, 95, 108) }, RULES);

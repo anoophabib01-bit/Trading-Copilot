@@ -257,3 +257,59 @@ test('a window too short to hold two swings is unclear, never a guess', () => {
   assert.equal(classifyStructureFromPivots([]), 'unclear');
   assert.equal(classifyStructureFromPivots(null), 'unclear');
 });
+
+
+// ── G4: per-playbook unclearPolicy (added 2026-09-08) ─────────────────────
+// RESTORED NOTE: the 21 tests ABOVE were deleted when this block was first
+// written and are restored here. They all pass against the G4 code — they
+// were not broken by it. They pin the doctrine this module exists to hold
+// (the 15M decides, the 1H cannot veto, a direction mismatch is always
+// refused, missing data is distinct from unclear, and a pre-2026-09-03
+// ledger row still explains itself). Add to this file; do not replace it.
+
+function unclear(structure1h) {
+  return { ok: false, bias: null, reason: htf.REASONS.UNCLEAR_15M, structure15m: 'unclear', structure1h, confirmation: null };
+}
+
+test('refuse-unless-1h-clean + 15M unclear + 1H bullish + bullish setup -> ALLOWED', () => {
+  const r = htf.checkSetup(unclear('bullish'), 'BULLISH', 'refuse-unless-1h-clean');
+  assert.equal(r.allowed, true);
+  assert.equal(r.htfConfirmation, 'unclear', 'must be marked so it cannot pass as a clean-bias setup');
+});
+
+test('refuse-unless-1h-clean + 1H unclear -> REFUSED', () => {
+  const r = htf.checkSetup(unclear('unclear'), 'BULLISH', 'refuse-unless-1h-clean');
+  assert.equal(r.allowed, false);
+});
+
+test('refuse-unless-1h-clean + 1H bearish (setup bullish) -> REFUSED', () => {
+  const r = htf.checkSetup(unclear('bearish'), 'BULLISH', 'refuse-unless-1h-clean');
+  assert.equal(r.allowed, false);
+});
+
+test('policy "refuse" + 15M unclear -> REFUSED (byte-identical to today)', () => {
+  const r = htf.checkSetup(unclear('bullish'), 'BULLISH', 'refuse');
+  assert.equal(r.allowed, false);
+});
+
+test('absent policy defaults to refuse', () => {
+  const r = htf.checkSetup(unclear('bullish'), 'BULLISH');
+  assert.equal(r.allowed, false);
+});
+
+test('setup-against-htf-bias is REFUSED under every policy value', () => {
+  const clean = { ok: true, bias: 'bullish', reason: htf.REASONS.OK, structure15m: 'bullish', structure1h: 'bearish', confirmation: 'disagrees' };
+  for (const p of ['refuse', 'refuse-unless-1h-clean', 'alert-unlabelled']) {
+    const r = htf.checkSetup(clean, 'BEARISH', p);
+    assert.equal(r.allowed, false, 'direction must never relax under ' + p);
+    assert.equal(r.reason, htf.REASONS.SETUP_DISAGREES);
+  }
+});
+
+test('a clean 15M that agrees with the setup is ALLOWED regardless of policy', () => {
+  const clean = { ok: true, bias: 'bullish', reason: htf.REASONS.OK, structure15m: 'bullish', structure1h: 'bullish', confirmation: 'confirmed' };
+  for (const p of ['refuse', 'refuse-unless-1h-clean']) {
+    const r = htf.checkSetup(clean, 'BULLISH', p);
+    assert.equal(r.allowed, true);
+  }
+});

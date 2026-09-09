@@ -72,7 +72,7 @@ test('rollupDay reproduces the hand-computed day summary exactly', () => {
     avgGap: 5990, firstThreeMax: 5, sizedUpIntoLoss: true, bigAfterWins: false,
     under5: 4, over15: 1, wins: 3, losses: 4, peak: 40, giveback: 30,
     flips: 0, maxConsecLoss: 3, tradedPast3Losses: true,
-    tradingMode: 'standard', holdExceeded: 0
+    tradingMode: 'standard', holdExceeded: 0, commPerCt: 1.0
   });
 });
 

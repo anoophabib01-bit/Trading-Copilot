@@ -36,7 +36,7 @@ const STATUS_TEXT = {
   'fetch-failed':    { health: 'amber',    text: 'bar fetch FAILED on the last tick' },
   'no-bars':         { health: 'amber',    text: 'no bars returned on the last tick' },
   'merge-rejected':  { health: 'amber',    text: 'bar merge REJECTED — spacing or timeframe mismatch' },
-  'no-signal':       { health: 'healthy',  text: 'watching — no setup on the last closed 30M bar' },
+  'no-signal':       { health: 'healthy',  text: 'watching — no setup on the last closed bar' },
   // The two that matter most, and the two that were invisible before this.
   'htf-blocked':     { health: 'healthy',  text: 'SETUP FOUND — held by the HTF gate (15M structure has no clean bias, or it reads the other way)' },
   'already-fired':   { health: 'healthy',  text: 'signal already recorded for this bar' },
@@ -67,7 +67,9 @@ function cadxWatcherRow(o) {
 
   const row = {
     id: 'c-adx',
-    label: 'Playbook C (ADX) 30M',
+    // G19: the timeframe comes from rules.json cfg.tfLabel, never a hardcoded
+    // '30M' — the watcher has been running on the 1H for days while reporting 30M.
+    label: 'Playbook C (ADX) ' + (opts.tfLabel || '1H'),
     running: !!opts.running,
     health: 'stopped',
     lastCheck: st.lastCheckAt ? new Date(st.lastCheckAt).toISOString() : null,

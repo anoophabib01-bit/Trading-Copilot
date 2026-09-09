@@ -16,7 +16,7 @@
     "hard": -500
   },
   "dayStop": {
-    "eval": 1500,
+    "eval": 1000,
     "funded": 200
   },
   "cooldownMinutes": 15,
@@ -41,6 +41,25 @@
     "retracePct": 50
   },
   "perTradeMaxLoss": 300,
+  "dailyReconcileToleranceUsd": 2,
+  "_dailyReconcile_comment": "ADDED 2026-09-08 (G25). The $ tolerance the daily feed-vs-stored-day reconciliation (feed-protocol.dailyReconciliationCheck) allows before it flags a disagreement. $2 tolerates rounding and a one-tick pnlBasis diff, but the 2026-09-08 gap (feed -$231.12 vs stored -$378.88 = $147.76) blows straight through it. Report-only: it never rewrites; a broker CSV through csvApply stays the only correction.",
+  "_dayStop_comment": "eval CHANGED 1500 -> 1000 on 2026-09-07. dayStop is documented in server.js (dayStopForContext) as 'the prop firm's max loss limit', and the firm changed: the new account is an APEX 50K EOD DRAWDOWN EVALUATION, which carries a FIXED $1,000 Daily Loss Limit (DLL). At $1,000 net intraday loss - realized AND unrealized - Apex auto-liquidates every position and pauses the account until the 6PM ET reset. 1500 was therefore a number the app could never actually reach: Apex would have flattened him 500 earlier. Hitting the DLL does NOT fail the account, it only ends the day. The number that FAILS the account is the EOD threshold below. Source: apextraderfunding.com help-center 'Daily Loss Limit Explained' (50K EOD eval row = $1,000; the DLL does not scale during an evaluation, only in a PA).",
+  "firmLimits": {
+    "firm": "Apex Trader Funding",
+    "product": "50K EOD Drawdown Evaluation",
+    "confirmedOn": "2026-09-07",
+    "dailyLossLimit": 1000,
+    "dailyLossLimitResetET": "18:00",
+    "dailyLossLimitFailsAccount": false,
+    "eodThresholdDrawdown": 2000,
+    "eodThresholdStart": 48000,
+    "eodThresholdLocksAt": 50100,
+    "eodThresholdTrailsOn": "end-of-day-close",
+    "profitTarget": 3000,
+    "minTradingDays": 0,
+    "flatBy": "16:59 ET",
+    "_comment": "DOCUMENTATION, not enforcement - nothing reads this block yet; it exists so the firm's real numbers live in the same file as the discipline rules instead of in someone's memory, and so a future drift check has something to compare against. Two DIFFERENT limits, routinely confused: (1) dailyLossLimit $1,000 is monitored intraday on total equity including open positions - hit it and Apex flattens you and pauses trading for the session, but the ACCOUNT SURVIVES and resumes at the next 6PM ET open. (2) eodThreshold is the one that KILLS the account: it is recalculated once per day at the close on the EOD balance, but is enforced intraday once set - touch $48,000 at any moment and it is immediate liquidation and evaluation failure. It stops trailing and freezes at $50,100 once it reaches the target-profit balance. There is no minimum number of trading days on the EOD eval. His own self-imposed stops (dailyLossTiers, perTradeMaxLoss 300) are far tighter than all of this and remain the operative numbers day to day - these are the outer walls, not the plan."
+  },
   "_sessionWindowsNote": "Declared in each exchange's OWN timezone and converted to IST at load time by session-windows.js (see its header). Fixed IST minutes were wrong for half of every year: India has no DST, London and New York both do, and they shift on different dates. Durations are unchanged from the old fixed values (London 90min, NY 120min) — this moves WHEN a window opens, not how long it runs. Do not add startMin/endMin back here; loadRules() computes sessionWindowsIST from this block.",
   "_comment": "Single source of truth for all discipline rules. Edit here — scorer, guardrails and reports all read this file. Times are IST wall-clock minutes (e.g. 810 = 13:30).",
   "_sizeCap_comment": "FIXED 2026-07-28 (Anoop): was 6, silently 3x looser than the documented hard rule (CLAUDE.md rule #2: max 2 contracts/entry). The 150K eval breach on 2026-07-21 was exactly this — sized 5 lots, doubled to 10, against a stated 2-cap the app was never actually enforcing at this number. 2026-08-15: these BASE numbers are now the FUNDED ruleset — stageRules.eval permits upward from here, stageRules.funded clamps. See stage-rules.js for why the safe numbers are the base ones.",
@@ -50,7 +69,7 @@
   "_maxHoldSeconds_comment": "ADDED 2026-08-15. Normal-mode ceiling of 30 min; scalperRules tightens to 900 (15 min). Anoop's note put a 15-min MINIMUM on normal mode; the data says the opposite — trades held over 15 min are 40% win rate and -$646 net across 15 trades, while the 5-15 min window is 22% of his trades and 145% of his profit (+$1,975, robust to dropping its best trade). Caveat kept on record: hold time is an outcome, not a decision, and those long holds are most likely failed scalps he refused to cut rather than planned swing trades — so this is a ceiling on hanging on, not evidence that swing trading fails for him.",
   "_qualifying_comment": "2026-07-28 (Anoop): only trades that closed with |P&L| >= $100 count toward the 5/session, 10/day cap. Anything that closed between -$100 and +$100 is a scratch/near-breakeven trade and doesn't count as one of the 5.",
   "_dailyLossTiers_comment": "CHANGED 2026-07-28 (Anoop): was -100/-150/-200.",
-  "_commission_comment": "0.95/side ($1.90 round turn), corrected 2026-08-24. Was 0.59, which under-charged every day's net by $0.72 per contract and left the app's balance drifting ABOVE the broker's. Two independent confirmations of 0.95: (1) replaying Tradovate's own Performance export for 2026-08-17..21 (97 round trips, 193 contracts) at 0.95/side yields a 5-day total of 811.80, i.e. a base balance of $50,811.80, which equals the broker's own start-of-day net liq to the cent (51,211.50 minus its Total P/L 399.70); at 0.59 it yields 950.76, off by exactly 193 x $0.72 = $138.96. (2) the same replay puts 2026-08-20 at -264.10, which is exactly the figure on Tradeify's own P&L calendar already recorded in tv-broker-feed.js's header from a separate source. Do NOT change this back without new evidence of the same standard: it feeds csvApply, day-rollup and the live P&L cross-check.",
+  "_commission_comment": "0.95/side ($1.90 round turn), corrected 2026-08-24. Was 0.59, which under-charged every day's net by $0.72 per contract and left the app's balance drifting ABOVE the broker's. Two independent confirmations of 0.95: (1) replaying Tradovate's own Performance export for 2026-08-17..21 (97 round trips, 193 contracts) at 0.95/side yields a 5-day total of 811.80, i.e. a base balance of $50,811.80, which equals the broker's own start-of-day net liq to the cent (51,211.50 minus its Total P/L 399.70); at 0.59 it yields 950.76, off by exactly 193 x $0.72 = $138.96. (2) the same replay puts 2026-08-20 at -264.10, which is exactly the figure on Tradeify's own P&L calendar already recorded in tv-broker-feed.js's header from a separate source. Do NOT change this back without new evidence of the same standard: it feeds csvApply, day-rollup and the live P&L cross-check. 2026-09-09 (Anoop): keep 0.95 — a little higher is fine, never lower. The Apex fills-derived rates (~0.52/side MNQ, ~0.67/side MGC, Claude 2026-09-09) were shown to Anoop and NOT adopted; 0.95 remains the single enforced rate for all symbols/eras until he says otherwise.",
   "challenge": {
     "greenDays": 5,
     "scoreTarget": 70
@@ -176,8 +195,28 @@
     "targetR": 2,
     "fvgFillWindowBars": 8,
     "sfpToFvgMaxBars": 3,
-    "outcomeHorizonBars": 12
+    "outcomeHorizonBars": 12,
+    "htfUnclearMode": "block",
+    "htf": {
+      "unclearPolicy": {
+        "_default": "refuse",
+        "A": "refuse",
+        "B": "refuse",
+        "C-ADX": "refuse-unless-1h-clean"
+      }
+    }
   },
+  "contracts": {
+    "MNQ": {
+      "pointValue": 2,
+      "tickSize": 0.25
+    },
+    "MGC": {
+      "pointValue": 10,
+      "tickSize": 0.1
+    }
+  },
+  "_contracts_comment": "ADDED 2026-09-08 (G10). Per-symbol contract specs for risk pricing. pointValue must never be hardcoded in JS; resolve it from this block by the row's symbol and REFUSE on unknown symbols.",
   "flattenByISTMinutes": 180,
   "edgeWindow": {
     "start": 1080,
