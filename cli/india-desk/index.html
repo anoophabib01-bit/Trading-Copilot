@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>India Desk — NSE</title>
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --line:#262b35; --ink:#e6e8ee; --mut:#8a92a3; --pos:#2ecc71; --neg:#e5484d; --amber:#f5a524; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--ink); }
+  header { padding:16px 22px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--mut); font-size:12px; }
+  .open { color:var(--pos); font-weight:700; }
+  .closed { color:var(--neg); font-weight:700; }
+  main { padding:22px; max-width:1100px; margin:0 auto; }
+  .band { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; }
+  .stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+  .stat .k { color:var(--mut); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  .stat .v { font-size:22px; font-weight:700; margin-top:6px; }
+  .stat .d { font-size:12px; margin-top:2px; }
+  .up { color:var(--pos); } .down { color:var(--neg); }
+  h2 { font-size:14px; margin:28px 0 10px; color:var(--mut); text-transform:uppercase; letter-spacing:.05em; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { padding:7px 10px; text-align:right; border-bottom:1px solid var(--line); }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:var(--mut); font-weight:600; font-size:11px; text-transform:uppercase; }
+  .scroll { overflow-x:auto; border:1px solid var(--line); border-radius:8px; background:var(--panel); }
+  .cold { background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--amber); border-radius:8px; padding:14px; margin-bottom:10px; }
+  .cold .name { font-weight:700; }
+  .cold .msg { color:var(--amber); margin-top:4px; font-size:13px; }
+  .cold.ready { border-left-color:var(--pos); }
+  .cold.error { border-left-color:var(--neg); }
+  .err { color:var(--neg); font-size:12px; margin-top:4px; }
+  .na { color:var(--mut); }
+  .foot { color:var(--mut); font-size:12px; margin-top:30px; border-top:1px solid var(--line); padding-top:12px; }
+  pre { white-space:pre-wrap; font-size:11px; color:var(--mut); max-height:260px; overflow:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>India Desk — NSE</h1>
+  <span class="sub">Separate surface. Research only — never a trade input.</span>
+  <span id="ist" class="sub"></span>
+</header>
+<main>
+  <div class="band" id="band"></div>
+
+  <h2>Most active</h2>
+  <div class="scroll"><table id="movers"></table></div>
+
+  <h2>NIFTY 50 index drivers</h2>
+  <div class="scroll"><table id="drivers"></table></div>
+
+  <h2>Institutional signals</h2>
+  <div id="cold"></div>
+
+  <div class="foot" id="foot"></div>
+</main>
+<script>
+var SIGNAL_LABELS = {
+  deliverySpike: 'Institutional accumulation',
+  deliveryDivergence: 'Delivery divergence',
+  sectorBreadth: 'Sector breadth'
+};
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c];
+  });
+}
+function num(v, d) {
+  if (v == null || !isFinite(v)) return '<span class="na">—</span>';
+  return Number(v).toLocaleString('en-IN', { minimumFractionDigits: d == null ? 0 : d, maximumFractionDigits: d == null ? 2 : d });
+}
+function pct(v) {
+  if (v == null || !isFinite(v)) return '<span class="na">—</span>';
+  var n = Number(v);
+  var cls = n > 0 ? 'up' : (n < 0 ? 'down' : '');
+  return '<span class="' + cls + '">' + (n > 0 ? '+' : '') + n.toFixed(2) + '%</span>';
+}
+
+function renderBand(d) {
+  var m = d.market || {};
+  var open = d.isOpen ? '<span class="open">OPEN</span>' : '<span class="closed">CLOSED</span>';
+  var status = m.status ? esc(m.status) : '—';
+  var g = m.giftNifty || {};
+  var h = '';
+  h += stat('NIFTY 50', num(m.niftyLast, 2), pct(m.niftyPctChange) + ' &nbsp;·&nbsp; ' + open + ' (' + status + ')');
+  h += stat('GIFT Nifty', num(g.last, 2), pct(g.pctChange) + ' &nbsp;·&nbsp; ' + esc(g.timestamp || ''));
+  h += stat('USD / INR', num(m.usdInr, 4), '');
+  h += stat('Market cap (₹ Cr)', num(m.marketCapCr, 0), m.marketCapTrUsd != null ? '$' + Number(m.marketCapTrUsd).toFixed(2) + ' T' : '');
+  h += stat('As of', '', esc(m.asOf || '—'));
+  document.getElementById('band').innerHTML = h;
+}
+function stat(k, v, d) {
+  return '<div class="stat"><div class="k">' + esc(k) + '</div><div class="v">' + v + '</div><div class="d">' + d + '</div></div>';
+}
+
+function renderMovers(rows) {
+  if (!rows || !rows.length) { document.getElementById('movers').innerHTML = '<tr><td>No movers data.</td></tr>'; return; }
+  var h = '<tr><th>Symbol</th><th>Last</th><th>Change %</th><th>Value (₹ Cr)</th><th>Day high</th><th>Day low</th><th>52w high</th><th>52w low</th></tr>';
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    h += '<tr><td>' + esc(r.symbol) + '</td><td>' + num(r.lastPrice) + '</td><td>' + pct(r.pChange)
+      + '</td><td>' + num(r.totalTradedValue) + '</td><td>' + num(r.dayHigh) + '</td><td>' + num(r.dayLow)
+      + '</td><td>' + num(r.yearHigh) + '</td><td>' + num(r.yearLow) + '</td></tr>';
+  }
+  document.getElementById('movers').innerHTML = h;
+}
+
+function renderDrivers(rows) {
+  if (!rows || !rows.length) { document.getElementById('drivers').innerHTML = '<tr><td>No index-driver data yet.</td></tr>'; return; }
+  var h = '<tr><th>Symbol</th><th>Weight %</th><th>pChange %</th><th>Point contrib</th><th>Cumulative % of move</th><th>Impact</th></tr>';
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    h += '<tr><td>' + esc(r.symbol) + '</td><td>' + num(r.weight_pct, 2) + '</td><td>' + pct(r.p_change_pct)
+      + '</td><td>' + num(r.index_point_contribution, 4) + '</td><td>' + num(r.cumulative_pct_of_move, 2)
+      + '</td><td>' + esc(r.impact) + '</td></tr>';
+  }
+  document.getElementById('drivers').innerHTML = h;
+}
+
+function renderCold(d) {
+  var cs = d.coldSignals || {};
+  var n = d.syncedSessions != null ? d.syncedSessions : 0;
+  var keys = ['deliverySpike', 'deliveryDivergence', 'sectorBreadth'];
+  var h = '';
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    var b = cs[key] || {};
+    var label = SIGNAL_LABELS[key] || key;
+    if (b.state === 'cold') {
+      h += '<div class="cold"><div class="name">' + esc(label) + '</div>'
+        + '<div class="msg">NOT AVAILABLE — needs 20+ synced sessions, currently ' + n + '.</div></div>';
+    } else if (b.state === 'error') {
+      h += '<div class="cold error"><div class="name">' + esc(label) + '</div>'
+        + '<div class="err">' + esc(b.error || 'error') + '</div></div>';
+    } else {
+      h += '<div class="cold ready"><div class="name">' + esc(label) + '</div>'
+        + '<div class="msg" style="color:var(--ink)">' + (b.rows && b.rows.length ? b.rows.length + ' row(s)' : 'no rows') + '</div>'
+        + '<pre>' + esc(JSON.stringify(b.rows, null, 2)) + '</pre></div>';
+    }
+  }
+  document.getElementById('cold').innerHTML = h;
+}
+
+function renderFoot(d) {
+  var bits = ['Built ' + esc(d.istNow)];
+  if (d.errors && d.errors.length) bits.push('<span class="err">' + d.errors.length + ' upstream error(s)</span>');
+  document.getElementById('foot').innerHTML = bits.join(' · ');
+}
+
+function load() {
+  document.getElementById('ist').textContent = '';
+  fetch('/api/desk').then(function (r) { return r.json(); }).then(function (d) {
+    document.getElementById('ist').textContent = d.istNow + ' · ' + (d.isOpen ? 'NSE open' : 'NSE closed');
+    renderBand(d); renderMovers(d.movers); renderDrivers(d.indexDrivers); renderCold(d); renderFoot(d);
+  }).catch(function (e) {
+    document.getElementById('band').innerHTML = '<div class="stat"><div class="err">Failed to load: ' + esc(e.message) + '</div></div>';
+  });
+}
+load();
+setInterval(load, 60000);
+</script>
+</body>
+</html>

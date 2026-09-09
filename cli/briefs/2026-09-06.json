@@ -1,0 +1,223 @@
+{
+  "generatedAt": "2026-09-06T15:39:33.680Z",
+  "now": {
+    "at": "11:39 ET / 21:09 IST",
+    "minutesToOpen": 1311
+  },
+  "instruments": [
+    {
+      "y": "MNQ=F",
+      "label": "MNQ",
+      "name": "Micro E-mini Nasdaq-100",
+      "tick": 0.25,
+      "tickValue": 0.5,
+      "ok": true,
+      "last": {
+        "price": 29565.25,
+        "t": 1788555599,
+        "at": "16:59 ET / 02:29 IST"
+      },
+      "priorRTH": {
+        "day": "2026-09-03",
+        "o": 29249.5,
+        "h": 29585,
+        "l": 29199.25,
+        "c": 29531,
+        "range": 385.75,
+        "rangePct": 52,
+        "volume": 1498943
+      },
+      "overnight": {
+        "h": 29720,
+        "l": 29481.5,
+        "c": 29588,
+        "range": 238.5,
+        "rangePct": 19,
+        "rangeVsMedian": 0.62,
+        "posInRange": 45,
+        "bars": 197,
+        "volume": 636437,
+        "from": "16:00 ET / 01:30 IST",
+        "to": "09:25 ET / 18:55 IST"
+      },
+      "gap": {
+        "pts": 57,
+        "pct": 0.19,
+        "usd": 114,
+        "dir": "up",
+        "percentile": 15
+      },
+      "sudden": [
+        {
+          "t": 1788525000,
+          "at": "08:30 ET / 18:00 IST",
+          "move": -114,
+          "z": -5.2,
+          "usd": 228,
+          "from": 29667.75,
+          "to": 29553.75
+        }
+      ],
+      "move5mSd": 22.1,
+      "sessionsAnalysed": 48
+    },
+    {
+      "y": "MGC=F",
+      "label": "MGC",
+      "name": "Micro Gold",
+      "tick": 0.1,
+      "tickValue": 1,
+      "ok": true,
+      "last": {
+        "price": 4476.6,
+        "t": 1788555598,
+        "at": "16:59 ET / 02:29 IST"
+      },
+      "priorRTH": {
+        "day": "2026-09-03",
+        "o": 4527.7,
+        "h": 4558.6,
+        "l": 4503.2,
+        "c": 4522.8,
+        "range": 55.4,
+        "rangePct": 58,
+        "volume": 127239
+      },
+      "overnight": {
+        "h": 4537.9,
+        "l": 4411.4,
+        "c": 4459.5,
+        "range": 126.5,
+        "rangePct": 92,
+        "rangeVsMedian": 1.54,
+        "posInRange": 38,
+        "bars": 198,
+        "volume": 215209,
+        "from": "16:00 ET / 01:30 IST",
+        "to": "09:25 ET / 18:55 IST"
+      },
+      "gap": {
+        "pts": -63.3,
+        "pct": -1.4,
+        "usd": 633,
+        "dir": "down",
+        "percentile": 81
+      },
+      "sudden": [
+        {
+          "t": 1788525000,
+          "at": "08:30 ET / 18:00 IST",
+          "move": -77.4,
+          "z": -21.1,
+          "usd": 774,
+          "from": 4519.2,
+          "to": 4441.8
+        },
+        {
+          "t": 1788526800,
+          "at": "09:00 ET / 18:30 IST",
+          "move": -14.7,
+          "z": -4,
+          "usd": 147,
+          "from": 4440.5,
+          "to": 4425.8
+        },
+        {
+          "t": 1788526500,
+          "at": "08:55 ET / 18:25 IST",
+          "move": -12.2,
+          "z": -3.3,
+          "usd": 122,
+          "from": 4452.7,
+          "to": 4440.5
+        }
+      ],
+      "move5mSd": 3.66,
+      "sessionsAnalysed": 48
+    }
+  ],
+  "context": [
+    {
+      "y": "^VIX",
+      "label": "VIX",
+      "kind": "index",
+      "name": "Volatility index",
+      "why": "risk appetite; MNQ inverse",
+      "ok": true,
+      "last": 14.53,
+      "chg": 0.21,
+      "chgPct": 1.47,
+      "refLabel": "prior daily close",
+      "percentile": 5,
+      "n": 254
+    },
+    {
+      "y": "^TNX",
+      "label": "10Y",
+      "kind": "index",
+      "name": "10-year yield",
+      "why": "rates drive MNQ multiple",
+      "ok": true,
+      "last": 4.78,
+      "chg": 0.02,
+      "chgPct": 0.46,
+      "refLabel": "prior daily close",
+      "percentile": 99,
+      "n": 253
+    },
+    {
+      "y": "DX-Y.NYB",
+      "label": "DXY",
+      "kind": "index",
+      "name": "Dollar index",
+      "why": "inverse to MGC",
+      "ok": true,
+      "last": 99.16,
+      "chg": 0.16,
+      "chgPct": 0.16,
+      "refLabel": "prior daily close",
+      "percentile": 53,
+      "n": 251
+    },
+    {
+      "y": "ES=F",
+      "label": "ES",
+      "kind": "future",
+      "name": "E-mini S&P 500",
+      "why": "breadth check on MNQ move",
+      "ok": true,
+      "last": 7722,
+      "chg": -1.75,
+      "chgPct": -0.02,
+      "refLabel": "prior RTH close",
+      "percentile": 72,
+      "n": 4533
+    }
+  ],
+  "alerts": [
+    {
+      "level": "high",
+      "instrument": "MNQ",
+      "text": "1 sudden move overnight. Largest -114 pts ($228/contract) in one 5m bar at 08:30 ET / 18:00 IST — 5.2 sigma."
+    },
+    {
+      "level": "high",
+      "instrument": "MGC",
+      "text": "Overnight range 126.5 pts is wider than 92% of the last 48 sessions (1.54x the mean)."
+    },
+    {
+      "level": "high",
+      "instrument": "MGC",
+      "text": "Gap down 63.3 pts ($633/contract) vs prior RTH close — larger than 81% of recent gaps."
+    },
+    {
+      "level": "high",
+      "instrument": "MGC",
+      "text": "3 sudden moves overnight. Largest -77.4 pts ($774/contract) in one 5m bar at 08:30 ET / 18:00 IST — 21.1 sigma."
+    }
+  ],
+  "eventRisk": {
+    "status": "NOT WIRED",
+    "note": "No economic calendar is connected yet. Install fred (npx -y @mvanhorn/printing-press-library install fred, free FRED_API_KEY) and this section becomes a real CPI/NFP/FOMC blackout check. Until then treat event risk as UNKNOWN, not as absent."
+  }
+}

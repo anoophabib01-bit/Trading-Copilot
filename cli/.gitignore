@@ -1,0 +1,7 @@
+# Relocated CLI config/data/state/cache — regenerable, and may hold credentials.
+state/
+# OHLCV corpus: large, and rebuildable with `node cli/corpus-pull.js`.
+# Note: rebuildable only within Yahoo's retention window (5m = 60d, 1m = 7d).
+# If deep history matters later, remove this line and commit the corpus.
+corpus/
+*.tmp
