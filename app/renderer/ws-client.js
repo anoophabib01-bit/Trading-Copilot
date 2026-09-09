@@ -83,6 +83,19 @@
         if (msg.message) emit('mcp:status', msg.message);
         break;
 
+      // 2026-09-09: the TV kill switch. Deliberately its OWN message, separate
+      // from mcp-status — a crash and a deliberate kill both end up
+      // connected:false, but they are not the same fact and must not render
+      // the same way (see server.js's handleTvKill comment for why).
+      case 'tv-kill-status':
+        window._tvKilled = !!msg.killed;
+        // Pass the whole message, not just the boolean — `closing`/`restoring`
+        // are transient sub-states (the OS-level TradingView.exe kill/relaunch
+        // is not instant) that the UI renders as their own text, not just
+        // collapsed into killed/not-killed.
+        emit('tv:killStatus', msg);
+        break;
+
       case 'mcp-status-msg':
         emit('mcp:status', msg.message);
         break;
@@ -1062,6 +1075,12 @@
     onMcpDisconnected: (cb) => on('mcp:disconnected',  cb),
     onMcpStatus:       (cb) => on('mcp:status',        cb),
     onModeUpdate:      (cb) => on('mode:update',       cb),
+    // TradingView kill switch (2026-09-09) — see server.js's handleTvKill for
+    // why this is deliberately not just another mcp:connected consumer.
+    tvKill:            () => rawSend({ type: 'tv-kill' }),
+    tvRestore:         () => rawSend({ type: 'tv-restore' }),
+    getTvKillStatus:   () => rawSend({ type: 'tv-kill-status-get' }),
+    onTvKillStatus:    (cb) => on('tv:killStatus',     cb),
     // Oversize guard: state on demand, and the explicit session switch.
     getOversizeStatus: () => rawSend({ type: 'oversize-guard-status' }),
     setOversizeGuard:  (enabled) => rawSend({ type: 'oversize-guard-toggle', enabled: !!enabled }),

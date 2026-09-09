@@ -22,11 +22,16 @@ function effective(stage, mode) {
 
 // ── The four combinations ────────────────────────────────────────────────────
 
-test('normal + eval: eval permits 4, trade count stays at the mode\'s 5', () => {
+test('normal + eval: eval permits 4, trade count stays at the mode\'s base', () => {
   const r = effective('eval', 'standard');
   assert.strictEqual(r.sizeCap, 4, 'SUPERSEDED AGAIN 2026-09-04/05 — see the decision-history test below');
   assert.strictEqual(r.sizeFloor, 2);
-  assert.strictEqual(r.tradesPerDay, 5, 'eval must NOT raise the trade count — count is owned by tradingMode');
+  // RAISED 5 -> 10 (2026-09-10, Anoop's own instruction, root rules.json
+  // tradesPerDay). eval's stageRules block carries no tradesPerDay override,
+  // so this passes through unclamped — proving the same invariant the old
+  // '5' proved ('eval must NOT raise the trade count — count is owned by
+  // tradingMode'), just at the new base value.
+  assert.strictEqual(r.tradesPerDay, 10, 'eval must NOT raise the trade count — count is owned by tradingMode');
   assert.strictEqual(r.contractsPerDay.max, 36);
   assert.strictEqual(r.maxHoldSeconds, 1800);
 });
@@ -35,7 +40,11 @@ test('normal + funded: everything clamps to the safe base', () => {
   const r = effective('funded', 'standard');
   assert.strictEqual(r.sizeCap, 2);
   assert.strictEqual(r.sizeFloor, 2);
-  assert.strictEqual(r.tradesPerDay, 5, 'min(mode 5, funded 6) = 5');
+  // RAISED base 5 -> 10 (2026-09-10). funded's OWN tradesPerDay (6) is still
+  // the tighter side of the clamp either way — min(10, 6) = 6, same as
+  // min(5, 6) = 5 was before. The invariant this test protects (funded wins
+  // when it's tighter) is unchanged; only the losing side of the min moved.
+  assert.strictEqual(r.tradesPerDay, 6, 'min(mode 10, funded 6) = 6');
   assert.strictEqual(r.contractsPerDay.max, 12);
   assert.strictEqual(r.dailyLossCap, 200);
 });
@@ -83,7 +92,11 @@ test('the funded clamp is one-way: a LOOSER funded block still cannot loosen', (
   // a loosened funded block can never produce a cap looser than the base.
   assert.strictEqual(r.sizeCap, RULES.sizeCap, 'min(base, funded 8) = base — never the 8');
   assert.ok(r.sizeCap < 8, 'the loosened config value must never win');
-  assert.strictEqual(r.tradesPerDay, 5, 'min(base 5, funded 50) = 5');
+  // RAISED 5 -> 10 (2026-09-10) with the base itself — this test's fake
+  // funded override (50) is still far looser than the base on either number,
+  // so the invariant it protects (funded can never LOOSEN past the base) is
+  // exercised identically; only the literal moved with the base.
+  assert.strictEqual(r.tradesPerDay, 10, 'min(base 10, funded 50) = 10');
 });
 
 test('sizeFloor clamps by MAX, not MIN — a higher floor is the tighter one', () => {

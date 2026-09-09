@@ -1384,6 +1384,7 @@ wss.on('connection', (ws) => {
   const cfg = loadConfig();
   send(ws, { type: 'config', data: cfg });
   send(ws, { type: 'mcp-status', connected: mcpBridge.ready && mcpBridge.tvConnected });
+  send(ws, { type: 'tv-kill-status', killed: tvKilledByUser });
   send(ws, { type: 'mode-update', mode: currentMode });
   // The HTF chip must not be blank on a fresh page load. Uses the 60s-cached
   // read, so a reconnect storm cannot turn into a burst of chart switches.
@@ -1551,6 +1552,9 @@ wss.on('connection', (ws) => {
         break;
       case 'screenshot-get':   handleScreenshot(ws, msg);  break;
       case 'mcp-reconnect':    startMCP();                 break;
+      case 'tv-kill':          handleTvKill(ws);           break;
+      case 'tv-restore':       handleTvRestore(ws);        break;
+      case 'tv-kill-status-get': broadcastTvKillStatus();  break;
       case 'checklist-done':   handleChecklistDone(ws, msg); break;
       case 'account-db-rebuild': handleAccountDbRebuild(ws, msg); break;
       case 'journey-action':   handleJourneyAction(ws, msg); break;
@@ -10310,6 +10314,125 @@ function startWatcherLivenessWatch() {
   };
   watcherLivenessInterval = setInterval(tick, 30 * 1000);
   setTimeout(tick, 10000); // first pass soon after boot, once monitors have had a chance to run
+}
+
+// ── TradingView KILL SWITCH (2026-09-09) ────────────────────────────────────
+// Anoop, after the first cut of this (bridge-only): "i want you to close the
+// tradingview app so that i do not take anymore trades after clicking on
+// kill tradingview app." The point isn't disconnecting the DATA FEED — it's
+// removing the chart from in front of him, on purpose, as a physical barrier
+// against himself. A bridge-only kill leaves TradingView Desktop sitting open
+// and chartable; that does not stop a trade someone is determined to take.
+//
+// So this now does TWO things, always together on Kill:
+//   1. mcpBridge.stop() — same as before, so nothing polls a dying process.
+//   2. Force-close TradingView.exe itself, via the SAME process name the
+//      launcher's own ensure-tradingview.ps1 already targets
+//      (`Get-Process TradingView | Stop-Process -Force`) — reusing a
+//      precedent already trusted in this repo, not a new guess at the name.
+//
+// WHY THIS DOES NOT TOUCH A LIVE POSITION: Tradovate (the broker) and
+// TradingView Desktop (the charting terminal) are separate applications
+// talking to separate accounts. Closing the terminal cannot close a
+// position — but it DOES remove his only in-app way to see or manage one.
+// The confirm dialog in app.js says this explicitly and tells him to use
+// Tradovate directly if he is in a trade. This is the one place in the whole
+// kill-switch feature that is genuinely irreversible mid-action (a position
+// he can't see is a position he can still lose money on) — the warning has
+// to be read, not just present.
+//
+// WHY IT DOES NOT AUTO-RECONNECT: mcpBridge.stop() sets _intentionalStop=true,
+// which the bridge's own exit handler already reads to skip
+// _scheduleBridgeRestart() (mcp-bridge.js:88-90) — that flag exists for
+// exactly this purpose, we are only now giving it a UI. A deliberate kill
+// that silently un-killed itself in 10 seconds would not be a kill switch.
+let tvKilledByUser = false;
+let tvRestoreInFlight = false;
+
+function broadcastTvKillStatus(extra) {
+  broadcast(Object.assign({ type: 'tv-kill-status', killed: tvKilledByUser }, extra || {}));
+}
+
+// 2026-09-10 (Anoop, after confirming the kill switch worked): "track it on
+// the days i use and add the details on the journal." This writes into the
+// SAME per-day note object the Journal tab already renders (notes__<slot>,
+// keyed by trading day — the identical store djSaveNote/'note-save' use), as
+// a new `tvKillEvents` array, rather than a separate file: the Journal is
+// where Anoop reads his day back, so a fact about that day belongs in the
+// data structure that tab already loads, not a second store the renderer
+// would need new plumbing to reach.
+//
+// This is a FACT LOG, not a note — the four dj-* fields next to it are his
+// own words and stay freely editable; this array is server-written only, so
+// nothing here can be silently edited away, matching the ledger discipline
+// the rest of this app already applies to armSetup/htf-reject rows.
+function logTvKillEvent(action) {
+  try {
+    const slot = jessiBucketKey(loadConfig());
+    const dayKey = dayRollup.tradingDayKey(Date.now());
+    const notes = dataLoad('notes__' + slot) || {};
+    const note = notes[dayKey] || {};
+    const events = Array.isArray(note.tvKillEvents) ? note.tvKillEvents : [];
+    events.push({ at: new Date().toISOString(), action });
+    note.tvKillEvents = events;
+    notes[dayKey] = note;
+    dataSave('notes__' + slot, notes);
+  } catch (e) { console.warn('[tv-kill-switch] failed to log to journal:', e.message); }
+}
+
+function handleTvKill(ws) {
+  tvKilledByUser = true;
+  console.log('[tv-kill-switch] Killing TradingView — bridge stopped AND TradingView.exe force-closed. Will not auto-reconnect until Restore is clicked.');
+  logTvKillEvent('kill');
+  try { mcpBridge.stop(); } catch (e) { console.warn('[tv-kill-switch] bridge stop() threw:', e.message); }
+  // mcpBridge's own 'exit' handler already broadcasts mcp-status:disconnected
+  // regardless of _intentionalStop (see mcp-bridge.js) — the existing TV-dead
+  // banner and dot pick that up with no extra wiring.
+  broadcastTvKillStatus({ closing: true });
+  // Force-close the Desktop app. Fire-and-forget on purpose: even if this
+  // fails (e.g. TradingView was already closed), the bridge is already down
+  // and the app-side lockout already holds — a failed OS-level kill must
+  // never look like the whole feature failed.
+  // execFile, not exec: no shell string to inject into, even though nothing
+  // here is user input — same discipline as the rest of this function.
+  const { execFile } = require('child_process');
+  execFile('powershell', ['-NoProfile', '-Command',
+    'Get-Process TradingView -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue'],
+    (err) => {
+      if (err) console.warn('[tv-kill-switch] TradingView.exe close attempt returned:', err.message);
+      else console.log('[tv-kill-switch] TradingView.exe close command completed.');
+      broadcastTvKillStatus({ closing: false });
+    });
+}
+
+function handleTvRestore(ws) {
+  if (tvRestoreInFlight) { console.log('[tv-kill-switch] Restore already in progress, ignoring duplicate click.'); return; }
+  tvRestoreInFlight = true;
+  tvKilledByUser = false;
+  console.log('[tv-kill-switch] Restoring — relaunching TradingView with the CDP flag, then reattaching the bridge.');
+  logTvKillEvent('restore');
+  broadcastTvKillStatus({ restoring: true });
+  broadcast({ type: 'mcp-status-msg', message: 'Relaunching TradingView…' });
+  // MUST relaunch with --remote-debugging-port, exactly like the batch
+  // launcher — TradingView started from the taskbar/Start menu has no CDP
+  // port and mcpBridge can never attach to it (see CLAUDE.md's own warning
+  // on this). Reuse the SAME script the launcher uses rather than
+  // re-implementing "find TradingView.exe, kill any bad instance, relaunch
+  // with the flag, poll for readiness" a second time in a different language.
+  const { execFile } = require('child_process');
+  const psScript = path.join(__dirname, '..', 'scripts', 'ensure-tradingview.ps1');
+  execFile('powershell',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', psScript, '-Port', '9222', '-TimeoutSec', '90'],
+    { timeout: 100000 },
+    (err, stdout, stderr) => {
+      tvRestoreInFlight = false;
+      if (stdout) console.log('[tv-kill-switch]', stdout.trim());
+      if (err) console.warn('[tv-kill-switch] ensure-tradingview.ps1 did not confirm readiness (continuing — the bridge heartbeat will keep retrying):', err.message);
+      // Attempt the bridge regardless of the script's own exit code, same as
+      // the batch launcher does — mcp-bridge.js's heartbeat/retry takes over
+      // from here if TradingView is still booting.
+      startMCP();
+    });
 }
 
 // ── MCP startup ────────────────────────────────────────────────────────────────

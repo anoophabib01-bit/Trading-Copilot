@@ -2170,6 +2170,74 @@ function setupWsEvents() {
     document.getElementById('tv-status-text').textContent = String(msg).slice(0, 45);
   });
 
+  // ── TradingView kill switch (2026-09-09) ──────────────────────────────────
+  // state.tvKilled is tracked separately from state.tvConnected: a crash
+  // reconnects on its own, a kill does not, and the button/banner must say
+  // which one happened rather than treat both as the same "disconnected".
+  //
+  // REVISED same day, from Anoop directly: "i want you to close the
+  // tradingview app so that i do not take anymore trades after clicking on
+  // kill tradingview app." A bridge-only kill leaves the chart sitting open
+  // and clickable — that stops the APP from acting, not him. So Kill now
+  // force-closes TradingView.exe itself (server.js's handleTvKill), and this
+  // is a barrier against himself, not a data-feed toggle — the confirm
+  // dialog below has to say that plainly, including the one real risk: he
+  // loses his in-app view of any open position and must use Tradovate
+  // directly if he's in a trade. `closing`/`restoring` are transient
+  // sub-states while the OS-level close/relaunch is in flight (not instant).
+  state.tvKilled = false;
+
+  function tvKillRender(msg) {
+    const killed = !!(msg && msg.killed);
+    state.tvKilled = killed;
+    const btn = document.getElementById('tv-kill-btn');
+    if (!btn) return;
+    if (msg && msg.restoring) {
+      btn.classList.remove('tv-killed');
+      btn.disabled = true;
+      btn.textContent = '⏳ Relaunching TradingView…';
+      btn.title = 'Relaunching TradingView Desktop with the debug flag, then reattaching. This can take up to a minute.';
+      return;
+    }
+    btn.disabled = false;
+    if (killed) {
+      btn.classList.add('tv-killed');
+      btn.textContent = (msg && msg.closing) ? '⏳ Closing TradingView…' : '🔌 Reconnect TradingView';
+      btn.title = 'You closed TradingView Desktop. Click to relaunch it and reconnect — this does not touch any broker position.';
+    } else {
+      btn.classList.remove('tv-killed');
+      btn.textContent = '🛑 Kill TradingView';
+      btn.title = 'Force-close TradingView Desktop so you cannot act on the chart. Does not touch your broker account or any open position.';
+    }
+  }
+
+  window.api.onTvKillStatus(tvKillRender);
+  window.api.getTvKillStatus();
+
+  window.tvKillButtonClick = function () {
+    if (state.tvKilled) {
+      // Restoring is the safe direction — no confirm needed, same as
+      // reconnecting after any other disconnect.
+      window.api.tvRestore();
+      addSystemMessage('🔌 Relaunching TradingView and reconnecting…');
+      return;
+    }
+    if (!confirm(
+      'CLOSE TradingView Desktop?\n\n' +
+      'This force-closes the TradingView application itself, not just this ' +
+      'app\'s connection to it — the chart will disappear from your screen. ' +
+      'Every watcher (PO3, engulf, FVG, SFP, C-ADX) goes quiet immediately and ' +
+      'stays quiet until you click Reconnect. It will NOT reopen on its own.\n\n' +
+      'It does NOT close any position and does NOT touch your broker account. ' +
+      'But if you are IN A TRADE, you will lose your in-app view of it — ' +
+      'manage that position directly in Tradovate (web or app), not here.\n\n' +
+      'Use this to stop yourself from taking another trade — not while you are ' +
+      'actively managing an open one.'
+    )) return;
+    window.api.tvKill();
+    addSystemMessage('🛑 Closing TradingView Desktop — this was deliberate and will not reopen on its own. If you are in a trade, manage it in Tradovate directly. Click "Reconnect TradingView" when you want it back.');
+  };
+
   // 2026-08-19 (SEMI_AUTONOMOUS_SYSTEM_PLAN.md item 2): persistent, always-
   // visible self-test line — updated in place on every result (initial boot
   // AND every reconnect re-test), never a toast that can be missed.
@@ -12630,6 +12698,24 @@ function djDayRow(date, dayStats, trades) {
         h += '<div>' + idxLabel + ' — avgWin ' + money(avgW) + ' / avgLoss ' + money(avgL) + ' → <b>' + ratio + '</b></div>';
       });
       h += '</div>';
+    }
+
+    // ── TradingView kill switch — fact log, not a note (2026-09-10) ────────
+    // Anoop, after confirming the switch worked: "track it on the days i use
+    // and add the details on the journal." Server-written only
+    // (logTvKillEvent in server.js), same day-note store the dj-* fields
+    // below live in — rendered here as a read-only line so it can never be
+    // mistaken for something he typed and can never be edited away.
+    if (Array.isArray(note.tvKillEvents) && note.tvKillEvents.length) {
+      const istTime = iso => {
+        const d = new Date(new Date(iso).getTime() + 5.5 * 3600000);
+        return String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+      };
+      const line = note.tvKillEvents.map(e =>
+        (e.action === 'kill' ? '🛑 Killed' : '🔌 Restored') + ' ' + istTime(e.at) + ' IST'
+      ).join('  ·  ');
+      h += '<div class="dj-tvkill" title="Auto-logged when you used the Kill TradingView button in the titlebar — not editable, this is a fact of what happened, not a note.">'
+        + '<span class="dj-tvkill-label">TradingView kill switch:</span> ' + line + '</div>';
     }
 
     // Dropdown-driven detail + free text, saved per day per account

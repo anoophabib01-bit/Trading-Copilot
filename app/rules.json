@@ -5,8 +5,9 @@
     "eval": 2,
     "funded": 20
   },
-  "tradesPerSession": 5,
-  "tradesPerDay": 5,
+  "tradesPerSession": 10,
+  "tradesPerDay": 10,
+  "_tradesPerSessionDay_comment": "RAISED 5 -> 10 (2026-09-10, Anoop's own instruction, standard-mode base). These only apply when tradingMode is 'standard' - see _tradingMode_comment below; the account has run in 'scalper' since 2026-08-31, where scalperRules.tradesPerSession (also raised, see that block) is the number that actually governs a live session.",
   "maxHoldSeconds": 1800,
   "qualifyingTradeMinAbsPnl": 100,
   "scorerTradesPerDayLimit": 10,
@@ -126,9 +127,9 @@
   "tradingMode": "scalper",
   "scalperRules": {
     "_comment": "Override rules when tradingMode === 'scalper'. Anything NOT listed here falls through to the standard rules above. 2026-08-15: sizeCap deliberately REMOVED from this block — contract size is now owned by stageRules (eval/funded), not by trading style. Leaving it here meant switching to scalper mode on a FUNDED account silently raised the size cap, which is the exact change his own data says destroys that account (funded: every size except 2 contracts loses money, -$1,717 across 31 trades).",
-    "tradesPerSession": 5,
+    "tradesPerSession": 10,
     "tradesPerDay": 10,
-    "_tradesPerDay_comment": "CHANGED 2026-08-15: was 15 (session 8). Anoop's note: scalper may exceed 5 trades, up to 10/day.",
+    "_tradesPerDay_comment": "CHANGED 2026-08-15: was 15 (session 8). Anoop's note: scalper may exceed 5 trades, up to 10/day. tradesPerSession RAISED 5 -> 10 on 2026-09-10 (Anoop's own instruction) to match tradesPerDay, which was already 10 — the session cap was the one number still showing 5 in the live 'N/lim TRADES' HUD under the mode this account actually runs on.",
     "dailyLossTiers": {
       "yellow": -200,
       "red": -300,

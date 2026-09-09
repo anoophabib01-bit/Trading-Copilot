@@ -173,6 +173,19 @@ body {
 }
 #titlebar .api-btn:hover { border-color: var(--text-mid); color: var(--text); }
 
+/* ── TV kill switch (2026-09-09) ─────────────────────────────────────────
+   Two states, never rendered the same: red border+text when TradingView is
+   live (this button KILLS it), amber fill when it's been killed by the user
+   (this button RESTORES it). Amber uses a filled background, not just a
+   border, so "killed" reads as an active alarm state at a glance rather
+   than blending into the row of quiet outline buttons beside it. */
+#titlebar .tv-kill-btn { border-color: var(--red); color: var(--red); font-weight: 600; }
+#titlebar .tv-kill-btn:hover { background: var(--red); color: #fff; border-color: var(--red); }
+#titlebar .tv-kill-btn.tv-killed { background: var(--amber); border-color: var(--amber); color: #1a1400; }
+#titlebar .tv-kill-btn.tv-killed:hover { background: var(--amber); filter: brightness(1.1); color: #1a1400; }
+#titlebar .tv-kill-btn:disabled { opacity: 0.6; cursor: wait; filter: none; }
+#titlebar .tv-kill-btn:disabled:hover { background: inherit; }
+
 /* ── Layout ───────────────────────────────────────────────────────────────── */
 #app {
   display: flex;
@@ -2412,6 +2425,11 @@ html.theme-dark #send-btn {
 .dj-statgrid span { font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-dim); }
 .dj-statgrid b { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; font-variant-numeric: tabular-nums; }
 .dj-note { margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--border); }
+/* Fact log, not a note — visually distinct from the editable dj-fields below
+   it (amber, filled, same family as the titlebar's tv-killed state) so it
+   reads as "this happened" rather than "you wrote this". */
+.dj-tvkill { margin-top: 9px; padding: 6px 10px; border-radius: 8px; background: color-mix(in srgb, var(--amber) 14%, transparent); border: 1px solid color-mix(in srgb, var(--amber) 40%, transparent); font-size: 11.5px; color: var(--text-dim); }
+.dj-tvkill-label { font-weight: 600; color: var(--amber); margin-right: 4px; }
 .dj-fields { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 7px; }
 .dj-f { display: flex; flex-direction: column; gap: 3px; }
 .dj-f span { font-size: 9px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-dim); }

@@ -140,6 +140,19 @@
     <button type="button" class="sizecap-btn" data-sizecap="inc" onclick="adjustSizeCap(1)" title="Raise the per-entry cap" aria-label="Raise size cap">+</button>
   </div>
   <div class="session-time" id="session-clock"></div>
+  <!-- ── TradingView kill switch (2026-09-09) ─────────────────────────────
+       Anoop: "i want you to close the tradingview app so that i do not take
+       anymore trades after clicking on kill tradingview app." A one-click,
+       no-ambiguity BARRIER AGAINST HIMSELF — it force-closes TradingView
+       Desktop itself, not just this app's connection to it, so the chart is
+       actually gone, not just unreachable. Placed right beside the account
+       switcher he already knows to look for. Two states, never ambiguous
+       which one is showing: red "Kill TradingView" when open, amber
+       "Reconnect TradingView" when closed, plus transient "Closing…" /
+       "Relaunching…" text while the OS-level action is in flight (neither
+       is instant). tvKillRender() in app.js owns all of that and the confirm
+       dialog; this button only dispatches. -->
+  <button class="api-btn tv-kill-btn" id="tv-kill-btn" onclick="tvKillButtonClick()" title="Force-close TradingView Desktop so you cannot act on the chart. Does not touch your broker account or any open position.">🛑 Kill TradingView</button>
   <!-- Reopen the account picker any time (2026-07-25, Anoop: "there should be
        an option to get to this page if i want to shift my account later on") -->
   <button class="api-btn" id="switch-acct-btn" onclick="showAccountGate(state.accountSize, state.mode)" title="Switch account — reopen the account picker">⇄ Account</button>
