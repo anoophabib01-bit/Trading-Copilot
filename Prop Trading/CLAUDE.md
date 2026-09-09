@@ -10,13 +10,54 @@ This file gives Claude full context to act as Anoop's trading advisor and co-pil
 **Location:** Hubballi, Karnataka, India — IST (UTC+5:30)  
 **Instruments:** MNQ (Micro Nasdaq), MGC (Micro Gold)  
 **Platforms:** Tradovate (execution) + TradingView desktop (charting)  
-**Prop Firm:** Tradeify (Select, 50K eval, account TDFYSL50413184562) — previously Lucid Trading / Apex (see history below)  
+**Prop Firm:** Apex Trader Funding — **50K EOD Drawdown Evaluation, opened 2026-09-07** (see "Apex 50K EOD Evaluation" below). Tradeify (Select, 50K eval, TDFYSL50413184562) preceded it; Lucid Trading / Apex before that (see history below).  
 **Primary Claude interface:** Mobile app (voice check-ins) + Cowork desktop
 
 **Monitor setup:** 3-screen  
 - Monitor 1: 1H + 15Min charts  
 - Monitor 2: 5Min entry chart  
 - Monitor 3: DOM + News + P&L
+
+---
+
+## Apex 50K EOD Evaluation — opened 2026-09-07 (CURRENT FIRM)
+
+Confirmed by Anoop 2026-09-07 when he opened the account: this is the **EOD Drawdown**
+evaluation, **not** the intraday/legacy trailing one. That distinction decides every
+number in this table — the intraday product has a $2,500 threshold that trails his
+peak *unrealized* equity and **no daily loss limit at all**. Do not mix the two.
+
+| Field | Detail |
+|---|---|
+| Firm / product | Apex Trader Funding — 50K **EOD Drawdown** Evaluation |
+| Start balance | $50,000 |
+| Profit target | $3,000 → $53,000 |
+| EOD threshold (the one that FAILS the account) | **$48,000** — $2,000 below start |
+| How the threshold moves | Recalculated **once per day at the close**, off the EOD balance — not off intraday peaks |
+| How it is enforced | **Intraday.** Once set, touching it at any moment = immediate liquidation + evaluation FAILED |
+| Threshold lock | Freezes at **$50,100** once it reaches the target-profit balance |
+| **Daily Loss Limit (DLL)** | **$1,000, fixed** — does not scale during an evaluation |
+| DLL measured on | Total equity, **realized + unrealized**, monitored in real time |
+| What hitting the DLL does | Auto-liquidates everything and pauses trading for the session. **Does NOT fail the account** — it resumes at the next 6PM ET open |
+| DLL reset | 6:00 PM ET daily |
+| Minimum trading days | **None** — pass the moment the target is met |
+| Flat by | 4:59 PM ET; the auto-close is a failsafe, not a tool |
+
+**The two limits are not the same thing and are routinely confused:**
+the **DLL ends your day**, the **EOD threshold ends your account**.
+
+**These are the outer walls, not the plan.** His own rules in `app/rules.json`
+are far tighter and remain the operative numbers day to day: `perTradeMaxLoss`
+$300, `dailyLossTiers` yellow -$250 / red -$350 / hard -$500. Reaching the
+$1,000 DLL means five consecutive rule-breaking losses already happened.
+
+`app/rules.json` was updated the same day: `dayStop.eval` **1500 → 1000** (it was
+documented as "the prop firm's max loss limit" and Apex flattens at $1,000, so
+$1,500 was unreachable), and a new `firmLimits` block records the table above as
+data. `firmLimits` is documentation only — nothing enforces it yet.
+
+Sources: Apex help centre — *Daily Loss Limit Explained* (50K EOD eval row = $1,000)
+and *EOD Evaluations*.
 
 ---
 

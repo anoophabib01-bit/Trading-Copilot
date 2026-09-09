@@ -112,6 +112,9 @@ node server.js            # or: launch.bat  (kills :7433, starts, polls, opens C
 launcher does not set it; `START CO-PILOT (LIVE ORDERS).bat` does. Never set it in code
 or in a default.
 
+**Anoop decision 2026-09-09:** `START CO-PILOT (LIVE ORDERS).bat` is the operative default
+for his sessions — the oversize guard must have hands (`canAct: true`), not alarm-only.
+
 **Tests:**
 
 ```
