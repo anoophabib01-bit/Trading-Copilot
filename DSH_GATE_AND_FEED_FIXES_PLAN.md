@@ -1341,6 +1341,53 @@ hidden.
 
 ---
 
+## G28 — the app goes blind on an OPEN position and reports FLAT  ★ safety, found live
+
+**Found live by DSH, 2026-09-14 19:31–19:47 IST.** Anoop opened his second trade of the day
+(Buy 1 MNQU6 @ 29,030.25, broker TP 29,357.25 / SL 28,830.25 working). For ~16 minutes the app
+did not know the position existed:
+
+- `sessions/Now.md` 19:44 IST: **Position: FLAT**; Day P&L −$115.60 *"estimated — broker panel
+  unreadable"*; Trades 1/10 *provisional*. The open +$89.50 appeared nowhere.
+- `DATA/tv_broker_feed_state.json`: `wasFlat: true`, `sizeSeenThisTrade: 0`, plus a phantom row
+  (`size 0, pnl +1.48, inferred: true, evidence: "degraded"`).
+- `per-trade-stop` broadcast: `level: "blind" … "unrealised P&L UNREADABLE, cannot verify the
+  -$300 cap (blind)"` — the guard that exists to cap a single trade could not evaluate the open
+  one. Meanwhile the oversize guard refused to act, correctly, on an unreadable read.
+- The broker panel's own `positions-table` returned its **empty-state placeholder**
+  ("There are no open positions in your trading account yet") while a 1-lot position and a
+  working TP/SL pair were live on the account — the Incident A shape, again.
+- **Recovery was manual and immediate:** one `tv-broker-check-now` over the app's own WebSocket
+  restored it. Straight after: `positions {success:true, visible:true, count:1, empty:false}`,
+  row `MNQU6 Long 1 @ 29,030.25, Profit +89.50`, header `equity 48,609.80`, guard
+  `blind:false, lastSeenSize:1`, and a `position-event: OPENED LONG 1 MNQU6`.
+
+**Two defects, not one:**
+1. **The blind window does not self-heal.** Nothing retried hard enough to re-mount the table;
+   the app stayed confidently FLAT on a live position for 16 minutes.
+2. **FLAT is a false statement, not "unknown".** The feed had the signal it needed elsewhere
+   (the per-trade stop said *unreadable* on another channel) while the live projection said FLAT.
+
+**Secondary:** open P&L never reaches the day number — `brokerOpenPnl / brokerTotalPnl /
+brokerNetLiq` are `null` in state, so day P&L stays closed-trades-only (−$115.60) while the
+account shows +$89.50 open.
+
+**Do:** (a) when the `positions` payload carries the empty-state placeholder while the panel is
+rendered-but-stale, treat it as UNREADABLE, never as flat — reuse G2's `visible`/`emptyStateText`
+plumbing; (b) add a bounded retry/re-mount via the existing `trading_ensure_panel_ready` path
+before the next fold decision; (c) render UNREADABLE in `sessions/Now.md`'s Position row instead
+of FLAT; (d) decide explicitly whether open P&L enters the day number (display only —
+enforcement must keep using realized balance).
+
+**ACCEPTANCE:** with a position open and the positions table forced to its placeholder, the app
+(a) reports Position UNREADABLE within one poll, (b) alarms on the same channel as
+`per-trade-stop`, (c) recovers with no manual `tv-broker-check-now`, and (d) a test pins
+"placeholder + known-live position ≠ flat". Suite green.
+
+**NOT to be landed mid-session** — it touches the guard paths Anoop is trading behind.
+
+---
+
 ## EXCLUDED — do not build these, and here is exactly why
 
 Two things are out of scope. Neither is an oversight and both were considered in full. **If you
