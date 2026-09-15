@@ -2341,6 +2341,28 @@ function setupWsEvents() {
     });
   }
 
+  // G28 (2026-09-15): the positions table is unreadable WHILE A POSITION IS OPEN.
+  // The server refuses to fold a guessed flat and broadcasts this. Without a surface
+  // the refusal happened silently — which is exactly how a live 1-lot long stayed
+  // invisible for 16 minutes on 2026-09-14 while the page read FLAT.
+  // Rate-limited to one banner per 5 minutes: the condition can persist across many
+  // polls, and a banner that repeats every poll is the alert-fatigue pattern that
+  // makes the one that matters unreadable.
+  let _posUnreadableShownAt = 0;
+  if (window.api && window.api.onPositionsUnreadable) {
+    window.api.onPositionsUnreadable((msg) => {
+      const now = Date.now();
+      if (now - _posUnreadableShownAt < 5 * 60 * 1000) return;
+      _posUnreadableShownAt = now;
+      const why = (msg && msg.reason) || 'the broker positions table is not rendering';
+      showAlertBanner('⚠ POSITION UNREADABLE — ' + why, 'amber');
+      if (typeof addSystemMessage === 'function') {
+        addSystemMessage('⚠ POSITION UNREADABLE — ' + why +
+          ' The app will NOT guess flat, so size and the per-trade stop may be blind. Check the broker panel (Positions tab).');
+      }
+    });
+  }
+
   // ── THE LOOP — pattern memory speaking about a REPEAT (2026-09-03) ───────
   // Anoop: "I need a new agent who lives inside this memory who gives
   // information when any mistake or positive trade is repeated directly in

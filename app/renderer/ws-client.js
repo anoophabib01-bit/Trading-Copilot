@@ -531,6 +531,15 @@
         emit('tv:mistakePattern', msg);
         break;
 
+      // G28 (2026-09-15): the positions table is rendering its empty-state placeholder
+      // while the order history holds an open position. The server REFUSES to fold a
+      // guessed flat and broadcasts this instead. It exists because that state was
+      // silent on 2026-09-14, when a live 1-lot long went unseen for 16 minutes and
+      // nothing on screen said so.
+      case 'positions-unreadable':
+        emit('tv:positionsUnreadable', msg);
+        break;
+
       // 2026-09-03: THE LOOP — the pattern-memory agent's reasoned answer to a
       // REPEAT. Distinct from 'mistake-pattern' above, which is the fast
       // deterministic detector: this one arrives only when something has
@@ -1123,6 +1132,7 @@
     onTvBrokerAccount: (cb) => on('tv:brokerAccount',   cb),
     onLiveFeedSelfTest: (cb) => on('tv:liveFeedSelfTest', cb),
     onMistakePattern:  (cb) => on('tv:mistakePattern',    cb),
+  onPositionsUnreadable: (cb) => on('tv:positionsUnreadable', cb),
     onLoopFeedback:    (cb) => on('loop:feedback',        cb),
     // Ask the Loop to speak now — see server.js's 'loop-run' case for why an
     // explicit ask bypasses the once-per-day gate but not the repeat bar.

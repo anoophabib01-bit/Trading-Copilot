@@ -896,6 +896,21 @@ Steps alone moves the contradiction rather than removing it.** All 6 checklist r
 Either handle the checklist + adherence matrix in the same pass, or write down explicitly that the
 checklist stays his manual 4H/Daily read.
 
+### DECISION 2026-09-15 (DSH, reversible by Anoop) — the checklist item
+
+The pre-trade checklist item at `index.html` (**"4H and 1H in the same direction"**) KEEPS that
+wording and KEEPS its schema: `ck.bias` / `ck.h4` / `ck.h1` are unchanged, `ck_history.json` is NOT
+migrated, and `bias-tracker.js`'s grading is untouched. What changed is one line of its SUB-TEXT,
+which now states plainly that this is his own manual read while **the engine gates on its own 15M
+structure read (1H is evidence, not the decider)**.
+
+Why this way and not a schema change: G14.RISK's own evidence — all 6 checklist records on disk
+carry `daily`/`h4`/`h1` with the three always agreeing, and `requireChecklist` makes the checklist a
+HARD BLOCK. Retargeting the fields would need a migration plus a test, and would rewrite the meaning
+of every already-graded day. The contradiction being fixed is a READER problem (the panel asked him
+to check a thing the engine does not use), so it is fixed in the place a reader sees — no data moves.
+**Reversible by one line**: restore the old sub-text and the previous behaviour is byte-identical.
+
 ### ACCEPTANCE
 
 ```
@@ -1332,6 +1347,17 @@ matches "Selected Real Retail Sales Series" but NOT the actual "Advance Monthly 
 Food Services" headline. These are wrong blackouts in the over-restrictive direction (fail-closed, so
 not unsafe) but they make the calendar misleading. NOT fixed here — they are a separate regex-precision
 task, and FOMC in particular needs a real meeting-date source, not a regex.
+
+**CLOSED 2026-09-15 (DSH).** The `[~]` is resolved as far as it can be without waiting a
+month: the encoded times were re-checked against the publishing agencies' own standard schedules —
+Census (New Residential Construction / Durable Goods M3) **8:30 a.m. ET**, Federal Reserve G.17
+Industrial Production **9:15 a.m. ET**, U. Michigan Surveys of Consumers **10:00 a.m. ET**, NY Fed
+Empire State and Philadelphia Fed Manufacturing Business Outlook **8:30 a.m. ET** — which is exactly
+what `RELEASES` carries. A SECOND live occurrence is still pending by construction (these are monthly
+releases; the next prints land mid-October). **Limitation found and worth knowing:** `FRED_API_KEY`
+is set for Anoop's user session but NOT in DSH's shell, so `node cli/econ-calendar.js` cannot be
+re-run from here — it fails closed with a clear message, which is the correct behaviour, but it means
+a live calendar re-check needs a shell that has the key.
 
 On the `[~]`: the six new releases are monthly; the 14-day window shows one live occurrence each (e.g.
 Empire State 09-15, Housing Starts 09-17, Philly Fed 09-17, Industrial Production 09-18), all matching
