@@ -1,0 +1,75 @@
+'use strict';
+// Trade protection: Anoop's dollar rule (200 stop / 600 target) turned into broker prices.
+// The two things these pin: the POINT VALUE must come from rules.json per instrument
+// (MGC is $10/pt, MNQ $2/pt - a points figure that is right on one is 5x wrong on the
+// other), and the DIRECTION is easy to invert (a long stop belongs BELOW entry).
+const test = require('node:test');
+const assert = require('node:assert');
+const path = require('node:path');
+const fs = require('node:fs');
+const { bracketFor, pointsForUsd, pointValueForSymbol } = require('../trade-protection.js');
+const rules = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'rules.json'), 'utf8'));
+
+test('a LONG 1 lot MNQ: 200 dollars = 100 points below, 600 = 300 points above', () => {
+  const b = bracketFor({ side: 'buy', qty: 1, entryPrice: 29200, pointValue: 2, stopLossUsd: 200, takeProfitUsd: 600 });
+  assert.equal(b.stopPoints, 100);
+  assert.equal(b.targetPoints, 300);
+  assert.equal(b.stopPrice, 29100);
+  assert.equal(b.targetPrice, 29500);
+  assert.equal(b.ratio, 3);
+});
+
+test('the same dollars at 4 lots is a quarter of the distance', () => {
+  const b = bracketFor({ side: 'buy', qty: 4, entryPrice: 29200, pointValue: 2, stopLossUsd: 200, takeProfitUsd: 600 });
+  assert.equal(b.stopPoints, 25);
+  assert.equal(b.targetPoints, 75);
+  assert.equal(b.stopPrice, 29175);
+});
+
+test('a SHORT is the mirror - stop ABOVE entry, target BELOW', () => {
+  const b = bracketFor({ side: 'sell', qty: 1, entryPrice: 29200, pointValue: 2, stopLossUsd: 200, takeProfitUsd: 600 });
+  assert.equal(b.stopPrice, 29300);
+  assert.equal(b.targetPrice, 28900);
+});
+
+test('MGC is 10 dollars a point, so the same rule is a fifth of the distance', () => {
+  const b = bracketFor({ side: 'buy', qty: 1, entryPrice: 4477, pointValue: 10, stopLossUsd: 200, takeProfitUsd: 600, tickSize: 0.1 });
+  assert.equal(b.stopPoints, 20);
+  assert.equal(b.targetPoints, 60);
+  assert.equal(b.stopPrice, 4457);
+  assert.equal(b.targetPrice, 4537);
+});
+
+test('prices snap to the tick when one is given', () => {
+  const b = bracketFor({ side: 'buy', qty: 3, entryPrice: 29200.13, pointValue: 2, stopLossUsd: 200, takeProfitUsd: 600, tickSize: 0.25 });
+  assert.equal(b.stopPrice % 0.25, 0);
+  assert.equal(b.targetPrice % 0.25, 0);
+});
+
+test('refuses nonsense rather than inventing a price', () => {
+  assert.throws(() => bracketFor({ side: 'hold', qty: 1, entryPrice: 29200, pointValue: 2, stopLossUsd: 200, takeProfitUsd: 600 }), /side must be/);
+  assert.throws(() => bracketFor({ side: 'buy', qty: 0, entryPrice: 29200, pointValue: 2, stopLossUsd: 200, takeProfitUsd: 600 }), /qty must be/);
+  assert.throws(() => bracketFor({ side: 'buy', qty: 1, entryPrice: 0, pointValue: 2, stopLossUsd: 200, takeProfitUsd: 600 }), /entryPrice must be/);
+  assert.throws(() => pointsForUsd(200, 1, 0), /pointValue must be/);
+});
+
+test('point values come from rules.json contracts, keyed by symbol', () => {
+  assert.equal(pointValueForSymbol(rules, 'MNQ'), 2);
+  assert.equal(pointValueForSymbol(rules, 'MGC'), 10);
+});
+
+test('a rolled contract still finds its instrument spec (MNQZ6 -> MNQ)', () => {
+  assert.equal(pointValueForSymbol(rules, 'MNQZ6'), 2);
+  assert.equal(pointValueForSymbol(rules, 'MNQU6'), 2);
+});
+
+test('an unknown symbol REFUSES - it does not assume MNQ', () => {
+  assert.throws(() => pointValueForSymbol(rules, 'ESZ6'), /refusing to guess/);
+  assert.throws(() => pointValueForSymbol(rules, ''), /symbol is required/);
+});
+
+test('Anoop 2026-09-15 values are the ones actually configured', () => {
+  assert.equal(rules.autoProtection.stopLossUsd, 200);
+  assert.equal(rules.autoProtection.takeProfitUsd, 600);
+  assert.equal(rules.autoProtection.enabled, true);
+});
