@@ -1570,6 +1570,40 @@ attachment is still unsolved (see the autoProtection note in rules.json).
 
 ---
 
+## G31 — protection attachment: what exists on this build, and what does not  ⚠ BLOCKED
+
+**Searched live 2026-09-15 by DSH, read-only (order rows checked before and after every probe;
+22 → 22 unchanged throughout).** Anoop wants a broker-side bracket per trade — stop 200 dollars,
+target 600. The rule and its maths are built (`app/trade-protection.js`, the `autoProtection`
+block in rules.json). The ATTACHMENT has no route on this layout:
+
+| Surface | Result |
+|---|---|
+| Order ticket (`side-control-*`, `place-and-modify-button`) | **not in the DOM at all** |
+| `.trading-panel-content` (the one that exists) | the BROKER panel: Positions / Orders / Account summary |
+| Buy/sell widget | one-click MARKET only; `presetsMenuButton` (286,109) and the widget caret are **inert** to a real CDP click — no menu renders |
+| Broker account dropdown (155,793) | no menu |
+| Bottom bar 'More' tab | no menu; the panel is `bottom-widgetbar-content paper_trading` |
+| Positions row, position OPEN | exactly ONE control: `close-settings-cell-button` ("Close") — flattens the position |
+| Chart right-click | price-scale menu only |
+| `ui_open_panel` with `panel: "trading"` | "Button not found for panel: trading" |
+
+**Two facts that say the capability exists somewhere:** the Orders table carries **Take Profit and
+Stop Loss COLUMNS**, and Anoop's own 2026-09-14 trade shows a real broker-side pair
+(`Buy Stop Loss 4 @ 29,414` + `Buy Take Profit 4 @ 29,332` beside the entry). So the broker
+supports brackets and something he clicks produces them — it just is not any surface this code can
+reach, and NOT finding it is not evidence it is absent from his screen.
+
+**Do not build on a guess.** The next step is NOT more probing, it is one question to him: **which
+control does he use to place an order with a stop and target** (he did it on 09-14). Whatever that
+is, automate that. Two fallbacks if it cannot be automated: (a) a TradingView layout/setting where
+the full order ticket is shown — the ticket path in `placeMarketOrder` already supports stop/target
+fields and would work unchanged; (b) app-side protection instead of a broker bracket: the existing
+per-trade stop machinery plus the now-proven order path can CLOSE at −200 / +600, which works today
+but only while this app is awake. Prefer (a)/(b) over scraping a UI nobody can find.
+
+---
+
 ## EXCLUDED — do not build these, and here is exactly why
 
 Two things are out of scope. Neither is an oversight and both were considered in full. **If you
