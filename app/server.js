@@ -12017,7 +12017,10 @@ function stopTVBrokerMonitor() {
 // (P&L unreadable) alarms loudly — never silent — because a blind stop is what
 // killed 3 September.
 function readUnrealisedPnl(rows) {
-  const names = ['unrealized pnl', 'unrealized p&l', 'unrealized', 'unrealised pnl', 'unrealised', 'unrealized profit/loss', 'open pnl', 'net pnl', 'pnl', 'profit/loss', 'p&l'];
+  // 'profit' FIRST: this broker's positions table names its per-position P&L column exactly
+  // that (measured 2026-09-15). The older key list never matched it, so the per-trade stop was
+  // reading no figure at all from the live table.
+  const names = ['profit', 'p/l', 'p&l', 'unrealized pnl', 'unrealized p&l', 'unrealized', 'unrealised pnl', 'unrealised', 'unrealized profit/loss', 'open pnl', 'net pnl', 'pnl', 'profit/loss'];
   let total = null;
   for (const row of Array.isArray(rows) ? rows : []) {
     if (!row) continue;
@@ -12025,7 +12028,8 @@ function readUnrealisedPnl(rows) {
     for (const want of names) {
       const hit = keys.find((k) => k.trim().toLowerCase() === want);
       if (hit !== undefined && row[hit] !== '' && row[hit] != null) {
-        const n = Number(String(row[hit]).replace(/[^0-9.\-]/g, ''));
+        // G32: sign-aware — a unicode-minus loss used to parse as a PROFIT here.
+        const n = positionProtection.parseMoney(row[hit]);
         if (Number.isFinite(n)) { total = (total == null ? 0 : total) + n; break; }
       }
     }

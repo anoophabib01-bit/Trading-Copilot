@@ -27,6 +27,33 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
+  /**
+   * Parse a broker money string into a NUMBER, sign included.
+   *
+   * WHY THIS EXISTS (found live 2026-09-15, by watching an app-side protection test):
+   * this broker renders losses with a UNICODE MINUS (U+2212), e.g. "\u221219.00\nUSD". The
+   * parser this replaces stripped every non [0-9.-] character, which DELETED that minus and
+   * turned a losing position into a winning one - so the per-trade stop compared +19 against
+   * a -300 cap and never fired. Every ASCII-minus assumption in this codebase has the same
+   * bug; this is the one place it is now handled, and both guards call it.
+   * Also handles: the \nUSD suffix, thousands commas, and accounting parentheses.
+   * Returns null (never 0) when there is no number, so callers can refuse instead of
+   * treating an unreadable figure as break-even.
+   */
+  function parseMoney(value) {
+    if (value === null || value === undefined) return null;
+    let s = String(value);
+    s = s.replace(/[\u2212\u2013\u2014\u2015]/g, '-');   // unicode minus / en / em dashes
+    s = s.replace(/[\u00a0\u202f]/g, ' ');                // non-breaking spaces
+    let neg = false;
+    if (/^\s*\(.*\)\s*$/.test(s)) { neg = true; s = s.replace(/[()]/g, ''); }
+    s = s.replace(/[^0-9.+-]/g, '');
+    if (!s || s === '-' || s === '+' || s === '.' || s === '-.') return null;
+    const n = Number(s);
+    if (!Number.isFinite(n)) return null;
+    return neg ? -Math.abs(n) : n;
+  }
+
   /** Unrealised dollars from prices. A long profits as price rises, a short as it falls. */
   function unrealisedUsd(input) {
     const i = input || {};
@@ -71,5 +98,5 @@
     return { action: 'none', reason: 'inside the band (' + usd.toFixed(2) + ')', unrealisedUsd: usd, source };
   }
 
-  return { decide, unrealisedUsd };
+  return { decide, unrealisedUsd, parseMoney };
 });

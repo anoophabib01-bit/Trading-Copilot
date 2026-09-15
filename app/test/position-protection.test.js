@@ -72,3 +72,32 @@ test('the configured rule is the one these tests assume', () => {
   assert.equal(rules.autoProtection.stopLossUsd, 200);
   assert.equal(rules.autoProtection.takeProfitUsd, 600);
 });
+// --- G32 (2026-09-15): the parse that a live test caught. This broker prints losses with a
+// UNICODE MINUS, and the old parser stripped it - turning -19.00 into +19.00, so the per-trade
+// stop compared a PROFIT against a loss cap and never fired. These are the real string shapes.
+const { parseMoney } = require('../position-protection.js');
+
+test('parseMoney: a unicode-minus loss stays NEGATIVE (the bug this exists for)', () => {
+  assert.equal(parseMoney('\u221219.00\nUSD'), -19);
+  assert.equal(parseMoney('\u22122.50 USD'), -2.5);
+  assert.equal(parseMoney('\u2212128.75'), -128.75);
+});
+
+test('parseMoney: profits and ASCII negatives', () => {
+  assert.equal(parseMoney('+89.50\nUSD'), 89.5);
+  assert.equal(parseMoney('-3.50 USD'), -3.5);
+  assert.equal(parseMoney('0.00'), 0);
+});
+
+test('parseMoney: commas and accounting parentheses', () => {
+  assert.equal(parseMoney('1,234.56'), 1234.56);
+  assert.equal(parseMoney('(19.00)'), -19);
+});
+
+test('parseMoney: no number returns NULL, never 0 - a 0 would read as break-even', () => {
+  assert.equal(parseMoney(''), null);
+  assert.equal(parseMoney(null), null);
+  assert.equal(parseMoney(undefined), null);
+  assert.equal(parseMoney('USD'), null);
+  assert.equal(parseMoney('\u2212'), null);
+});
