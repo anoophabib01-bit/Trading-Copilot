@@ -84,9 +84,9 @@ test('clamp: sane values pass through', () => {
   assert.equal(r.takeProfitUsd, 450);
 });
 
-test('clamp: a tiny stop cannot sneak under the floor', () => {
-  assert.equal(clampAutoProtection({ stopLossUsd: 1 }, cur).stopLossUsd, 25);
-  assert.equal(clampAutoProtection({ takeProfitUsd: 2 }, cur).takeProfitUsd, 25);
+test('clamp: a tiny stop cannot sneak under the floor (5 since 2026-09-15, was 25)', () => {
+  assert.equal(clampAutoProtection({ stopLossUsd: 1 }, cur).stopLossUsd, 5);
+  assert.equal(clampAutoProtection({ takeProfitUsd: 2 }, cur).takeProfitUsd, 5);
 });
 
 test('clamp: an absurd value is capped, not accepted', () => {
