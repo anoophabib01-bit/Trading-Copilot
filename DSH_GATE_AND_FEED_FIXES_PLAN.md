@@ -1655,6 +1655,39 @@ that "fired". A guard is only proven when something actually moved.
 
 ---
 
+## G33 — app-side protection: BOTH directions now live-verified
+
+**2026-09-15, on Anoop's own trade, at his request.** He was LONG 4 MNQZ6; he asked for the target
+to be 300 "just for this trade". The band was re-armed at +300 and the app closed the position on its
+next check:
+
+```
+12:54:00.651  [position-protection] TARGET on 4 MNQZ6 at 350 — TARGET: +350.00 is at or past +300
+12:54:03.914  [order-gateway]       FLATTEN sell 4 MNQZ6: SUBMITTED
+12:54:03.940  [position-protection] CLOSE sell 4 MNQZ6: SUBMITTED
+12:54:08.023  [tv-position]         CLOSED MNQZ6 (was 4 lots)
+```
+
+Recorded as **LONG 5, +$337 net** (`day_trades`), day net ~+317, balance 49,350.08. The target was
+restored to 600 immediately afterwards, so this was a one-trade change, not a config edit.
+
+With the STOP side already verified earlier the same day (a SHORT closed at -15.50 on a $15 band),
+**both arms of the protection are now proven against the live account** rather than inferred. Note
+the overshoot: the guard polls every ~5s, so it closed at +350 against a +300 target — a threshold,
+not a fill price.
+
+**Also changed at his request:** `oversizeGuard.maxPerDay` 6 -> 999999, i.e. **no daily intervention
+cap**. His words: "i do not want any guard budget. it should be ON until i turn it off". What still
+bounds a runaway, unchanged: confirmReads 2, cooldownMs per position, and the one-outstanding-
+reduction rule.
+
+**Seen while verifying (not fixed here):** `[day-record] reconciliation FAILED: tradeCount 11 does not
+equal 11 rows minus 1 rejected phantom(s) (10) — the per-day cap is counting a wrong number.` The
+advisory reconciliation is doing its job (it reported rather than reconciled silently), but the
+count disagreement is real and belongs with G24/G25.
+
+---
+
 ## EXCLUDED — do not build these, and here is exactly why
 
 Two things are out of scope. Neither is an oversight and both were considered in full. **If you
