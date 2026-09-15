@@ -209,7 +209,13 @@ function renderNowMarkdown(state, nowMs) {
   // ── Position ──
   out.push('## Position');
   out.push('');
-  out.push(s.position ? cell(s.position) : 'FLAT');
+  // G28 (2026-09-15): UNREADABLE is its own answer. The broker's positions table can
+  // render its empty-state placeholder while a position is really open (measured live
+  // 2026-09-14), and printing FLAT there is the single most dangerous line this page can
+  // show: it is the page Anoop glances at. Say what is actually known.
+  out.push(s.positionsUnreadable
+    ? '**UNREADABLE** — broker positions table is not rendering (a position may be open)'
+    : (s.position ? cell(s.position) : 'FLAT'));
   out.push('');
 
   // ── Watchers ──

@@ -61,6 +61,7 @@ const barRecovery = require('./bar-recovery'); // startup self-repair for a miss
 const htfStatus = require('./htf-status');    // hourly "which side are the watchers looking?" evidence (2026-09-02, pure + unit-tested)
 const priorityLock = require('./priority-lock'); // the broker/chart lock, with a fast lane for the position watch (2026-09-02)
 const panelRepair = require('./panel-repair'); // decides WHEN to re-render an unreadable broker tab (2026-09-01)
+const positionsReadQuality = require('./positions-read-quality'); // G28: FLAT vs UNREADABLE when the table renders empty
 const foldOnly = require('./renderer/fold-only');  // shared predicate: fold-derived rows carry a real net and no trade detail
 const mistakePatterns = require('./mistake-patterns'); // live pattern-matching against Anoop's own documented failure history (2026-08-19, F1 first slice — advisory only, unit-tested)
 const positionEvents = require('./position-events'); // fast open/close/scale/flip detector for the 5s positions watch (2026-08-20, pure + unit-tested)
@@ -8421,6 +8422,21 @@ function writeNowFile() {
         tradesPerDay: rules.tradesPerDay,
         dailyLossTiers: rules.dailyLossTiers,
       },
+      // G28 (2026-09-15): this Position line had NO supplier — nothing ever passed
+      // `position`, so the page printed FLAT unconditionally, including through the
+      // 2026-09-14 window where a 1-lot long was open for ~16 minutes. Derived from the
+      // last broker positions read, with the unreadable case rendered distinctly.
+      position: (function () {
+        try {
+          if (!Array.isArray(tvLastPositions) || !tvLastPositions.length) return null;
+          const qty = tvLastPositions.reduce(function (s2, r) {
+            return s2 + (parseFloat(String((r && r.Qty) || '0').replace(/,/g, '')) || 0);
+          }, 0);
+          return qty + ' ' + ((tvLastPositions[0] && tvLastPositions[0].Symbol) || '') + ' ' +
+            String((tvLastPositions[0] && tvLastPositions[0].Side) || '').toUpperCase();
+        } catch (e) { return null; }
+      })(),
+      positionsUnreadable: tvBrokerPositionsUnreadable,
       watchers: buildWatchersStatus(),
       recent: LIVE_EVENT_RING,
     }, Date.now());
@@ -10592,6 +10608,11 @@ let tvBrokerPnlDriftLogged = null;
 // header balance — the condition that makes a stale number look live.
 let tvBrokerSummaryStaleLogged = null;
 let tvBrokerFeedReadOk = null; // null = never polled yet; tracks state so log lines only fire on transitions, not every 10s
+// G28 (2026-09-15): a positions table rendering its empty-state placeholder while a
+// position is really open. Distinct from tvBrokerFeedReadOk (which is about the table
+// being ABSENT) — this one is about the table being present but not painting its rows.
+let tvBrokerPositionsUnreadable = false;
+let tvBrokerPositionsUnreadableLogged = false;
 let tvBrokerOrdersSuspectLogged = false; // tracks the orders-table-empty-but-position-open transition, same log-once-per-state pattern
 let tvBrokerWalkDesyncLogged = false; // same log-once-per-state pattern for the order-walk-vs-positions disagreement (2026-08-20, H5)
 // 2026-08-20 (found in review): the timestamp of THIS process's first broker
@@ -11051,6 +11072,70 @@ async function pollTVBrokerAccountInner() {
     // note there for why the panel, not the walk, is the side that is usually
     // stale when the two disagree.
     let positions = (result.positions && result.positions.positions) || [];
+
+    // ── G28 (2026-09-15): FLAT-WHILE-OPEN ──────────────────────────────────
+    // Live, 2026-09-14: a 1-lot MNQU6 long was open for ~16 minutes while this feed
+    // reported FLAT, counted only closed P&L, and the per-trade stop alarmed blind.
+    // The broker's positions table was rendering its empty-state PLACEHOLDER
+    // ("There are no open positions in your trading account yet") — the same shape as
+    // a genuinely flat account, so the panel alone cannot tell them apart. The
+    // tie-breaker is evidence that does NOT come from the panel: a WORKING take-profit
+    // / stop-loss order, or the signed net of today's FILLED orders. Either one against
+    // zero position rows is a contradiction, not a flat. See positions-read-quality.js.
+    // A contradiction gets one forced positions re-render (the same tool + budget the
+    // desync path below uses); if the table still paints empty, the poll REFUSES to
+    // fold rather than recording a guessed flat — a wrong flat silently disables the
+    // size cap and the per-trade stop, which is exactly Incident A's failure.
+    let posQuality = null;
+    try {
+      let workingExits = 0, filledNet = 0;
+      (orders || []).forEach(function (o) {
+        if (!o) return;
+        const status = String(o.Status || '').toLowerCase();
+        if (status === 'working' && /take profit|stop loss/i.test(String(o.Type || ''))) workingExits++;
+        if (tvBrokerFeed.isFilledOrderRow(o)) {
+          const side = String(o.Side || '').toLowerCase();
+          const qty = parseFloat(String(o['Filled Qty'] || o.Qty || '0').replace(/,/g, '')) || 0;
+          if (side.indexOf('buy') >= 0) filledNet += qty;
+          else if (side.indexOf('sell') >= 0) filledNet -= qty;
+        }
+      });
+      const openPnlRaw = (result.summary && result.summary.header) ? result.summary.header.profit : null;
+      const openPnl = openPnlRaw == null ? 0 : (parseFloat(String(openPnlRaw).replace(/[^0-9.+-]/g, '')) || 0);
+      posQuality = positionsReadQuality.classify({
+        positionsSuccess: true,
+        positionCount: positions.length,
+        workingExitOrders: workingExits,
+        walkNetQty: filledNet,
+        summaryOpenPnl: openPnl,
+      });
+      if (posQuality.state === 'unreadable' || posQuality.state === 'suspect') {
+        console.warn('[tv-broker] G28 positions read is ' + posQuality.state.toUpperCase() + ' — ' + posQuality.reason);
+        const rawP28 = await withBrokerLock(function () { return mcpBridge.callTool('trading_refresh_panel_table', { table: 'positions' }); });
+        const fixP28 = parseToolResult(rawP28);
+        if (fixP28 && fixP28.ok && Array.isArray(fixP28.positions) && fixP28.positions.length) {
+          positions = fixP28.positions;
+          tvLastPositions = fixP28.positions;
+          posQuality = { state: 'open', contradiction: false, reason: 'recovered by a forced positions re-render' };
+          console.warn('[tv-broker] G28 forced positions re-render RECOVERED ' + positions.length + ' row(s) — the table was stale, not flat');
+          recordLiveEvent('POSITION', 'RECOVERED', 'positions table was rendering empty while a position was open — re-render restored ' + positions.length + ' row(s)');
+        }
+      }
+    } catch (e) { console.warn('[tv-broker] G28 positions-quality check threw: ' + e.message); }
+
+    if (posQuality && posQuality.state === 'unreadable') {
+      tvBrokerPositionsUnreadable = true;
+      const reason28 = 'positions table rendered EMPTY while the order history holds an open position (G28) — refusing to fold a guessed flat; a forced re-render did not restore the rows.';
+      if (tvBrokerPositionsUnreadableLogged !== true) { console.warn('[tv-broker] ' + reason28); tvBrokerPositionsUnreadableLogged = true; }
+      broadcast({ type: 'positions-unreadable', reason: reason28, open: true, at: Date.now() });
+      recordLiveEvent('POSITION', 'UNREADABLE', posQuality.reason);
+      scheduleLiveFeedSelfTest(1500);
+      return;
+    }
+    if (tvBrokerPositionsUnreadable) console.log('[tv-broker] positions table reads rows again — flat/open state is trustworthy');
+    tvBrokerPositionsUnreadable = false;
+    tvBrokerPositionsUnreadableLogged = false;
+
     const isFlat = !positions.length;
     // SUMMED, not maxed (2026-09-02). Tradovate renders one row per position,
     // so `Math.max` over the rows reported a 5-lot scale-in as 1 — which is
