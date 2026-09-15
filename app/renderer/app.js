@@ -11371,6 +11371,7 @@ function csvIngest(filename, csvText) {
     const lines = ['Reconciliation report — ' + filename];
     let anyDiff = false;
     let anyLive = false;
+    const policyDates = []; // 2026-09-15: per-date counts for the auto-apply policy
     // Report only — what Apply actually does is fixed centrally inside
     // csvApply() itself now (see its 4.5 AUDIT FIX comment: mergeCsvIntoStored
     // replaces a tolerance-identical stored row in place, so a real P&L
@@ -11387,6 +11388,8 @@ function csvIngest(filename, csvText) {
           ? Number(getRules().commissionPerContractPerSide) : 0,
       });
       if (liveRows.length) anyLive = true;
+      policyDates.push({ date: d, csvOnly: m.csvOnly.length, liveOnly: m.liveOnly.length,
+        disagree: disagree.length, matched: m.matched.length, csvCount: csvRows.length });
       const bits = [];
       if (m.csvOnly.length) { bits.push(m.csvOnly.length + ' in the file only — the live feed MISSED these (server was down?)'); anyDiff = true; }
       if (m.liveOnly.length) { bits.push(m.liveOnly.length + ' live-feed trades the file does not have'); anyDiff = true; }
@@ -11397,6 +11400,24 @@ function csvIngest(filename, csvText) {
     if (!anyLive) lines.push('  No live-feed record exists for these days yet — the app has not seen them close live.');
     if (!anyDiff) lines.push('  No differences — the file matches the live-feed record. Nothing to apply.');
     addSystemMessage(lines.join('\n'));
+    // 2026-09-15 (Anoop): "if next time if the app is not active and if i upload CSV it should
+    // pick trades that are missing and update in the app." A file whose ONLY difference is
+    // trades the app never recorded (it was not running) cannot change anything already
+    // stored, so it no longer waits for the confirm click. Anything that could rewrite or drop
+    // a recorded row (live-only rows, P&L disagreements) still stops at the confirm card.
+    const verdict = (typeof window !== 'undefined' && window.CsvReconcilePolicy)
+      ? window.CsvReconcilePolicy.decide({ dates: policyDates })
+      : { action: 'confirm' };
+    if (verdict.action === 'auto-apply') {
+      addSystemMessage('Applied automatically — ' + verdict.added + ' missing trade' +
+        (verdict.added === 1 ? '' : 's') + ' from the file that the live feed never saw (the app was not running). Nothing already recorded was changed.');
+      csvApply(filename, parsed);
+      return;
+    }
+    if (verdict.action === 'no-op') {
+      addSystemMessage('The file matches the app record exactly — nothing to apply.');
+      return;
+    }
     renderCsvReconcileCard(filename, parsed, anyDiff);
   }).catch(() => {
     addSystemMessage('Could not read the live-feed day record for comparison — apply only if you are sure (confirm below).');
