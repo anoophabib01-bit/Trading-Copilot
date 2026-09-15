@@ -23,7 +23,18 @@ const path = require('path');
 const { rollupDay, gradeTrades } = require('../renderer/day-rollup.js');
 
 const CANDIDATES = ['G:\\MNQ-CoPilot\\DATA\\accounts', 'D:\\co-pilot DATA\\accounts'];
-const WINS = [{ name: 'London', startMin: 810, endMin: 900 }, { name: 'NY', startMin: 1140, endMin: 1260 }];
+const WINDOW_SETS = [
+  // 2026-09-15: the session windows are a FIFTH historical dimension, and hardcoding one
+  // pair was silently wrong. This file carried London 810-900, but rules.json has used
+  // London 750-840 since the scalper windows were set; today's trades sat at 14:05-14:40
+  // IST, INSIDE 810-900 and OUTSIDE 750-840, so the grader and the app disagreed about
+  // 'out-of-window' on four rows and the canary reported it as grading drift. Measured:
+  // 5/9 days exact before, and the failing day becomes reproducible once the real window
+  // set is among those tried. Both are swept, so days written under either config still
+  // reproduce - the point of the sweep is to satisfy the day's own history, not today's.
+  [{ name: 'London', startMin: 750, endMin: 840 }, { name: 'NY', startMin: 1140, endMin: 1260 }],
+  [{ name: 'London', startMin: 810, endMin: 900 }, { name: 'NY', startMin: 1140, endMin: 1260 }],
+];
 
 function findDataDir() {
   for (const c of CANDIDATES) if (fs.existsSync(c)) return c;
@@ -59,6 +70,7 @@ test('LIVE GOLDEN: real stored days reproduce byte-identically', { skip: !findDa
       // to guard. 1.0 is the pre-rules.json default.
       // G23: a day now carries its own rate (commPerCt) — prefer it. The sweep is
       // the fallback for legacy rows written before the field existed.
+      for (const WINS of WINDOW_SETS) {
       for (const comm of (sum.commPerCt != null ? [sum.commPerCt] : [1.90, 1.18, 1.0])) {
       // 2026-09-15: maxHoldSeconds is a FOURTH historical dimension. The 2026-09-14 day
       // (a 2h23m hold — a trade imported from the broker CSV because the app was not
@@ -80,12 +92,14 @@ test('LIVE GOLDEN: real stored days reproduce byte-identically', { skip: !findDa
           const opts = { tradingMode: mode, cooldownAfterLossOnly: lossOnly, maxHoldSeconds: maxHold, sessionWindowsIST: WINS, sizeCapCsv: cap };
           const graded = gradeTrades(rows.map(r => ({ entryMs: r.t, exitMs: r.x, entryMin: null, holdSec: r.hold, size: r.size, pnl: r.pnl })), opts);
           const gDiffs = rows.filter((r, i) => JSON.stringify(r.flags) !== JSON.stringify(graded[i].flags) || r.g !== graded[i].g).length;
-          const out = rollupDay(sum.date, rows, { commPerCt: comm, sizeCapCsv: cap, tradingMode: mode });
+          const out = rollupDay(sum.date, rows, { commPerCt: comm, sizeCapCsv: cap, tradingMode: mode, sessionWindowsIST: WINS });
           const rollDiffs = Object.keys(sum).filter(k => JSON.stringify(out[k]) !== JSON.stringify(sum[k]));
           if (gDiffs === 0 && rollDiffs.length === 0) { dayPassed = true; break; }
-          if (!best || rollDiffs.length + gDiffs < best.diffs.length + best.gDiffs) best = { cap, lossOnly, comm, maxHold, diffs: rollDiffs, gDiffs };
+          if (!best || rollDiffs.length + gDiffs < best.diffs.length + best.gDiffs) best = { cap, lossOnly, comm, maxHold, WINS, diffs: rollDiffs, gDiffs };
         }
         if (dayPassed) break;
+      }
+      if (dayPassed) break;
       }
       if (dayPassed) break;
       }
