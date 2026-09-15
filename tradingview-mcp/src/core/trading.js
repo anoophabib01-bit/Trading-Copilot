@@ -1312,33 +1312,69 @@ export async function probeOrderEntry() {
  * qtyEl. Deliberately a separate step from any click: the caller must compare
  * the read-back to what it asked for before anything is submitted.
  */
-export function widgetSetQtyJS(qtyNum) {
+/**
+ * Rect + current text of the widget's quantity control. Pure read.
+ */
+export function widgetQtyProbeJS() {
   return `
     (function() {
-      var qtyEl = document.querySelector('[data-name="qtyEl"]');
-      if (!qtyEl) return { ok: false, error: 'qtyEl not found' };
-      function fire(el) {
-        var r = el.getBoundingClientRect();
-        var opts = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-        try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (e) {}
-        el.dispatchEvent(new MouseEvent('mousedown', opts));
-        el.dispatchEvent(new MouseEvent('mouseup', opts));
-        el.dispatchEvent(new MouseEvent('click', opts));
-      }
-      fire(qtyEl);
-      var widget = document.querySelector('[data-name="buy-sell-buttons"]');
-      var inputs = widget ? Array.from(widget.querySelectorAll('input')) : [];
-      var input = inputs[0];
-      if (!input) return { ok: false, error: 'qty editor did not open (no input inside the widget)' };
-      var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-      setter.call(input, '${qtyNum}');
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-      input.blur();
-      var shown = String(qtyEl.innerText || qtyEl.textContent || '').trim();
-      return { ok: true, requested: ${qtyNum}, shown: shown };
+      var q = document.querySelector('[data-name="qtyEl"]');
+      if (!q) return { found: false };
+      var r = q.getBoundingClientRect();
+      return { found: true, x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2),
+               w: Math.round(r.width), h: Math.round(r.height),
+               text: String(q.innerText || q.textContent || '').trim() };
     })()
   `;
+}
+
+/** Rect + current text of the widget's side button. Pure read. */
+export function widgetSideButtonProbeJS(side) {
+  const s = String(side).toLowerCase();
+  return `
+    (function() {
+      var b = document.querySelector('[data-name="${s}-order-button"]');
+      if (!b) return { found: false };
+      var r = b.getBoundingClientRect();
+      return { found: true, x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), w: Math.round(r.width) };
+    })()
+  `;
+}
+
+/**
+ * The qty editor's input, wherever it rendered. TradingView portals popups, so
+ * this searches the whole document and prefers whatever currently has focus.
+ */
+export function qtyEditorInputJS() {
+  return `
+    (function() {
+      var inputs = Array.from(document.querySelectorAll('input')).filter(function(i) {
+        var r = i.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        if (i.type === 'checkbox' || i.type === 'radio' || i.type === 'hidden') return false;
+        return true;
+      });
+      var pick = inputs.filter(function(i) { return i === document.activeElement; })[0] || inputs[0];
+      if (!pick) return { found: false, count: inputs.length };
+      var r = pick.getBoundingClientRect();
+      return { found: true, value: String(pick.value || ''), focused: pick === document.activeElement,
+               x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), count: inputs.length };
+    })()
+  `;
+}
+
+/**
+ * REAL OS-level mouse click via CDP Input. This is the only kind of click this
+ * widget honours: JS-dispatched PointerEvent/MouseEvent from inside the page did
+ * NOT open the qty editor (measured 2026-09-15, dryRun returned
+ * "qty editor did not open (no input inside the widget)"), while a real CDP
+ * click on the BUY button did submit an order.
+ */
+async function realClickAt(x, y) {
+  const c = await getClient();
+  await c.Input.dispatchMouseEvent({ type: 'mouseMoved', x, y, buttons: 0 });
+  await c.Input.dispatchMouseEvent({ type: 'mousePressed', x, y, button: 'left', clickCount: 1, buttons: 1 });
+  await c.Input.dispatchMouseEvent({ type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 });
 }
 
 /** Click a widget side button with real pointer + mouse events. */
@@ -1374,18 +1410,40 @@ export async function placeViaWidget({ side, qty, symbol, dryRun = false } = {})
   const before = await getOrders().catch(() => ({ success: false, orders: [] }));
   const beforeIds = orderIdsOf(before && before.orders);
 
-  const setRes = await evaluate(widgetSetQtyJS(qtyNum));
-  if (!setRes || !setRes.ok) {
-    throw new Error('REFUSING TO SUBMIT — could not set the order size on the buy/sell widget (' + ((setRes && setRes.error) || 'unknown') + '). No order was placed.');
+  // G29: drive the widget with REAL CDP input. The editor only opens on a real
+  // click, and the size is only accepted once it has been read back off qtyEl.
+  const qtyProbe = await evaluate(widgetQtyProbeJS());
+  if (!qtyProbe || !qtyProbe.found) {
+    throw new Error('REFUSING TO SUBMIT — the buy/sell widget qty control was not found. No order was placed.');
   }
-  if (parseQtyText(setRes.shown) !== qtyNum) {
-    throw new Error('REFUSING TO SUBMIT — asked for ' + qtyNum + ' but the widget reads back "' + setRes.shown + '". No order was placed.');
+  await realClickAt(qtyProbe.x, qtyProbe.y);
+  await new Promise((r) => setTimeout(r, 600));
+  let editor = await evaluate(qtyEditorInputJS());
+  if (!editor || !editor.found) {
+    throw new Error('REFUSING TO SUBMIT — clicking the widget qty control did not open an editor (found ' + ((editor && editor.count) || 0) + ' inputs). No order was placed.');
+  }
+  await realClickAt(editor.x, editor.y);
+  const c = await getClient();
+  await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
+  await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'a', code: 'KeyA' });
+  await c.Input.insertText({ text: String(qtyNum) });
+  await new Promise((r) => setTimeout(r, 250));
+  await c.Input.dispatchKeyEvent({ type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+  await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
+  await new Promise((r) => setTimeout(r, 400));
+  const afterSet = await evaluate(widgetQtyProbeJS());
+  const readBack = parseQtyText(afterSet && afterSet.text);
+  if (readBack !== qtyNum) {
+    throw new Error('REFUSING TO SUBMIT — asked for ' + qtyNum + ' but the widget reads back "' + ((afterSet && afterSet.text) || '?') + '". No order was placed.');
   }
   if (dryRun) {
-    return { success: true, dryRun: true, path: 'widget', qtyReadBack: parseQtyText(setRes.shown), wouldClick: s, symbol: symbol || null, note: 'size verified on the widget; nothing was clicked' };
+    return { success: true, dryRun: true, path: 'widget', qtyReadBack: readBack, wouldClick: s, symbol: symbol || null, note: 'size verified on the widget; nothing was clicked' };
   }
 
-  const clickRes = await evaluate(widgetClickSideJS(s));
+  const sideBtn = await evaluate(widgetSideButtonProbeJS(s));
+  if (!sideBtn || !sideBtn.found) throw new Error('REFUSING TO SUBMIT — the ' + s + ' button was not found on the widget. No order was placed.');
+  await realClickAt(sideBtn.x, sideBtn.y);
+  const clickRes = { ok: true };
   if (!clickRes || !clickRes.ok) throw new Error((clickRes && clickRes.error) || 'widget click failed');
 
   let verified = false, verifyDetail = null, created = null;
