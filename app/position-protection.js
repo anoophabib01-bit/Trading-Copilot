@@ -28,6 +28,25 @@
   'use strict';
 
   /**
+   * The side that CLOSES a position, from however the broker spelled it.
+   *
+   * WHY THIS IS ITS OWN FUNCTION (found live 2026-09-15): oversize-guard.netPosition returns
+   * side UPPERCASE ('LONG'/'SHORT'), while both enforcement paths derived the closing side
+   * with `side === 'long' ? 'sell' : ...` — lowercase. The comparison was never true, the
+   * closing side came back null, and the acting branch was skipped SILENTLY. The per-trade
+   * stop therefore alarmed on every breach and closed nothing: the guard that this repo's own
+   * replay says turns -$1,946 into +$910 never had hands. Case-insensitive here, and the
+   * callers now say out loud when they cannot determine a side instead of doing nothing.
+   * Returns null for anything it does not recognise - never a guess.
+   */
+  function closingSideFor(side) {
+    const s = String(side == null ? '' : side).trim().toLowerCase();
+    if (s === 'long' || s === 'buy' || s === 'b') return 'sell';
+    if (s === 'short' || s === 'sell' || s === 's') return 'buy';
+    return null;
+  }
+
+  /**
    * Parse a broker money string into a NUMBER, sign included.
    *
    * WHY THIS EXISTS (found live 2026-09-15, by watching an app-side protection test):
@@ -98,5 +117,5 @@
     return { action: 'none', reason: 'inside the band (' + usd.toFixed(2) + ')', unrealisedUsd: usd, source };
   }
 
-  return { decide, unrealisedUsd, parseMoney };
+  return { decide, unrealisedUsd, parseMoney, closingSideFor };
 });

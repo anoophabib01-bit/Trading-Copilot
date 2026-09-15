@@ -12096,7 +12096,8 @@ function enforcePerTradeStop(rows) {
   }
 
   const side = pos && pos.side;
-  const closingSide = side === 'long' ? 'sell' : (side === 'short' ? 'buy' : null);
+  const closingSide = positionProtection.closingSideFor(side);
+  if (!closingSide) console.warn('[per-trade-stop] could not determine a closing side from side="' + side + '" — NOT acting (this used to be a silent skip)');
   const canAct = process.env.TV_ALLOW_LIVE_ORDERS === '1';
 
   broadcast({
@@ -12139,7 +12140,7 @@ function enforcePerTradeStop(rows) {
 //
 // The honest limitation, stated here because it is the whole reason a bracket would be
 // better: this only protects while the app is awake.
-let positionProtectionState = { key: null, attempted: false, blindFired: false };
+let positionProtectionState = { key: null, attempted: false, blindFired: false, closeFailures: 0 };
 function enforcePositionProtection(rows) {
   const rules = getActiveRules();
   const ap = rules.autoProtection || {};
@@ -12147,12 +12148,12 @@ function enforcePositionProtection(rows) {
   const pos = oversizeGuard.netPosition(rows);
   const size = pos ? Number(pos.size) : 0;
   if (!Number.isFinite(size) || size === 0) {
-    positionProtectionState = { key: null, attempted: false, blindFired: false };
+    positionProtectionState = { key: null, attempted: false, blindFired: false, closeFailures: 0 };
     return;
   }
   const posKey = String((pos && pos.symbol) || '?') + '|' + String((pos && pos.side) || '?');
   if (positionProtectionState.key !== posKey) {
-    positionProtectionState = { key: posKey, attempted: false, blindFired: false };
+    positionProtectionState = { key: posKey, attempted: false, blindFired: false, closeFailures: 0 };
   }
   let pointValue = null;
   try { pointValue = tradeProtection.pointValueForSymbol(rules, pos && pos.symbol); } catch (e) { pointValue = null; }
@@ -12170,7 +12171,7 @@ function enforcePositionProtection(rows) {
   if (verdict.action === 'none') return;
 
   const side = pos && pos.side;
-  const closingSide = side === 'long' ? 'sell' : (side === 'short' ? 'buy' : null);
+  const closingSide = positionProtection.closingSideFor(side);
   const canAct = process.env.TV_ALLOW_LIVE_ORDERS === '1';
 
   if (verdict.action === 'blind') {
@@ -12183,7 +12184,10 @@ function enforcePositionProtection(rows) {
   }
 
   // verdict.action === 'close'
-  positionProtectionState.attempted = true;
+  // The shot is NOT spent here. It is spent only once a close has actually been submitted:
+  // a refused or failed attempt must not disarm protection for the rest of the position's life
+  // (found live 2026-09-15 — the first attempt was skipped by a casing bug and the latch,
+  // already set, meant nothing ever tried again). Failures retry, bounded, then alarm loudly.
   const isTarget = /^TARGET/.test(verdict.reason);
   const level = isTarget ? 'target' : 'stop';
   console.log('[position-protection] ' + level.toUpperCase() + ' on ' + size + ' ' + (pos && pos.symbol) + ' at ' + verdict.unrealisedUsd + ' — ' + verdict.reason);
@@ -12197,10 +12201,25 @@ function enforcePositionProtection(rows) {
     }) + '\n');
   } catch (e) { /* logging must never break the guard */ }
 
-  if (canAct && closingSide && pos && pos.symbol) {
+  if (!closingSide) {
+    console.warn('[position-protection] cannot determine a closing side from side="' + side + '" — refusing to act (never guess a direction)');
+    return;
+  }
+  if (canAct && pos && pos.symbol) {
     (async () => {
       try {
         const res = await placeMarketOrder({ kind: 'flatten', side: closingSide, qty: size, symbol: pos.symbol });
+        if (res && res.ok) {
+          positionProtectionState.attempted = true;
+        } else {
+          positionProtectionState.closeFailures = (positionProtectionState.closeFailures || 0) + 1;
+          if (positionProtectionState.closeFailures >= 3) {
+            positionProtectionState.attempted = true;
+            console.error('[position-protection] CLOSE FAILED 3 times — giving up on this position. ' + ((res && (res.reason || res.error)) || 'no reason reported'));
+            broadcast({ type: 'position-protection', level: 'failed', size, symbol: pos.symbol,
+              message: 'PROTECTION COULD NOT CLOSE — 3 attempts failed. Close this position yourself: ' + ((res && (res.reason || res.error)) || 'unknown reason') });
+          }
+        }
         console.log('[position-protection] CLOSE ' + closingSide + ' ' + size + ' ' + pos.symbol + ': ' + (res && res.ok ? 'SUBMITTED' : (res && res.refused ? 'REFUSED' : 'FAILED')));
       } catch (e) { console.warn('[position-protection] close failed:', e.message); }
     })();

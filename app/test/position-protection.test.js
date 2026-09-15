@@ -101,3 +101,27 @@ test('parseMoney: no number returns NULL, never 0 - a 0 would read as break-even
   assert.equal(parseMoney('USD'), null);
   assert.equal(parseMoney('\u2212'), null);
 });
+// --- G32 (2026-09-15): the casing bug that cost a live test. oversize-guard.netPosition returns
+// side UPPERCASE, both guards compared it to lowercase, so the closing side was always null and
+// the acting branch was skipped in silence. The per-trade stop never closed anything.
+const { closingSideFor } = require('../position-protection.js');
+
+test('closingSideFor: UPPERCASE (what netPosition actually returns) resolves', () => {
+  assert.equal(closingSideFor('LONG'), 'sell');
+  assert.equal(closingSideFor('SHORT'), 'buy');
+});
+
+test('closingSideFor: any casing or the broker wording works', () => {
+  assert.equal(closingSideFor('long'), 'sell');
+  assert.equal(closingSideFor('Long'), 'sell');
+  assert.equal(closingSideFor('buy'), 'sell');
+  assert.equal(closingSideFor('SELL'), 'buy');
+  assert.equal(closingSideFor(' s '), 'buy');
+});
+
+test('closingSideFor: unknown returns NULL - never a guessed direction', () => {
+  assert.equal(closingSideFor(''), null);
+  assert.equal(closingSideFor(null), null);
+  assert.equal(closingSideFor('?'), null);
+  assert.equal(closingSideFor(undefined), null);
+});
