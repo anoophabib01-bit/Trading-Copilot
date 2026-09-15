@@ -1432,6 +1432,28 @@ today; (c) add a `trading_cancel_order` primitive — there is none, which is wh
 order could not be cancelled programmatically (DSH's UI attempts failed: the Cancel control
 `close-settings-cell-button` exists but is hover-revealed and the synthetic click did not take).
 
+**STATUS 2026-09-15 — BUILT by DSH, commit `4aa49b3`, NOT yet live-verified.**
+`tradingview-mcp` now has: `trading_probe_order_entry` (READ-ONLY, ungated — reports which
+entry path exists and the size currently on the widget); `placeMarketOrder` probing first and
+taking the buy/sell-widget path when no ticket is mounted (refusing loudly when neither exists,
+and REFUSING a stop/target request on the widget path rather than placing a naked position);
+a strict pre-click size check that reads the size back off `qtyEl` and aborts on any mismatch;
+`dryRun` (stages everything up to the click and stops); post-submit verification by ORDER-ID
+DIFF (the old check passed on any pre-existing order for the symbol — it could report success
+without this call having placed anything); and `trading_cancel_order` (gated, verifies by
+re-reading the status, restores the previous tab) — the first cancel primitive in the project.
+Unit tests: `tradingview-mcp/tests/order-entry.test.js`, 13 tests, all pass.
+
+**Next, in this order — do NOT skip 1 and 2:** (1) restart the app so the mcp child process
+loads this code (the bridge spawns `tradingview-mcp` as a child; the running instance still has
+the old build); (2) run the probe, then `place_market_order` with `dryRun: true` — both click
+nothing, and (2) proves the size read-back end to end; (3) ONLY with Anoop's explicit go-ahead
+and him watching: one real 1-lot order through the new path, verified in the broker's own orders
+table, then closed. **The one step that could not be verified read-only is whether clicking
+`qtyEl` opens its editor** (the widget has no `<input>` until it does) — if it does not, the
+read-back fails and the code refuses to click, which is the correct failure mode, and the next
+attempt should drive the field by keyboard instead.
+
 **ACCEPTANCE:** with the ticket closed and a position open, (1) the guard's reduce SUCCEEDS and
 the position is reduced by exactly the overage, verifiable in the broker's own orders table;
 (2) a confirmed trade ticket places one market order of the confirmed size; (3) a pure test pins
