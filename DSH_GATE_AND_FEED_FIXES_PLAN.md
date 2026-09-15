@@ -1604,6 +1604,57 @@ but only while this app is awake. Prefer (a)/(b) over scraping a UI nobody can f
 
 ---
 
+## G32 — the per-trade stop could never close anything, and losses parsed as profits  ★★ safety
+
+**Both found live on 2026-09-15, by running a deliberate app-side protection test and watching it
+not work.** Neither was visible in a single log line; both were found because a guard that should
+have acted, did not.
+
+### 32a — the closing side was always null, so the acting branch was skipped in silence
+
+`oversize-guard.netPosition` returns side **UPPERCASE** (`'LONG'`/`'SHORT'`). Both enforcement paths
+derived the closing side as `side === 'long' ? 'sell' : (side === 'short' ? 'buy' : null)` —
+lowercase. That comparison can never be true, so `closingSide` was null and the order branch was
+skipped **without a word**:
+
+```
+[position-protection] STOP on 1 MNQZ6 at -13.5 — STOP: -13.50 is at or past -8
+   (then nothing: no order, no error, position ran to -23.50 and was closed by hand)
+```
+
+The same line exists in `enforcePerTradeStop`, so **the -$300 per-trade stop has been alarming on
+every breach and closing nothing** — the guard this repo's own replay credits with turning
+-$1,946 into +$910. The oversize guard escaped it because it derives the side by its own path,
+which is exactly why its 5-to-4 reduce worked on the same day.
+
+**Fixed:** `position-protection.closingSideFor(side)` — case-insensitive, accepts LONG/SHORT and
+BUY/SELL, returns null for anything unrecognised (never a guessed direction) — used by BOTH guards,
+and both now log loudly when they cannot determine a side instead of doing nothing quietly.
+
+### 32b — a Unicode-minus loss parsed as a PROFIT
+
+This broker renders losses with **U+2212** (`"\u221219.00\nUSD"`). The parser stripped everything
+outside `[0-9.-]`, which DELETED that minus: -19.00 became **+19.00**. The guard then compared a
+profit against a loss cap and could never trip. Separately, `readUnrealisedPnl`'s key list had
+twelve spellings of "unrealised P&L" and not the one this table actually uses — `Profit` — so it
+was reading no figure at all from the live table.
+
+**Fixed:** `position-protection.parseMoney` normalises unicode minus/en/em dashes, handles the
+`\nUSD` suffix, thousands commas and accounting parentheses, and returns **null (never 0)** when
+there is no number — a 0 would read as break-even and silently pass a loss cap. `readUnrealisedPnl`
+now matches `Profit` first and calls it.
+
+### 32c — a failed close used to consume the one shot
+
+The protection latch was set BEFORE the outcome was known, so the first attempt (skipped by 32a)
+disarmed the guard for that position permanently. Now the shot is spent only on a successful submit;
+failures retry, bounded at three, and then broadcast a message telling him to close it himself.
+
+**Lesson worth keeping:** every one of these was invisible to a passing test suite and to a guard
+that "fired". A guard is only proven when something actually moved.
+
+---
+
 ## EXCLUDED — do not build these, and here is exactly why
 
 Two things are out of scope. Neither is an oversight and both were considered in full. **If you
