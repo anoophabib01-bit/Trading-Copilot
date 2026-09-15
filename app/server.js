@@ -12197,7 +12197,7 @@ function enforcePositionProtection(rows) {
     fs.appendFileSync(path.join(DATA_DIR, 'protocols', 'position-protection.jsonl'), JSON.stringify({
       at: new Date().toISOString(), day: dayRollup.tradingDayKey(Date.now()),
       level, observed: { size, symbol: pos && pos.symbol, side }, unrealised: verdict.unrealisedUsd,
-      reason: verdict.reason, canAct, submitted: false,
+      reason: verdict.reason, canAct, submitted: null, // real outcome appended AFTER the attempt, never assumed
     }) + '\n');
   } catch (e) { /* logging must never break the guard */ }
 
@@ -12220,6 +12220,7 @@ function enforcePositionProtection(rows) {
               message: 'PROTECTION COULD NOT CLOSE — 3 attempts failed. Close this position yourself: ' + ((res && (res.reason || res.error)) || 'unknown reason') });
           }
         }
+        try { fs.appendFileSync(path.join(DATA_DIR, 'protocols', 'position-protection.jsonl'), JSON.stringify({ at: new Date().toISOString(), level, event: 'close-result', symbol: pos.symbol, size, submitted: !!(res && res.ok), refused: !!(res && res.refused), reason: (res && (res.reason || res.error)) || null }) + '\n'); } catch (e2) {}
         console.log('[position-protection] CLOSE ' + closingSide + ' ' + size + ' ' + pos.symbol + ': ' + (res && res.ok ? 'SUBMITTED' : (res && res.refused ? 'REFUSED' : 'FAILED')));
       } catch (e) { console.warn('[position-protection] close failed:', e.message); }
     })();

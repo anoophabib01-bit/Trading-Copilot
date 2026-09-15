@@ -102,7 +102,10 @@
   function clampAutoProtection(input, currentRules) {
     const cur = (currentRules && currentRules.autoProtection) || {};
     const inb = input || {};
-    const STOP_MIN = 25, STOP_MAX = 5000, TGT_MIN = 25, TGT_MAX = 10000;
+    // Floor is 5, not 25 (2026-09-15, Anoop): he asked to be able to run a $15 band, and a
+    // floor that refuses a value he wants is a floor he will work around. It still catches the
+    // thing it exists for - a blank, a zero, or a stray keystroke - without limiting him.
+    const STOP_MIN = 5, STOP_MAX = 5000, TGT_MIN = 5, TGT_MAX = 10000;
     const clampOne = (v, fallback, lo, hi) => {
       const n = Number(v);
       if (!Number.isFinite(n) || n <= 0) return fallback;
