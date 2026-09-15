@@ -1536,6 +1536,40 @@ the position is reduced by exactly the overage, verifiable in the broker's own o
 
 ---
 
+## G30 — "verified: false" means UNKNOWN, not "did not happen"  ★ found on myself, live
+
+**Demonstrated live 2026-09-15, by DSH, on Anoop's account.** `placeMarketOrder` verifies a submit
+by polling for a NEW order id for **4 seconds** (10 × 400ms). A sell was submitted, no new id
+appeared inside that window, and the call returned `verified: false` with
+`"no NEW order id appeared within 4s — the click may not have submitted anything"`. **The order
+landed anyway, a moment later.** The very next sell — sent because the first looked like a failure —
+found the account already flat and opened a 1-lot SHORT, which then had to be closed with the
+position row's own Close control. Final state flat, but the sequence is the danger:
+
+```
+sell 1 → verified:false (4s window) → order fills AFTER the window
+sell 1 → verified:true  → now SHORT 1 (unintended)
+click position-row Close → flat
+```
+
+This is the exact failure the code's own comments warn about — *"a caller that retries an ambiguous
+'did that go through?' can double a position"* — and the current shape invites it, because
+`verified:false` reads like "nothing was sent". It is NOT evidence of that; it is the absence of
+evidence, and the order may still be in flight.
+
+**Do:** (a) lengthen the window (this broker's fills appeared ~4-6s out — poll longer, e.g. 15s, and
+stop early the moment a new id appears); (b) return a tri-state — `submitted | not_seen | failed` —
+so no caller can read "not seen" as "did not happen"; (c) make every caller that acts on failure
+**re-read the position first** (the app's guard and handleTradeConfirm both retry paths); (d) a test
+pinning that `verified:false` never causes a second order without a position re-read.
+
+**Also learned live, useful elsewhere:** with a position OPEN, the positions-table row carries
+exactly one control — `close-settings-cell-button` (aria-label "Close") — which flattens the whole
+position and works. There is **no TP/SL or bracket affordance in that row**, which is why protection
+attachment is still unsolved (see the autoProtection note in rules.json).
+
+---
+
 ## EXCLUDED — do not build these, and here is exactly why
 
 Two things are out of scope. Neither is an oversight and both were considered in full. **If you
