@@ -89,5 +89,35 @@
     return specForSymbol(rules, symbol).pointValue;
   }
 
-  return { bracketFor, pointsForUsd, pointValueForSymbol, specForSymbol };
+  /**
+   * Clamp a UI-supplied protection band. Server-side, because these are RISK numbers: a
+   * renderer bug, a stale form or a replayed message must not be able to widen them (the
+   * same reason stage-rules clamps sizeCap). Bounds are deliberately wide enough to be
+   * useless as a strategy opinion and narrow enough to catch a typo: 25..5000 for the stop,
+   * 25..10000 for the target. A blank/invalid value KEEPS the existing number rather than
+   * falling to zero - an empty box must never silently switch protection off. The block's
+   * own _comment/_status strings are re-attached, because Object.assign on the block would
+   * otherwise drop the reasoning that lives beside the numbers.
+   */
+  function clampAutoProtection(input, currentRules) {
+    const cur = (currentRules && currentRules.autoProtection) || {};
+    const inb = input || {};
+    const STOP_MIN = 25, STOP_MAX = 5000, TGT_MIN = 25, TGT_MAX = 10000;
+    const clampOne = (v, fallback, lo, hi) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) return fallback;
+      return Math.min(hi, Math.max(lo, Math.round(n)));
+    };
+    const stop = clampOne(inb.stopLossUsd, Number.isFinite(Number(cur.stopLossUsd)) ? Number(cur.stopLossUsd) : 200, STOP_MIN, STOP_MAX);
+    const target = clampOne(inb.takeProfitUsd, Number.isFinite(Number(cur.takeProfitUsd)) ? Number(cur.takeProfitUsd) : 600, TGT_MIN, TGT_MAX);
+    return {
+      enabled: inb.enabled === undefined ? (cur.enabled !== false) : inb.enabled !== false,
+      stopLossUsd: stop,
+      takeProfitUsd: target,
+      _comment: cur._comment,
+      _status: cur._status,
+    };
+  }
+
+  return { bracketFor, pointsForUsd, pointValueForSymbol, specForSymbol, clampAutoProtection };
 });

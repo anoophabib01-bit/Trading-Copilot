@@ -102,6 +102,8 @@ const healthProtocol = require('./health-protocol');
 // enforceOversizeGuard(). Reduces an oversized position back to the size cap.
 const oversizeGuard = require('./oversize-guard');
 const perTradeStop = require('./per-trade-stop'); // T1.1 per-trade max-loss tripwire (pure decision)
+const positionProtection = require('./position-protection'); // G32 (2026-09-15) app-side protection: close at -stop / +target
+const tradeProtection = require('./trade-protection');       // point value per symbol for the price fallback
 const edgeWindow = require('./edge-window'); // T3.4 edge-window gate (pure decision)
 const barArchive = require('./bar-archive'); // F0.2 durable bar archive (forward-testing dataset)
 const tradeForensics = require('./trade-forensics'); // F1 MAE/MFE + winner invariant (shared kernel with signal-outcome)
@@ -1641,6 +1643,13 @@ wss.on('connection', (ws) => {
           // sizeCap is the one rule the UI can move, so it is the one rule the
           // UI must not be trusted with. Clamped here, server-side, because a
           // renderer bug or a replayed message must not be able to widen it.
+          // G32 (2026-09-15): the protection band is settable from the UI, so like sizeCap it
+          // is clamped SERVER-SIDE - a renderer bug or a replayed message must not be able to
+          // widen a risk number. clampAutoProtection also re-attaches the block's own
+          // _comment/_status strings, which a plain Object.assign would have dropped.
+          if (msg.data && msg.data.autoProtection) {
+            _next.autoProtection = tradeProtection.clampAutoProtection(msg.data.autoProtection, loadRules());
+          }
           if (msg.data && msg.data.sizeCap !== undefined) {
             const _cap = stageRules.clampSizeCap(msg.data.sizeCap, _next);
             _next.sizeCap = _cap;
@@ -12112,6 +12121,105 @@ function enforcePerTradeStop(rows) {
   }
 }
 
+// ── G32 (2026-09-15): APP-SIDE PROTECTION — close at -stop / +target ────────
+// Anoop: "i think app-side protection is better". The rule is his (rules.json
+// autoProtection: stopLossUsd 200, takeProfitUsd 600); the broker-side bracket has no
+// route on this build (G31). This closes the trade instead, through the same gateway the
+// per-trade stop uses, on the SAME read that proves the positions panel is readable.
+//
+// Deliberately a SIBLING of enforcePerTradeStop rather than folded into it: the two answer
+// different questions (-200 here versus the -300 backstop) and each keeps its own latch, so
+// a failure in one cannot disarm the other. Flat resets the latch, so a NEW position always
+// starts protected - the 2026-09-03 lesson, where a one-shot-per-day latch left a 20-lot
+// unprotected.
+//
+// The honest limitation, stated here because it is the whole reason a bracket would be
+// better: this only protects while the app is awake.
+let positionProtectionState = { key: null, attempted: false, blindFired: false };
+function enforcePositionProtection(rows) {
+  const rules = getActiveRules();
+  const ap = rules.autoProtection || {};
+  if (ap.enabled === false) return;
+  const pos = oversizeGuard.netPosition(rows);
+  const size = pos ? Number(pos.size) : 0;
+  if (!Number.isFinite(size) || size === 0) {
+    positionProtectionState = { key: null, attempted: false, blindFired: false };
+    return;
+  }
+  const posKey = String((pos && pos.symbol) || '?') + '|' + String((pos && pos.side) || '?');
+  if (positionProtectionState.key !== posKey) {
+    positionProtectionState = { key: posKey, attempted: false, blindFired: false };
+  }
+  let pointValue = null;
+  try { pointValue = tradeProtection.pointValueForSymbol(rules, pos && pos.symbol); } catch (e) { pointValue = null; }
+  const verdict = positionProtection.decide({
+    side: pos && pos.side,
+    size,
+    entryPrice: readEntryPrice(rows, pos && pos.symbol),
+    unrealisedUsd: readUnrealisedPnl(rows),
+    pointValue,
+    stopLossUsd: ap.stopLossUsd,
+    takeProfitUsd: ap.takeProfitUsd,
+    enabled: ap.enabled !== false,
+    alreadyAttempted: positionProtectionState.attempted,
+  });
+  if (verdict.action === 'none') return;
+
+  const side = pos && pos.side;
+  const closingSide = side === 'long' ? 'sell' : (side === 'short' ? 'buy' : null);
+  const canAct = process.env.TV_ALLOW_LIVE_ORDERS === '1';
+
+  if (verdict.action === 'blind') {
+    if (positionProtectionState.blindFired) return;
+    positionProtectionState.blindFired = true;
+    console.warn('[position-protection] BLIND — ' + verdict.reason);
+    broadcast({ type: 'position-protection', level: 'blind', reason: verdict.reason, size, symbol: pos && pos.symbol, canAct,
+      message: 'PROTECTION BLIND — ' + verdict.reason + '. The -$' + ap.stopLossUsd + ' / +$' + ap.takeProfitUsd + ' band cannot be enforced right now.' });
+    return;
+  }
+
+  // verdict.action === 'close'
+  positionProtectionState.attempted = true;
+  const isTarget = /^TARGET/.test(verdict.reason);
+  const level = isTarget ? 'target' : 'stop';
+  console.log('[position-protection] ' + level.toUpperCase() + ' on ' + size + ' ' + (pos && pos.symbol) + ' at ' + verdict.unrealisedUsd + ' — ' + verdict.reason);
+  broadcast({ type: 'position-protection', level, unrealised: verdict.unrealisedUsd, size, symbol: pos && pos.symbol, canAct, reason: verdict.reason,
+    message: (isTarget ? 'PROTECTION TARGET' : 'PROTECTION STOP') + ' — ' + (verdict.unrealisedUsd != null ? verdict.unrealisedUsd.toFixed(0) : '?') + ' on ' + size + ' lots' + (canAct ? ' — CLOSING' : ' — ALARM ONLY (live orders off)') });
+  try {
+    fs.appendFileSync(path.join(DATA_DIR, 'protocols', 'position-protection.jsonl'), JSON.stringify({
+      at: new Date().toISOString(), day: dayRollup.tradingDayKey(Date.now()),
+      level, observed: { size, symbol: pos && pos.symbol, side }, unrealised: verdict.unrealisedUsd,
+      reason: verdict.reason, canAct, submitted: false,
+    }) + '\n');
+  } catch (e) { /* logging must never break the guard */ }
+
+  if (canAct && closingSide && pos && pos.symbol) {
+    (async () => {
+      try {
+        const res = await placeMarketOrder({ kind: 'flatten', side: closingSide, qty: size, symbol: pos.symbol });
+        console.log('[position-protection] CLOSE ' + closingSide + ' ' + size + ' ' + pos.symbol + ': ' + (res && res.ok ? 'SUBMITTED' : (res && res.refused ? 'REFUSED' : 'FAILED')));
+      } catch (e) { console.warn('[position-protection] close failed:', e.message); }
+    })();
+  }
+}
+
+// Entry price for a symbol from the broker rows — the price fallback for the band when the
+// broker's own unrealised figure is missing. Returns null rather than a guess, so the guard
+// reports BLIND instead of enforcing against an invented entry.
+function readEntryPrice(rows, symbol) {
+  const want = String(symbol || '').toUpperCase();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row) continue;
+    const sym = String(row.Symbol || row.symbol || '').toUpperCase();
+    if (want && sym && sym.indexOf(want) === -1 && want.indexOf(sym) === -1) continue;
+    const key = Object.keys(row).find((k) => /avg\.? ?fill price/i.test(k));
+    if (!key) continue;
+    const n = Number(String(row[key]).replace(/[^0-9.\-]/g, ''));
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
 async function pollTVPositions() {
   if (!mcpBridge.ready || !mcpBridge.tvConnected) return;
   // A slow CDP read must not stack ticks on top of each other — at 5s with a
@@ -12176,6 +12284,8 @@ async function pollTVPositions() {
     // has already returned). See oversize-guard.js for the safety model.
     try { enforceOversizeGuard(rows); } catch (e) { console.warn('[oversize] guard threw:', e.message); }
     try { enforcePerTradeStop(rows); } catch (e) { console.warn('[per-trade-stop] guard threw:', e.message); }
+    // G32: app-side -200 / +600 protection, same verified read, its own latch.
+    try { enforcePositionProtection(rows); } catch (e) { console.warn('[position-protection] guard threw:', e.message); }
 
     const events = positionEvents.diffPositions(tvLastPositions, rows);
     tvLastPositions = rows;

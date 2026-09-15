@@ -8191,6 +8191,16 @@ function openSettings() {
     val('settings-eval-daycap',  'evalDayCap',  acc.evalDayCap);
     val('settings-eval-daystop', 'evalDayStop', acc.evalDayStop);
 
+    // G32 (2026-09-15): the app-side protection band, read from the LIVE rules (not from
+    // state.account) because these are rules.json numbers and window.RULES is the copy the
+    // server broadcasts on every rules-set - so the fields always show what is actually
+    // being enforced, never a stale local echo.
+    const apRules = (window.RULES && window.RULES.autoProtection) || {};
+    const stEl = document.getElementById('settings-protect-stop');
+    if (stEl) stEl.value = Number.isFinite(Number(apRules.stopLossUsd)) ? Number(apRules.stopLossUsd) : '';
+    const tgEl = document.getElementById('settings-protect-target');
+    if (tgEl) tgEl.value = Number.isFinite(Number(apRules.takeProfitUsd)) ? Number(apRules.takeProfitUsd) : '';
+
     if (cfg.telegramBotToken) document.getElementById('settings-telegram-token').value = cfg.telegramBotToken;
     document.getElementById('settings-telegram-chatid').value = cfg.telegramChatId !== undefined ? cfg.telegramChatId : '';
     document.getElementById('settings-tv-enabled').checked = !!cfg.tvEnabled;
@@ -8233,6 +8243,26 @@ async function saveSettings() {
   const evalFloor   = num('settings-eval-floor', acc.evalFloor);
   const evalDayCap  = num('settings-eval-daycap', acc.evalDayCap);
   const evalDayStop = num('settings-eval-daystop', acc.evalDayStop);
+
+  // G32: the protection band is a RULES write, not a config write - it is a trading number,
+  // so it goes through rules-set where the server clamps it. Blank means "leave it alone"
+  // rather than "zero": an empty box must never silently disable protection.
+  const protectEls = {
+    stop: document.getElementById('settings-protect-stop'),
+    target: document.getElementById('settings-protect-target'),
+  };
+  const wantProtect = {};
+  if (protectEls.stop && protectEls.stop.value !== '') {
+    const v = parseFloat(protectEls.stop.value);
+    if (Number.isFinite(v) && v > 0) wantProtect.stopLossUsd = v;
+  }
+  if (protectEls.target && protectEls.target.value !== '') {
+    const v = parseFloat(protectEls.target.value);
+    if (Number.isFinite(v) && v > 0) wantProtect.takeProfitUsd = v;
+  }
+  if (Object.keys(wantProtect).length && window.api && window.api.setRules) {
+    try { window.api.setRules({ autoProtection: Object.assign({ enabled: true }, wantProtect) }); } catch (e) {}
+  }
 
   const telegramBotToken = document.getElementById('settings-telegram-token').value.trim();
   const telegramChatId   = document.getElementById('settings-telegram-chatid').value.trim();

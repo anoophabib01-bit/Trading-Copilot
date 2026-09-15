@@ -73,3 +73,41 @@ test('Anoop 2026-09-15 values are the ones actually configured', () => {
   assert.equal(rules.autoProtection.takeProfitUsd, 600);
   assert.equal(rules.autoProtection.enabled, true);
 });
+// --- G32 (2026-09-15): the UI can now change these, so they are clamped server-side.
+// A risk number a renderer can widen is not a risk number - the same reason sizeCap is clamped.
+const { clampAutoProtection } = require('../trade-protection.js');
+const cur = { autoProtection: { enabled: true, stopLossUsd: 200, takeProfitUsd: 600, _comment: 'keep me', _status: 'keep me too' } };
+
+test('clamp: sane values pass through', () => {
+  const r = clampAutoProtection({ stopLossUsd: 150, takeProfitUsd: 450 }, cur);
+  assert.equal(r.stopLossUsd, 150);
+  assert.equal(r.takeProfitUsd, 450);
+});
+
+test('clamp: a tiny stop cannot sneak under the floor', () => {
+  assert.equal(clampAutoProtection({ stopLossUsd: 1 }, cur).stopLossUsd, 25);
+  assert.equal(clampAutoProtection({ takeProfitUsd: 2 }, cur).takeProfitUsd, 25);
+});
+
+test('clamp: an absurd value is capped, not accepted', () => {
+  assert.equal(clampAutoProtection({ stopLossUsd: 999999 }, cur).stopLossUsd, 5000);
+  assert.equal(clampAutoProtection({ takeProfitUsd: 999999 }, cur).takeProfitUsd, 10000);
+});
+
+test('clamp: a BLANK or invalid box keeps the existing number - it never disables protection', () => {
+  assert.equal(clampAutoProtection({ stopLossUsd: '' }, cur).stopLossUsd, 200);
+  assert.equal(clampAutoProtection({ stopLossUsd: -50 }, cur).stopLossUsd, 200);
+  assert.equal(clampAutoProtection({ takeProfitUsd: null }, cur).takeProfitUsd, 600);
+  assert.equal(clampAutoProtection({}, cur).stopLossUsd, 200);
+});
+
+test('clamp: the block reasoning survives a UI write', () => {
+  const r = clampAutoProtection({ stopLossUsd: 250 }, cur);
+  assert.equal(r._comment, 'keep me');
+  assert.equal(r._status, 'keep me too');
+  assert.equal(r.enabled, true);
+});
+
+test('clamp: enabled:false from the UI is honoured', () => {
+  assert.equal(clampAutoProtection({ enabled: false }, cur).enabled, false);
+});
