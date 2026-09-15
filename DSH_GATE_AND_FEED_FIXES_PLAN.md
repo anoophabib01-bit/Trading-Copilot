@@ -1388,6 +1388,58 @@ enforcement must keep using realized balance).
 
 ---
 
+## G29 — the app cannot place an order at all: no ticket, no hands  ★ safety, found live
+
+**Found live 2026-09-15 (DSH).** Anoop was SHORT 8 MNQZ6 against a size cap of 4. The oversize
+guard detected it correctly and tried to reduce — **three times, every one failed**:
+
+```
+{"observed":{"size":8,"side":"SHORT","symbol":"MNQZ6"},"sizeCap":4,"action":{"side":"buy","qty":4},
+ "mode":"reduce","submitted":false,"result":{"success":false,
+ "error":"side control button not found: side-control-buy"},"durationMs":27}
+```
+
+(08:33:28Z, 08:34:03Z, 08:34:38Z = 14:03–14:04 IST. Log: `DATA/protocols/oversize-guard.jsonl`.)
+
+**Root cause, verified by DOM inspection over CDP:** `trading_place_market_order` assumes
+TradingView's ORDER TICKET is already open — it queries `[data-name="side-control-buy"]` and
+`[data-name="place-and-modify-button"]` inside `.trading-panel-content`. On this machine the
+ticket is NOT mounted, so both selectors return 0 elements and the call fails in ~20ms:
+
+```
+side-control-buy: 0   side-control-sell: 0   place-and-modify-button: 0
+.trading-panel-content: 1  (that is the BROKER panel: Positions/Orders/Account summary)
+buy-order-button: 1   sell-order-button: 1   (inside [data-name="buy-sell-buttons"])
+```
+
+**Nothing in tradingview-mcp opens the ticket** — `grep -rn "order-ticket|buy-order-button" \
+tradingview-mcp/src` returns zero hits outside comments. So this is not only the guard: a
+CONFIRMED trade ticket from the Judge would fail the same way. The Phase-2 confirm/execute flow
+has never been able to place an order, exactly as `TODOS.md` warned ("built, not live-verified").
+
+**⚠ OPERATIONAL WARNING FOR WHOEVER PICKS THIS UP.** `[data-name="buy-order-button"]` /
+`sell-order-button` are **NOT "open the ticket" buttons — they are one-click market orders**.
+DSH verified this the expensive way on 2026-09-15: a JS `.click()` and a real CDP mouse click on
+BUY each filled 1 lot (14:05:41 @ 29,273.00, 14:06:10 @ 29,278.75), opening an unintended 2-lot
+long that then also left a bracket **Sell Stop 2 @ 29,261.75 (order 650961251054) working with no
+position**. Never "test" a trading control by clicking it. Inspect the DOM, read the order
+tables, and only click a control whose label states exactly what it does.
+
+**Do:** (a) give the order path a way to open the ticket before it needs the ticket's controls —
+the widget buttons or the panel's trade affordance, driven by real `Input.dispatchMouseEvent`
+(a plain `.click()` did not open anything either); (b) then set side/qty and submit exactly as
+today; (c) add a `trading_cancel_order` primitive — there is none, which is why a stray working
+order could not be cancelled programmatically (DSH's UI attempts failed: the Cancel control
+`close-settings-cell-button` exists but is hover-revealed and the synthetic click did not take).
+
+**ACCEPTANCE:** with the ticket closed and a position open, (1) the guard's reduce SUCCEEDS and
+the position is reduced by exactly the overage, verifiable in the broker's own orders table;
+(2) a confirmed trade ticket places one market order of the confirmed size; (3) a pure test pins
+"ticket not open ⇒ open it, do not assume the click missed"; (4) cancel works from the app.
+**All of it must be verified on the real account outside a live session, with Anoop watching.**
+
+---
+
 ## EXCLUDED — do not build these, and here is exactly why
 
 Two things are out of scope. Neither is an oversight and both were considered in full. **If you
