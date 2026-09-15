@@ -1494,6 +1494,24 @@ moment still returned the empty-state placeholder. So a reader that skips the re
 though the data is reachable — which is the whole shape of G28, and why G28's fix is a REFUSAL plus
 an alarm rather than a smarter read.
 
+**THE GUARD'S REDUCE IS NOW LIVE-VERIFIED 2026-09-15, deliberately, with Anoop's go-ahead.**
+Five lots were bought against a cap of 4 (order 650961251090, filled, via the widget path). The
+position read Long 5, and **9 seconds later the guard reduced it to 4 on its own**:
+
+```
+{"at":"2026-09-15T09:11:09.346Z","observed":{"size":5,"side":"LONG","symbol":"MNQZ6"},
+ "sizeCap":4,"action":{"side":"sell","qty":1},"reason":"5 contracts is over the 4 cap — reducing by 1",
+ "mode":"reduce","submitted":true,
+ "result":{"success":true,"path":"widget","submittedSide":"sell","requestedQty":1,"verified":true}}
+```
+
+That is the exact call that failed three times this morning with "side control button not found:
+side-control-buy". It now takes the widget path, verifies on a new order id, and reports success.
+The remaining 4 were then closed by hand (order 650961251104) — account flat, profit 0.00.
+Balance 49,030.34 → 49,051.14 (**+$20.80, market luck during a ~40-second exposure, NOT a result
+of the test**). Both the oversize buy and the flat were confirmed by reading the broker before
+each next action; nothing was over-traded.
+
 **Still open on this task:** the widget path cannot attach stop-loss/take-profit, so it REFUSES a
 request that includes either (never places a naked position). Attaching protection separately, or
 reviving the ticket path, is the next slice. And the guard's reduce has not yet fired on a real
