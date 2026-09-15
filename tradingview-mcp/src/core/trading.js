@@ -302,12 +302,33 @@ function setTicketPriceFieldJS(wantRegexLiteral, otherRegexLiteral, price) {
   `;
 }
 
-export async function placeMarketOrder({ side, qty, symbol, stopPrice, targetPrice }) {
+export async function placeMarketOrder({ side, qty, symbol, stopPrice, targetPrice, dryRun = false }) {
   const s = String(side || '').toLowerCase();
   if (s !== 'buy' && s !== 'sell') throw new Error(`side must be "buy" or "sell", got: ${side}`);
   const qtyNum = Number(qty);
   if (!Number.isFinite(qtyNum) || qtyNum <= 0 || Math.floor(qtyNum) !== qtyNum) {
     throw new Error(`qty must be a positive whole number, got: ${qty}`);
+  }
+
+  // G29 (2026-09-15): choose the path this build actually offers BEFORE assuming the
+  // ticket exists. Live evidence for why: the app's oversize guard tried to reduce an
+  // 8-lot breach against a 4 cap three times on 2026-09-15 and every attempt failed
+  // with "side control button not found: side-control-buy" — the ticket was never
+  // mounted, so the guards below found nothing. Fails CLOSED: if the widget is the
+  // available path and a stop/target was requested, refuse rather than place a naked
+  // position, because the widget cannot attach either.
+  const pathProbe = await probeOrderEntry().catch(() => null);
+  if (pathProbe && pathProbe.path === 'widget') {
+    if (stopPrice != null || targetPrice != null) {
+      throw new Error('REFUSING TO SUBMIT — no order ticket is mounted on this build, so stop-loss/take-profit cannot be attached here. Place the order and attach protection separately. No order was placed.');
+    }
+    return placeViaWidget({ side, qty, symbol, dryRun });
+  }
+  if (pathProbe && pathProbe.path === 'none') {
+    throw new Error('REFUSING TO SUBMIT — neither the order ticket nor the buy/sell widget was found in TradingView. No order was placed.');
+  }
+  if (dryRun) {
+    throw new Error('dryRun is only supported on the buy/sell widget path. No order was placed.');
   }
 
   // side-control-buy/sell are TOGGLE buttons, not "set to this side" buttons
@@ -1180,4 +1201,301 @@ export async function refreshPanelTable({ table = 'orders', settleMs = 700 } = {
 // 2026-09-02 use this name and there is no reason to churn them.
 export async function refreshOrdersTable(opts = {}) {
   return refreshPanelTable(Object.assign({}, opts, { table: 'orders' }));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// G29 (2026-09-15) — THE ORDER TICKET IS NOT ALWAYS MOUNTED
+// ════════════════════════════════════════════════════════════════════════════
+// Measured live on Anoop's account: the placeMarketOrder flow above assumes the
+// ORDER TICKET is open. On his TradingView it is NOT — a DOM probe returned
+// side-control-buy: 0, side-control-sell: 0, place-and-modify-button: 0, while
+// .trading-panel-content: 1 (and that one is the BROKER panel: Positions /
+// Orders / Account summary). The app's oversize guard tried to reduce an 8-lot
+// breach against a 4 cap three times and failed every time in ~20ms with
+// "side control button not found: side-control-buy" (DATA/protocols/
+// oversize-guard.jsonl, 2026-09-15 08:33-08:34Z). handleTradeConfirm fails
+// identically, which is why the Phase-2 execute flow had never placed an order.
+//
+// What DOES exist on this build is the buy/sell widget:
+//   [data-name="buy-sell-buttons"] holding [data-name="qtyEl"],
+//   [data-name="sell-order-button"], [data-name="buy-order-button"]
+//
+// ⚠ THOSE TWO BUTTONS ARE ONE-CLICK MARKET ORDERS, NOT "open the ticket"
+// BUTTONS. Verified the expensive way: a JS .click() and then a real CDP mouse
+// click on BUY each filled exactly 1 lot on the live account (2026-09-15
+// 14:05:41 and 14:06:10), opening an unintended 2-lot long. Nothing here may
+// click one without first reading the size back off qtyEl and matching it to
+// the requested size — and dryRun exists so the whole path can be proven
+// without submitting anything.
+//
+// ⚠ ALSO: the post-submit check inside placeMarketOrder is too weak to reuse
+// here — it looks for ANY filled/working order matching the symbol, which is
+// already true on a day that has traded. The widget path diffs the ORDER ID SET
+// before/after instead, so "verified" means an order that did not exist a
+// moment ago now does.
+
+/** Quantity shown by the widget's qty element, e.g. "1" or "12". Pure. */
+export function parseQtyText(text) {
+  const m = String(text == null ? '' : text).match(/\d+/);
+  return m ? Number(m[0]) : null;
+}
+
+/** Set of Order IDs in an orders array. Pure. */
+export function orderIdsOf(orders) {
+  const out = new Set();
+  (Array.isArray(orders) ? orders : []).forEach((o) => {
+    const id = o && o['Order ID'];
+    if (id != null && String(id) !== '') out.add(String(id));
+  });
+  return out;
+}
+
+/** Order rows present in `after` whose Order ID was not in `before`. Pure. */
+export function newOrderIds(before, after) {
+  const b = before instanceof Set ? before : orderIdsOf(before);
+  return (Array.isArray(after) ? after : []).filter((o) => {
+    const id = o && o['Order ID'];
+    return id != null && String(id) !== '' && !b.has(String(id));
+  });
+}
+
+/**
+ * Which order path this build actually offers. Pure — takes a plain probe
+ * object, so it is testable without CDP.
+ */
+export function chooseOrderPath(probe) {
+  const p = probe || {};
+  if (p.ticketSideControl && p.placeButton) return { path: 'ticket', reason: 'order ticket is mounted' };
+  if (p.widgetQtyEl && p.widgetSideButton) return { path: 'widget', reason: 'ticket not mounted; buy/sell widget present' };
+  return { path: 'none', reason: 'neither the order ticket nor the buy/sell widget was found' };
+}
+
+/** Status of one order id: 'filled' | 'working' | ... | 'absent'. Pure. */
+export function orderStatusOf(orders, orderId) {
+  const want = String(orderId);
+  const row = (Array.isArray(orders) ? orders : []).find((o) => o && String(o['Order ID']) === want);
+  if (!row) return 'absent';
+  return String(row.Status || '').toLowerCase();
+}
+
+/** Read-only DOM probe of the order-entry affordances. */
+export function orderEntryProbeJS() {
+  return `
+    (function() {
+      var q = function(sel) { return document.querySelectorAll(sel).length; };
+      var widget = document.querySelector('[data-name="buy-sell-buttons"]');
+      var qtyEl = document.querySelector('[data-name="qtyEl"]');
+      return {
+        ticketSideControl: q('[data-name="side-control-buy"]') + q('[data-name="side-control-sell"]'),
+        placeButton: q('[data-name="place-and-modify-button"]'),
+        widgetQtyEl: qtyEl ? 1 : 0,
+        widgetSideButton: q('[data-name="buy-order-button"]') + q('[data-name="sell-order-button"]'),
+        widgetText: widget ? String(widget.innerText || '').trim().slice(0, 60) : null,
+        qtyText: qtyEl ? String(qtyEl.innerText || qtyEl.textContent || '').trim() : null
+      };
+    })()
+  `;
+}
+
+export async function probeOrderEntry() {
+  const probe = await evaluate(orderEntryProbeJS());
+  const chosen = chooseOrderPath(probe);
+  return Object.assign({ success: true }, probe, {
+    qty: parseQtyText(probe && probe.qtyText),
+    path: chosen.path,
+    reason: chosen.reason,
+  });
+}
+
+/**
+ * Open the widget's quantity editor and set it, then read the value BACK off
+ * qtyEl. Deliberately a separate step from any click: the caller must compare
+ * the read-back to what it asked for before anything is submitted.
+ */
+export function widgetSetQtyJS(qtyNum) {
+  return `
+    (function() {
+      var qtyEl = document.querySelector('[data-name="qtyEl"]');
+      if (!qtyEl) return { ok: false, error: 'qtyEl not found' };
+      function fire(el) {
+        var r = el.getBoundingClientRect();
+        var opts = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+        try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (e) {}
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
+      }
+      fire(qtyEl);
+      var widget = document.querySelector('[data-name="buy-sell-buttons"]');
+      var inputs = widget ? Array.from(widget.querySelectorAll('input')) : [];
+      var input = inputs[0];
+      if (!input) return { ok: false, error: 'qty editor did not open (no input inside the widget)' };
+      var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(input, '${qtyNum}');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.blur();
+      var shown = String(qtyEl.innerText || qtyEl.textContent || '').trim();
+      return { ok: true, requested: ${qtyNum}, shown: shown };
+    })()
+  `;
+}
+
+/** Click a widget side button with real pointer + mouse events. */
+export function widgetClickSideJS(side) {
+  const s = String(side).toLowerCase();
+  return `
+    (function() {
+      var btn = document.querySelector('[data-name="${s}-order-button"]');
+      if (!btn) return { ok: false, error: '${s}-order-button not found' };
+      var r = btn.getBoundingClientRect();
+      var opts = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+      try { btn.dispatchEvent(new PointerEvent('pointerdown', opts)); btn.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (e) {}
+      btn.dispatchEvent(new MouseEvent('mousedown', opts));
+      btn.dispatchEvent(new MouseEvent('mouseup', opts));
+      btn.dispatchEvent(new MouseEvent('click', opts));
+      return { ok: true };
+    })()
+  `;
+}
+
+/**
+ * Place a market order through the buy/sell widget. Refuses to click unless the
+ * size read back off qtyEl equals the size asked for. dryRun stops before the
+ * click, which is how this path gets proven on a live account safely.
+ */
+export async function placeViaWidget({ side, qty, symbol, dryRun = false } = {}) {
+  const s = String(side || '').toLowerCase();
+  if (s !== 'buy' && s !== 'sell') throw new Error('side must be "buy" or "sell", got: ' + side);
+  const qtyNum = Number(qty);
+  if (!Number.isFinite(qtyNum) || qtyNum <= 0 || Math.floor(qtyNum) !== qtyNum) {
+    throw new Error('qty must be a positive whole number, got: ' + qty);
+  }
+  const before = await getOrders().catch(() => ({ success: false, orders: [] }));
+  const beforeIds = orderIdsOf(before && before.orders);
+
+  const setRes = await evaluate(widgetSetQtyJS(qtyNum));
+  if (!setRes || !setRes.ok) {
+    throw new Error('REFUSING TO SUBMIT — could not set the order size on the buy/sell widget (' + ((setRes && setRes.error) || 'unknown') + '). No order was placed.');
+  }
+  if (parseQtyText(setRes.shown) !== qtyNum) {
+    throw new Error('REFUSING TO SUBMIT — asked for ' + qtyNum + ' but the widget reads back "' + setRes.shown + '". No order was placed.');
+  }
+  if (dryRun) {
+    return { success: true, dryRun: true, path: 'widget', qtyReadBack: parseQtyText(setRes.shown), wouldClick: s, symbol: symbol || null, note: 'size verified on the widget; nothing was clicked' };
+  }
+
+  const clickRes = await evaluate(widgetClickSideJS(s));
+  if (!clickRes || !clickRes.ok) throw new Error((clickRes && clickRes.error) || 'widget click failed');
+
+  let verified = false, verifyDetail = null, created = null;
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 400));
+    try {
+      const after = await getOrders();
+      const fresh = newOrderIds(beforeIds, after && after.orders);
+      const match = fresh.find((o) => !symbol || String(o.Symbol || '').indexOf(symbol) !== -1);
+      if (match) {
+        verified = true;
+        created = { id: match['Order ID'], symbol: match.Symbol, side: match.Side, qty: match.Qty || match['Filled Qty'], status: match.Status };
+        verifyDetail = 'new order id ' + match['Order ID'] + ' appeared after the click';
+        break;
+      }
+    } catch (e) { verifyDetail = 'readback error: ' + (e && e.message); }
+  }
+  if (!verified) verifyDetail = 'no NEW order id appeared within 4s — the click may not have submitted anything';
+
+  return { success: true, path: 'widget', submittedSide: s, requestedQty: qtyNum, verified, verifyDetail, created, dryRun: false };
+}
+
+/**
+ * Cancel one order by id. This build exposes no REST cancel, so it borrows the
+ * Orders tab (the tab-visiting discipline refreshPanelTable already uses),
+ * hovers the row so its action buttons paint, clicks the row's OWN Cancel
+ * control, then VERIFIES the status changed before reporting success. The
+ * previously active tab is restored even on a throw — a tab left on Orders
+ * freezes the positions table, and a frozen positions table reads as flat.
+ */
+export async function cancelOrder({ orderId, dryRun = false } = {}) {
+  if (orderId == null || String(orderId) === '') throw new Error('orderId is required');
+  const wantId = String(orderId);
+  const dataName = REFRESHABLE.orders.dataName;
+  const panel = await evaluate(bottomPanelStateJS());
+  if (!panel || !panel.present || panel.collapsed !== false) {
+    await evaluate(openBrokerPanelJS());
+    await new Promise((r) => setTimeout(r, 900));
+  }
+  let click = null;
+  let result = null;
+  try {
+    click = await evaluate(clickPanelTabJS(REFRESHABLE.orders.tabText));
+    if (!click || !click.ok) throw new Error('could not select the Orders tab');
+    await new Promise((r) => setTimeout(r, 800));
+
+    const located = await evaluate(`
+      (function() {
+        var t = document.querySelector('table[data-name="${dataName}"]');
+        if (!t) return { ok: false, error: 'orders table missing' };
+        var trs = Array.from(t.querySelectorAll('tbody tr'));
+        for (var i = 0; i < trs.length; i++) {
+          var texts = Array.from(trs[i].querySelectorAll('td')).map(function(c) { return String(c.innerText || '').trim(); });
+          if (texts.indexOf('${wantId}') === -1) continue;
+          var r = trs[i].getBoundingClientRect();
+          if (r.width === 0) return { ok: false, error: 'row for ' + ${JSON.stringify(wantId)} + ' has no layout (tab not visible?)' };
+          var b = trs[i].querySelector('[data-name="close-settings-cell-button"]');
+          if (!b) return { ok: false, error: 'that row has no cancel control' };
+          var opts = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+          trs[i].dispatchEvent(new MouseEvent('mousemove', opts));
+          trs[i].dispatchEvent(new MouseEvent('mouseover', opts));
+          var br = b.getBoundingClientRect();
+          return { ok: true, btnW: Math.round(br.width), btnLabel: b.getAttribute('aria-label') };
+        }
+        return { ok: false, error: 'order id not found in the orders table' };
+      })()
+    `);
+    if (!located || !located.ok) throw new Error((located && located.error) || 'could not locate the order row');
+    if (dryRun) {
+      result = { success: true, dryRun: true, orderId: wantId, located, note: 'row and Cancel control found; nothing clicked' };
+    } else {
+      if (!located.btnW) throw new Error('the cancel control has no layout — refusing to click blind');
+      const clicked = await evaluate(`
+        (function() {
+          var t = document.querySelector('table[data-name="${dataName}"]');
+          var trs = Array.from(t.querySelectorAll('tbody tr'));
+          for (var i = 0; i < trs.length; i++) {
+            var texts = Array.from(trs[i].querySelectorAll('td')).map(function(c) { return String(c.innerText || '').trim(); });
+            if (texts.indexOf('${wantId}') === -1) continue;
+            var b = trs[i].querySelector('[data-name="close-settings-cell-button"]');
+            if (!b) return { ok: false, error: 'cancel control vanished' };
+            var r = b.getBoundingClientRect();
+            var opts = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+            try { b.dispatchEvent(new PointerEvent('pointerdown', opts)); b.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (e) {}
+            b.dispatchEvent(new MouseEvent('mousedown', opts));
+            b.dispatchEvent(new MouseEvent('mouseup', opts));
+            b.dispatchEvent(new MouseEvent('click', opts));
+            return { ok: true };
+          }
+          return { ok: false, error: 'row gone before the click' };
+        })()
+      `);
+      if (!clicked || !clicked.ok) throw new Error((clicked && clicked.error) || 'cancel click failed');
+      let status = 'unknown';
+      for (let i = 0; i < 8; i++) {
+        await new Promise((r) => setTimeout(r, 400));
+        const ord = await getOrders().catch(() => null);
+        status = orderStatusOf(ord && ord.orders, wantId);
+        if (status !== 'working' && status !== 'unknown') break;
+      }
+      result = {
+        success: true, orderId: wantId, status,
+        cancelled: status === 'cancelled' || status === 'canceled' || status === 'absent',
+        note: 'verified by re-reading the order status, not by assuming the click worked',
+      };
+    }
+  } finally {
+    if (click && click.ok && click.prevActive) {
+      try { await evaluate(clickPanelTabJS([click.prevActive])); } catch (e) {}
+    }
+  }
+  return result;
 }

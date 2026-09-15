@@ -86,6 +86,18 @@ export function registerTradingTools(server) {
   // registering it unconditionally would make it reachable by any MCP
   // client before the thing that's supposed to gate it is built. Flip the
   // env var on deliberately, per session, once the confirm flow is real.
+
+  // G29 (2026-09-15), READ-ONLY and therefore NOT gated: reports which order-entry
+  // affordance this build actually has. Exists because the app spent a whole session
+  // believing the order ticket was there when it was not — the oversize guard's reduce
+  // failed three times with "side control button not found: side-control-buy" while
+  // TradingView was showing the broker panel and nothing else. Safe to call any time:
+  // it queries the DOM, opens nothing and clicks nothing.
+  server.tool('trading_probe_order_entry', 'READ-ONLY. Reports whether the order ticket is mounted and/or the buy/sell widget is present, the size currently shown on the widget, and which path a real order would take. Clicks nothing, submits nothing.', {}, async () => {
+    try { return jsonResult(await core.probeOrderEntry()); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
   if (process.env.TV_ALLOW_LIVE_ORDERS === '1') {
     server.tool('trading_place_market_order', 'PLACES A REAL MARKET ORDER on the connected broker account — real money moves the instant this is called. Only call this after the human has explicitly authorized this specific trade (side, quantity, symbol). Verifies the order-ticket UI reflects the requested side/quantity/symbol via the submit button\'s own label before submitting; refuses rather than guessing if anything looks wrong. Optional stopPrice/targetPrice: UNVERIFIED DOM automation (2026-08-17) — if given and the ticket\'s stop-loss/take-profit fields cannot be found and set with confidence, the ENTIRE order is refused (fails closed, nothing is submitted) rather than placing a naked position.', {
       side: z.enum(['buy', 'sell']).describe('Order direction'),
@@ -93,9 +105,22 @@ export function registerTradingTools(server) {
       symbol: z.string().optional().describe('Expected symbol, e.g. "MNQU6" — if given, refuses to submit unless the order ticket shows this symbol'),
       stopPrice: z.number().positive().optional().describe('Absolute stop-loss price. UNVERIFIED automation — if it cannot be set, the whole order is refused.'),
       targetPrice: z.number().positive().optional().describe('Absolute take-profit price. UNVERIFIED automation — if it cannot be set, the whole order is refused.'),
-    }, async ({ side, qty, symbol, stopPrice, targetPrice }) => {
-      try { return jsonResult(await core.placeMarketOrder({ side, qty, symbol, stopPrice, targetPrice })); }
+      dryRun: z.boolean().optional().describe('G29: stop after VERIFYING the order size on the buy/sell widget, without clicking to submit. Widget path only. Use it to prove the order path is ready on a live account without trading.')
+    }, async ({ side, qty, symbol, stopPrice, targetPrice, dryRun }) => {
+      try { return jsonResult(await core.placeMarketOrder({ side, qty, symbol, stopPrice, targetPrice, dryRun })); }
       catch (err) { return jsonResult({ success: false, error: err.message }, true); }
     });
+
+    // G29 (2026-09-15): there was no cancel primitive anywhere in this project, which is why a
+    // stray working order could not be removed programmatically. Cancel modifies orders, so it
+    // sits behind the same TV_ALLOW_LIVE_ORDERS gate as placement.
+    server.tool('trading_cancel_order', 'CANCEL one working order by Order ID. Selects the Orders tab, hovers the row, clicks that row\'s own Cancel control, then RE-READS the status and reports whether it actually cancelled (never assumes the click worked). dryRun locates the row without clicking. Always restores the previously active tab.', {
+      orderId: z.string().describe('Order ID to cancel'),
+      dryRun: z.boolean().optional().describe('Locate the row and Cancel control but do not click.'),
+    }, async ({ orderId, dryRun }) => {
+      try { return jsonResult(await core.cancelOrder({ orderId, dryRun })); }
+      catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    });
+
   }
 }
