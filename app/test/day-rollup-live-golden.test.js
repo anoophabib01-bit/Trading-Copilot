@@ -60,18 +60,34 @@ test('LIVE GOLDEN: real stored days reproduce byte-identically', { skip: !findDa
       // G23: a day now carries its own rate (commPerCt) — prefer it. The sweep is
       // the fallback for legacy rows written before the field existed.
       for (const comm of (sum.commPerCt != null ? [sum.commPerCt] : [1.90, 1.18, 1.0])) {
+      // 2026-09-15: maxHoldSeconds is a FOURTH historical dimension. The 2026-09-14 day
+      // (a 2h23m hold — a trade imported from the broker CSV because the app was not
+      // running) exposed why Infinity is not enough. Infinity was chosen so the scalper
+      // pass "never invents a hold-exceeded flag the stored row cannot have" — but the
+      // converse bites identically: a real scalper day DOES carry hold-exceeded against
+      // the 15-minute rule, so pinning Infinity makes that day permanently
+      // unreproducible. Measured before this change: 4/9 days exact, and five days off by
+      // EXACTLY ONE ROW'S GRADE — every one of them a hold flag — with the majority
+      // assertion failing at 4/9. (It was exactly 4/8 before that day landed, i.e. this
+      // was already sitting on the boundary.) Sweeping the real values takes the
+      // byte-identical count to 8/9; the one remaining day (s1 2026-08-31) differs on
+      // avgHold/medHold alone with ZERO row-grade diffs — rows rewritten after its
+      // summary was stored, which this test already tolerates.
+      for (const maxHold of [900, 1800, Infinity]) {
       for (const lossOnly of [false, true]) {
         for (let cap = 1; cap <= 8; cap++) {
           const mode = lossOnly ? 'scalper' : (sum.tradingMode || 'standard');
-          const opts = { tradingMode: mode, cooldownAfterLossOnly: lossOnly, maxHoldSeconds: Infinity, sessionWindowsIST: WINS, sizeCapCsv: cap };
+          const opts = { tradingMode: mode, cooldownAfterLossOnly: lossOnly, maxHoldSeconds: maxHold, sessionWindowsIST: WINS, sizeCapCsv: cap };
           const graded = gradeTrades(rows.map(r => ({ entryMs: r.t, exitMs: r.x, entryMin: null, holdSec: r.hold, size: r.size, pnl: r.pnl })), opts);
           const gDiffs = rows.filter((r, i) => JSON.stringify(r.flags) !== JSON.stringify(graded[i].flags) || r.g !== graded[i].g).length;
           const out = rollupDay(sum.date, rows, { commPerCt: comm, sizeCapCsv: cap, tradingMode: mode });
           const rollDiffs = Object.keys(sum).filter(k => JSON.stringify(out[k]) !== JSON.stringify(sum[k]));
           if (gDiffs === 0 && rollDiffs.length === 0) { dayPassed = true; break; }
-          if (!best || rollDiffs.length + gDiffs < best.diffs.length + best.gDiffs) best = { cap, lossOnly, comm, diffs: rollDiffs, gDiffs };
+          if (!best || rollDiffs.length + gDiffs < best.diffs.length + best.gDiffs) best = { cap, lossOnly, comm, maxHold, diffs: rollDiffs, gDiffs };
         }
         if (dayPassed) break;
+      }
+      if (dayPassed) break;
       }
       if (dayPassed) break;
       }
