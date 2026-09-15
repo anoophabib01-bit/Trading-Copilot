@@ -1444,6 +1444,36 @@ without this call having placed anything); and `trading_cancel_order` (gated, ve
 re-reading the status, restores the previous tab) — the first cancel primitive in the project.
 Unit tests: `tradingview-mcp/tests/order-entry.test.js`, 13 tests, all pass.
 
+**LIVE-VERIFIED 2026-09-15 (Anoop watching, real money, minimum size).**
+
+Step 2 — the path, without submitting: probe → `path: "widget"` (ticket absent, widget size 1);
+`place_market_order` with `dryRun: true` → `success: true, qtyReadBack: 1, wouldClick: "buy"`;
+broker order table unchanged, 10 rows before and after. Run BOTH through the app's own bridge after
+a restart (the first attempt failed while the app was still running the pre-G29 child build — the
+mcp child is only respawned by a full app restart).
+
+Step 3 — one real 1-lot round trip through the app's own tool path:
+```
+BUY  1 MNQZ6  → order 650961251076  Filled @ 29,271.25   verified: new order id appeared
+SELL 1 MNQZ6  → order 650961251082  Filled              verified: new order id appeared
+positions after: count 0, empty  →  balance 49,023.38 → 49,030.34 (round trip +$6.96 net)
+```
+Both directions reported `verified: true` on a NEW order id — the old "any order for this symbol"
+check could not have proven this. Nothing was over-traded: a 1-lot long was confirmed open via
+`trading_get_positions` BEFORE the closing sell was sent.
+
+**NOTE for whoever reads this next:** the MCP's `getPositions`/`getAccount` SEE a position reliably
+(auto-repair mounts the table before reading), while a RAW DOM read of the same table at the same
+moment still returned the empty-state placeholder. So a reader that skips the repair is blind even
+though the data is reachable — which is the whole shape of G28, and why G28's fix is a REFUSAL plus
+an alarm rather than a smarter read.
+
+**Still open on this task:** the widget path cannot attach stop-loss/take-profit, so it REFUSES a
+request that includes either (never places a naked position). Attaching protection separately, or
+reviving the ticket path, is the next slice. And the guard's reduce has not yet fired on a real
+oversize breach since the fix — it now shares the exact primitive proven above, but that is an
+inference, not a verification.
+
 **Next, in this order — do NOT skip 1 and 2:** (1) restart the app so the mcp child process
 loads this code (the bridge spawns `tradingview-mcp` as a child; the running instance still has
 the old build); (2) run the probe, then `place_market_order` with `dryRun: true` — both click
