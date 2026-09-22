@@ -60,6 +60,44 @@ Prop Trading/
 # `git add -A`.
 .dsh-vision-bridge/
 
+# ── Generated / derived artifacts (2026-09-22 cleanup) ──────────────────────
+# Python bytecode from the vectorbt research spike. Never source, never portable
+# across a Python version - the two committed .pyc files were cpython-314.
+__pycache__/
+*.pyc
+
+# The "hive" agent-orchestrator's own saved state (agents, tmux targets, pty ids,
+# a prompt queue). A different tool's file that happened to sit in this directory
+# and got swept in by a bare `git add -A`. Nothing in app/, cli/, setup/,
+# scripts/ or tradingview-mcp/ reads it - verified by grep.
+roster.json
+
+# Jr kilo (vectorbt regime research) — OUTPUTS, not source. 800 KB of sweep
+# results and a 560 KB bar export, all regenerable from the .py files beside
+# them via export_bars.py / run_sweep.py. The scripts, the reports and
+# requirements.txt stay tracked.
+Jr kilo/vectorbt-research/vectorbt_input.csv
+Jr kilo/vectorbt-research/sweep_results*.json
+Jr kilo/vectorbt-research/regime_sweep_results.json
+
+# Saved market briefs — one generated JSON per ET date (see cli/README.md).
+# Output, not input: market-brief.js --save / gold-brief.js --save write here.
+cli/briefs/*.json
+
+# graphify code-analysis tool output (513 KB: graph.html 242 KB, graph.json
+# 263 KB, an AST cache and a .sig). Regenerable, machine-specific, and the only
+# thing that references it is the graph it generated. app/.graphifyignore stays
+# tracked — that one is configuration.
+graphify-out/
+
+# One-off analysis artifacts, referenced by nothing in the repo (checked by
+# grep over the whole tree):
+#  - the 150K eval target ladder: that account is gone, this is a 50K Apex EOD
+#    eval now (see app/rules.json firmLimits and Prop Trading/CLAUDE.md).
+#  - a single scalping-analysis chart png.
+app/MNQ_150K_Eval_Target_Ladder.xlsx
+app/week_scalping_analysis.png
+
 # Timestamped backups (app.js.bak-2026-09-17, rules.json.bak-enable-<ts>).
 # The blanket `*.bak` above only catches the bare suffix, so this catches the
 # dated variants that a restore procedure leaves behind. Ignored, not deleted:
