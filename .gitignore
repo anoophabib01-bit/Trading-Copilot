@@ -60,6 +60,48 @@ Prop Trading/
 # `git add -A`.
 .dsh-vision-bridge/
 
+# ── LOCAL-ONLY WORKING CONTEXT (2026-09-22) ─────────────────────────────────
+# Anoop, after the prune: "this project was handled by claude previously so
+# deleting file will effect and there is no MD file stating how this project
+# works. i want you to keep everything locally do not delete anything local."
+#
+# Every file below is BACK ON DISK and stays there. They are listed here only so
+# that (a) they no longer clutter `git status`, and (b) a bare `git add -A`
+# cannot put session handoffs and one-off utility scripts into a public push -
+# which is how several of these got published in the first place.
+#
+# HANDOVER / WORKING CONTEXT - the running conversation between Anoop and the
+# agent that builds this app, session by session. HOW_MNQ_COPILOT_WORKS.md in
+# particular is the plain-language "how does this thing work" guide for someone
+# who has never traded and never read the code.
+CLAUDE_HANDOFF_2026-09-04.md
+CLAUDE_HANDOFF_INDIA_DESK_2026-09-06.md
+CLAUDE_HANDOFF_QUESTIONNAIRE_2026-09-09.md
+CLAUDE_PROPOSAL_2026-09-04.md
+DSH_START_HERE.md
+DSH_PROJECT_HANDOFF.md
+DSH_F0_F4_ACCEPTANCE_FIXES.md
+DSH_INDIA_DESK_PLAN.md
+DSH_TRADE_FORENSICS_PLAN.md
+HOW_MNQ_COPILOT_WORKS.md
+TRADINGVIEW_MCP_AUDIT.md
+bug-audit-report-2026-08-12.md
+PART6_IMPLEMENTATION_RUNBOOK.md
+PART6_VERIFICATION_RESULT.md
+PART7_BRAIN_LOOP_DESIGN.md
+app/TRADEZELLA_GAP_ANALYSIS.md
+app/TRAINING_PLAN_90D.md
+
+# LOCAL UTILITIES - one-off scripts for this machine. They still work; they are
+# just not part of what a clone of this project needs.
+RENAME FOLDER.bat
+RENAME FOLDER.ps1
+Create Desktop Shortcut (G).bat
+
+# Scratch from the Obsidian vault (vault root = repo root).
+2026-08-24.md
+*.tmp
+
 # ── Generated / derived artifacts (2026-09-22 cleanup) ──────────────────────
 # Python bytecode from the vectorbt research spike. Never source, never portable
 # across a Python version - the two committed .pyc files were cpython-314.
