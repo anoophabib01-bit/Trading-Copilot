@@ -1,1 +1,0 @@
-these are the cookbooks https://docs.typesafe.ai/cookbooks/consistency_noul_cookbook and the advance one is  https://docs.typesafe.ai/cookbooks/autoresearch_feature_discovery which is see capability to use in trading co-pilot app for finding good trades and and importing more playbooks that work and giving better propabilites for profit as output or signal in chart for entry.

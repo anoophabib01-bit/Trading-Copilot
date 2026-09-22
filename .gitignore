@@ -80,6 +80,13 @@ Jr kilo/vectorbt-research/vectorbt_input.csv
 Jr kilo/vectorbt-research/sweep_results*.json
 Jr kilo/vectorbt-research/regime_sweep_results.json
 
+# cli/cli-paths.json — written by `node cli/discover.js`, and it holds THIS
+# machine's absolute paths (C:\Users\Admin\AppData\Local\Programs\PrintingPress\
+# bin\...). Committing it means every other clone gets paths that cannot exist.
+# Untracked, not deleted: the local file stays and the cli/ scripts keep working.
+# Regenerate with: node cli/discover.js
+cli/cli-paths.json
+
 # Saved market briefs — one generated JSON per ET date (see cli/README.md).
 # Output, not input: market-brief.js --save / gold-brief.js --save write here.
 cli/briefs/*.json

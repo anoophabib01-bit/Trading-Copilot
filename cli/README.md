@@ -50,7 +50,7 @@ node --test "cli/test/*.test.js"      # 30 tests, no network
 > — never as clear.
 
 Both live in `%LOCALAPPDATA%\Programs\PrintingPress\bin`. Absolute paths are
-recorded in [`cli-paths.json`](cli-paths.json) — **never rely on `PATH`.** The
+recorded in `cli/cli-paths.json` — **never rely on `PATH`.** The
 installer's bin directory is not on it, and `START CO-PILOT.bat` runs with a
 different `PATH` than a developer shell, so `exec('yahoo-finance-pp-cli ...')`
 would be `ENOENT` at runtime.
@@ -84,7 +84,7 @@ would be `ENOENT` at runtime.
 | `econ-calendar.js` | FRED release calendar → blackout windows. **Fails closed** |
 | `backtest-po3.js` | Base rates for `app/amd-phase.js` against the corpus |
 | `corpus-pull.js` | Pulls and merges OHLCV into `cli/corpus/` |
-| `cli-paths.json` | Resolved binary paths + per-CLI operational notes |
+| `cli-paths.json` | Resolved binary paths + per-CLI operational notes. **NOT in the repo** — it records this machine's absolute paths, so every clone would get paths that cannot exist. Generated locally by `node cli/discover.js`; until you run it, `market-cli.js` reports each CLI as "not found" rather than failing obscurely |
 | `corpus/` | `<symbol>/<interval>.jsonl`, one bar per line, merged by timestamp |
 | `briefs/` | Saved briefs, one JSON per ET date |
 | `state/` | Per-CLI local store, reached only by passing `db: true` to `run()`/`runNdjson()` |

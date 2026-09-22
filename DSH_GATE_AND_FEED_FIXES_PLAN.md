@@ -1310,7 +1310,7 @@ weaken that assertion to make room for a new field.
 [x] each new release verified against its own publishing agency's calendar, not guessed
 [~] etHour/etMin cross-checked for at least the next 2 real occurrences of each new release (1 occurrence live; see note)
 [x] tier assignment justified in a comment, calibrated against the existing GDP/PCE/RETAIL/CLAIMS entries
-[x] cli/test/econ-calendar.test.js EXTENDED (not replaced) — see the test-file rule in DSH_START_HERE.md
+[x] cli/test/econ-calendar.test.js EXTENDED (not replaced)
 [x] cli/test/cli.test.js's no-directional-vocabulary assertion is unchanged and still passes
 [x] node cli/econ-calendar.js --days 14 shows the new releases in a live run, with correct blackout math
 [x] no new field carries a value, a consensus figure, or a direction — dates and times only
