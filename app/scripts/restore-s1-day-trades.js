@@ -44,7 +44,16 @@ const path = require('path');
 const patternStore = require('../pattern-memory-store');
 
 const WRITE = process.argv.includes('--write');
-const DATA = 'G:\\MNQ-CoPilot\\DATA';
+// Renamed 2026-09-18. Anchor on app/server.js so a stray folder of the new
+// name cannot point this recovery script at an empty directory.
+const DATA = (function () {
+  const path = require('path');
+  const roots = ['G:\\Trading-CoPilot', 'G:\\MNQ-CoPilot'];
+  for (let i = 0; i < roots.length; i++) {
+    try { if (fs.existsSync(path.join(roots[i], 'app', 'server.js'))) return path.join(roots[i], 'DATA'); } catch (e) {}
+  }
+  return 'G:\\MNQ-CoPilot\\DATA';
+})();
 const SLOT_DIR = path.join(DATA, 'accounts', 's1');
 const LIVE = path.join(SLOT_DIR, 'day_trades.json');
 const BACKUP = path.join(SLOT_DIR, 'day_trades.json.bak-pre-size0-test');

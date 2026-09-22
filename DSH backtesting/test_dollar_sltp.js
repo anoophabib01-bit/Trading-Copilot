@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('fs');
-const backtest = require('G:/MNQ-CoPilot/app/backtest');
-const rules = JSON.parse(fs.readFileSync('G:/MNQ-CoPilot/app/rules.json','utf8'));
+const backtest = require('G:/Trading-CoPilot/app/backtest');
+const rules = JSON.parse(fs.readFileSync('G:/Trading-CoPilot/app/rules.json','utf8'));
 function load(f){const d=JSON.parse(fs.readFileSync(f,'utf8'));const b=Array.isArray(d)?d:(d.bars||[]);return b.filter(x=>x&&typeof x.time==='number'&&typeof x.close==='number');}
 const pv=backtest.MNQ_POINT_VALUE, horizon=rules.playbooks.outcomeHorizonBars||12;
 function runFixedDollar(bars, lookback, stopUsd, targetUsd){
@@ -20,7 +20,7 @@ function runFixedDollar(bars, lookback, stopUsd, targetUsd){
   }
   return trades;
 }
-const files = ['G:/MNQ-CoPilot/DATA/bars/mnq_1h_sepnov.json','G:/MNQ-CoPilot/DATA/bars/mnq_1h_flat.json','G:/MNQ-CoPilot/DATA/bars/mnq_1h_downtrend.json','G:/MNQ-CoPilot/DATA/bars/mnq_1h_uptrend.json','G:/MNQ-CoPilot/DATA/bars/mnq_60.json'];
+const files = ['G:/Trading-CoPilot/DATA/bars/mnq_1h_sepnov.json','G:/Trading-CoPilot/DATA/bars/mnq_1h_flat.json','G:/Trading-CoPilot/DATA/bars/mnq_1h_downtrend.json','G:/Trading-CoPilot/DATA/bars/mnq_1h_uptrend.json','G:/Trading-CoPilot/DATA/bars/mnq_60.json'];
 const barsAll = files.map(load);
 function agg(t){ if(!t.length) return null; const net=t.reduce((a,b)=>a+b.net,0); const w=t.filter(x=>x.net>0),l=t.filter(x=>x.net<=0); const gw=w.reduce((a,b)=>a+b.net,0),gl=-l.reduce((a,b)=>a+b.net,0); let eq=0,peak=0,dd=0; for(const x of t){eq+=x.net;peak=Math.max(peak,eq);dd=Math.max(dd,peak-eq);} return {n:t.length,net,pf:gl>0?gw/gl:Infinity,dd,win:w.length/t.length*100}; }
 

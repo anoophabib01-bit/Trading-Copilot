@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Co-Pilot</title>
+  <title>Trading Co-Pilot</title>
   <link rel="stylesheet" href="styles.css">
   <!-- G5 EXACT PORT (2026-08-08, v3): a literal rule-for-rule port of
        designs/main-dashboard-20260802/variant-G5-themes.html onto this app's
@@ -46,7 +46,7 @@
 
 <!-- ── Title bar ──────────────────────────────────────────────────────────── -->
 <div id="titlebar">
-  <div class="logo">CO-<span>PILOT</span></div>
+  <div class="logo">TRADING <span>CO-PILOT</span></div>
 
   <!-- Mode toggle -->
   <!-- FIX (2026-07-21): default active state flipped from FUNDED to EVAL. The
@@ -124,20 +124,18 @@
   <div id="oversize-chip" title="Oversize guard — click to arm/disarm for this session. The cap it enforces (2–6) is set in the left rail under Today → Size cap." onclick="toggleOversizeGuard()">
     <span id="oversize-chip-dot"></span><span id="oversize-chip-text">Size guard…</span>
   </div>
-  <!-- ── Size cap, next to the guard that enforces it (2026-09-05) ────────
-       Anoop asked for the cap adjustment to live here rather than three clicks
-       deep in the left rail's Today flyout. The number the guard enforces and
-       the switch that arms the guard now read as one control, which is how he
-       thinks about them.
-       This is a SECOND VIEW of the same state, not a second source: both copies
-       call the same adjustSizeCap() and are painted by the same
-       renderSizeCapRow(). There is deliberately no local number here to drift
-       from rules.json — and the server clamps every request regardless. -->
-  <div id="sizecap-chip" title="Per-entry contract cap — the size the guard next to this enforces. 2–6; 6 is the hard ceiling.">
-    <button type="button" class="sizecap-btn" data-sizecap="dec" onclick="adjustSizeCap(-1)" title="Lower the per-entry cap" aria-label="Lower size cap">−</button>
-    <span class="sizecap-chip-k">Cap</span>
-    <span class="sizecap-val" data-sizecap-val>2</span>
-    <button type="button" class="sizecap-btn" data-sizecap="inc" onclick="adjustSizeCap(1)" title="Raise the per-entry cap" aria-label="Raise size cap">+</button>
+  <!-- ── Plan chip (2026-09-21, consolidated) ───────────────────────────────
+       The old titlebar had THREE chips for one "today" concept — the oversize
+       guard status, a standalone − Cap 4 + adjuster, and a separate Day plan
+       chip — each duplicating the left rail's Today flyout. The guard status
+       stays (it is a live safety state that must always name itself in words;
+       its text already carries "cap N"). The cap ADJUSTER and the Day plan
+       opener are now ONE chip: it shows the live plan, and clicking it opens
+       the Today flyout, which is the single home of every control (cap,
+       satisfaction, chunk, streak gate). Painted by renderDayPlanRow() from the
+       same day-plan.js values the server hands every agent — one source. -->
+  <div id="plan-chip" onclick="openDayPlan()" title="Day plan — satisfaction number, eval pace, streak gate and the post-payout window. The size cap and every control live in the Today panel (click to open).">
+    <span id="plan-chip-text">Plan…</span>
   </div>
   <div class="session-time" id="session-clock"></div>
   <!-- ── TradingView kill switch (2026-09-09) ─────────────────────────────
@@ -195,6 +193,13 @@
         <div class="section-title">Since your last exit</div>
         <div id="exit-drift-verdict" class="xd-verdict"></div>
         <div id="exit-drift-detail" class="xd-detail"></div>
+        <!-- The same drift converted to money at the two sizes that matter
+             (2026-09-21, Anoop: "always calculate in points and dollars with 2
+             and 4 size"). Points measure the market; dollars decide whether the
+             number is worth acting on. Sizes and point value are read from
+             rules.json, never literals — MGC is $10/pt against MNQ's $2, so the
+             same point reading is five times the money on the other contract. -->
+        <div id="exit-drift-money" class="xd-detail xd-money"></div>
         <!-- Declared checklist bias vs. what price actually did since the exit.
              Hidden unless exit-bias-align.js had something to say. -->
         <div id="exit-drift-bias" class="xd-bias" style="display:none"></div>
@@ -208,6 +213,14 @@
       <div class="panel-section lp-pinned lp-pinned-idle" id="exit-drift-idle">
         <div class="section-title">Since your last exit</div>
         <div class="xd-detail">No reading yet — either nothing has closed, or price has not moved far enough from your exit to say anything honest.</div>
+        <!-- "Always calculate in points and dollars" (Anoop, 2026-09-21). A
+             sub-threshold drift is NO_READ as a DIRECTION, but it is still a
+             measured distance, so the money it is worth is shown here rather
+             than withheld. Deliberately NOT filled during COOLING: inside the
+             post-exit cooldown the module withholds on purpose (see
+             exit-drift.js), and a dollars figure is exactly the regret feed
+             that refusal exists to prevent. -->
+        <div id="exit-drift-money-idle" class="xd-detail xd-money" style="display:none"></div>
       </div>
 
       <!-- ── Collapsed rail ───────────────────────────────────────
@@ -323,7 +336,59 @@
         <button type="button" class="lp-fly-close" onclick="LeftRail.close()" title="Close (Esc)" aria-label="Close today">×</button>
         <div class="section-title">Today</div>
         <div id="gonogo-badge" class="gonogo-badge pending">PENDING CHECK-IN</div>
+
+        <div class="section-title" style="margin-top:10px;">Day plan</div>
+        <!-- ── DAY PLAN (2026-09-19) ─────────────────────────────────────────
+             The three numbers that decide whether today is FINISHED, all from
+             day-plan.js — the same module the server hands every agent, so this
+             panel and the sentence Jessi says cannot disagree:
+               · Day done at  — Deva's satisfaction number. The app could always
+                 say he was down too much; this is the half that was missing.
+               · Eval chunk   — remaining target / plan days, computed live so
+                 it can never go stale mid-eval.
+               · Stops left   — after N consecutive losses, how many full stops
+                 remain before the daily loss limit ends the day.
+             Like the size cap directly above, these buttons only ASK: server.js
+             clamps every one of them, so a renderer bug cannot widen a number
+             that ends a session. -->
+        <div class="stat-row" style="margin-top:9px;">
+          <span class="stat-label">Day done at</span>
+          <span class="sizecap-ctl">
+            <button type="button" class="sizecap-btn" data-sat="dec" onclick="adjustSatisfaction(-50)" title="Lower the satisfaction number — the day closes sooner" aria-label="Lower satisfaction number">−</button>
+            <span class="sizecap-val" id="stat-satisfaction">$300</span>
+            <button type="button" class="sizecap-btn" data-sat="inc" onclick="adjustSatisfaction(50)" title="Raise the satisfaction number — the day runs longer" aria-label="Raise satisfaction number">+</button>
+          </span>
+        </div>
         <div class="stat-row">
+          <span class="stat-label">Satisfaction</span>
+          <span class="stat-value" id="stat-sat-status">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Eval chunk</span>
+          <span class="sizecap-ctl">
+            <button type="button" class="sizecap-btn" data-evdays="dec" onclick="adjustEvalDays(-1)" title="Fewer days for the plan → a larger daily chunk" aria-label="Fewer plan days">−</button>
+            <span class="sizecap-val" id="stat-evalchunk">—</span>
+            <button type="button" class="sizecap-btn" data-evdays="inc" onclick="adjustEvalDays(1)" title="More days for the plan → a smaller daily chunk" aria-label="More plan days">+</button>
+          </span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Stops left</span>
+          <span class="stat-value" id="stat-stopsleft">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Streak gate</span>
+          <span class="sizecap-ctl">
+            <button type="button" class="sizecap-btn" data-streak="dec" onclick="adjustStreakGate(-1)" title="Fire the streak gate sooner (fewer losses)" aria-label="Lower streak threshold">−</button>
+            <span class="sizecap-val" id="stat-streakgate">2</span>
+            <button type="button" class="sizecap-btn" data-streak="inc" onclick="adjustStreakGate(1)" title="Fire the streak gate later (more losses)" aria-label="Raise streak threshold">+</button>
+          </span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Payout watch</span>
+          <span class="stat-value" id="stat-payoutwatch">—</span>
+        </div>
+        <div class="sizecap-note" id="plan-note">Loading the day plan…</div>
+        <div class="stat-row" style="margin-top:9px;">
           <span class="stat-label">P&L</span>
           <span class="stat-value" id="stat-pnl">$0</span>
         </div>
@@ -357,6 +422,8 @@
           </span>
         </div>
         <div class="sizecap-note" id="sizecap-note">2–6 per entry · 6 is the hard ceiling</div>
+
+        <!-- Day plan rows moved to the TOP of this flyout — see above the P&L row. -->
         </div>
 
         <button type="button" class="lp-row" data-fly="fly-news" aria-expanded="false" aria-controls="fly-news">
@@ -538,6 +605,31 @@
 
       <!-- Analysis tab -->
       <div id="tab-analysis">
+
+        <!-- ── Playbook registry + shadow router (Phase 2, 2026-09-19) ───────
+             The registry half needs NO model and works today: it is the one place
+             that answers "is Playbook B on?", and the ON/OFF advice beside each
+             row is computed from Anoop's own resolved signals (Wilson lower bound
+             above break-even, n>=30). The router half is dormant until a TypeSafe
+             key exists — invite-only as of 2026-09-19 — and says so on its own
+             row rather than showing an empty panel. -->
+        <div class="analysis-block" id="router-analysis-block">
+          <div class="block-title">Playbooks
+            <span class="dayplan-tab-ctl">
+              <button type="button" class="sizecap-btn" onclick="refreshRouter()" title="Re-read the registry and the measured switch from the server">&#8635;</button>
+            </span>
+          </div>
+          <div id="router-rows"><div class="dayplan-tab-line">&mdash;</div></div>
+          <div class="dayplan-tab-line" id="router-switch">&mdash;</div>
+          <div class="dayplan-tab-line" id="router-shadow">&mdash;</div>
+          <div class="dayplan-tab-line" id="router-plan">&mdash;</div>
+          <div class="dayplan-tab-line" id="router-escalation">&mdash;</div>
+          <div class="dayplan-tab-line" id="router-measure">&mdash;</div>
+          <div id="router-composite" class="router-composite"></div>
+          <div class="dayplan-tab-line" id="router-voice">&mdash;</div>
+        </div>
+
+
         <div class="analysis-block">
           <div class="block-title">Bias</div>
           <div class="bias-display neutral" id="bias-display">NEUTRAL</div>
@@ -879,6 +971,12 @@
             <div class="edg-row"><div class="edg-n">CS4</div><div><div class="edg-txt">TF ladder: 4H → 1H → 15M → 3M/5M. Entry only at the bottom. Read only at the top.</div><div class="edg-why">Reading at 3M without checking 4H is like reading one word of a paragraph and making a decision. Every step down the ladder confirms the previous one. Skip none.</div></div><span class="edg-tag strategy">STRATEGY</span></div>
           </div>
         </div>
+
+        <!-- Doctrine reference (2026-09-19). Filled from window.PropFirmDoctrine
+             by renderDoctrineBlock() — the SAME text server.js splices into THE
+             LOOP, Jessi, the Scalper, the Post-Chart analyst and the main chat,
+             so this panel cannot paraphrase a rule the agents do not have. -->
+        <div id="rules-doctrine"></div>
       </div>
 
       <!-- Ladder tab (target ladder — synced to whichever account is active) -->
@@ -1270,151 +1368,158 @@
 
 <!-- ── Settings overlay ─────────────────────────────────────────────────── -->
 <div id="settings-overlay">
-  <div id="settings-box">
-    <h2>Settings</h2>
-    <div class="settings-field">
-      <label>Theme</label>
-      <div class="theme-switch no-drag" id="theme-switch">
-        <button class="theme-switch-btn" data-theme-btn="dark" onclick="setTheme('dark')">Indigo</button>
-        <button class="theme-switch-btn" data-theme-btn="graphite" onclick="setTheme('graphite')">Graphite</button>
-        <button class="theme-switch-btn" data-theme-btn="light" onclick="setTheme('light')">Paper</button>
+      <div id="settings-box">
+    <div class="settings-head">
+      <h2>Settings <span style="font-size:10px;font-weight:400;color:var(--text-dim);letter-spacing:.06em">v5 &middot; control room</span></h2>
+    </div>
+    <div class="settings-layout">
+      <nav class="settings-rail">
+        <button type="button" class="settings-tab is-active" data-stab="keys" onclick="showSettingsTab('keys')">Keys</button>
+        <button type="button" class="settings-tab" data-stab="trading" onclick="showSettingsTab('trading')">Trading</button>
+        <button type="button" class="settings-tab" data-stab="integrations" onclick="showSettingsTab('integrations')">Integrations</button>
+        <button type="button" class="settings-tab" data-stab="diagnostics" onclick="showSettingsTab('diagnostics')">Diagnostics</button>
+      </nav>
+      <div class="settings-panes">
+        <section class="settings-pane is-active" data-spane="keys">
+          <div class="settings-field">
+            <label>Theme</label>
+            <div class="theme-switch no-drag" id="theme-switch"><button class="theme-switch-btn" data-theme-btn="dark" onclick="setTheme('dark')">Indigo</button><button class="theme-switch-btn" data-theme-btn="graphite" onclick="setTheme('graphite')">Graphite</button><button class="theme-switch-btn" data-theme-btn="light" onclick="setTheme('light')">Paper</button></div>
+          </div>
+          <div class="settings-field">
+            <label>DeepSeek API key</label>
+            <input type="password" id="settings-deepseek-key" autocomplete="off" placeholder="sk-…">
+            <div class="settings-hint">Every agent — chat, voice, Scalper, Debate, Judge.</div>
+          </div>
+          <div class="settings-field">
+            <label style="font-weight:400"><input type="checkbox" id="settings-disable-deepseek" style="width:auto;margin-right:7px;vertical-align:middle">Disable DeepSeek <span style="color:var(--text-dim)">— falls back to Gemini, key kept</span></label>
+          </div>
+          <div class="settings-field">
+            <label>Gemini API key</label>
+            <input type="password" id="settings-gemini-key" autocomplete="off" placeholder="AIza…">
+            <div class="settings-hint">Backup only. If it answers, the reply is flagged in the chat.</div>
+          </div>
+          <div class="settings-field">
+            <label>TypeSafe API key</label>
+            <input type="password" id="settings-typesafe-key" autocomplete="off" placeholder="apikey_…">
+            <div class="settings-hint">Classifies journal notes and ranks setups. Never decides size or stops.</div>
+          </div>
+          <div class="settings-field">
+            <label>OpenRouter API key</label>
+            <input type="password" id="settings-openrouter-key" autocomplete="off" placeholder="sk-or-v1-…">
+            <div class="settings-hint">Only used when the backend is OpenRouter.</div>
+          </div>
+          <div class="settings-field">
+            <label>Backend</label>
+            <select id="settings-typesafe-backend"><option value="typesafe">TypeSafe direct — api.typesafe.ai</option><option value="openrouter">OpenRouter — fallback</option></select>
+          </div>
+          <div class="settings-field">
+            <label>Model</label>
+            <input type="text" id="settings-typesafe-model" autocomplete="off" placeholder="jev-latest">
+            <div class="settings-hint">Blank uses the backend default. The id is host-specific.</div>
+          </div>
+          <div class="settings-field">
+            <label style="font-weight:400"><input type="checkbox" id="settings-typesafe-journal" style="width:auto;margin-right:7px;vertical-align:middle">Classify journal notes <span style="color:var(--text-dim)">— one call per saved note</span></label>
+          </div>
+          <div class="settings-field">
+            <label style="font-weight:400"><input type="checkbox" id="settings-typesafe-router" style="width:auto;margin-right:7px;vertical-align:middle">Rank armed setups <span style="color:var(--text-dim)">— shadow, one call per setup</span></label>
+          </div>
+          <div class="settings-field">
+            <label>Debate escalation</label>
+            <select id="settings-typesafe-escalation"><option value="observe">Observe — record, suppress nothing</option><option value="gate">Gate — skip debates outside the band</option><option value="off">Off — untouched</option></select>
+          </div>
+          <div class="settings-field">
+            <label>Speaking voice</label>
+            <select id="settings-voice-name"><option value="en-IN-NeerjaNeural">Neerja — Indian English</option><option value="en-IN-PrabhatNeural">Prabhat — Indian English</option><option value="en-US-JennyNeural">Jenny — US</option><option value="en-US-GuyNeural">Guy — US</option><option value="browser">Browser — offline</option></select>
+          </div>
+        </section>
+        <section class="settings-pane" data-spane="trading">
+          <div class="settings-field">
+            <label>Auto-protection — one roof, per stage</label>
+            <div class="settings-hint">Every per-trade number, one place. The app flattens a position at the stop and target, and once in profit it <b>trails the stop</b> (break-even first, then behind the peak) so a winner is banked instead of closed early. Evaluation and funded each have their own numbers. Blank = keep the current value; <b>0 in both trail boxes = no trailing</b>.</div>
+          </div>
+          <div class="settings-field">
+            <label>Evaluation</label>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;">
+              <div><span class="settings-hint">Stop ($)</span><input type="number" id="settings-protect-eval-stop" placeholder="201" step="1"></div>
+              <div><span class="settings-hint">Target ($)</span><input type="number" id="settings-protect-eval-target" placeholder="600" step="1"></div>
+              <div><span class="settings-hint">Break-even at ($)</span><input type="number" id="settings-protect-eval-be" placeholder="150" step="1"></div>
+              <div><span class="settings-hint">Trail distance ($)</span><input type="number" id="settings-protect-eval-trail" placeholder="150" step="1"></div>
+            </div>
+          </div>
+          <div class="settings-field">
+            <label>Funded</label>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;">
+              <div><span class="settings-hint">Stop ($)</span><input type="number" id="settings-protect-funded-stop" placeholder="200" step="1"></div>
+              <div><span class="settings-hint">Target ($)</span><input type="number" id="settings-protect-funded-target" placeholder="300" step="1"></div>
+              <div><span class="settings-hint">Break-even at ($)</span><input type="number" id="settings-protect-funded-be" placeholder="100" step="1"></div>
+              <div><span class="settings-hint">Trail distance ($)</span><input type="number" id="settings-protect-funded-trail" placeholder="100" step="1"></div>
+            </div>
+          </div>
+          <div class="settings-field">
+            <div class="settings-hint">Your account numbers — balance, floor, buffer, day stop, target and cushion — are <b>not</b> set here. They are derived from the account's own terms and shown live in the left rail's Account panel.</div>
+          </div>
+        </section>
+        <section class="settings-pane" data-spane="integrations">
+          <div class="settings-field">
+            <label>Bot token</label>
+            <input type="password" id="settings-telegram-token" autocomplete="off" placeholder="from @BotFather">
+          </div>
+          <div class="settings-field">
+            <label>Chat ID</label>
+            <input type="text" id="settings-telegram-chatid" autocomplete="off" placeholder="auto-fills on first message">
+          </div>
+          <div class="settings-field">
+            <div class="settings-hint">Telegram is disabled (your decision, 2026-09-04). These are kept for the record and send nothing.</div>
+          </div>
+          <div class="settings-field">
+            <label style="font-weight:400"><input type="checkbox" id="settings-tv-enabled" style="width:auto;margin-right:7px;vertical-align:middle">Enable live feed <span style="color:var(--text-dim)">— only if your firm permits API access</span></label>
+          </div>
+          <div class="settings-field">
+            <label>Environment</label>
+            <select id="settings-tv-env"><option value="demo">demo</option><option value="live">live</option></select>
+          </div>
+          <div class="settings-field">
+            <label>Username</label>
+            <input type="text" id="settings-tv-name" autocomplete="off" placeholder="your Tradovate login">
+          </div>
+          <div class="settings-field">
+            <label>Password</label>
+            <input type="password" id="settings-tv-password" autocomplete="off" placeholder="">
+          </div>
+          <div class="settings-field">
+            <label>App ID</label>
+            <input type="text" id="settings-tv-appid" autocomplete="off" placeholder="Trading Co-Pilot">
+          </div>
+          <div class="settings-field">
+            <label>API key (CID) / secret</label>
+            <div style="display:flex;gap:8px;"><input type="text" id="settings-tv-cid" autocomplete="off" placeholder="cid"><input type="password" id="settings-tv-sec" autocomplete="off" placeholder="secret"></div>
+          </div>
+          <div class="settings-field">
+            <button class="btn-cancel" onclick="testTradovateConn()" style="width:100%">Test connection</button>
+            <div id="settings-tv-status" class="settings-hint">Not tested. Confirm your firm allows API access before enabling.</div>
+          </div>
+        </section>
+        <section class="settings-pane" data-spane="diagnostics">
+          <div class="settings-field">
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button type="button" class="settings-action-btn" id="settings-typesafe-test" onclick="testTypesafe()" title="ONE real call, to see the key work before trusting it">Send one test call</button>
+              <button type="button" class="settings-action-btn" id="settings-typesafe-consistency" onclick="checkRubricStability()" title="Runs the journal rubric 8 times and measures whether the answers hold still (~$0.0004)">Check rubric stability</button>
+              <button type="button" class="settings-action-btn" id="settings-typesafe-sweep" onclick="runAnswerSweep()" title="Re-scores stored answers under new cutoffs. Calls nothing.">Replay stored answers</button>
+              <button type="button" class="settings-action-btn" onclick="refreshTypesafeStatus()">Refresh</button>
+            </div>
+            <div id="settings-typesafe-status" class="settings-hint">Loading status...</div>
+          </div>
+          <div class="settings-field">
+            <div class="settings-hint">These run tests and measurements. They change nothing and are here rather than on the Keys tab because they are tools, not settings.</div>
+          </div>
+        </section>
       </div>
     </div>
-    <div class="settings-field">
-      <label>DeepSeek API Key — the brain behind every agent (platform.deepseek.com)</label>
-      <input type="password" id="settings-deepseek-key" placeholder="sk-…" autocomplete="off">
-      <div style="font-size:11px;margin-top:6px;color:var(--text-dim);line-height:1.5">Answers chat, voice, Scalper, Debate, Judge, PO3 and Post-Session. One key, one model.</div>
-    </div>
-    <div class="settings-field">
-      <label><input type="checkbox" id="settings-disable-deepseek" style="width:auto;margin-right:6px;vertical-align:middle;">Disable DeepSeek (kill switch — drop to the backup brain without deleting the key)</label>
-    </div>
-    <div class="settings-field">
-      <label>Gemini API Key — BACKUP ONLY, used if DeepSeek fails or runs out of credit (free: aistudio.google.com/apikey)</label>
-      <input type="password" id="settings-gemini-key" placeholder="AIza…" autocomplete="off">
-      <div style="font-size:11px;margin-top:6px;color:var(--text-dim);line-height:1.5">Leave blank to run DeepSeek-only — but then a DeepSeek outage means no answers at all. If this ever answers, the reply is flagged in the chat so you always know it wasn't your primary brain.</div>
-    </div>
-    <div class="settings-field">
-      <label>Speaking voice (how Jessi sounds in Voice mode)</label>
-      <select id="settings-voice-name">
-        <option value="en-IN-NeerjaNeural">Neerja — Indian English, female (neural, default)</option>
-        <option value="en-IN-PrabhatNeural">Prabhat — Indian English, male (neural)</option>
-        <option value="en-US-JennyNeural">Jenny — US English, female (neural)</option>
-        <option value="en-US-GuyNeural">Guy — US English, male (neural)</option>
-        <option value="browser">Browser voice — basic, fully offline</option>
-      </select>
-    </div>
-    <div class="settings-field">
-      <label>Account Balance ($)</label>
-      <input type="number" id="settings-balance" placeholder="50000" step="1">
-    </div>
-    <div class="settings-field">
-      <label>Today's Profit/Loss ($) — for size scaling</label>
-      <input type="number" id="settings-profit" placeholder="0" step="1">
-    </div>
-
-    <div class="settings-subhead">Funded Stage</div>
-    <div class="settings-field">
-      <label>Hard Floor ($)</label>
-      <input type="number" id="settings-funded-floor" placeholder="48000" step="1">
-    </div>
-    <div class="settings-field">
-      <label>Day Stop — Hard Cutoff ($)</label>
-      <input type="number" id="settings-funded-daystop" placeholder="200" step="1">
-    </div>
-    <div class="settings-field">
-      <label>Day Target — Min ($) / Max ($)</label>
-      <div style="display:flex;gap:8px;">
-        <input type="number" id="settings-funded-targetmin" placeholder="150" step="1">
-        <input type="number" id="settings-funded-targetmax" placeholder="300" step="1">
-      </div>
-    </div>
-    <div class="settings-field">
-      <label>Next Payout — Balance Target ($)</label>
-      <input type="number" id="settings-payout" placeholder="52000" step="1">
-    </div>
-
-    <div class="settings-subhead">Eval Stage</div>
-    <div class="settings-field">
-      <label>DD Floor ($)</label>
-      <input type="number" id="settings-eval-floor" placeholder="49364" step="1">
-    </div>
-    <div class="settings-field">
-      <label>Day Cap — Consistency Max ($)</label>
-      <input type="number" id="settings-eval-daycap" placeholder="1499" step="1">
-    </div>
-    <div class="settings-field">
-      <label>Day Stop ($)</label>
-      <input type="number" id="settings-eval-daystop" placeholder="400" step="1">
-    </div>
-
-    <!-- G32 (2026-09-15): Anoop asked to change these from the UI. APP-SIDE protection band
-         (rules.json autoProtection) - the app closes the trade at -stop or +target through the
-         same gateway the guards use. Dollars, not points: the point distance depends on the
-         instrument and the size and is computed, never typed. Bounds are enforced SERVER-SIDE
-         (trade-protection.clampAutoProtection) so a renderer bug cannot widen a risk number -
-         same doctrine as sizeCap. -->
-    <div class="settings-field">
-      <label>Protection Stop ($)</label>
-      <input type="number" id="settings-protect-stop" placeholder="200" step="5" min="5" max="5000">
-    </div>
-    <div class="settings-field">
-      <label>Protection Target ($)</label>
-      <input type="number" id="settings-protect-target" placeholder="600" step="5" min="5" max="10000">
-    </div>
-
-    <div class="settings-subhead">Telegram Bot</div>
-    <!-- G18: Telegram is hard-disabled (TELEGRAM_ENABLED=false, Anoop 2026-09-04).
-         The note makes that legible so a token typed here never looks like it will
-         send. The fields stay for record only. -->
-    <div class="settings-field" style="color:var(--text-dim);font-size:11px;margin-bottom:6px">
-      Telegram is disabled (your decision, 2026-09-04). The token fields below are kept for the record and do not send anything.
-    </div>
-    <div class="settings-field">
-      <label>Telegram Bot Token</label>
-      <input type="password" id="settings-telegram-token" placeholder="from @BotFather" autocomplete="off">
-    </div>
-    <div class="settings-field">
-      <label>Telegram Chat ID (optional)</label>
-      <input type="text" id="settings-telegram-chatid" placeholder="auto-fills on first message if left blank">
-    </div>
-
-    <div class="settings-subhead">Tradovate Live Feed (read-only, optional)</div>
-    <div class="settings-field">
-      <label><input type="checkbox" id="settings-tv-enabled" style="width:auto;margin-right:6px;vertical-align:middle;">Enable live feed — only if Lucid permits API access</label>
-    </div>
-    <div class="settings-field">
-      <label>Environment</label>
-      <select id="settings-tv-env" class="form-select"><option value="demo">demo</option><option value="live">live</option></select>
-    </div>
-    <div class="settings-field">
-      <label>Tradovate Username</label>
-      <input type="text" id="settings-tv-name" autocomplete="off" placeholder="your Tradovate login">
-    </div>
-    <div class="settings-field">
-      <label>Password</label>
-      <input type="password" id="settings-tv-password" autocomplete="off">
-    </div>
-    <div class="settings-field">
-      <label>App ID</label>
-      <input type="text" id="settings-tv-appid" autocomplete="off" placeholder="MNQ Co-Pilot">
-    </div>
-    <div class="settings-field">
-      <label>API Key (CID) / Secret</label>
-      <div style="display:flex;gap:8px;">
-        <input type="text" id="settings-tv-cid" autocomplete="off" placeholder="cid">
-        <input type="password" id="settings-tv-sec" autocomplete="off" placeholder="secret">
-      </div>
-    </div>
-    <div class="settings-field">
-      <button class="btn-cancel" onclick="testTradovateConn()" style="width:100%">Test Connection</button>
-      <div id="settings-tv-status" style="font-size:11px;margin-top:6px;color:var(--text-dim);line-height:1.5">Not tested. Confirm Lucid allows API access before enabling.</div>
-    </div>
-
     <div class="settings-actions">
       <button class="btn-cancel" onclick="closeSettings()">Cancel</button>
       <button class="btn-save" onclick="saveSettings()">Save</button>
     </div>
-  </div>
+  </div>>>
 </div>
 
 <!-- compromise.js (local UMD bundle, no CDN/API call) — used by Alok in app.js
@@ -1497,6 +1602,25 @@
      definition of what a "state" entry vs a "lesson" is. -->
 <script src="../mind-log.js"></script>
 <script src="../armed-detectors.js"></script>
+<!-- day-plan.js (UMD) — the satisfaction number, the eval pace and the streak
+     gate. Same one file the server reads for every agent's context, so the HUD
+     tag and the sentence Jessi says can never disagree. Must load BEFORE
+     app.js, whose guardrail HUD reads window.DayPlan. -->
+<script src="../day-plan.js"></script>
+<!-- position-protection.js (UMD, 2026-09-21) — resolveAutoProtection + the
+     trailing-stop decide(). Same one file the server enforces, so the Settings
+     band and the enforced band can never come from two different blocks. Loaded
+     BEFORE app.js, whose currentProtection() reads window.PositionProtection. -->
+<script src="../position-protection.js"></script>
+<!-- accounts-index.js (UMD) — one derivation of every account's status, so the
+     picker, the footer and the coaching context cannot disagree about which
+     accounts exist or which are breached. Loaded BEFORE app.js, which renders
+     the account picker from window.AccountsIndex. -->
+<script src="../accounts-index.js"></script>
+<!-- prop-firm-doctrine.js (UMD) — the doctrine the agents run on, shown in the
+     Rules tab so the text driving every persona is readable in the app rather
+     than only inside a prompt. Same ONE copy the server splices into them. -->
+<script src="../prop-firm-doctrine.js"></script>
 <!-- journal-notes.js (UMD) — the stick-rate scorecard maths, shared with
      server.js so the Journal panel and Jessi quote the same numbers. -->
 <script src="../journal-notes.js"></script>

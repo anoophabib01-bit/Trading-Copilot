@@ -4,7 +4,7 @@
 // Anoop, 2026-09-06: "make sure you name a NEW folder naming CLI and use only
 // that folder for all the information related to CLI so that you can refer
 // anytime". Everything about an external market CLI — the binary path, its
-// on-disk state, the wrapper, the docs — lives under G:\MNQ-CoPilot\cli\.
+// on-disk state, the wrapper, the docs — lives under G:\Trading-CoPilot\cli\.
 //
 // ── WHY THIS MODULE EXISTS AT ALL ──────────────────────────────────────────
 // PRINTING_PRESS_INTEGRATION.md proposed a client that would have failed on

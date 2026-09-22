@@ -1,7 +1,7 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { checkTradeCountEscalation, F1_WIN_THRESHOLD, checkInvertedRR } = require('../mistake-patterns.js');
+const { checkTradeCountEscalation, F1_WIN_THRESHOLD, checkInvertedRR, checkPostPayoutRelapse } = require('../mistake-patterns.js');
 
 test('F1_WIN_THRESHOLD is 2, matching the documented "stop at 2 good trades" text', () => {
   assert.equal(F1_WIN_THRESHOLD, 2);
@@ -366,3 +366,101 @@ test('F4: an empty day is not a match', () => {
   assert.strictEqual(checkBreakEvenChurn([], F4OPTS).matched, false);
   assert.strictEqual(checkBreakEvenChurn(null, F4OPTS).matched, false);
 });
+
+
+// ── F5: post-payout relapse (2026-09-19) ───────────────────────────────────
+// Deva's window. The signals are pre-existing ones (cap, size-up-while-red,
+// the rulebook's 5-trade checkpoint); what is new is that they only mean this
+// inside the days that follow a payout.
+const PAYOUT = { date: '2026-09-14', amount: 700 };
+const F5OPTS = { lastPayout: PAYOUT, daysSincePayout: 2, windowDays: 5, overtradeAt: 5, sizeCap: 2 };
+
+test('F5: silent with no payout on record', () => {
+  const r = checkPostPayoutRelapse([{ pnl: -500, size: 9, at: 1 }], { daysSincePayout: 1, sizeCap: 2 });
+  assert.strictEqual(r.matched, false);
+});
+
+test('F5: silent outside the window, however bad the day looks', () => {
+  const bad = [{ pnl: -500, size: 9, at: 1 }, { pnl: -100, size: 9, at: 2 }];
+  const r = checkPostPayoutRelapse(bad, Object.assign({}, F5OPTS, { daysSincePayout: 6 }));
+  assert.strictEqual(r.matched, false);
+});
+
+test('F5: fires on the LAST day of the window, not past it', () => {
+  const bad = [{ pnl: -500, size: 9, at: 1 }];
+  assert.strictEqual(checkPostPayoutRelapse(bad, Object.assign({}, F5OPTS, { daysSincePayout: 5 })).matched, true);
+  assert.strictEqual(checkPostPayoutRelapse(bad, Object.assign({}, F5OPTS, { daysSincePayout: 5.5 })).matched, false);
+});
+
+test('F5: a clean day inside the window is NOT a relapse', () => {
+  const clean = [{ pnl: 120, size: 2, at: 1 }, { pnl: -80, size: 2, at: 2 }];
+  assert.strictEqual(checkPostPayoutRelapse(clean, F5OPTS).matched, false);
+});
+
+test('F5: sizing up while red outranks the other signatures', () => {
+  const r = checkPostPayoutRelapse(
+    [{ pnl: -50, size: 2, at: 1 }, { pnl: -120, size: 5, at: 2 }, { pnl: 5, size: 5, at: 3 }],
+    F5OPTS
+  );
+  assert.strictEqual(r.matched, true);
+  assert.strictEqual(r.kind, 'size-up-into-loss');
+  assert.match(r.message, /from 2 to 5 contracts/);
+  assert.match(r.message, /breached the 150K eval/);
+});
+
+test('F5: a size-up taken while GREEN is not the size-up-into-loss signature', () => {
+  const r = checkPostPayoutRelapse(
+    [{ pnl: 60, size: 2, at: 1 }, { pnl: 10, size: 2, at: 2 }],
+    F5OPTS
+  );
+  assert.strictEqual(r.matched, false);
+});
+
+test('F5: oversize alone fires and names the cap', () => {
+  // A single trade at size 4 against a cap of 2: it is the first trade of the
+  // day, so there is no previous size and the size-up-into-loss signature
+  // cannot apply — this isolates the oversize branch.
+  const r = checkPostPayoutRelapse([{ pnl: -30, size: 4, at: 1 }], F5OPTS);
+  assert.strictEqual(r.kind, 'oversize');
+  assert.match(r.message, /Biggest size today was 4 against a cap of 2/);
+});
+
+test('F5: overtrading fires at the rulebook checkpoint', () => {
+  const five = Array.from({ length: 5 }, (_, i) => ({ pnl: i === 2 ? -5 : 10, size: 1, at: i + 1 }));
+  const r = checkPostPayoutRelapse(five, F5OPTS);
+  assert.strictEqual(r.kind, 'overtrading');
+  assert.match(r.message, /at 5 trades/);
+  assert.match(r.message, /5-trade caution checkpoint/);
+});
+
+test('F5: the threshold and the window both come from the caller (rules.json)', () => {
+  const three = Array.from({ length: 3 }, (_, i) => ({ pnl: 10, size: 1, at: i + 1 }));
+  assert.strictEqual(checkPostPayoutRelapse(three, Object.assign({}, F5OPTS, { overtradeAt: 3 })).matched, true);
+  assert.strictEqual(checkPostPayoutRelapse(three, Object.assign({}, F5OPTS, { overtradeAt: 4 })).matched, false);
+});
+
+test('F5: the message always states the window and the payout it belongs to', () => {
+  const r = checkPostPayoutRelapse([{ pnl: -10, size: 9, at: 1 }], F5OPTS);
+  assert.match(r.message, /trading day 2 of 5/);
+  assert.match(r.message, /\$700 payout on 2026-09-14/);
+  assert.strictEqual(r.lastPayoutDate, '2026-09-14');
+  assert.strictEqual(r.payoutAmount, 700);
+});
+
+test('F5: unverified rows are excluded rather than guessed at', () => {
+  const rows = [{ pnlUnknown: true, size: 20, at: 1 }, { pnl: 10, size: 1, at: 2 }];
+  const r = checkPostPayoutRelapse(rows, F5OPTS);
+  assert.strictEqual(r.matched, false, 'a row whose $ result is unknown cannot prove a signature');
+  assert.strictEqual(r.tradeCount, 1);
+});
+
+test('F5: an empty day inside the window is not a match', () => {
+  assert.strictEqual(checkPostPayoutRelapse([], F5OPTS).matched, false);
+  assert.strictEqual(checkPostPayoutRelapse(null, F5OPTS).matched, false);
+});
+
+test('F5: disabled means silent regardless of the window', () => {
+  const bad = [{ pnl: -500, size: 9, at: 1 }];
+  assert.strictEqual(checkPostPayoutRelapse(bad, Object.assign({}, F5OPTS, { enabled: false })).matched, false);
+});
+

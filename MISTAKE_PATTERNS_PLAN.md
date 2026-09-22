@@ -365,7 +365,7 @@ is a personal app, not a developer tool). Codex unavailable on this machine
 voice, not two. Consensus columns below say so rather than implying agreement
 that was never tested.
 
-Restore point: `~/.gstack/projects/MNQ-CoPilot/master-autoplan-restore-20260820-145527.md`
+Restore point: `~/.gstack/projects/Trading-CoPilot/master-autoplan-restore-20260820-145527.md`
 
 ## Consensus tables
 

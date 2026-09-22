@@ -1,7 +1,7 @@
 'use strict';
 /**
  * token-audit.js — Stage 1 (token economics) exercise, run against the REAL
- * system prompt + tool schema from claude-agent.js in mnq-copilot-workflow.
+ * system prompt + tool schema from claude-agent.js in trading-copilot-workflow.
  *
  * WHAT THIS DOES DIFFERENTLY FROM YOUR CURRENT CODE:
  * Your app manages context by proxy — character counts (MAX_CHARS for CSV)
@@ -125,7 +125,7 @@ async function main() {
   const tools = agent.ALL_TOOLS;
 
   console.log('═══════════════════════════════════════════════════════════');
-  console.log(' STAGE 1 AUDIT — MNQ Co-Pilot / DeepSeek (prompts from claude-agent.js)');
+  console.log(' STAGE 1 AUDIT — Trading Co-Pilot / DeepSeek (prompts from claude-agent.js)');
   console.log('═══════════════════════════════════════════════════════════\n');
 
   // 1. System prompt alone (no tools, no history) — the floor cost of every call

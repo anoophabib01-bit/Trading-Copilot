@@ -174,6 +174,12 @@
     if (trades) parts.push(trades + (lim ? ' ' + lim : '') + ' trades');
     var size = txt('stat-size'); if (size) parts.push(size);
     var brk = txt('stat-break'); if (brk && brk !== '—') parts.push('break ' + brk);
+    // Day plan, summarised on the COLLAPSED row (2026-09-19). The rows themselves
+    // live in the flyout; this line is so the plan is visible without opening it —
+    // Anoop opened the panel and reported not seeing the new rows at all, and a
+    // summary that survives collapsing is the honest fix for that.
+    var chunk = txt('stat-evalchunk'); if (chunk && chunk !== '—') parts.push('chunk ' + chunk);
+    var stops = txt('stat-stopsleft'); if (stops && stops !== '—') parts.push(stops);
     // A NO-GO is the one thing that must survive collapsing, so its reason —
     // not the row's usual stat line — is what the summary shows.
     var badgeTxt = badge ? (badge.textContent || '').trim() : '';

@@ -6,7 +6,7 @@ const path = require('path');
 const AD = require('../account-db.js');
 
 // Build a throwaway DATA/ fixture per test — real fs, temp dir, never touches
-// the actual G:\MNQ-CoPilot\DATA this module runs against in production.
+// the actual G:\Trading-CoPilot\DATA this module runs against in production.
 function makeFixtureAccount(dataDir, slotId, files) {
   const dir = path.join(dataDir, 'accounts', slotId);
   fs.mkdirSync(dir, { recursive: true });

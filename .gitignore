@@ -41,3 +41,27 @@ Untitled.base
 
 # Personal career documents (resume, Upwork profile copy) - not project source.
 career/
+
+# Personal trading rulebook / life record (2026-09-21, Anoop's instruction:
+# "do not give my data of the app"). Prop Trading/CLAUDE.md carries his name,
+# email, city, four Tradovate account IDs, a Lucid dashboard userKey, his
+# lifetime loss figure and a full per-session P&L log. It has NEVER been on the
+# remote — origin/main has no Prop Trading/ tree at all — and this keeps it that
+# way. The folder stays on disk and stays tracked-out; deleting this line plus
+# `git add "Prop Trading"` puts it back if he ever decides otherwise.
+# NOTE: the same file is ALSO written to by hand during sessions, so it must
+# never be swept in by a bare `git add -A`.
+Prop Trading/
+
+# Vision-bridge tooling scratch (2026-09-21). Same class as .dsh-filess/ and
+# .dsh-plugins/ above: an agent tool's own working directory — an npm cache
+# (.npm-cache/_cacache, thousands of files), one-off recon scripts, logs — not
+# part of this project. It sat untracked and would have been swept in by a bare
+# `git add -A`.
+.dsh-vision-bridge/
+
+# Timestamped backups (app.js.bak-2026-09-17, rules.json.bak-enable-<ts>).
+# The blanket `*.bak` above only catches the bare suffix, so this catches the
+# dated variants that a restore procedure leaves behind. Ignored, not deleted:
+# they are the only copy of a file if a restore was never completed.
+*.bak-*

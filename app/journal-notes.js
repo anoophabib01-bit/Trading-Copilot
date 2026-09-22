@@ -46,7 +46,11 @@ function clip(s, max) {
 function hasContent(note) {
   if (!note || typeof note !== 'object') return false;
   return !!(clip(note.lesson, MAX_LESSON) || clip(note.text, MAX_TEXT)
-    || clip(note.mood, 40) || clip(note.mistake, 40) || clip(note.followedPlan, 10));
+    || clip(note.mood, 40) || clip(note.mistake, 40) || clip(note.followedPlan, 10)
+    // 2026-09-19: a day where he filled in ONLY the loss-journal fields is not
+    // an empty day — treating it as one would hide exactly what he bothered to write.
+    || clip(note.entryCriteria, MAX_TEXT) || clip(note.exitCriteria, MAX_TEXT)
+    || clip(note.stateAtEntry, 40) || clip(note.stateNow, 40));
 }
 
 /**
@@ -111,6 +115,19 @@ function formatOne(row) {
   if (text) lines.push('  What he wrote: "' + text + '"');
   const lesson = clip(n.lesson, MAX_LESSON);
   if (lesson) lines.push('  Lesson he set for himself: "' + lesson + '"');
+  // The loss-journal fields (two-journal split, 2026-09-19). Deva's point was
+  // that a losing day needs data a winning day does not: the criteria he
+  // actually applied, and his state at entry versus after the loss. Goes in
+  // VERBATIM like every other field here — his own sentence is the signal, not
+  // my summary of it, and an agent that rewrites it loses the only thing that
+  // makes it land.
+  const entry = clip(n.entryCriteria, MAX_TEXT);
+  const exit = clip(n.exitCriteria, MAX_TEXT);
+  if (entry) lines.push('  Entry criteria he recorded: "' + entry + '"');
+  if (exit) lines.push('  Exit criteria he recorded: "' + exit + '"');
+  const sEntry = clip(n.stateAtEntry, 40);
+  const sNow = clip(n.stateNow, 40);
+  if (sEntry || sNow) lines.push('  State at entry: ' + (sEntry || '—') + '  →  after the loss: ' + (sNow || '—'));
   return lines.join('\n');
 }
 

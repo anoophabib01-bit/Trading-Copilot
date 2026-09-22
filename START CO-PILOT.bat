@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableDelayedExpansion
-title MNQ Co-Pilot - start everything
+title Trading Co-Pilot - start everything
 color 0A
 
 REM ============================================================================
@@ -45,12 +45,15 @@ REM  If TradingView is ALREADY running with the debug port open, this now reuses
 REM  it instead of killing a working chart and paying the cold start again.
 REM ============================================================================
 
-set "ROOT=G:\MNQ-CoPilot"
+set "ROOT=G:\Trading-CoPilot"
+REM The project folder was renamed 2026-09-18. Prefer the new name, fall back to
+REM the old one, so this launcher works whether or not the rename has happened.
+if not exist "%ROOT%\app\server.js" if exist "G:\MNQ-CoPilot\app\server.js" set "ROOT=G:\MNQ-CoPilot"
 set "PS=powershell -NoProfile -ExecutionPolicy Bypass -File"
 
 echo.
 echo  ============================================
-echo    MNQ CO-PILOT
+echo    TRADING CO-PILOT
 echo  ============================================
 
 REM Say out loud which mode this is. Which shortcut you double-click is the
@@ -73,12 +76,38 @@ if not exist "%ROOT%\app\server.js" (
     pause & exit /b 1
 )
 
+REM ------------------------------------------------------- first-run check ---
+REM  A trader who has never completed setup has no app\profile.json, and
+REM  app\rules.json still holds the numbers of whoever configured it first.
+REM  Say so plainly, offer the wizard, but NEVER block the launch -- this same
+REM  launcher is how the original owner gets to his own trading day, and a
+REM  guard that locks him out of his own app would be worse than the problem.
+REM  Default after the timeout is C (continue), not S.
+if not exist "%ROOT%\app\profile.json" (
+    echo  [i] This install has not been through setup yet.
+    echo      No app\profile.json, so app\rules.json may still hold
+    echo      another trader's limits. Check them before you trade.
+    echo.
+    choice /C SC /T 20 /D C /N /M "      [S] Run setup first    [C] Start Co-Pilot anyway (auto-continues in 20s) "
+    if errorlevel 2 goto :skip_setup
+    echo.
+    echo  [i] Launching setup on http://127.0.0.1:7434 ...
+    echo      Finish the wizard, then run this launcher again.
+    echo.
+    cd /d "%ROOT%"
+    start "Co-Pilot Setup" cmd /k "node setup\server.js"
+    pause
+    exit /b 0
+)
+:skip_setup
+
+
 REM ------------------------------------------------------------ TradingView ---
 echo  [1/2] Making sure TradingView is up with the debug connection...
 %PS% "%~dp0scripts\ensure-tradingview.ps1" -Port 9222 -TimeoutSec 90
 if errorlevel 1 (
     echo.
-    echo       [!] TradingView is not answering on port 9222.
+    echo       [i] TradingView is not answering on port 9222.
     echo           Chart features will be down until it is. The server keeps
     echo           retrying on its own heartbeat, so it may still recover.
 ) else (

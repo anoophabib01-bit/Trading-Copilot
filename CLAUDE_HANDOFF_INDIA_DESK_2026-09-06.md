@@ -39,7 +39,7 @@ Measured: `sync --full` and `workflow archive --full` with no `--resources` both
 ## Remaining (not DSH this pass)
 
 - **`auth login --chrome`** (one-time, above) — unblocks the sync.
-- **Schedule I0.2** — Windows Task Scheduler daily after 15:30 IST: `node G:\MNQ-CoPilot\cli\india-desk\sync.js`. Survives reboot.
+- **Schedule I0.2** — Windows Task Scheduler daily after 15:30 IST: `node G:\Trading-CoPilot\cli\india-desk\sync.js`. Survives reboot.
 - **I2.1** — turn the cold panel live once warm; read each command's `--help` for real shapes (`PRINTING_PRESS_INTEGRATION.md` shapes are invented and wrong).
 - **Out of scope, restated** — no India→MNQ link, no write path, no Telegram, binaries stay in the printing-press install root.
 
@@ -92,7 +92,7 @@ these two: a per-CLI capability the wrapper treated as universal.
   false claim. Added `dbPathFor(name)` and a **first-class `db` option** on both `run()` and
   `runNdjson()`: `db: true` appends `--db cli/state/<name>/data.db` and creates the directory;
   `db: '<path>'` overrides. Verified: `index-driver` with `db:true` sends
-  `--db G:\MNQ-CoPilot\cli\state\nse-india\data.db`, and `movers` without it still returns 20 rows.
+  `--db G:\Trading-CoPilot\cli\state\nse-india\data.db`, and `movers` without it still returns 20 rows.
   **DSH can now drop the hand-passed `--db` strings in `sync.js` and `nse.js` in favour of
   `{ db: true }`** — same behaviour, one place to change it.
 - **`cli/README.md`** — the three relocation claims corrected, plus new Verified-facts entries for

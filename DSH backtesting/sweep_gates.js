@@ -1,15 +1,15 @@
 'use strict';
 const fs = require('fs');
-const backtest = require('G:/MNQ-CoPilot/app/backtest');
-const detectors = require('G:/MNQ-CoPilot/app/detectors');
-const spec = require('G:/MNQ-CoPilot/app/playbook-spec');
-const playbookC = require('G:/MNQ-CoPilot/app/playbook-c');
+const backtest = require('G:/Trading-CoPilot/app/backtest');
+const detectors = require('G:/Trading-CoPilot/app/detectors');
+const spec = require('G:/Trading-CoPilot/app/playbook-spec');
+const playbookC = require('G:/Trading-CoPilot/app/playbook-c');
 const TOL = 0.0005;
 
-const rules = JSON.parse(fs.readFileSync('G:/MNQ-CoPilot/app/rules.json', 'utf8'));
+const rules = JSON.parse(fs.readFileSync('G:/Trading-CoPilot/app/rules.json', 'utf8'));
 function loadBars(f){ const d = JSON.parse(fs.readFileSync(f,'utf8')); const b = Array.isArray(d)?d:(d.bars||[]); return b.filter(x=>x&&typeof x.time==='number'&&typeof x.close==='number'); }
-const b60 = loadBars('G:/MNQ-CoPilot/DATA/bars/mnq_60.json');
-const b240 = loadBars('G:/MNQ-CoPilot/DATA/bars/mnq_240.json');
+const b60 = loadBars('G:/Trading-CoPilot/DATA/bars/mnq_60.json');
+const b240 = loadBars('G:/Trading-CoPilot/DATA/bars/mnq_240.json');
 const spanDays = (b60[b60.length-1].time - b60[0].time)/86400;
 const pad = (v,n)=>String(v).padEnd(n);
 const bump = (o,k)=>o[k]=(o[k]||0)+1;

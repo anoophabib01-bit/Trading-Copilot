@@ -87,20 +87,52 @@
   }
 
   /**
+   * Resolve the EFFECTIVE protection numbers for a stage ('eval' | 'funded').
+   *
+   * rules.json's autoProtection now carries a per-stage map (eval / funded), each
+   * with stopLossUsd / takeProfitUsd / breakEvenAtUsd / trailDistanceUsd, so the
+   * band can be tighter in evaluation and looser once funded. Falls back to the
+   * FLAT keys (stopLossUsd etc. on the block itself) so any caller or config that
+   * predates the per-stage split keeps working unchanged. `trailEnabled` is
+   * derived, never typed separately: the trail runs only when BOTH trail numbers
+   * are positive.
+   */
+  function resolveAutoProtection(autoProtection, mode) {
+    const base = autoProtection || {};
+    const stage = (mode === 'funded' ? base.funded : base.eval) || {};
+    const pick = (k) => (stage[k] != null ? stage[k] : base[k]);
+    const be = Number(pick('breakEvenAtUsd'));
+    const trail = Number(pick('trailDistanceUsd'));
+    return {
+      enabled: base.enabled !== false,
+      stopLossUsd: pick('stopLossUsd'),
+      takeProfitUsd: pick('takeProfitUsd'),
+      breakEvenAtUsd: be,
+      trailDistanceUsd: trail,
+      trailEnabled: Number.isFinite(be) && be > 0 && Number.isFinite(trail) && trail > 0,
+    };
+  }
+
+  /**
    * @param {{side:string, size:number, entryPrice?:number, lastPrice?:number,
    *          unrealisedUsd?:number|null, pointValue?:number, stopLossUsd:number,
-   *          takeProfitUsd:number, enabled?:boolean, alreadyAttempted?:boolean}} input
-   * @returns {{action:'none'|'close'|'blind', reason:string, unrealisedUsd:number|null, source:string}}
+   *          takeProfitUsd:number, breakEvenAtUsd?:number, trailDistanceUsd?:number,
+   *          peakUsd?:number|null, enabled?:boolean, alreadyAttempted?:boolean}} input
+   * @returns {{action:'none'|'close'|'blind', reason:string, unrealisedUsd:number|null,
+   *            source:string, peakUsd:number|null, stopLevelUsd:number|null}}
    */
   function decide(input) {
     const i = input || {};
     const stop = Number(i.stopLossUsd);
     const target = Number(i.takeProfitUsd);
+    const be = Number(i.breakEvenAtUsd);
+    const trail = Number(i.trailDistanceUsd);
     const size = Number(i.size);
-    if (i.enabled === false) return { action: 'none', reason: 'protection disabled in rules.json', unrealisedUsd: null, source: 'disabled' };
-    if (!(size > 0)) return { action: 'none', reason: 'no open position', unrealisedUsd: null, source: 'flat' };
-    if (!(stop > 0) || !(target > 0)) return { action: 'blind', reason: 'autoProtection stop/target missing or non-positive in rules.json', unrealisedUsd: null, source: 'rules' };
-    if (i.alreadyAttempted) return { action: 'none', reason: 'already attempted a close for this position', unrealisedUsd: null, source: 'latch' };
+    const early = (reason, source) => ({ action: 'none', reason, unrealisedUsd: null, source, peakUsd: null, stopLevelUsd: null });
+    if (i.enabled === false) return early('protection disabled in rules.json', 'disabled');
+    if (!(size > 0)) return early('no open position', 'flat');
+    if (!(stop > 0) || !(target > 0)) return { action: 'blind', reason: 'autoProtection stop/target missing or non-positive in rules.json', unrealisedUsd: null, source: 'rules', peakUsd: null, stopLevelUsd: null };
+    if (i.alreadyAttempted) return early('already attempted a close for this position', 'latch');
 
     let usd = (i.unrealisedUsd === null || i.unrealisedUsd === undefined) ? null : Number(i.unrealisedUsd);
     let source = 'broker';
@@ -109,13 +141,35 @@
       source = 'prices';
     }
     if (usd === null || !Number.isFinite(usd)) {
-      return { action: 'blind', reason: 'P&L unreadable (no broker figure and no usable price/entry)', unrealisedUsd: null, source: 'unreadable' };
+      return { action: 'blind', reason: 'P&L unreadable (no broker figure and no usable price/entry)', unrealisedUsd: null, source: 'unreadable', peakUsd: null, stopLevelUsd: null };
     }
 
-    if (usd <= -stop) return { action: 'close', reason: 'STOP: ' + usd.toFixed(2) + ' is at or past -' + stop, unrealisedUsd: usd, source };
-    if (usd >= target) return { action: 'close', reason: 'TARGET: +' + usd.toFixed(2) + ' is at or past +' + target, unrealisedUsd: usd, source };
-    return { action: 'none', reason: 'inside the band (' + usd.toFixed(2) + ')', unrealisedUsd: usd, source };
+    // High-water mark of unrealised profit. Tracks only up, and is held by the
+    // CALLER across polls (this function is pure): the server stores it in
+    // positionProtectionState.peakUsd and resets it on flat / a new position.
+    const peakIn = Number(i.peakUsd);
+    const peak = Number.isFinite(peakIn) ? Math.max(peakIn, usd) : usd;
+
+    // Trailing stop (2026-09-21). Once unrealised profit has EVER reached
+    // breakEvenAtUsd, the protective stop rises to max(break-even, peak −
+    // trailDistanceUsd) and can only rise from there; below that threshold the
+    // fixed −stop still applies. The single expression IS the break-even lock:
+    // at the instant peak == be the stop is be − trail (0 when be == trail), so a
+    // trade that ran to the trigger can no longer close as a loss.
+    const trailArmed = be > 0 && trail > 0 && peak >= be;
+    const stopLevel = trailArmed ? Math.max(0, peak - trail) : -stop;
+
+    if (usd >= target) return { action: 'close', reason: 'TARGET: +' + usd.toFixed(2) + ' is at or past +' + target, unrealisedUsd: usd, source, peakUsd: peak, stopLevelUsd: stopLevel };
+    if (trailArmed && usd <= stopLevel) return { action: 'close', reason: 'TRAIL: ' + usd.toFixed(2) + ' fell to the trailing stop at +' + stopLevel.toFixed(2) + ' (peak ' + peak.toFixed(2) + ')', unrealisedUsd: usd, source, peakUsd: peak, stopLevelUsd: stopLevel };
+    if (!trailArmed && usd <= -stop) return { action: 'close', reason: 'STOP: ' + usd.toFixed(2) + ' is at or past -' + stop, unrealisedUsd: usd, source, peakUsd: peak, stopLevelUsd: stopLevel };
+    return {
+      action: 'none',
+      reason: trailArmed
+        ? 'inside the band (' + usd.toFixed(2) + ') — trailing stop armed at +' + stopLevel.toFixed(2)
+        : 'inside the band (' + usd.toFixed(2) + ')',
+      unrealisedUsd: usd, source, peakUsd: peak, stopLevelUsd: stopLevel,
+    };
   }
 
-  return { decide, unrealisedUsd, parseMoney, closingSideFor };
+  return { decide, unrealisedUsd, parseMoney, closingSideFor, resolveAutoProtection };
 });

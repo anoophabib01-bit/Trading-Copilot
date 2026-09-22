@@ -18,8 +18,19 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const CONFIG_PATH = path.join(os.homedir(), '.mnq-copilot-config.json');
-const DEFAULT_DATA_DIR = 'G:\\MNQ-CoPilot\\DATA';
+const CONFIG_PATH = path.join(os.homedir(), '.trading-copilot-config.json');
+// The project folder was renamed MNQ-CoPilot -> Trading-CoPilot (2026-09-18).
+// Anchor on app/server.js rather than the bare folder name: a stray empty
+// G:\Trading-CoPilot (a DSH session artifact) must never be mistaken for the
+// real project, or DATA would silently move to a fresh empty directory.
+function pickProjectRoot() {
+  const candidates = ['G:\\Trading-CoPilot', 'G:\\MNQ-CoPilot'];
+  for (let i = 0; i < candidates.length; i++) {
+    try { if (fs.existsSync(path.join(candidates[i], 'app', 'server.js'))) return candidates[i]; } catch (e) {}
+  }
+  return 'G:\\MNQ-CoPilot';
+}
+const DEFAULT_DATA_DIR = path.join(pickProjectRoot(), 'DATA');
 const FALLBACK_DATA_DIR = path.join(__dirname, 'data');
 
 function loadConfiguredDataDir() {

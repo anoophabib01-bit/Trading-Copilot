@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert');
-const { sizeUpAfterLossViolation } = require('../renderer/size-freeze-guard.js');
+const { sizeUpAfterLossViolation, sizeUpAfterLossReading } = require('../renderer/size-freeze-guard.js');
 
 test('THE PATTERN THIS CATCHES: size rises right after a loss, even on a net-positive day', () => {
   // Two winning trades first (day is +$50), THEN a loss, THEN a size-up.
@@ -97,4 +97,67 @@ test('regression: normal (non-inferred) trade behavior is completely unchanged',
   assert.strictEqual(sizeUpAfterLossViolation([{ size: 4, pnl: -30 }], 2), false);
   assert.strictEqual(sizeUpAfterLossViolation([{ size: 2, pnl: 30 }], 4), false);
   assert.strictEqual(sizeUpAfterLossViolation([{ size: 2, pnl: 0 }], 4), false);
+});
+
+// ── 2026-09-21: A SCRATCH IS NOT A LOSS ─────────────────────────────────────
+// The guard raised the full-screen "DAILY STOP HIT" on a day that closed
+// +$124.30 over 4 trades at a max size of 4/4 — every limit intact. The trigger
+// was trade 2: 4 contracts after trade 1 closed -$0.90 on 1 contract.
+
+test('the real 2026-09-21 false stop: 1 lot at -$0.90, then 4 lots, is NOT a violation', () => {
+  const trades = [{ size: 1, pnl: -0.9 }];
+  assert.strictEqual(sizeUpAfterLossViolation(trades, 4, { breakEvenBandUsd: 100 }), false);
+});
+
+test('that same shape is reported as a scratch, with the band named', () => {
+  const read = sizeUpAfterLossReading([{ size: 1, pnl: -0.9 }], 4, { breakEvenBandUsd: 100 });
+  assert.strictEqual(read.violation, false);
+  assert.strictEqual(read.level, 'scratch');
+  assert.match(read.reason, /break-even band/);
+});
+
+test('a REAL loss followed by a size-up is still a hard violation inside the band rule', () => {
+  const trades = [{ size: 2, pnl: -126 }];
+  assert.strictEqual(sizeUpAfterLossViolation(trades, 4, { breakEvenBandUsd: 100 }), true);
+});
+
+test('the band boundary itself counts as a loss — the band is a strict interior', () => {
+  assert.strictEqual(sizeUpAfterLossViolation([{ size: 2, pnl: -100 }], 4, { breakEvenBandUsd: 100 }), true);
+  assert.strictEqual(sizeUpAfterLossViolation([{ size: 2, pnl: -99.99 }], 4, { breakEvenBandUsd: 100 }), false);
+});
+
+test('NO BAND SUPPLIED is the old behaviour — every negative close is a loss', () => {
+  // Fail SAFE: a missing rules key must not silently arm a permissive band.
+  assert.strictEqual(sizeUpAfterLossViolation([{ size: 1, pnl: -0.9 }], 4), true);
+  assert.strictEqual(sizeUpAfterLossViolation([{ size: 1, pnl: -0.9 }], 4, {}), true);
+  assert.strictEqual(sizeUpAfterLossViolation([{ size: 1, pnl: -0.9 }], 4, { breakEvenBandUsd: 0 }), true);
+  assert.strictEqual(sizeUpAfterLossViolation([{ size: 1, pnl: -0.9 }], 4, { breakEvenBandUsd: -5 }), true);
+});
+
+test('a scratch still cannot be a violation when the size does NOT rise', () => {
+  assert.strictEqual(sizeUpAfterLossViolation([{ size: 4, pnl: -0.9 }], 4, { breakEvenBandUsd: 100 }), false);
+  assert.strictEqual(sizeUpAfterLossViolation([{ size: 4, pnl: -0.9 }], 2, { breakEvenBandUsd: 100 }), false);
+});
+
+test('the reading quotes the size the decision was made on, not the raw one (inferred case)', () => {
+  const trades = [
+    { size: 5, pnl: 20 },
+    { size: 0, pnl: -300, inferred: true },
+  ];
+  const read = sizeUpAfterLossReading(trades, 6, { breakEvenBandUsd: 100 });
+  assert.strictEqual(read.violation, true);
+  assert.strictEqual(read.prevSize, 5, 'must name the substituted day-max, not the literal 0');
+  assert.match(read.reason, /after a -300 loss on 5 contracts/);
+});
+
+test('a scratch previous trade is excluded regardless of how the size compares', () => {
+  const trades = [{ size: 1, pnl: -99 }, { size: 4, pnl: -12 }]; // second is a scratch, and the most recent
+  assert.strictEqual(sizeUpAfterLossViolation(trades, 6, { breakEvenBandUsd: 100 }), false);
+});
+
+test('reading never throws on garbage, band or no band', () => {
+  assert.doesNotThrow(() => sizeUpAfterLossReading(null, 4, { breakEvenBandUsd: 100 }));
+  assert.doesNotThrow(() => sizeUpAfterLossReading([{ size: 'x', pnl: -10 }], 4, { breakEvenBandUsd: 100 }));
+  assert.doesNotThrow(() => sizeUpAfterLossReading([{ size: 2, pnl: -10 }], NaN, { breakEvenBandUsd: 100 }));
+  assert.strictEqual(sizeUpAfterLossReading(null, 4, { breakEvenBandUsd: 100 }).violation, false);
 });

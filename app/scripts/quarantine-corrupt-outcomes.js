@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const dir = 'G:/MNQ-CoPilot/DATA/signals';
+const dir = 'G:/Trading-CoPilot/DATA/signals';
 const NL = String.fromCharCode(10);
 const files = fs.readdirSync(dir).filter(f => f.endsWith('.outcomes.jsonl'));
 let quarantined = 0;

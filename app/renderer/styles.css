@@ -1075,16 +1075,91 @@ body.panel-resizing * { user-select: none !important; }
   justify-content: center;
 }
 #settings-overlay.visible { display: flex; }
+/* ── Settings: VERTICAL TABS (2026-09-21) ──────────────────────────────────
+   Rebuilt at Anoop's request ('make it vertical and with tabs'). The previous
+   version was one column of ~40 fields in a scroll box, then eight collapsed
+   <details> — and the collapse swallowed the Save and Cancel buttons into the
+   Tradovate section, so there was no way to save. Tabs cannot hide the footer:
+   .settings-actions is a sibling of the layout, outside every pane. */
+/* ── THE FOOTER MUST NOT BE LOSABLE (2026-09-21, third report of this) ─────
+   Save and Cancel went missing TWICE. First they were inside a collapsed
+   <details>. Then, with the flex layout, `max-height` + `overflow: hidden` on a
+   flex COLUMN is the classic way to clip a footer: the scrollable middle child
+   grows to its content, the box is capped, and `.settings-actions` is pushed
+   past the clipped bottom edge — present in the DOM, invisible on screen.
+    (a) a DEFINITE height, not max-height: a flex column with a real height
+        makes its children obey it, where max-height is only a ceiling;
+   (b) the footer is sticky to the bottom of the box as well, so even if some
+        future layout change reintroduces the overflow, it pins instead of
+        leaving; and `flex-shrink: 0` so it can never be squeezed to nothing. */
 #settings-box {
   background: var(--surface);
   border: 1px solid var(--border2);
   border-radius: var(--radius-lg);
-  padding: 28px;
-  width: 420px;
-  max-height: 84vh;
-  overflow-y: auto;
+  width: min(780px, 95vw);
+  height: min(88vh, 760px);
+  display: flex; flex-direction: column;
+  overflow: hidden;
   box-shadow: var(--shadow-3);
+  resize: none;
 }
+.settings-head { flex: 0 0 auto; padding: 16px 20px 10px; border-bottom: 1px solid var(--border); }
+.settings-head h2 { margin: 0; font-size: 15px; }
+.settings-layout { flex: 1 1 auto; display: flex; min-height: 0; }
+
+/* The rail: vertical list of sections, always visible, never scrolled away. */
+.settings-rail {
+  flex: 0 0 138px; display: flex; flex-direction: column; gap: 2px;
+  padding: 12px 10px; border-right: 1px solid var(--border); overflow-y: auto;
+}
+.settings-tab {
+  text-align: left; background: transparent; border: none; font-family: inherit;
+  color: var(--text-dim); font-size: 12.5px; padding: 8px 10px;
+  border-radius: 7px; cursor: pointer; line-height: 1.3;
+}
+.settings-tab:hover { background: var(--surface3); color: var(--text); }
+.settings-tab.is-active { background: var(--surface3); color: var(--text); font-weight: 600; box-shadow: inset 2px 0 0 var(--accent, var(--green)); }
+
+/* The pane: only the selected section is in the DOM's layout, so the scroll
+   is one screen instead of forty fields. */
+/* min-height: 0 is REQUIRED on a flex item that scrolls inside a flex parent —
+   without it the item refuses to shrink below its content and overflows instead. */
+.settings-panes { flex: 1 1 auto; min-width: 0; min-height: 0; overflow-y: auto; padding: 16px 20px 20px; }
+.settings-pane { display: none; }
+.settings-pane.is-active { display: block; }
+.settings-pane-title {
+  font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--text-dim); margin: 0 0 12px;
+}
+
+/* The footer: a SIBLING of .settings-layout, never inside a pane. */
+.settings-actions {
+  flex: 0 0 auto; flex-shrink: 0; display: flex; gap: 8px; justify-content: flex-end;
+  padding: 12px 20px; border-top: 1px solid var(--border);
+  position: sticky; bottom: 0; z-index: 5;
+  background: var(--surface);
+  border-bottom-left-radius: var(--radius-lg);
+  border-bottom-right-radius: var(--radius-lg);
+}
+
+/* ── Settings action buttons (2026-09-21) ──────────────────────────────────
+   These used .sizecap-btn — the titlebar's tiny '− Cap 4 +' control — which is
+   background:transparent, border:none, line-height:1 and has no padding. For a
+   one-character control that is fine; for 'Check rubric stability' it renders
+   INVISIBLE and its wrapped lines OVERLAP each other, because line-height:1
+   leaves no room between wrapped lines. Anoop reported exactly that. This is a
+   real button: visible surface, padding, and normal line height. */
+.settings-action-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--surface3); color: var(--text);
+  border: 1px solid var(--border2); border-radius: 8px;
+  padding: 7px 11px; font-size: 12px; font-weight: 600; font-family: inherit;
+  line-height: 1.35; white-space: nowrap; cursor: pointer;
+}
+.settings-action-btn:hover { background: var(--surface2); border-color: var(--text-dim); }
+.settings-action-btn:disabled { opacity: .55; cursor: default; }
+
+
 #settings-box h2 {
   font-size: 15px;
   font-weight: 700;
@@ -1102,14 +1177,25 @@ body.panel-resizing * { user-select: none !important; }
   padding-top: 14px;
 }
 .settings-field { margin-bottom: 14px; }
+/* ── Settings typography (2026-09-21) ──────────────────────────────────────
+   These were UPPERCASE with letter-spacing, so a 111-character label rendered
+   as a wall of capitals and the panel read as noise rather than as settings.
+   Sentence case, one shade brighter, normal spacing. Labels are being SHORTENED
+   to names at the same time — a sentence belongs in the hint, not the label. */
 .settings-field label {
   display: block;
-  font-size: 11px;
-  color: var(--text-dim);
-  margin-bottom: 6px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: 5px;
+  letter-spacing: 0;
+  line-height: 1.35;
 }
+.settings-field label label, .settings-field label input[type="checkbox"] { display: inline; }
+.settings-field + .settings-field { margin-top: 12px; }
+/* The hint: one quiet line, never a paragraph. It carries the sentence the
+   label used to shout. */
+.settings-hint { font-size: 11px; line-height: 1.45; color: var(--text-dim); margin-top: 5px; }
 .settings-field input {
   width: 100%;
   background: var(--surface2);
@@ -1732,6 +1818,10 @@ input.ladder-in{width:62px;background:var(--surface);border:1px solid var(--bord
 @keyframes gr-stop-pulse{0%,100%{box-shadow:var(--shadow-3),0 0 0 0 rgba(220,38,38,.45);}50%{box-shadow:var(--shadow-3),0 0 0 14px rgba(220,38,38,0);}}
 #gr-stop-overlay .gr-stop-title{font-size:22px;font-weight:800;color:var(--red);margin-bottom:10px;}
 #gr-stop-overlay .gr-stop-sub{font-size:13px;color:var(--text-mid);line-height:1.6;margin-bottom:16px;}
+/* WHICH limit stopped the day, with the numbers (2026-09-21). Sits between the
+   title and the generic instruction, which is the order he reads: what happened,
+   then what to do. Empty on any stop recorded before stopReason existed. */
+#gr-stop-overlay .gr-stop-reason{font-size:13px;font-weight:600;color:var(--text);line-height:1.55;margin-bottom:12px;padding:10px 12px;border:1px solid var(--border2);border-radius:var(--radius-sm);background:var(--surface2);text-align:left;}
 /* 2026-08-16: mandatory-pause message — visible only while the ack control
    below is disabled (grShowStop() sets its text; empty when unlocked, so an
    empty div takes no visual space). */
@@ -2430,6 +2520,72 @@ html.theme-dark #send-btn {
    reads as "this happened" rather than "you wrote this". */
 .dj-tvkill { margin-top: 9px; padding: 6px 10px; border-radius: 8px; background: color-mix(in srgb, var(--amber) 14%, transparent); border: 1px solid color-mix(in srgb, var(--amber) 40%, transparent); font-size: 11.5px; color: var(--text-dim); }
 .dj-tvkill-label { font-weight: 600; color: var(--amber); margin-right: 4px; }
+/* Two journals (2026-09-19). Deva's split: the questions that matter after a
+   WIN (what to repeat) are not the ones that matter after a LOSS (why it
+   happened). The day's own P&L picks the form, so the header always states
+   which journal he is writing in. */
+/* Day plan in the Analysis tab (2026-09-19) — the third view of the plan. */
+.dayplan-tab-ctl { display: inline-flex; align-items: center; gap: 3px; margin-left: 12px; vertical-align: middle; }
+.dp-ctl-label { font-size: 9px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-dim); }
+.dayplan-tab-ctl .sizecap-val { font-size: 11px; min-width: 30px; text-align: center; }
+.dayplan-tab-line { font-size: 11.5px; color: var(--text-dim); line-height: 1.5; margin-top: 2px; }
+.dayplan-tab-line.dp-done { color: var(--green); font-weight: 700; }
+.dayplan-tab-line.dp-warn { color: var(--amber); }
+.dayplan-tab-line.dp-dim { opacity: .72; }
+
+/* ── Playbook registry rows (Phase 2, 2026-09-19) ────────────────────────────
+   A toggle, a name and one measured line per playbook. The toggle is the only
+   control in this panel and it is deliberately plain: it switches what the app
+   SHOWS and MEASURES, and the shadow tag beside the name is what says whether
+   anything could ever be placed. */
+.router-row {
+  display: flex; align-items: baseline; gap: 6px;
+  padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,.04);
+}
+.router-row:last-child { border-bottom: 0; }
+.router-toggle {
+  flex: 0 0 auto; min-width: 40px; padding: 1px 6px;
+  font-size: 10px; font-weight: 700; letter-spacing: .04em;
+  background: rgba(255,255,255,.06); color: var(--text-dim);
+  border: 1px solid rgba(255,255,255,.12); border-radius: 3px; cursor: pointer;
+}
+.router-toggle.on { background: rgba(60,200,120,.16); color: var(--green); border-color: rgba(60,200,120,.35); }
+.router-toggle.locked { cursor: default; opacity: .85; }
+.router-toggle:not(.locked):hover { border-color: rgba(255,255,255,.3); }
+.router-name { flex: 0 0 auto; font-size: 11.5px; color: var(--text); }
+.router-detail { flex: 1 1 auto; text-align: right; font-size: 10.5px; color: var(--text-dim); }
+/* The composite breakdown: the per-dimension percentage leads, so the shape of
+   the grade is readable before the words are. */
+.router-comp-val {
+  flex: 0 0 auto; min-width: 34px; text-align: right; font-size: 11px; font-weight: 700;
+  color: var(--text); font-variant-numeric: tabular-nums;
+}
+#router-composite { margin-top: 4px; }
+.router-tag {
+  font-size: 9px; text-transform: uppercase; letter-spacing: .05em;
+  padding: 0 3px; border-radius: 2px;
+  background: rgba(255,255,255,.07); color: var(--text-dim);
+}
+
+/* Plan chip (2026-09-21, consolidated) — the always-visible entry to the
+   day plan. Replaced the old #dayplan-chip + #sizecap-chip pair: the cap
+   adjuster and the day plan opener are now one chip that opens the Today
+   flyout, which is the single home of every control. */
+#plan-chip { display: flex; align-items: center; gap: 6px; padding: 3px 10px; margin-right: 8px;
+  border: 1px solid var(--border2); border-radius: 999px; background: var(--surface2);
+  font-size: 11px; font-family: 'JetBrains Mono', monospace; color: var(--text-mid);
+  cursor: pointer; white-space: nowrap; }
+#plan-chip:hover { border-color: var(--accent); color: var(--text); }
+#plan-chip.plan-reached { border-color: var(--green); color: var(--green); }
+#plan-chip.plan-warn { border-color: var(--amber); color: var(--amber); }
+
+/* Two journals (2026-09-19) — the tab-level count behind the per-day split. */
+.jr-journal-split { font-size: 12px; line-height: 1.5; padding: 6px 10px; margin: 0 0 10px;
+  background: var(--surface3); border: 1px solid var(--border); border-radius: 8px; color: var(--text-dim); }
+.dj-jhead { margin: 8px 0 6px; padding: 5px 9px; border-radius: 7px; font-size: 11px; line-height: 1.35;
+  background: var(--surface3); border: 1px solid var(--border); color: var(--text-dim); }
+.dj-jhead.dj-jloss { background: color-mix(in srgb, var(--red) 12%, transparent); border-color: color-mix(in srgb, var(--red) 38%, transparent); color: var(--red); }
+.dj-jhead.dj-jwin { background: color-mix(in srgb, var(--green) 12%, transparent); border-color: color-mix(in srgb, var(--green) 38%, transparent); color: var(--green); }
 .dj-fields { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 7px; }
 .dj-f { display: flex; flex-direction: column; gap: 3px; }
 .dj-f span { font-size: 9px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-dim); }
@@ -3131,34 +3287,6 @@ html.theme-dark .analysis-block { padding: 14px; margin-bottom: 14px; }
                                animation: og-pulse 1.6s ease-in-out infinite; }
 #oversize-chip.og-off        { color: var(--text-dim); border-style: dashed; }
 @keyframes og-pulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
-
-/* Size cap, sat beside the guard that enforces it (2026-09-05). Deliberately
-   the same pill geometry as #oversize-chip so the two read as one control —
-   the number and the switch that acts on it. Neutral, never coloured: the
-   guard's chip owns the alarm states, and two pulsing red things next to each
-   other would dilute the one that means "size is unenforced right now". */
-#sizecap-chip {
-  display: inline-flex; align-items: center; gap: 4px;
-  padding: 2px 4px 2px 4px; margin-right: 8px;
-  border-radius: 11px; font-size: 11px; font-weight: 600;
-  letter-spacing: .02em; user-select: none; white-space: nowrap;
-  border: 1px solid var(--border); background: var(--surface);
-  color: var(--text-dim);
-}
-#sizecap-chip .sizecap-chip-k { color: var(--text-dim); font-weight: 600; }
-#sizecap-chip .sizecap-val {
-  min-width: 12px; text-align: center;
-  color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums;
-}
-#sizecap-chip .sizecap-btn {
-  border: none; background: transparent; color: var(--text-dim);
-  font-size: 13px; line-height: 1; font-weight: 700;
-  padding: 2px 5px; border-radius: 7px; cursor: pointer; font-family: inherit;
-}
-#sizecap-chip .sizecap-btn:hover:not(:disabled) { background: var(--surface2); color: var(--text); }
-/* At the floor or the ceiling the button must LOOK spent, not merely refuse to
-   work — a + that still lights up at 6 reads as a broken app, not a limit. */
-#sizecap-chip .sizecap-btn:disabled { opacity: .3; cursor: default; }
 
 /* ── Forensics tab (2026-09-05) ───────────────────────────────────────────
    Reuses the existing palette variables so it themes with everything else.

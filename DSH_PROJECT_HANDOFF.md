@@ -37,14 +37,14 @@ That changes what "done" means for you:
 
 ## 2. The one-copy rule — read this before you open anything
 
-`G:\MNQ-CoPilot` is the **only** copy of this project. Not a mirror, not a working copy — the one
+`G:\Trading-CoPilot` is the **only** copy of this project. Not a mirror, not a working copy — the one
 that runs. This has gone wrong twice before you (see `CLAUDE.md`'s own header): once when old
 copies under `C:\` and `D:\` were never actually removed after a "move to G", and once when an
 entire debugging session was spent editing a stale copy under `C:\Users\Admin\Claude\Projects\`
 before discovering the real server runs from here. Real fixes had to be redone.
 
 **Before your first edit in any session: confirm you are reading and writing under
-`G:\MNQ-CoPilot`.** If you ever see a second `rules.json`, `server.js` or `DATA/` directory
+`G:\Trading-CoPilot`.** If you ever see a second `rules.json`, `server.js` or `DATA/` directory
 anywhere else on this machine, stop and ask before touching either copy.
 
 ---
@@ -285,7 +285,7 @@ from — worth internalizing as the METHOD, not just the result:
   `scalperRules.tradesPerSession` was the one field still sitting at 5, and it's what the
   `'N/lim TRADES — DONE'` HUD line actually reads.
 - The day stop was **not** in `rules.json` at all — it was a hardcoded `300` default in
-  `renderer/app.js`'s `ACCOUNT_PROFILES`, overridable via `~/.mnq-copilot-config.json`'s
+  `renderer/app.js`'s `ACCOUNT_PROFILES`, overridable via `~/.trading-copilot-config.json`'s
   `evalDayStop` field (the same field the Settings panel's own "Eval day stop" input writes to).
   Set that config field to `400` directly — zero code change, reused existing infrastructure
   rather than editing a hardcoded literal.

@@ -181,3 +181,17 @@ test('engulf-alert is NOT an arming event — alerts must not be scored as setup
   assert.equal(isArmingEvent('engulf-alert'), false);
   assert.equal(isArmingEvent('engulf-fire'), true);
 });
+
+// ── PLAYBOOK C ARMS THROUGH THE SAME PATH (2026-09-21) ──────────────────────
+// C-ADX was the one playbook missing from this set. Its monitor arms through
+// the same armSetup() call A and B use, and the row carries a real entry and
+// stop from planEntry, so there was no basis for excluding it. The cost of the
+// omission was invisible rather than loud: the shadow router reads armed setups
+// and is scored against outcome rows, so it had logged three live C-ADX reads
+// against a ledger that could never contain a C-ADX outcome — measured that
+// day as 3 router rows, 2 outcomes, 0 joined. The join key was correct; the
+// two populations simply never overlapped.
+test('c-adx-fire IS an arming event — Playbook C arms through armSetup too', () => {
+  assert.equal(isArmingEvent('c-adx-fire'), true);
+  assert.equal(isArmingEvent('playbook-c-reject'), false);
+});

@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('fs');
-const backtest = require('G:/MNQ-CoPilot/app/backtest');
-const rules = JSON.parse(fs.readFileSync('G:/MNQ-CoPilot/app/rules.json','utf8'));
+const backtest = require('G:/Trading-CoPilot/app/backtest');
+const rules = JSON.parse(fs.readFileSync('G:/Trading-CoPilot/app/rules.json','utf8'));
 function load(f){const d=JSON.parse(fs.readFileSync(f,'utf8'));const b=Array.isArray(d)?d:(d.bars||[]);return b.filter(x=>x&&typeof x.time==='number'&&typeof x.close==='number');}
 const buf=rules.playbooks.stopBufferPoints||3, rr=rules.playbooks.targetR||2, horizon=rules.playbooks.outcomeHorizonBars||12, pv=backtest.MNQ_POINT_VALUE;
 const minPts=rules.playbooks.minRiskPoints||0, maxUsd=rules.perTradeMaxLoss||Infinity;
@@ -39,7 +39,7 @@ function runLong(bars, lookback, erMin, hFrom, hTo){
 }
 function s(t){ if(!t.length) return 'n=0'; const net=t.reduce((a,b)=>a+b.net,0); const w=t.filter(x=>x.net>0); const l=t.filter(x=>x.net<=0); const gw=w.reduce((a,b)=>a+b.net,0),gl=-l.reduce((a,b)=>a+b.net,0); const pf=gl>0?(gw/gl).toFixed(2):'inf'; return 'n='+t.length+' $'+net.toFixed(0)+' PF'+pf; }
 
-const files = { 'uptrend':'G:/MNQ-CoPilot/DATA/bars/mnq_1h_uptrend.json', 'downtrend':'G:/MNQ-CoPilot/DATA/bars/mnq_1h_downtrend.json', 'in-sample':'G:/MNQ-CoPilot/DATA/bars/mnq_60.json', 'flat(Nov-Jan)':'G:/MNQ-CoPilot/DATA/bars/mnq_1h_flat.json' };
+const files = { 'uptrend':'G:/Trading-CoPilot/DATA/bars/mnq_1h_uptrend.json', 'downtrend':'G:/Trading-CoPilot/DATA/bars/mnq_1h_downtrend.json', 'in-sample':'G:/Trading-CoPilot/DATA/bars/mnq_60.json', 'flat(Nov-Jan)':'G:/Trading-CoPilot/DATA/bars/mnq_1h_flat.json' };
 console.log('LONG L10 breakout, all hours, with trendiness (ER20) filter:');
 console.log('filter         ' + Object.keys(files).map(f=>f.padEnd(15)).join(''));
 for (const er of [0, 0.2, 0.25, 0.3]){

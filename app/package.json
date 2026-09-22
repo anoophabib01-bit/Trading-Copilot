@@ -1,7 +1,7 @@
 {
-  "name": "mnq-copilot",
+  "name": "trading-copilot",
   "version": "1.0.0",
-  "description": "MNQ Trading Co-Pilot — Anoop Habib",
+  "description": "Trading Co-Pilot — Anoop Habib",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

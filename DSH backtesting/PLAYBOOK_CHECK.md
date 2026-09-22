@@ -1,7 +1,7 @@
 # DSH Backtesting - Current Playbook & Infrastructure Check
 
 > Result of auditing the existing playbooks and backtest tooling in the app
-> (G:\MNQ-CoPilot). No strategy action taken - this is the 'check current
+> (G:\Trading-CoPilot). No strategy action taken - this is the 'check current
 > playbooks' deliverable.
 
 ## TradingView access - CONFIRMED

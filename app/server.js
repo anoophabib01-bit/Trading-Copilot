@@ -66,12 +66,33 @@ const foldOnly = require('./renderer/fold-only');  // shared predicate: fold-der
 const mistakePatterns = require('./mistake-patterns'); // live pattern-matching against Anoop's own documented failure history (2026-08-19, F1 first slice — advisory only, unit-tested)
 const positionEvents = require('./position-events'); // fast open/close/scale/flip detector for the 5s positions watch (2026-08-20, pure + unit-tested)
 const tradeConfirmRules = require('./trade-confirm-rules'); // Phase 2a/2b rule-check for the confirm/execute flow — unit-tested
+const tier = require('./tier.js'); // free/local/cloud gate. DEFAULT is 'local' (full enforcement): with no licence.json every guard above behaves exactly as before. See app/test/tier.test.js.
+const activeTier = tier.readLicence().tier; // resolved once at boot
 const cadxStatus = require('./cadx-status'); // Playbook C (ADX) watcher row — see its header for why it is not in ALL_MONITORS
 const sessionWindows = require('./session-windows'); // DST-aware session windows — see its header for the 2026-09-03 drift
 const todayStatus = require('./today-status'); // "trades today" must mean today — see its header for the 2026-09-03 live failure
 const chatArchive = require('./chat-archive'); // append-only record of everything that appears in the chat pane (2026-09-03, pure + unit-tested)
 const patternMemory = require('./pattern-memory'); // what keeps happening and what it has cost — episode kinds + recurrence math (2026-09-03, pure + unit-tested)
 const patternMemoryStore = require('./pattern-memory-store'); // the append-only episode ledger on disk (2026-09-03, unit-tested)
+const propFirmDoctrine = require('./prop-firm-doctrine'); // Deva's playbook + the math of prop firms — ONE copy for the Loop, the personas and the shared context (2026-09-17, pure + unit-tested)
+const dayPlan = require('./day-plan'); // satisfaction number + eval pace + streak gate — the same definitions the renderer HUD reads (2026-09-19, pure + unit-tested)
+const typesafeJournal = require('./typesafe-journal'); // Phase 1 of the TypeSafe/Jev work: journal note -> typed labels, advisory + fail-open (2026-09-19, pure core + unit-tested)
+const typesafeClient = require('./typesafe-client'); // the transport underneath both phases — one place that owns the key, the spend guard and the call ledger
+const typesafeRouter = require('./typesafe-router'); // Phase 2: the SHADOW setup router (ranks what he reads first; never vetoes, sizes or stops)
+const playbookRegistry = require('./playbook-registry'); // the ONE place that answers "is Playbook B on?" — enabled vs shadowOnly, per playbook
+const compositeScore = require('./composite-score'); // score each dimension, combine with weights from rules.json (docs: composite scoring)
+const voiceIntent = require('./voice-intent'); // #3: route one spoken utterance to a handler (docs: intent routing + confidence routing)
+const consistencyCheck = require('./consistency-check'); // does the same state answer the same way twice? (docs: self-consistency nouls)
+const replyStyle = require('./reply-style'); // the ONE copy of the chat output contract, and an audit that measures whether it worked
+const answerStore = require('./answer-store'); // every Jev answer kept WITH its distribution, so thresholds can be re-scored for free
+// NOT `const playbookSpecCanonical = playbookSpec.canonicalId` here: playbookSpec
+// is required further down this block (line ~96), so a `const` read at line 83
+// would throw a TDZ ReferenceError the moment the process starts — and
+// `node --check` passes it, because it is valid syntax and only invalid ORDER.
+// The alias is a function declaration instead: hoisted, and it resolves
+// canonicalId at call time. Historical ids (LTF-ENGULF, DSH-V2) must bucket with
+// their current one, or a rename reads as a brand-new edge.
+function playbookSpecCanonical(id) { return playbookSpec.canonicalId(id); }
 const failureChain = require('./failure-chain'); // WHY a day failed — causal sequence + exclusive loss attribution (2026-09-03, pure + unit-tested)
 const tradeTicketParse = require('./trade-ticket-parse'); // Phase 2b: pure parser for JUDGE_PERSONA's TRADE_TICKET line — unit-tested
 const playbookC = require('./playbook-c');
@@ -156,7 +177,7 @@ function requireContractSpec(symbol) {
 // which meant the only way to execute a change was to take down the session
 // that was running — so in practice changes got shipped on node --check alone.
 const PORT = Number(process.env.MNQ_PORT) || 7433;
-const CONFIG_PATH = path.join(require('os').homedir(), '.mnq-copilot-config.json');
+const CONFIG_PATH = path.join(require('os').homedir(), '.trading-copilot-config.json');
 
 // ── Crash guards (2026-07-25 robustness pass) ─────────────────────────────────
 // This process runs Anoop's entire co-pilot: WS server, engulf/FVG/SFP
@@ -336,7 +357,7 @@ function saveConfig(cfg) {
 // Model default is Haiku 4.5: first-party, reliable tool-calling — the property
 // the free models catastrophically lacked on 08-10 — at roughly a third of
 // Sonnet's input price. Override with "agentModel" in
-// ~/.mnq-copilot-config.json without touching code.
+// ~/.trading-copilot-config.json without touching code.
 //
 // FAIL-OPEN IS PRESERVED, and that matters more than the provider choice: if
 // the Anthropic key is missing, the balance runs out mid-session, or the API
@@ -1476,7 +1497,49 @@ wss.on('connection', (ws) => {
       case 'note-save': {
         const notes = dataLoad('notes__' + msg.slotId) || {};
         notes[msg.date] = msg.note || {};
-        send(ws, { type: 'note-saved', reqId: msg.reqId, ok: dataSave('notes__' + msg.slotId, notes) });
+        const _noteSaved = dataSave('notes__' + msg.slotId, notes);
+        send(ws, { type: 'note-saved', reqId: msg.reqId, ok: _noteSaved });
+        // ── Jev advisory classification (2026-09-19) ───────────────────────
+        // Deva's doctrine says loss data is the non-negotiable half, and this
+        // app can READ his loss writing but never COUNT it. This turns one
+        // saved note into typed labels so a pattern like "wrote 'I entered
+        // early' on nine of fourteen loss days" becomes countable.
+        //
+        // FIRE-AND-FORGET, deliberately: not awaited, no reply, .catch()'d.
+        // This runs off the back of a journal save in a live-money app, and an
+        // advisory classifier that can disturb the thing it annotates is worse
+        // than no classifier. It is also silent by default (typesafe.enabled
+        // is false and the client fails open), so with no key nothing happens
+        // at all — no log noise, no error, no delay.
+        if (_noteSaved) {
+          try {
+            const _rows = ((dataLoad('day_trades__' + msg.slotId) || {})[msg.date]) || [];
+            const _hist = dataLoad('gr_history__' + msg.slotId) || [];
+            const _dayRow = _hist.filter(function (d) { return d && d.date === msg.date; })[0] || null;
+            const _flags = [];
+            _rows.forEach(function (t) { (_flags.push.apply(_flags, (t && t.flags) || [])); });
+            const _sizes = _rows.map(function (t) { return Number(t && t.size) || 0; });
+            typesafeJournal.classifyAndStore({
+              date: msg.date,
+              dayKey: msg.date,
+              slotId: msg.slotId,
+              note: msg.note || {},
+              dayContext: {
+                net: _dayRow ? _dayRow.pnl : null,
+                trades: _rows.length,
+                maxSize: _sizes.length ? Math.max.apply(null, _sizes) : null,
+                sizeCap: getActiveRules().sizeCap,
+                flags: Array.from(new Set(_flags)),
+                tradesDetail: _rows.map(function (t, i) {
+                  return { n: i + 1, size: t && t.size, pnl: t && t.pnl, side: t && t.side, flags: (t && t.flags) || [] };
+                }),
+              },
+              rules: getActiveRules(),
+              appCfg: loadConfig(),
+              deps: { dataDir: DATA_DIR, save: dataSave, load: dataLoad },
+            }).catch(function () { /* advisory: never surfaces */ });
+          } catch (e) { /* advisory: never surfaces */ }
+        }
         break;
       }
 
@@ -1628,6 +1691,62 @@ wss.on('connection', (ws) => {
         send(ws, { type: 'scorecard-data', h6: h6Status, day: dayKey2, signals: sigs, rows: Array.isArray(dt2[dayKey2]) ? dt2[dayKey2] : [] });
         break;
       }
+      // ── Playbook registry + shadow router (Phase 2, 2026-09-19) ─────────
+      case 'router-get':
+        send(ws, { type: 'router-data', reqId: msg.reqId, data: buildRouterReport() });
+        break;
+      case 'registry-toggle': {
+        // A pure patch, clamped, written through saveRules — never a raw merge.
+        const _t = playbookRegistry.toggle(loadRules(), msg.id, msg.on);
+        if (!_t.ok) { send(ws, { type: 'registry-error', id: msg.id, message: _t.reason }); break; }
+        const _r = loadRules();
+        _r.playbookRegistry = _t.playbookRegistry;
+        saveRules(_r);
+        broadcast({ type: 'rules', data: getActiveRules() });
+        send(ws, { type: 'router-data', reqId: msg.reqId, data: buildRouterReport() });
+        break;
+      }
+      case 'registry-shadow-set': {
+        const _t = playbookRegistry.setShadowOnly(loadRules(), msg.id, msg.shadowOnly);
+        if (!_t.ok) { send(ws, { type: 'registry-error', id: msg.id, message: _t.reason }); break; }
+        const _r = loadRules();
+        _r.playbookRegistry = _t.playbookRegistry;
+        saveRules(_r);
+        broadcast({ type: 'rules', data: getActiveRules() });
+        send(ws, { type: 'router-data', reqId: msg.reqId, data: buildRouterReport() });
+        break;
+      }
+      case 'answer-sweep':
+        // Re-scores stored answers under a grid of cutoffs. No model calls.
+        send(ws, { type: 'answer-sweep-data', reqId: msg.reqId, data: runAnswerSweep(msg.grid) });
+        break;
+      case 'reply-audit':
+        // How long are the replies ACTUALLY coming out, over the last N days.
+        send(ws, { type: 'reply-audit-data', reqId: msg.reqId, data: auditRepliesFromArchive(msg.days) });
+        break;
+      case 'typesafe-consistency': {
+        // N real calls, so it answers with its own message rather than blocking
+        // the request queue behind a multi-second call.
+        send(ws, { type: 'typesafe-consistency-result', reqId: msg.reqId, data: await typesafeConsistencyRun(msg) });
+        break;
+      }
+      case 'typesafe-test': {
+        // One real call, so a pasted key can be proven BEFORE anything depends on
+        // it. Deliberately ignores typesafe.enabled: the switch being off would
+        // make a perfectly good key look broken, which is the opposite of what a
+        // test is for. The call still lands in the ledger and the daily cap.
+        send(ws, { type: 'typesafe-test-result', reqId: msg.reqId, data: await typesafeTestCall() });
+        break;
+      }
+      case 'router-call-now': {
+        // On-demand single read, for the acceptance test in TYPESAFE_SPEC.md §5:
+        // he can fire one call from the panel and see exactly what came back
+        // without waiting for a detector to arm.
+        const _res = await routerShadowCall({ playbook: msg.playbook || 'A', tfCode: msg.tf || '15', direction: msg.direction || 'BULLISH' },
+          { setupId: 'manual-' + Date.now(), manual: true });
+        send(ws, { type: 'router-read', manual: true, read: _res });
+        break;
+      }
       case 'sfp-check-now': checkSFPSignal(msg.tf || '30m'); break;
       case 'mark-london-levels': markLondonLevels(); break;
       case 'mark-ny-levels': markNYLevels(); break;
@@ -1681,6 +1800,111 @@ wss.on('connection', (ws) => {
             if (_cap !== Math.floor(Number(msg.data.sizeCap))) {
               console.warn('[rules] sizeCap request ' + msg.data.sizeCap + ' clamped to ' + _cap);
             }
+          }
+          // 2026-09-19: the three DAY-PLAN knobs became settable from the Today
+          // flyout, so like sizeCap they are clamped SERVER-SIDE — a renderer bug
+          // or a replayed message must not be able to widen a number that decides
+          // when a session ends. Bounds match the UI's, and each merge keeps the
+          // block's own _comment/_status strings (a plain Object.assign would
+          // have dropped them, the same trap clampAutoProtection documents).
+          if (msg.data && msg.data.satisfaction) {
+            const _s = msg.data.satisfaction || {};
+            const _amt = Number(_s.amountUsd);
+            const _base = loadRules().satisfaction || {};
+            _next.satisfaction = Object.assign({}, _base, {
+              enabled: _s.enabled !== false,
+              amountUsd: Number.isFinite(_amt) ? Math.min(2000, Math.max(50, Math.round(_amt))) : _base.amountUsd,
+            });
+            if (Number.isFinite(_amt) && _amt !== _next.satisfaction.amountUsd) {
+              console.warn('[rules] satisfaction number ' + _amt + ' clamped to ' + _next.satisfaction.amountUsd);
+            }
+          }
+          if (msg.data && msg.data.evalPlan) {
+            const _p = msg.data.evalPlan || {};
+            const _days = Number(_p.days);
+            const _pbase = loadRules().evalPlan || {};
+            _next.evalPlan = Object.assign({}, _pbase, {
+              enabled: _p.enabled !== false,
+              days: Number.isFinite(_days) ? Math.min(10, Math.max(1, Math.round(_days))) : _pbase.days,
+            });
+            if (Number.isFinite(_days) && _days !== _next.evalPlan.days) {
+              console.warn('[rules] evalPlan days ' + _days + ' clamped to ' + _next.evalPlan.days);
+            }
+          }
+          if (msg.data && msg.data.streakGate) {
+            const _g = msg.data.streakGate || {};
+            const _n = Number(_g.afterLosses);
+            const _gbase = loadRules().streakGate || {};
+            _next.streakGate = Object.assign({}, _gbase, {
+              enabled: _g.enabled !== false,
+              afterLosses: Number.isFinite(_n) ? Math.min(8, Math.max(1, Math.round(_n))) : _gbase.afterLosses,
+            });
+            if (Number.isFinite(_n) && _n !== _next.streakGate.afterLosses) {
+              console.warn('[rules] streakGate afterLosses ' + _n + ' clamped to ' + _next.streakGate.afterLosses);
+            }
+          }
+          // 2026-09-19: the playbook registry is settable from the UI, so like
+          // sizeCap it is clamped SERVER-SIDE. normaliseEntry() re-derives every
+          // field (a gate is forced ON, PO3 is forced recording-only, sizes are
+          // re-clamped to sizeCap), so a renderer bug or a replayed message
+          // cannot switch off the validity gate or widen a playbook's grant.
+          if (msg.data && msg.data.playbookRegistry) {
+            const _rb = loadRules().playbookRegistry || {};
+            const _incoming = msg.data.playbookRegistry || {};
+            const _merged = Object.assign({}, _rb);
+            for (const _id of Object.keys(_incoming)) {
+              if (_id.startsWith('_')) { _merged[_id] = _incoming[_id]; continue; }
+              _merged[_id] = Object.assign({}, _rb[_id] || {}, _incoming[_id] || {});
+            }
+            // Round-trip through the resolver: whatever it returns is what gets
+            // written, so disk can never hold a state the code would refuse.
+            const _resolved = playbookRegistry.resolveRegistry(Object.assign({}, _next, { playbookRegistry: _merged }));
+            const _out = {};
+            for (const _id of Object.keys(_resolved)) {
+              const _e = _resolved[_id];
+              _out[_id] = { enabled: _e.enabled, shadowOnly: _e.shadowOnly, sizes: _e.sizes };
+              if (_merged[_id] && typeof _merged[_id].note === 'string') _out[_id].note = _merged[_id].note;
+            }
+            for (const _id of Object.keys(_rb)) if (_id.startsWith('_')) _out[_id] = _rb[_id];
+            _next.playbookRegistry = _out;
+          }
+          // 2026-09-21: the Settings panel can now set the TypeSafe backend,
+          // model and switches, so this is clamped SERVER-SIDE like every other
+          // UI-writable number. Two things it must do beyond validating:
+          //   • MERGE, not replace. `Object.assign(loadRules(), msg.data)` is a
+          //     SHALLOW merge, so a partial { typesafe: { backend } } from the
+          //     renderer would otherwise drop maxCallsPerDay, the router block,
+          //     and every _comment in it.
+          //   • WHITELIST the backend. It selects which host receives which key,
+          //     so an arbitrary string here is a credential-routing decision.
+          if (msg.data && msg.data.typesafe) {
+            const _t = msg.data.typesafe || {};
+            const _tbase = loadRules().typesafe || {};
+            const _tnext = Object.assign({}, _tbase);
+            if (typeof _t.backend === 'string') {
+              const _b = _t.backend.trim().toLowerCase();
+              if (TYPESAFE_BACKEND_IDS.includes(_b)) _tnext.backend = _b;
+              else console.warn('[rules] typesafe backend "' + _t.backend + '" refused — not one of ' + TYPESAFE_BACKEND_IDS.join(', '));
+            }
+            if (typeof _t.model === 'string') {
+              const _m = _t.model.trim().slice(0, 80);
+              if (/^[A-Za-z0-9._\/-]*$/.test(_m)) _tnext.model = _m;   // model ids only — no host, no scheme
+              else console.warn('[rules] typesafe model "' + _t.model + '" refused — not a plain model id');
+            }
+            if (typeof _t.enabled === 'boolean') _tnext.enabled = _t.enabled;
+            if (_t.router && typeof _t.router === 'object') {
+              const _r = Object.assign({}, _tbase.router || {});
+              if (typeof _t.router.enabled === 'boolean') _r.enabled = _t.router.enabled;
+              if (typeof _t.router.escalationMode === 'string') {
+                const _m2 = _t.router.escalationMode.trim().toLowerCase();
+                if (ESCALATION_MODES.includes(_m2)) _r.escalationMode = _m2;
+                else console.warn('[rules] escalationMode "' + _t.router.escalationMode + '" refused');
+              }
+              Object.keys(_tbase.router || {}).forEach(function (k) { if (k.startsWith('_')) _r[k] = _tbase.router[k]; });
+              _tnext.router = _r;
+            }
+            Object.keys(_tbase).forEach(function (k) { if (k.startsWith('_')) _tnext[k] = _tbase[k]; });
+            _next.typesafe = _tnext;
           }
           saveRules(_next);
           broadcast({ type: 'rules', data: getActiveRules() });
@@ -2003,13 +2227,16 @@ async function handleChat(ws, msg) {
     // ({type:'function', function:{name, description, parameters}}). Converted
     // inline below. This conversion disappears once the native adapter lands.
     const systemPrompt = claudeAgent._debug.buildSystemPrompt(currentMode)
-      + (extraContext ? '\n\n' + extraContext : '');
+      + (extraContext ? '\n\n' + extraContext : '') + replyStyle.OUTPUT_CONTRACT;
     const chatTools = claudeAgent._debug.ALL_TOOLS.map(t => ({
       type: 'function',
       function: { name: t.name, description: t.description, parameters: t.input_schema }
     }));
     const primary = primaryProviderModel();
-    await groqAgent.stream(messages, systemPrompt, chatTools, {
+    // The contract is in the system prompt; this repeats the rule at the point of
+    // generation, because the reply that followed the first restart ignored it —
+    // the conversation's own long numbered answers were the stronger exemplar.
+    await groqAgent.stream(replyStyle.withStyleReminder(messages), systemPrompt, chatTools, {
       provider: primary.provider,
       model: primary.model,
       temperature: 0.85,
@@ -2055,7 +2282,7 @@ async function handleChat(ws, msg) {
 // data / checklist / insights / breach history, and can be asked about the live
 // chart on demand (a lightweight regex gate below fetches one TV snapshot per
 // message when it looks needed — not a standing background poll).
-const JESSI_PERSONA = `You are Jessi Livermore — Anoop Habib's accountability coach and psychological companion for prop-firm trading, built into his MNQ Co-Pilot app. Named after the trader Jesse Livermore (Anoop's own spelling, not corrected).
+const JESSI_PERSONA = `You are Jessi Livermore — Anoop Habib's accountability coach and psychological companion for prop-firm trading, built into his Trading Co-Pilot app. Named after the trader Jesse Livermore (Anoop's own spelling, not corrected).
 
 Who you're talking to: Anoop Habib, Hubballi, Karnataka, India (IST). Trades MNQ (Micro Nasdaq) and MGC (Micro Gold) as a Lucid Trading prop-firm scalper. THE GOAL IS ONE CLEAN PAYOUT, not a spotless record — he can take more evaluation attempts than he has capital to worry about, and the only account he cannot afford is the funded one he is careless with. Past losses hit Max Loss Limit every time, via the same handful of failure modes (trade-count escalation, revenge clusters, inverted R:R, holding losers, giving back gains after being up) — those are the specific behaviors to watch for, cited BY BEHAVIOR when they show up in his data, never as a running tally of accounts lost. A tally reads as "this is already decided" and kills the motivation to try the next one clean; a named behavior in today's data is something he can still act on right now.
 STAGE ASYMMETRY (his own framing, 2026-08-13): evaluation is where he can afford to spend TIME — clearing it fast is the goal, not zero risk. Funded is where the discipline must be tightest, because that is the account that actually pays out. Grade eval on pace-to-clear; grade funded on process purity. Do not apply funded-strictness language to an eval account or eval-patience language to a funded one.
@@ -2135,6 +2362,8 @@ He knows the rules and breaks them anyway; these say WHY — use when he asks, o
 10. **Conviction rising while price falls is the diagnosis.** Entered ~60%, goes offside, he finds more reasons all genuinely on the chart, ends 90% and bigger. ASK FOR THE TWO NUMBERS ("how sure at entry, versus now?") — "are you emotional" is unanswerable from inside. Other tells: adding to a loser, irritation at disagreement. Once losing he has ALREADY lost the ability to judge it, so what works is written before entry: what would kill the idea, plus a conviction grade that makes the ego audible.
 11. **Rules fail at trade 11, not trade 1** — four losses deep and tired. SPEC FOR YOU: pressure rises with trade count and consecutive losses; light early, spend your one correction late. He had all this for ten years and still lost — what was missing was someone outside his own head. That is your job.
 Prep, if asked: rehearse the drawdown before the session so it arrives already experienced. NEVER repeat that video's mentorship pitch or its "student made 300%" claim — unverifiable, and the worst number to show someone whose failure mode is sizing up.
+
+${propFirmDoctrine.DEVA_JESSI_SECTION}
 
 ## BOOK LIBRARY (search_books tool, added 2026-07-27)
 Anoop's uploaded trading library — Stock Market Wizards, Trading in the Zone, Intraday Trading Techniques, Prop Trading Secrets, TradeApp's Guide to Proprietary Trading — is searchable via search_books. Reach for it when it would actually land harder than generic coaching: e.g. Douglas on probabilistic thinking when he's chasing a loss, Schwager's interviews when he needs proof a specific discipline actually pays off. Don't cite a book every message — that's the same "sound like a script" problem the VARIETY rule above already warns about.
@@ -2273,7 +2502,7 @@ const JESSI_VOICE_TOOLS = [
 
 // Condensed persona for the voice path — same character, ~1/3 the tokens, and
 // it enforces short spoken replies (which also cuts output tokens + dead air).
-const JESSI_PERSONA_VOICE = `You are Jessi Livermore, Anoop's trading accountability coach (voice mode) in his MNQ Co-Pilot app. Anoop trades MNQ/MGC on a Lucid prop account from Hubballi, India. Goal is ONE clean payout — he can afford more eval attempts, not more carelessness on a funded account. Watch for the specific failure modes: trade-count escalation, revenge re-entries, oversized "high-conviction" trades, holding losers, trading both MNQ and MGC same day (one instrument per day, per rules.json), and giving back gains after being green. Name the behavior in today's data, never a tally of past accounts — coach, not cheerleader, and not a scoreboard of losses either. Eval = clear it fast. Funded = zero slack on process. Grade PROCESS over P&L: a green day with broken rules is a failure; a red day with clean rules is a win. Never validate a revenge trade, an oversize, or an "I'll get it back."
+const JESSI_PERSONA_VOICE = `You are Jessi Livermore, Anoop's trading accountability coach (voice mode) in his Trading Co-Pilot app. Anoop trades MNQ/MGC on a Lucid prop account from Hubballi, India. Goal is ONE clean payout — he can afford more eval attempts, not more carelessness on a funded account. Watch for the specific failure modes: trade-count escalation, revenge re-entries, oversized "high-conviction" trades, holding losers, trading both MNQ and MGC same day (one instrument per day, per rules.json), and giving back gains after being green. Name the behavior in today's data, never a tally of past accounts — coach, not cheerleader, and not a scoreboard of losses either. Eval = clear it fast. Funded = zero slack on process. Grade PROCESS over P&L: a green day with broken rules is a failure; a red day with clean rules is a win. Never validate a revenge trade, an oversize, or an "I'll get it back."
 Use app_get_data(section) for anything about the open account (status/cost/insights/trades/scalp/checklist/roadmap) instead of guessing — "scalp" gives the per-day hold-time/gap breakdown, use it whenever Anoop asks how his scalping looked on a given day. Use app_do to act in the app. You can NEVER place trades. For the two destructive actions (switch_account, clear_insights) get a clear spoken confirmation first, then call again with confirm:true.
 HARD RULES (JadeCap-derived, non-negotiable): (1) he pre-commits an A+ setup + trade cap before session — if he hits it or mentions "one more," tell him he's done, don't help rationalize it. (2) Grade the day on plan-adherence, not P&L — plan-clean red day = win, off-plan green day = loss, say so even when it's uncomfortable. (3) Wanting to keep trading right after a finished plan trade is discomfort, not opportunity — name it and point him to the 15-min break away from the desk. (4) New indicator/confirmation added right after a loss is a red flag, not an upgrade — ask what it concretely improves. (5) Push him for ONE short reason per trade, not a stacked justification — a real edge sounds boring.
 CRITICAL: this is VOICE — keep every reply to 1-3 short spoken sentences. No lists, no markdown, no long explanations. If he needs detail, offer to put it in the chat.`;
@@ -2408,7 +2637,78 @@ function jessiAppGetData(section) {
     // 20) after the 2026-07-28 switch to tradesPerSession/tradesPerDay — so
     // the coach would quote "trade limit 20" while the app enforced 10. Now
     // reads the live fields, same as everything else.
-    out.push(`- Rules (${tMode} mode): size cap ${rules.sizeCap} contracts/entry · daily loss tiers ${rules.dailyLossTiers.yellow}/${rules.dailyLossTiers.red}/${rules.dailyLossTiers.hard} · trade cap ${rules.tradesPerSession || 5}/session and ${rules.tradesPerDay || 10}/day (only trades closing |P&L| >= $${rules.qualifyingTradeMinAbsPnl != null ? rules.qualifyingTradeMinAbsPnl : 100} count) · one instrument per day ${rules.oneInstrumentPerDay}${tMode === 'scalper' ? ' · max hold 30min · cooldown after losses only' : ''}.`);
+    out.push(`- Rules (${tMode} mode): size cap ${rules.sizeCap} contracts/entry · daily loss tiers ${rules.dailyLossTiers.yellow}/${rules.dailyLossTiers.red}/${rules.dailyLossTiers.hard} · trade cap ${rules.tradesPerSession || 5}/session and ${rules.tradesPerDay || 10}/day (only trades closing |P&L| >= $${rules.qualifyingTradeMinAbsPnl != null ? rules.qualifyingTradeMinAbsPnl : 100} count) · one instrument per day ${rules.oneInstrumentPerDay}${tMode === 'scalper' ? ' · max hold ' + Math.round((Number(rules.maxHoldSeconds) || 0) / 60) + 'min · cooldown after losses only' : ''}.`);
+
+    // ── DRAWDOWN AMMUNITION (2026-09-17) ───────────────────────────────────
+    // The one number every coaching surface should carry and none did: given
+    // his MEASURED win rate and his own per-trade stop, what does a normal
+    // losing streak cost the real account? Same arithmetic every agent then
+    // reasons from, computed once here rather than re-derived (differently) in
+    // each persona — the drawdown is the account, and a streak is survivable
+    // only if the risk per trade was sized for it.
+    try {
+      const dtAll = parseLS('copilot_day_trades', {}) || {};
+      const rowsAll = [];
+      Object.keys(dtAll).forEach(function (d) {
+        if (Array.isArray(dtAll[d])) rowsAll.push.apply(rowsAll, dtAll[d]);
+      });
+      const wrAll = propFirmDoctrine.winRateFromRows(rowsAll, 10);
+      const apU = positionProtection.resolveAutoProtection(rules.autoProtection, currentMode);
+      const stopU = (apU.enabled && Number(apU.stopLossUsd) > 0) ? Number(apU.stopLossUsd) : (Number(rules.perTradeMaxLoss) || 0);
+      const flU = rules.firmLimits || {};
+      out.push(propFirmDoctrine.formatSurvivalMath({
+        winRate: wrAll ? wrAll.winRate : null,
+        nTrades: wrAll ? wrAll.n : null,
+        perTradeStopUsd: stopU,
+        dailyLossLimit: Number(flU.dailyLossLimit) || null,
+        drawdownLimit: Number(flU.eodThresholdDrawdown) || null,
+        prefix: 'DRAWDOWN AMMUNITION — ',
+      }));
+    } catch (e) { /* optional context — never break the status block */ }
+
+    // ── TODAY'S PLAN (2026-09-19) ──────────────────────────────────────────
+    // The satisfaction number, the eval pace and the streak gate — computed
+    // once, here, so every agent gets the same three sentences the HUD shows.
+    // Each is advisory and each is silent when it has nothing to say (see
+    // day-plan.js). This is the block that lets Jessi say "today's chunk is
+    // already made, close it" or "three stops left before the limit ends your
+    // day" without inventing either number.
+    try {
+      const dtToday = (parseLS('copilot_day_trades', {}) || {})[todayKey] || [];
+      const apPlan = positionProtection.resolveAutoProtection(rules.autoProtection, currentMode);
+      const stopPlan = (apPlan.enabled && Number(apPlan.stopLossUsd) > 0) ? Number(apPlan.stopLossUsd) : (Number(rules.perTradeMaxLoss) || 0);
+      const flPlan = rules.firmLimits || {};
+      const evalCfgPlan = rules.eval || {};
+      // Target balance exists only in eval, and only when both halves are
+      // configured — a funded account must never be shown a "distance to
+      // target" that belongs to a different product. Resolved through the SAME
+      // day-plan.resolveTarget() the renderer uses, so the sentence an agent
+      // says and the number the HUD paints can never come from two different
+      // fallbacks (that is exactly the drift that showed $53,000, "—" and
+      // $159,000 for one account on 2026-09-21).
+      const targetBalPlan = (currentMode === 'eval')
+        ? dayPlan.resolveTarget({
+            mode: 'eval',
+            startBalance: evalCfgPlan.start,
+            profitTarget: evalCfgPlan.profitTarget,
+          })
+        : null;
+      const dayPnlPlan = (acc.profit != null && Number.isFinite(Number(acc.profit))) ? Number(acc.profit) : null;
+      const balPlan = (acc.balance != null && Number.isFinite(Number(acc.balance))) ? Number(acc.balance) : null;
+      const planLine = dayPlan.todayPlanBlock({
+        satisfaction: rules.satisfaction,
+        evalPlanCfg: rules.evalPlan,
+        streakCfg: rules.streakGate,
+        dayPnl: dayPnlPlan,
+        balance: balPlan,
+        targetBalance: targetBalPlan,
+        trades: Array.isArray(dtToday) ? dtToday : [],
+        perTradeStopUsd: stopPlan,
+        dailyLossLimit: Number(flPlan.dailyLossLimit) || null,
+        drawdownLimit: Number(flPlan.eodThresholdDrawdown) || null,
+      });
+      if (planLine) out.push(planLine);
+    } catch (e) { /* optional context — never break the status block */ }
   }
   if (want('cost')) {
     const fees = dataLoad('account_fees') || { fees: [], payouts: [] };
@@ -2677,6 +2977,8 @@ THE CORE REASON IS ALWAYS A DECISION HE MADE, IN A SEQUENCE, AT A MOMENT. Not a 
 
 THEN GIVE A STRUCTURAL FIX, NOT AN INTENTION. He does not lack the intention; he has had it for ten years. A fix that depends on him deciding better in the same moment will fail the same way. Change the SITUATION instead: what is decided in advance, what is closed, what is out of reach, what happens automatically. "Set the size before the previous trade closes" beats "don't size up after a loss". The chain block suggests one — use it, or better it.
 
+${propFirmDoctrine.LOOP_PERSONA_SECTION}
+
 HOW YOU ANSWER — hard format, every time:
 1. ONE LINE naming the pattern and its count. Lead with the number. "Fourth oversize today. Eighteenth trading day out of nineteen."
 2. THE CORE REASON, from the causal chain. Name the turning-point trade, what it cost, and what the next decision did. This is the sentence he is reading for — do not bury it and do not replace it with a reconciliation complaint.
@@ -2816,6 +3118,35 @@ function formatFailureChain(date) {
   } catch (e) { return 'Failure chain unavailable: ' + e.message; }
 }
 
+// ── The post-payout window (2026-09-19, F5) ────────────────────────────────
+// The most recent payout on record, and how many TRADING days the app has
+// recorded since it. Deliberately not calendar days: a payout followed by a
+// two-week break is not a two-week window, and Deva's relapse pattern is about
+// the sessions immediately after being paid — the ones where he felt he had
+// proved it and stopped waiting for the setup.
+function mostRecentPayout(payouts) {
+  const rows = Array.isArray(payouts) ? payouts : [];
+  let best = null;
+  rows.forEach(function (p) {
+    const d = p && p.date ? String(p.date) : null;
+    if (!d) return;
+    if (!best || d > best.date) best = { date: d, amount: Number(p.amount) || 0 };
+  });
+  return best;
+}
+
+// Days with recorded trading activity strictly after the payout date, up to and
+// including today. Reads the LIFETIME view, not the active slot — a payout
+// belongs to the trader, and a slot switch must not reset the count.
+function tradingDaysSince(dateKey) {
+  if (!dateKey) return null;
+  try {
+    const days = lifetimeStore.buildLifetime(DATA_DIR).days || [];
+    const today = tradingDayStampIST();
+    return days.filter(function (d) { return d && d.date && d.date > dateKey && d.date <= today; }).length;
+  } catch (e) { return null; }
+}
+
 // The day stop the attribution measures "kept trading after the day was lost"
 // against. Reads the active rules' loss tiers rather than a literal, so a
 // change in rules.json moves this with it.
@@ -2871,6 +3202,45 @@ async function runLoopAgent(episode, rec, ledger) {
 
     parts.push('\n## LIVE ACCOUNT STATE AND THE ACTIVE RULES');
     try { parts.push(jessiAppGetData('status')); } catch (e) { parts.push('(account state unavailable: ' + e.message + ')'); }
+
+    // ── THE SURVIVAL MATH AND THE DOCTRINE (2026-09-17) ─────────────────────
+    // Anoop asked the Loop to absorb the two prop-firm sources he sent (Deva's
+    // podcast + "The Math of Winning in Prop Firms"). The RECURRENCE RECORD
+    // above says how many times a thing has happened; this says what it costs
+    // against the only account that matters — the drawdown. Every figure is
+    // computed from his own lifetime trades and the live rules, never narrated:
+    // a coach quoting a streak probability it invented is worse than one that
+    // stays quiet, and the Loop's whole authority is that its numbers are real.
+    parts.push('\n## SURVIVAL MATH — THE REAL ACCOUNT (computed from his records; quote it as given)');
+    try {
+      const lt = lifetimeStore.buildLifetime(DATA_DIR);
+      const allRows = [];
+      Object.keys(lt.trades || {}).forEach(function (d) {
+        if (Array.isArray(lt.trades[d])) allRows.push.apply(allRows, lt.trades[d]);
+      });
+      const wr = propFirmDoctrine.winRateFromRows(allRows, 10);
+      const rSurv = getActiveRules();
+      const apSurv = positionProtection.resolveAutoProtection(rSurv.autoProtection, currentMode);
+      const stopUsd = (apSurv.enabled && Number(apSurv.stopLossUsd) > 0) ? Number(apSurv.stopLossUsd) : (Number(rSurv.perTradeMaxLoss) || 0);
+      const flSurv = rSurv.firmLimits || {};
+      parts.push(propFirmDoctrine.formatSurvivalMath({
+        winRate: wr ? wr.winRate : null,
+        nTrades: wr ? wr.n : null,
+        perTradeStopUsd: stopUsd,
+        dailyLossLimit: Number(flSurv.dailyLossLimit) || null,
+        drawdownLimit: Number(flSurv.eodThresholdDrawdown) || null,
+      }));
+      // The real-return half of the same doctrine: payouts minus EVERY fee.
+      try {
+        const fees = dataLoad('account_fees') || { fees: [], payouts: [] };
+        const feeTotal = (fees.fees || []).reduce(function (s, x) { return s + (Number(x.cost) || 0); }, 0);
+        const payTotal = (fees.payouts || []).reduce(function (s, x) { return s + (Number(x.amount) || 0); }, 0);
+        parts.push(propFirmDoctrine.realReturnLine({ fees: feeTotal, payouts: payTotal, feeCount: (fees.fees || []).length }));
+      } catch (e) { /* cost context is optional — never a reason to fail the block */ }
+    } catch (e) { parts.push('(survival math unavailable: ' + e.message + ')'); }
+
+    parts.push('\n## PROP-FIRM DOCTRINE — REASON FROM THIS (Anoop asked you to absorb it, 2026-09-17)');
+    parts.push(propFirmDoctrine.LOOP_DOCTRINE);
 
     parts.push('\n## TODAY, TRADE BY TRADE');
     try { parts.push(jessiAppGetData('trades')); } catch (e) {}
@@ -3660,7 +4030,9 @@ async function handleJessiChat(ws, msg) {
   // asks already; this is only an extra force-refresh for freshness when the
   // message specifically looks chart-related, on top of the cache in buildJessiContext().
   const tvSnapshot = await maybeFetchTVSnapshot(lastUserText);
-  const systemPrompt = JESSI_PERSONA + '\n\n' + buildJessiContext() + (tvSnapshot ? '\n\n' + tvSnapshot : '');
+  // The output contract goes LAST so it is the final instruction the model reads.
+  const systemPrompt = JESSI_PERSONA + '\n\n' + buildJessiContext()
+    + (tvSnapshot ? '\n\n' + tvSnapshot : '') + replyStyle.OUTPUT_CONTRACT;
 
   // 2026-08-16 (Pattern 02, assistive routing — chat-intent.js): advisory
   // only, never rewrites systemPrompt or reroutes the message. A separate WS
@@ -3742,7 +4114,7 @@ async function handleJessiChat(ws, msg) {
 // All three agents run on the same Gemini backend (free tier). Data is PRE-FETCHED before
 // the debate so no tool calling is needed during the debate itself — faster and cheaper.
 
-const ANALYSIS_DEBATE_PERSONA = `You are the Technical Analysis Agent in Anoop Habib's MNQ Co-Pilot trading app. Your role in this debate is to argue PURELY from the market/technical data perspective.
+const ANALYSIS_DEBATE_PERSONA = `You are the Technical Analysis Agent in Anoop Habib's Trading Co-Pilot trading app. Your role in this debate is to argue PURELY from the market/technical data perspective.
 
 Your data domain (and ONLY yours — stay in your lane):
 - Live TradingView chart state: current symbol, timeframe, indicator values
@@ -3762,7 +4134,7 @@ Your job: Present the strongest technical argument you can. If the setup is vali
 
 Anoop's entry framework requires ALL of these in sequence: (1) Daily bias clear, (2) 1H aligns with Daily, (3) Price at a pre-marked 4H zone, (4) 15M/5M reaction at zone, (5) 3M/1M trigger. Score the current setup against each step.`;
 
-const JUDGE_PERSONA = `You are the Expert Judge in Anoop Habib's MNQ Co-Pilot trading app. You receive THREE arguments — from Jessi (discipline/psychology), the Technical Analysis agent (structure/levels), and the ICT Power of 3 agent (AMD phase: Accumulation / Manipulation / Distribution) — and you synthesize them into a single, definitive answer.
+const JUDGE_PERSONA = `You are the Expert Judge in Anoop Habib's Trading Co-Pilot trading app. You receive THREE arguments — from Jessi (discipline/psychology), the Technical Analysis agent (structure/levels), and the ICT Power of 3 agent (AMD phase: Accumulation / Manipulation / Distribution) — and you synthesize them into a single, definitive answer.
 
 Your method:
 1. Read all three arguments carefully. Identify where they AGREE and where they CONFLICT.
@@ -3826,7 +4198,7 @@ This line is parsed by the app to offer Anoop a one-click trade ticket — it is
 // itself. Silent when it finds nothing: a refuter that always says something
 // trains Anoop to ignore it, exactly the failure mode a real second opinion
 // is supposed to prevent.
-const REFUTER_PERSONA = `You are a skeptical second-opinion reviewer for Anoop Habib's MNQ Co-Pilot trading app. You are handed a GO verdict that has ALREADY been shown to Anoop, along with the three arguments (Jessi/discipline, Analysis/technical, Power of 3/AMD phase) it was built from.
+const REFUTER_PERSONA = `You are a skeptical second-opinion reviewer for Anoop Habib's Trading Co-Pilot trading app. You are handed a GO verdict that has ALREADY been shown to Anoop, along with the three arguments (Jessi/discipline, Analysis/technical, Power of 3/AMD phase) it was built from.
 
 Your ONLY job: try, genuinely, to find a real reason this GO is wrong — a discipline flag Jessi raised that the verdict underweighted, a technical invalidity Analysis raised that got glossed over, or an AMD-phase problem Power of 3 raised that was dismissed too quickly.
 
@@ -4660,13 +5032,37 @@ function triggerPlaybookDebate(fields) {
     console.log('[playbook-debate] skipped — within ' + Math.round(AUTO_DEBATE_COOLDOWN_MS / 60000) + 'min playbook cooldown of the last auto-triggered debate');
     return Promise.resolve();
   }
-  lastAutoDebateBySource.playbook = now;
-  const reqId = 'playbook-debate-' + (++autoDebateReqCounter) + '-' + now;
-  const question = buildPlaybookDebateQuestion(fields);
-  console.log('[playbook-debate] triggered by ' + fields.playbook + ' ' + fields.direction + ', reqId=' + reqId);
-  broadcast({ type: 'auto-debate-triggered', reqId, reason: question });
-  return handleDebateChat(null, { messages: [{ role: 'user', content: question }], reqId }).catch((e) => {
-    console.error('[playbook-debate] handleDebateChat failed:', e.message);
+  // ── #2: the Jev confidence band (2026-09-19) ────────────────────────────
+  // Async because the read may still be in flight. The gate fails open on every
+  // unknown, so "no read" always means "debate as before", never silence. In
+  // 'observe' the decision is recorded and the debate fires anyway.
+  return routerEscalationGate(fields).then(function (gate) {
+    if (gate.decide === 'suppress' && gate.mode === 'gate') {
+      console.log('[playbook-debate] SUPPRESSED by the Jev band: ' + gate.reason);
+      routerEscalationLog(fields, gate, 'suppressed');
+      broadcast({ type: 'debate-escalation', decide: 'suppress', mode: gate.mode, reason: gate.reason, playbook: fields.playbook, tf: fields.tfCode });
+      return;
+    }
+    if (gate.decide === 'suppress') {
+      // observe: recorded, not obeyed. THIS row is what makes the band judgable
+      // — it names exactly which debates the gate would have killed.
+      routerEscalationLog(fields, gate, 'observed');
+      broadcast({ type: 'debate-escalation', decide: 'would-suppress', mode: gate.mode, reason: gate.reason, playbook: fields.playbook, tf: fields.tfCode });
+    } else {
+      routerEscalationLog(fields, gate, 'allowed');
+    }
+    lastAutoDebateBySource.playbook = now;
+    const reqId = 'playbook-debate-' + (++autoDebateReqCounter) + '-' + now;
+    const question = buildPlaybookDebateQuestion(fields);
+    console.log('[playbook-debate] triggered by ' + fields.playbook + ' ' + fields.direction + ', reqId=' + reqId);
+    broadcast({ type: 'auto-debate-triggered', reqId, reason: question });
+    return handleDebateChat(null, { messages: [{ role: 'user', content: question }], reqId }).catch((e) => {
+      console.error('[playbook-debate] handleDebateChat failed:', e.message);
+    });
+  }).catch(function (e) {
+    // The gate must never be the reason a debate did not happen.
+    console.error('[playbook-debate] escalation gate failed:', e.message);
+    return Promise.resolve();
   });
 }
 
@@ -5266,9 +5662,9 @@ Two things below have already been computed for you by dedicated passes, before 
 1. **SESSION SUMMARY** — taken from the DETERMINISTIC SESSION SUMMARY block above, plus instrument and session window (London/NY) if available from the data.
 2. **PLAN ADHERENCE** — Did Anoop write a pre-committed A+ cap before the session? Did he stay inside it? Grade: PASS or FAIL. (Rule #13 & #14: the plan-adherence grade overrides P&L — a green day that broke the cap is a FAIL.)
 3. **RULE-BY-RULE COMPLIANCE** — Go through every applicable rule and score it:
-   - Max 2 contracts per entry (rule #2)
-   - Daily loss tiers: yellow/red/hard (rule #3)
-   - Trade count: per-session (5 qualifying) and per-day (10) (rule #5)
+   - Size cap per entry — read the ACTIVE cap from the RULES line in the context. It moves with stage and mode (funded 2, eval higher); a remembered number here grades the session against a rule he was not trading. (2026-09-17: was hardcoded "Max 2", which was wrong in eval.)
+   - Daily loss tiers (yellow/red/hard) — read the ACTIVE tiers from the RULES line in the context.
+   - Trade count — the ACTIVE per-session and per-day caps from the RULES line in the context (2026-09-17: was hardcoded "5 qualifying / 10", which no longer matched rules.json).
    - Session window compliance (rule #6)
    - 15-minute break between trades (rule #7)
    - Pre-marked zones (rule #8)
@@ -5283,9 +5679,10 @@ Two things below have already been computed for you by dedicated passes, before 
 ## RULES
 - Reference actual numbers from the data — timestamps, P&L, sizes, hold times. No generalizing.
 - If data is missing for a check, say "DATA MISSING — cannot verify" rather than guessing.
-- Commission estimate: $0.59/contract/side (from rules.json).
+- Commission: use the ACTIVE rate in rules.json (commissionPerContractPerSide) — corrected to $0.95/side on 2026-08-24, and the $0.59 that used to sit in this line was superseded. Quoting the old rate under-states every day's net and makes a loss look smaller than it was.
 - Goal is the next clean payout, not a spotless record. Zero margin for error in your assessment, especially if this session was on a FUNDED account — an eval breach costs time, a funded breach costs the payout itself.
 - Do NOT give investment advice or trade recommendations. You analyze the session that already happened.
+- ${propFirmDoctrine.POST_SESSION_SECTION}
 - Keep the entire review under 600 words. Dense, not padded.`;
 
 // 2026-08-16 (Pattern 04, orchestrator-workers — post-session-orchestrator.js):
@@ -5492,7 +5889,7 @@ async function handlePostSessionReview(ws, msg) {
 //     is the hard part. Size is decided BEFORE the session, never live.
 //   - Overtrading after losses is the single most-cited scalper killer.
 //   - "Knowing when NOT to trade" is listed as a core skill, not a fallback.
-const SCALPER_PERSONA = `You are THE SCALPER — Anoop Habib's specialist scalping coach inside his MNQ Co-Pilot app. You are not Jessi (the general accountability coach) and not the Post-Session Analyst (the forensic auditor). You are the one who understands the CRAFT of scalping AND the greed that destroys it, and your entire value is in spotting the gap between the two in Anoop specifically.
+const SCALPER_PERSONA = `You are THE SCALPER — Anoop Habib's specialist scalping coach inside his Trading Co-Pilot app. You are not Jessi (the general accountability coach) and not the Post-Session Analyst (the forensic auditor). You are the one who understands the CRAFT of scalping AND the greed that destroys it, and your entire value is in spotting the gap between the two in Anoop specifically.
 
 ## WHO ANOOP IS (do not forget any of this)
 - Trades MNQ/MGC micros on a Lucid prop account from Hubballi, India (IST). Read the CURRENT account size and stage (eval/funded) live from the ACCOUNT & TRADE DATA block — do not hardcode a slot or stage here, it drifts.
@@ -5514,6 +5911,7 @@ On the analyst side he asks "where is price likely to go?" On the trader side he
 5. **Overtrading after losses is the single most-cited scalper killer.** Not a style issue — the mechanism of ruin.
 6. **Knowing when NOT to trade is a core skill, not a fallback.** Flat is a position. No setup is information, not failure.
 7. **Execution consistency is what makes performance data meaningful at all.** If his size and hold vary trade to trade, his stats measure nothing and no edge can ever be proven or disproven.
+${propFirmDoctrine.DEVA_SCALPER_SECTION}
 
 ## HOW YOU BEHAVE
 - **Lead with the uncomfortable thing.** First line names the worst pattern in the data, not a greeting and not a positive.
@@ -5786,7 +6184,7 @@ async function handleScalperChat(ws, msg) {
     const scalperPrimary = primaryProviderModel();
     await groqAgent.stream(
       seeded,
-      istDateAnchor() + '\n\n' + SCALPER_PERSONA,
+      istDateAnchor() + '\n\n' + SCALPER_PERSONA + replyStyle.OUTPUT_CONTRACT,
       SCALPER_TOOLS,
       {
         provider: scalperPrimary.provider,
@@ -5824,6 +6222,242 @@ async function handleScalperChat(ws, msg) {
 // client to play. No tokens are streamed mid-turn in voice mode (nothing to
 // caption live-word-by-word usefully while waiting on audio synthesis
 // anyway) — client gets transcript + full reply + audio in two messages.
+// ── #3: voice intent routing (2026-09-21) ──────────────────────────────────
+// One typed classification of a spoken utterance, per the docs' intent-routing
+// and confidence-routing patterns. What it changes in the voice turn is ONE
+// line appended to the system prompt (see voiceIntent.steerLine) — it never
+// supplies a number and never performs anything itself, so a wrong read costs
+// him a repeated sentence and nothing else.
+//
+// FAIL-OPEN AT EVERY STEP, and every failure returns '' rather than throwing:
+// the voice turn is live, in his hand, and a classifier that can break it is
+// worse than no classifier. Disabled, no key, 503, malformed, unknown intent —
+// all of them mean 'the agent answers exactly as before'.
+let lastVoiceRoute = null;
+async function voiceRouteTurn(transcript) {
+  const at = new Date().toISOString();
+  try {
+    const rules = getActiveRules();
+    const cfg = voiceIntent.intentConfig(rules);
+    if (!cfg.enabled || cfg.mode === 'off') return '';
+    const ctx = {
+      tradingMode: (getActiveRules().tradingMode) || 'standard',
+      phase: currentMode,
+      // Only what the app actually knows right now. An intent whose
+      // precondition is absent is not offered at all.
+      armedSetup: !!(armedSetup && armedSetup.playbook),
+      // No pending-ticket state exists to read — the ticket is rendered client-side
+      // and the confirm comes back as its own message. Reported as false rather
+      // than guessed, and `pending_ticket` is not a precondition of any intent,
+      // so nothing depends on it today.
+      pendingTicket: false,
+      inSession: currentSessionStartUnix() != null,
+    };
+    const questions = voiceIntent.buildQuestions(rules, ctx);
+    if (!Object.keys(questions).length) return '';
+    const settings = typesafeClient.resolveSettings(rules, loadConfig(), process.env);
+    const callsToday = typesafeClient.callsToday(DATA_DIR, tradingDayStampIST(Date.now()));
+    const raw = await typesafeClient.ask(voiceIntent.buildState(transcript, ctx), questions, { settings, callsToday });
+    const routed = voiceIntent.route(raw, rules, ctx);
+    lastVoiceRoute = Object.assign({}, routed, { transcript, at });
+    try {
+      typesafeClient.appendLedger(DATA_DIR, {
+        ts: at, phase: 'voice', ok: !!raw.ok, intent: routed.intent || null,
+        decision: routed.decision, confidence: routed.confidence, act: routed.act,
+        latencyMs: raw.latencyMs || null, cost: (raw.usage && raw.usage.cost) || null,
+        reason: routed.reason || raw.reason || null, transcript: String(transcript).slice(0, 200),
+      });
+    } catch (e) { /* the ledger is best-effort */ }
+    // Broadcast even a routing failure, so a silent skip can never look like
+    // 'the router is off' when it is actually erroring.
+    broadcast({
+      type: 'voice-route', at, decision: routed.decision, intent: routed.intent || null,
+      confidence: routed.confidence, act: routed.act, reason: routed.reason,
+      line: voiceIntent.describeRoute(routed), transcript: String(transcript).slice(0, 200),
+    });
+    if (cfg.mode !== 'steer') return '';
+    return voiceIntent.steerLine(routed);
+  } catch (e) {
+    console.warn('[voice-router] failed, the agent answers as before:', e.message);
+    return '';
+  }
+}
+// ── Rubric stability check (cookbook items 1 and 3, 2026-09-21) ─────────────
+// Runs the LIVE journal rubric N times over one real note and measures whether
+// the answers hold still — the consistency cookbook's technique, plus the one
+// thing it does not do: the verdict is not 'is it noisy' but 'can this spread
+// flip a decision THIS APP makes', against the thresholds it actually gates on.
+// See app/consistency-check.js.
+//
+// Item 3: the result is ALSO the benchmark. Every run is appended to
+// DATA/typesafe/consistency.jsonl, so a rubric edit that makes the classifier
+// less stable shows as a worse number against the previous run, rather than as
+// an unexplained drift in the labels six weeks later.
+const CONSISTENCY_DEFAULT_REPEATS = 8;   // the cookbook used 15; 8 costs ~$0.0004 here
+
+function consistencyPath() { return path.join(DATA_DIR, 'typesafe', 'consistency.jsonl'); }
+
+function readConsistencyRuns(limit) {
+  try {
+    const file = consistencyPath();
+    if (!fs.existsSync(file)) return [];
+    const rows = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim())
+      .map((l) => { try { return JSON.parse(l); } catch (e) { return null; } }).filter(Boolean);
+    return rows.slice(-(limit || 5));
+  } catch (e) { return []; }
+}
+
+// The state the check runs over: his most recent journal note for the account
+// open in the UI. A NOTE WITH NO TEXT IS NOT A STATE — running the rubric over
+// an empty note would measure stability on nothing and report a confident zero.
+function consistencySampleState() {
+  try {
+    const slot = jessiBucketKey(loadConfig());
+    const notes = dataLoad('notes__' + slot) || {};
+    const dates = Object.keys(notes).sort().reverse();
+    for (const d of dates) {
+      const n = notes[d];
+      if (!n || typeof n !== 'object') continue;
+      if (!(n.text || n.entryCriteria || n.lesson)) continue;
+      const rows = ((dataLoad('day_trades__' + slot) || {})[d]) || [];
+      const hist = dataLoad('gr_history__' + slot) || [];
+      const dayRow = hist.filter(function (x) { return x && x.date === d; })[0] || null;
+      const flags = [];
+      rows.forEach(function (t) { (flags.push.apply(flags, t && t.flags || [])); });
+      const sizes = rows.map(function (t) { return Number(t && t.size) || 0; });
+      return {
+        date: d,
+        state: typesafeJournal.buildState(n, {
+          net: dayRow ? dayRow.pnl : null,
+          trades: rows.length,
+          maxSize: sizes.length ? Math.max.apply(null, sizes) : null,
+          sizeCap: getActiveRules().sizeCap,
+          flags: Array.from(new Set(flags)),
+          tradesDetail: rows.map(function (t, i) {
+            return { n: i + 1, size: t && t.size, pnl: t && t.pnl, side: t && t.side, flags: (t && t.flags) || [] };
+          }),
+        }, d),
+      };
+    }
+  } catch (e) { /* fall through to no-sample */ }
+  return null;
+}
+
+// Run the check. Never throws — a stability check that can break the Settings
+// panel is worse than no check.
+async function typesafeConsistencyRun(opts) {
+  const o = opts || {};
+  const at = new Date().toISOString();
+  try {
+    const rules = getActiveRules();
+    const wantRepeats = Number(o.repeats);
+    const cfgRepeats = Number(rules.typesafe && rules.typesafe.consistencyRepeats);
+    const repeats = Number.isFinite(wantRepeats) && wantRepeats >= 3 ? Math.min(20, Math.floor(wantRepeats))
+      : (Number.isFinite(cfgRepeats) ? Math.min(20, Math.max(3, Math.floor(cfgRepeats))) : CONSISTENCY_DEFAULT_REPEATS);
+    const sample = o.sampleState ? { date: o.date || 'provided', state: o.sampleState } : consistencySampleState();
+    if (!sample) return { ok: false, reason: 'no journal note with written text yet — the check needs one real note to run over' };
+    const questions = typesafeJournal.buildQuestions(rules.mistakeTaxonomy);
+    if (!Object.keys(questions).length) return { ok: false, reason: 'no usable rubric in rules.json.mistakeTaxonomy — nothing to check' };
+    // Ignores typesafe.enabled for the same reason the Settings test does: a
+    // disabled switch would make a perfectly good rubric look broken.
+    const testRules = Object.assign({}, rules, { typesafe: Object.assign({}, rules.typesafe, { enabled: true }) });
+    const settings = typesafeClient.resolveSettings(testRules, loadConfig(), process.env);
+    const day = tradingDayStampIST(Date.now());
+    const callsBefore = typesafeClient.callsToday(DATA_DIR, day);
+    const runs = [];
+    let cost = 0;
+    for (let i = 0; i < repeats; i++) {
+      const r = await typesafeClient.ask(sample.state, questions, { settings, callsToday: callsBefore + i });
+      runs.push(r);
+      cost += (r.usage && r.usage.cost) || 0;
+    }
+    const summary = consistencyCheck.summariseRun(runs, {});
+    const row = {
+      ts: at, rubric: 'mistakeTaxonomy', date: sample.date, repeats: summary.repeats,
+      failed: summary.failed, worstSd: summary.worstSd, verdicts: {},
+      flipping: summary.flipping, near: summary.near, cost: Math.round(cost * 1e8) / 1e8,
+      summary: summary.summary,
+    };
+    for (const q of summary.questions) row.verdicts[q.id] = { verdict: q.verdict, sd: q.sd, mean: q.mean, distinct: q.distinct };
+    try {
+      fs.mkdirSync(path.join(DATA_DIR, 'typesafe'), { recursive: true });
+      fs.appendFileSync(consistencyPath(), JSON.stringify(row) + '\n', 'utf8');
+    } catch (e) { /* best-effort; the response still carries the result */ }
+    const prev = readConsistencyRuns(2)[0] || null;
+    return {
+      ok: true, at, date: sample.date, repeats: summary.repeats, failed: summary.failed,
+      worstSd: summary.worstSd, questions: summary.questions, flipping: summary.flipping,
+      near: summary.near, summary: summary.summary, cost: row.cost,
+      previous: prev ? { ts: prev.ts, worstSd: prev.worstSd, repeats: prev.repeats } : null,
+      // A worse number than last time is the whole reason the benchmark exists.
+      drift: prev ? Math.round((summary.worstSd - (prev.worstSd || 0)) * 10000) / 10000 : null,
+    };
+  } catch (e) { return { ok: false, reason: 'check threw: ' + e.message, at }; }
+}
+// ── Reply audit (2026-09-21) ────────────────────────────────────────────────
+// Reads the REAL replies out of the chat archive and reports the distribution,
+// so a prompt change can be judged against the days before it instead of by
+// feel. The archive is the source because it is the only append-only record of
+// what actually reached the pane — measuring what the agent was TOLD to write
+// would measure the instruction, not the output.
+function auditRepliesFromArchive(days) {
+  try {
+    const dir = path.join(DATA_DIR, 'chat_archive');
+    if (!fs.existsSync(dir)) return { n: 0, verdict: 'NO_DATA', summary: 'No chat archive yet.' };
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')).sort().reverse();
+    const rows = [];
+    for (const f of files.slice(0, Math.max(1, days || 3))) {
+      const linesRaw = fs.readFileSync(path.join(dir, f), 'utf8').split('\n').filter((l) => l.trim());
+      // The archive re-emits rows as they stream (same id, higher seq), so fold
+      // to the NEWEST revision per id before measuring — otherwise a streamed
+      // reply is counted once per token batch and the median is meaningless.
+      const byId = new Map();
+      const order = [];
+      for (const l of linesRaw) {
+        let r = null;
+        try { r = JSON.parse(l); } catch (e) { continue; }
+        if (!r || r.role !== 'assistant' || !r.text) continue;
+        if (!byId.has(r.id)) order.push(r.id);
+        const prev = byId.get(r.id);
+        if (!prev || (r.seq || 0) >= (prev.seq || 0)) byId.set(r.id, r);
+      }
+      for (const id of order) rows.push(byId.get(id));
+    }
+    const out = replyStyle.auditReplies(rows);
+    out.days = Math.max(1, days || 3);
+    out.archiveFiles = files.length;
+    return out;
+  } catch (e) {
+    return { n: 0, verdict: 'ERROR', summary: 'audit failed: ' + e.message };
+  }
+}
+// ── Settings sweep (2026-09-21) ─────────────────────────────────────────────
+// Re-scores every stored Jev answer under a grid of confidence floors WITHOUT
+// calling the model, then reports the winner and what it did on the half it was
+// never chosen from. Pattern from trade-jev, whose whole settings search ran off
+// stored answers and cost nothing.
+function runAnswerSweep(grid) {
+  try {
+    const records = answerStore.readRecords(DATA_DIR);
+    if (!records.length) {
+      return { ok: false, reason: 'no stored answers yet — the store fills as setups arm', records: 0 };
+    }
+    const outcomes = {};
+    try {
+      for (const o of readOutcomeRows(30)) {
+        if (!o || !o.resolved) continue;
+        const sid = o.setupId ? String(o.setupId) : null;
+        if (!sid) continue;
+        const win = o.hit === 'target' ? true : (o.hit === 'stop' ? false : (o.favourable === true));
+        outcomes[sid] = { outcome: win, points: Number(o.atHorizon) };
+      }
+    } catch (e) { /* no outcomes yet is normal early */ }
+    const withOut = answerStore.withOutcomes(records, outcomes);
+    const resolved = withOut.filter((r) => r.outcome !== null);
+    const result = answerStore.sweep(withOut, grid || { minConfidence: [0.5, 0.6, 0.7, 0.8, 0.9] }, {});
+    return Object.assign({ ok: true, records: records.length, resolved: resolved.length }, result);
+  } catch (e) { return { ok: false, reason: 'sweep failed: ' + e.message }; }
+}
 async function handleJessiVoiceSend(ws, msg) {
   const { reqId, messages } = msg;
   // 2026-09-02 (Landing 2): ONE input path. msg.transcript is produced by the
@@ -5879,7 +6513,13 @@ async function handleJessiVoiceSend(ws, msg) {
     // snapshot injected here (Jessi can call quote_get/market_key_levels if
     // she actually needs it) — that snapshot was another chunk of every turn.
     const turnMessages = [...(messages || []).slice(-8), { role: 'user', content: transcript }];
-    const systemPrompt = JESSI_PERSONA_VOICE + '\n\n' + buildJessiContext(true);
+    // #3 (2026-09-21): ONE classification of the utterance, and at most ONE line
+    // added to the prompt. Empty on any failure and on an 'agent' decision, so
+    // the common case is bit-for-bit the prompt this turn has always used.
+    let voiceSteer = '';
+    try { voiceSteer = await voiceRouteTurn(transcript); } catch (e) { voiceSteer = ''; }
+    const systemPrompt = JESSI_PERSONA_VOICE + '\n\n' + buildJessiContext(true)
+      + (voiceSteer ? '\n\n' + voiceSteer : '') + replyStyle.OUTPUT_CONTRACT_SHORT;
 
     // 2026-09-02 (Landing 2): the voice-brain picker is gone. It offered
     // Gemini / Groq / two local Ollama models — a per-surface override that
@@ -8536,6 +9176,484 @@ function ledgerSignal(fields) {
   }
 }
 
+// ── Playbook registry + SHADOW setup router (Phase 2, 2026-09-19) ──────────
+// TYPESAFE_SPEC.md §3. The router asks Jev ONE typed choice question on every
+// armed setup — "which ENABLED playbook does this state most resemble?" — and
+// records the answer BESIDE the detector's own tag. It ranks what Anoop reads
+// first. It never vetoes a signal, never touches size, stop or the confirm path,
+// and no guard in this file reads any of it.
+//
+// WHY ITS OWN FILE AND NOT A COLUMN ON THE LEDGER: DATA/signals/<day>.jsonl is
+// append-only, and rewriting a row to add a column would break the one property
+// that makes it trustworthy. signal-outcome.js already writes a sibling
+// .outcomes.jsonl joined by setupId; this is the same shape. The column is JOINED
+// at read time, not written into the row.
+const ROUTER_SHADOW_DAYS = 30;
+
+// Whitelisted here as well as in typesafe-client.js, deliberately: this list is
+// what the SERVER will accept from the UI, and it must not be widen-able by a
+// renderer edit. The backend selects which host receives which key.
+const TYPESAFE_BACKEND_IDS = typesafeClient.BACKEND_IDS.slice();
+
+/**
+ * Send one real call so a pasted key can be proven before anything depends on
+ * it. Uses the ACTIVE backend and whatever key is on file, and reports the raw
+ * outcome — including a refusal, because "it did not work" with the vendor's own
+ * reason is the whole value of a test button.
+ */
+async function typesafeTestCall() {
+  const at = new Date().toISOString();
+  try {
+    const rules = getActiveRules();
+    const appCfg = loadConfig();
+    // Force enabled for the TEST only: see the note on the caller.
+    const testRules = Object.assign({}, rules, {
+      typesafe: Object.assign({}, rules.typesafe, { enabled: true }),
+    });
+    const settings = typesafeClient.resolveSettings(testRules, appCfg, process.env);
+    const callsToday = typesafeClient.callsToday(DATA_DIR, tradingDayStampIST(Date.now()));
+    const questions = {
+      reachable: {
+        type: 'noul',
+        instructions: 'This is a connectivity check from the app. Answer whether the request reached you and the state is readable.',
+        // MUST be an object, never a string: a string here 400s the WHOLE
+        // request with "questions.reachable.criteria expected object, received
+        // string" (confirmed live 2026-09-21T12:37 — the ledger recorded
+        // phase 'settings-test', ok false, reason 'HTTP 400'). Same shape rule
+        // typesafe-router.js documents for its own noul question.
+        criteria: {
+          true: 'The request arrived and the state is readable.',
+          false: 'The request did not arrive, or the state could not be read.',
+        },
+      },
+    };
+    const raw = await typesafeClient.ask(
+      { test: 'Connectivity check from the MNQ Co-Pilot app.', at },
+      questions,
+      { settings, callsToday });
+    const out = {
+      ok: !!raw.ok,
+      backend: settings.backend,
+      endpoint: settings.endpoint,
+      model: raw.model || settings.model,
+      keySource: settings.keySource,
+      keyPresent: !!settings.key,
+      latencyMs: raw.latencyMs != null ? raw.latencyMs : null,
+      cost: (raw.usage && raw.usage.cost != null) ? raw.usage.cost : null,
+      answer: (raw.answers && raw.answers.reachable) ? raw.answers.reachable.noul : null,
+      reason: raw.reason || null,
+      callsToday,
+    };
+    try {
+      typesafeClient.appendLedger(DATA_DIR, {
+        ts: at, phase: 'settings-test', ok: out.ok, backend: out.backend, model: out.model,
+        latencyMs: out.latencyMs, cost: out.cost, reason: out.reason, keySource: out.keySource,
+      });
+    } catch (e) { /* the ledger is best-effort */ }
+    return out;
+  } catch (e) {
+    return { ok: false, reason: 'test threw: ' + e.message, at };
+  }
+}
+
+function routerShadowPaths(day) {
+  const dir = path.join(DATA_DIR, 'signals');
+  return { dir, file: path.join(dir, day + '.router.jsonl') };
+}
+
+// Append one router read. Failure-tolerant, exactly like ledgerSignal(): a disk
+// problem must never disturb the live setup it was only annotating.
+function routerShadowSignal(result, ctx) {
+  try {
+    const day = tradingDayStampIST(Date.now());
+    const { dir, file } = routerShadowPaths(day);
+    const row = typesafeRouter.routerShadowRow(result, ctx || {});
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(file, typesafeRouter.serializeRouterRow(row), 'utf8');
+    return row;
+  } catch (e) {
+    console.warn('[router-shadow] write failed:', e.message);
+    return null;
+  }
+}
+
+function readRouterShadowRows(days) {
+  const dir = path.join(DATA_DIR, 'signals');
+  const out = [];
+  try {
+    if (!fs.existsSync(dir)) return out;
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.router.jsonl')).sort().reverse();
+    for (const f of files.slice(0, days)) out.push(...readJsonl(path.join(dir, f)));
+  } catch (e) { /* a read problem reports as "no data", never as an edge */ }
+  return out;
+}
+
+function readOutcomeRows(days) {
+  const dir = path.join(DATA_DIR, 'signals');
+  const out = [];
+  try {
+    if (!fs.existsSync(dir)) return out;
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.outcomes.jsonl')).sort().reverse();
+    for (const f of files.slice(0, days)) out.push(...readJsonl(path.join(dir, f)));
+  } catch (e) { /* same */ }
+  return out;
+}
+
+// The whole Phase 2 payload. Everything the panel shows is recomputed here from
+// disk on every request, so the tab can never display a number the server did
+// not just derive.
+function buildRouterReport() {
+  const rules = getActiveRules();
+  const appCfg = loadConfig();
+  const settings = typesafeClient.resolveSettings(rules, appCfg, process.env);
+  const day = tradingDayStampIST(Date.now());
+  const callsToday = typesafeClient.callsToday(DATA_DIR, day);
+  const routerCfg = typesafeRouter.routerSettings(rules);
+  const registry = playbookRegistry.listRegistry(rules);
+  const eligible = typesafeRouter.eligiblePlaybooks(rules, routerCfg).map((e) => e.id);
+  const routerRows = readRouterShadowRows(ROUTER_SHADOW_DAYS);
+  const outcomeRows = readOutcomeRows(ROUTER_SHADOW_DAYS);
+  const joined = typesafeRouter.joinToOutcomes(routerRows, outcomeRows);
+  const evaluate = typesafeRouter.evaluateRouter(joined.entries, { minSamples: routerCfg.minSamples });
+  const reads = routerRows.filter((r) => r && r.ok);
+  const shadows = routerRows.filter((r) => r && r.event === 'router-shadow');
+  const escalations = routerRows.filter((r) => r && r.event === 'router-escalation');
+  const lastRead = shadows.length ? shadows[shadows.length - 1] : null;
+  const lastEscalation = escalations.length ? escalations[escalations.length - 1] : null;
+  // The pre-trade advisory's own counters. 'asked' is distinct from 'answered':
+  // a day with no written plan produces neither, and that difference is the
+  // whole reason both are reported.
+  const planRows = shadows.filter((r) => r.planAsked);
+  const planMatched = planRows.filter((r) => r.planMatch != null && r.planMatch >= 0.5).length;
+  return {
+    day,
+    // The two switches are reported separately and by name, because "why did
+    // nothing happen" is the question a silent skip makes unanswerable.
+    switches: {
+      journal: rules.typesafe ? rules.typesafe.enabled === true : false,
+      router: routerCfg.enabled,
+      keyPresent: !!settings.key,
+      keySource: settings.keySource,
+      model: settings.model,
+      backend: settings.backend,
+      backendLabel: settings.backendLabel,
+      endpoint: settings.endpoint,
+      callsToday,
+      maxCallsPerDay: settings.maxCallsPerDay,
+    },
+    // #2, reported by name: the mode, and what the gate last decided. In
+    // 'observe' the decided-but-not-obeyed rows are the evidence that would
+    // justify ever switching to 'gate'.
+    escalation: {
+      mode: escalationMode(rules),
+      band: routerCfg.escalateBand,
+      today: escalations.length,
+      wouldSuppress: escalations.filter((e) => e.outcome === 'observed').length,
+      suppressed: escalations.filter((e) => e.outcome === 'suppressed').length,
+      allowed: escalations.filter((e) => e.outcome === 'allowed').length,
+      last: lastEscalation,
+    },
+    // #5, the written plan the advisory is judged against.
+    plan: {
+      written: !!readWrittenPlan(),
+      asked: planRows.length,
+      matched: planMatched,
+      lastMatch: lastRead && lastRead.planAsked ? lastRead.planMatch : null,
+    },
+    registry,
+    eligible,
+    stats: {
+      reads: reads.length,
+      failed: routerRows.length - reads.length,
+      lastRead,
+      // Per playbook, with the switch recommendation computed from HIS OWN
+      // resolved signals. This is the half of Phase 2 that needs no model at
+      // all: the registry, the measured rate and the ON/OFF advice all work
+      // today, with Jev switched off and no key anywhere.
+      //
+      // Per CONTRACT (points), and the win test is the same pessimistic one the
+      // resolver uses: a stop is a loss even when the horizon closed green.
+      advice: registry.filter((e) => e.kind === 'setup' && !e.unknown).map((e) => {
+        const canon = playbookSpecCanonical(e.id);
+        const rows = outcomeRows.filter((o) => o && o.resolved && playbookSpecCanonical(o.playbook) === canon);
+        const wins = rows.filter((o) => o.hit === 'target' || (o.hit !== 'stop' && o.favourable === true)).length;
+        const pts = rows.map((o) => Number(o.atHorizon)).filter((v) => Number.isFinite(v));
+        const exp = pts.length ? Math.round((pts.reduce((a, b) => a + b, 0) / pts.length) * 100) / 100 : null;
+        const verdict = playbookRegistry.decideSwitch(
+          { n: rows.length, wins, winRate: rows.length ? wins / rows.length : null, expectancyPerContract: exp },
+          rules);
+        return {
+          id: e.id, label: e.label, enabled: e.enabled, shadowOnly: e.shadowOnly, locked: e.locked,
+          kind: e.kind, unknown: e.unknown, blurb: e.blurb,
+          n: rows.length, wins, expectancyPoints: exp,
+          recommend: verdict.recommend, reason: verdict.reason, ci: verdict.ci || null,
+          line: playbookRegistry.describeEntry(e, { n: rows.length }),
+        };
+      }),
+    },
+    measurement: {
+      scored: joined.entries.length,
+      unjoined: joined.unjoined.length,
+      unjoinedSample: joined.unjoined.slice(-3),
+      orphanOutcomes: joined.orphanOutcomes,
+      routerRows: joined.routerRows,
+      evaluate,
+    },
+    // The shadow row's own wording rule, applied server-side so no renderer can
+    // rephrase it into a probability.
+    line: lastRead ? typesafeRouter.describeRanking(lastRead, lastRead.detector) : null,
+  };
+}
+
+// One router read, start to finish. Shared by the armSetup hook and the manual
+// button so both paths record identically — a manual read that took a different
+// route would produce rows the measurement could not use.
+async function routerShadowCall(fields, opts) {
+  const o = opts || {};
+  const rules = getActiveRules();
+  const appCfg = loadConfig();
+  const settings = typesafeClient.resolveSettings(rules, appCfg, process.env);
+  const routerCfg = typesafeRouter.routerSettings(rules);
+  const at = new Date().toISOString();
+  try {
+    if (!routerCfg.enabled) return { ok: false, skipped: true, reason: 'router disabled in rules.json (typesafe.router.enabled)' };
+    const eligible = typesafeRouter.eligiblePlaybooks(rules, routerCfg);
+    // His OWN pre-session words, read at fire time. This is what makes the plan
+    // question (#5) answerable at all: without text on file the question is not
+    // asked, rather than asked against an invented standard.
+    const writtenPlan = readWrittenPlan();
+    const questions = typesafeRouter.buildQuestions(eligible, { writtenPlan });
+    if (!Object.keys(questions).length) {
+      // Fewer than two enabled setups AND no written plan: every state would
+      // "match" the only playbook, which is a fact about the registry rather
+      // than a reading of the market.
+      return { ok: false, skipped: true, reason: 'nothing to ask — fewer than two enabled playbooks and no written plan for today' };
+    }
+    const callsToday = typesafeClient.callsToday(DATA_DIR, tradingDayStampIST(Date.now()));
+    const state = typesafeRouter.buildState(fields, {
+      sessionTier: signalLedger.sessionTierForMinutes(
+        Math.floor((Date.now() + 5.5 * 3600000) % 86400000 / 60000),
+        (rules.sessionWindowsIST || []).map((w) => ({ startMin: w.startMin, name: w.name || null }))),
+      hourTrend: (po3TrendCache['60'] && po3TrendCache['60'].value) ? po3TrendCache['60'].value.label : null,
+      newsBlackout: computeNewsStatus().inBlackout,
+      symbol: chartSymbolCache.symbol,
+      writtenPlan,
+    });
+    // Four atomic Scores on the SAME request as the ranking Choice — the docs'
+    // composite-scoring pattern, and free of extra latency because the questions
+    // run in parallel over one state. Combined here, in code, with weights from
+    // rules.json, so the blend is a data edit rather than a prompt rewrite.
+    const scoreQuestions = compositeScore.buildScoreQuestions(rules);
+    const allQuestions = Object.assign({}, questions, scoreQuestions);
+    // ── the economics this setup has to beat (2026-09-21) ──────────────────
+    // From the Jev trading repos: jev-trader tells its model what a trade must
+    // clear ("the trade crosses the spread, so the move must beat that cost").
+    // Here the cost is the round-turn commission expressed in POINTS, so it sits
+    // in the same unit as the stop and the target and the model can compare them.
+    const _com = Number(rules.commissionPerContractPerSide);
+    const _pv = Number(rules.pointValue) || 2;   // MNQ is $2/point
+    const _costPoints = Number.isFinite(_com) && _com > 0 ? Math.round((_com * 2 / _pv) * 100) / 100 : null;
+    const _entry = Number(fields.entry);
+    const _stop = Number(fields.stop);
+    const _target = Number(fields.target);
+    const _risk = Number.isFinite(_entry) && Number.isFinite(_stop) ? Math.abs(_entry - _stop) : null;
+    const _reward = Number.isFinite(_entry) && Number.isFinite(_target) ? Math.abs(_target - _entry) : null;
+    if (_costPoints != null) {
+      state.economics = {
+        riskPoints: _risk, rewardPoints: _reward,
+        rMultiple: (_risk && _reward) ? Math.round((_reward / _risk) * 100) / 100 : null,
+        costPoints: _costPoints,
+        mustBeatPoints: _costPoints,
+      };
+    } else if (_risk || _reward) {
+      state.economics = { riskPoints: _risk, rewardPoints: _reward, rMultiple: (_risk && _reward) ? Math.round((_reward / _risk) * 100) / 100 : null, costPoints: null, mustBeatPoints: null };
+    }
+    const raw = await typesafeClient.ask(state, allQuestions, { settings, callsToday });
+    const result = typesafeRouter.shapeResult(raw, eligible, {
+      detector: fields.playbook, setupId: o.setupId || null, at,
+    });
+    const compositeView = Object.keys(scoreQuestions).length
+      ? compositeScore.combine(raw.answers || {}, rules)
+      : null;
+    if (compositeView) result.compositeView = compositeView;
+    const esc = typesafeRouter.escalation(result, routerCfg);
+    const row = routerShadowSignal(result, {
+      setupId: o.setupId || null, tf: fields.tfCode || fields.tf || null,
+      signalTs: o.signalTs || null, escalate: esc.escalate, escalateReason: esc.reason,
+    });
+    // Hand the read to the debate path (#2). Kept as the LAST read rather than a
+    // map: the gate only ever needs the read for the setup in front of it, and a
+    // stale-map that never gets cleaned is how a gate starts gating on last
+    // hour's setup. The setupId + a time bound are both checked before use.
+    lastRouterRead = {
+      setupId: o.setupId || null, detector: fields.playbook || null,
+      detectorCanonical: result.detectorCanonical || null,
+      escalate: esc.escalate, confidence: result.confidence,
+      reason: esc.reason, at: Date.now(), ok: !!result.ok,
+    };
+    try {
+      typesafeClient.appendLedger(DATA_DIR, {
+        ts: at, phase: 'router', question: Object.keys(questions).join('+'), ok: !!result.ok,
+        planMatch: result.planMatch != null ? result.planMatch : null,
+        planAsked: !!questions.plan_match,
+        pick: result.pick || null, detector: fields.playbook || null,
+        confidence: result.confidence, latencyMs: result.latencyMs || null,
+        model: result.model || null, reason: result.reason || raw.reason || null, setupId: o.setupId || null,
+      });
+    } catch (e) { /* the call ledger is best-effort; the shadow row is the record */ }
+    // ── store the ANSWER (2026-09-21) ──────────────────────────────────────
+    // Pattern from trade-jev: "run once, replay many times". An answer already
+    // carries the full distribution, so a different confidence cutoff is
+    // arithmetic over data already on disk rather than weeks of waiting for new
+    // setups. Written HERE, at the only place an answer is received, so no future
+    // caller has to remember to store it.
+    try {
+      const _a = (raw.answers && raw.answers.match) || null;
+      answerStore.appendRecords(DATA_DIR, [answerStore.buildRecord({
+        ts: at, setupId: o.setupId || null, playbook: fields.playbook,
+        tf: fields.tfCode || fields.tf || null, question: 'match',
+        answer: _a ? { choice: _a.choice, probabilities: _a.probabilities, confidence: _a.confidence } : {},
+      })]);
+    } catch (e) { /* the store is best-effort; the shadow row is still the record */ }
+    // Broadcast even when the read failed, so a silent skip can never look like
+    // "nothing happened" in the panel.
+    broadcast({
+      type: 'router-read', manual: !!o.manual, row,
+      line: typesafeRouter.describeRanking(result, fields.playbook),
+      // The breakdown, so WHY a setup graded the way it did is visible rather
+      // than a number arriving from nowhere.
+      composite: compositeView ? {
+        composite: compositeView.composite,
+        coverage: compositeView.coverage,
+        parts: compositeView.parts,
+        weightsUsed: compositeView.weightsUsed,
+        line: compositeScore.explain(compositeView),
+      } : null,
+      escalate: esc.escalate, escalateReason: esc.reason,
+    });
+    return row || result;
+  } catch (e) {
+    return { ok: false, reason: 'router threw: ' + e.message };
+  }
+}
+
+// Fired from armSetup — the single choke point every confirmed setup passes
+// through, so hooking here cannot miss a playbook the way hooking each monitor
+// separately would (the same argument shadowRecordMachineOrder is built on).
+// FIRE-AND-FORGET and .catch()'d: an advisory read must never be able to
+// disturb the live alert it annotates.
+function routerShadowOnArm(fields, setupId, signalTs) {
+  try {
+    if (!typesafeRouter.routerSettings(getActiveRules()).enabled) return;
+    routerShadowCall(fields, { setupId, signalTs })
+      .catch(function () { /* advisory: never surfaces */ });
+  } catch (e) { /* advisory: never surfaces */ }
+}
+
+// ── #2: the confidence-band gate on the EXPENSIVE path (2026-09-19) ─────────
+// triggerPlaybookDebate already convenes the full multi-agent debate (Jessi +
+// Analysis + PO3, then the Judge, 10-90s observed live) on every confirmed
+// Playbook A and B, on a 10-minute cooldown. The band's only real effect is
+// therefore SUPPRESSION, not addition — it can stop a debate that would
+// otherwise have run, and a stopped debate can mean a TRADE_TICKET that never
+// surfaces. That is an omission that can cost money, so it is wired with THREE
+// modes and ships in the middle one:
+//
+//   'off'     — the gate does not run. The debate path is bit-for-bit today's.
+//   'observe' — DEFAULT. Every decision the gate WOULD make is computed,
+//               logged and broadcast, and the debate fires anyway. Nothing
+//               about live behaviour changes while the evidence accrues.
+//   'gate'    — the decision is obeyed: outside the band, no debate.
+//
+// Observe-first is the same order every other measured thing in this app was
+// introduced (shadow orders before orders, the registry before the router). It
+// also means the question "would this band have suppressed anything that
+// mattered" is answered by data BEFORE it costs a missed trade.
+const ROUTER_READ_MAX_AGE_MS = 3 * 60 * 1000;
+let lastRouterRead = null;
+
+const ESCALATION_MODES = ['off', 'observe', 'gate'];
+
+function escalationMode(rules) {
+  const r = (rules && rules.typesafe && rules.typesafe.router) || {};
+  const m = String(r.escalationMode || '').toLowerCase();
+  return ESCALATION_MODES.includes(m) ? m : 'observe';
+}
+
+/**
+ * Would the band let this debate run?
+ *
+ * FAIL-OPEN ON EVERY UNKNOWN, and each one says which unknown it was: no read,
+ * a failed read, a stale read, a read for a different playbook. The gate may
+ * only ever suppress on a POSITIVE, current, correctly-attributed read — an
+ * advisory service that is down must not be able to silence a verdict.
+ */
+async function routerEscalationGate(fields) {
+  try {
+    const rules = getActiveRules();
+    const cfg = typesafeRouter.routerSettings(rules);
+    const mode = escalationMode(rules);
+    if (!cfg.enabled) return { decide: 'allow', mode, reason: 'router disabled in rules.json — debate path unchanged' };
+    if (mode === 'off') return { decide: 'allow', mode, reason: 'escalationMode off — debate path unchanged' };
+    const read = lastRouterRead;
+    if (!read || !read.ok) return { decide: 'allow', mode, reason: 'no usable router read — failing open' };
+    if (Date.now() - read.at > ROUTER_READ_MAX_AGE_MS) return { decide: 'allow', mode, reason: 'last router read is stale — failing open' };
+    const canon = playbookSpecCanonical(fields && fields.playbook);
+    if (read.detectorCanonical && canon && read.detectorCanonical !== canon) {
+      return { decide: 'allow', mode, reason: 'last read was for ' + read.detectorCanonical + ', this is ' + canon + ' — failing open' };
+    }
+    if (read.escalate) return { decide: 'allow', mode, reason: 'in the band — ' + read.reason, read };
+    return { decide: 'suppress', mode, reason: 'outside the band — ' + read.reason, read };
+  } catch (e) {
+    return { decide: 'allow', mode: 'observe', reason: 'gate threw (' + e.message + ') — failing open' };
+  }
+}
+
+/**
+ * Record one gate decision. Written to the SAME router file, with a different
+ * event name, so the outcome join keeps ignoring it (joinToOutcomes filters on
+ * event === 'router-shadow') while the escalation history stays in one place.
+ */
+function routerEscalationLog(fields, gate, outcome) {
+  try {
+    const day = tradingDayStampIST(Date.now());
+    const { dir, file } = routerShadowPaths(day);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(file, JSON.stringify({
+      ts: new Date().toISOString(),
+      event: 'router-escalation',
+      outcome: outcome,                    // 'allowed' | 'observed' | 'suppressed' | 'fired-anyway'
+      decide: gate.decide,
+      mode: gate.mode,
+      reason: gate.reason,
+      playbook: fields && fields.playbook ? fields.playbook : null,
+      tf: (fields && (fields.tfCode || fields.tf)) || null,
+      confidence: (gate.read && gate.read.confidence != null) ? gate.read.confidence : null,
+      setupId: (gate.read && gate.read.setupId) || null,
+    }) + '\n', 'utf8');
+  } catch (e) { /* advisory: never breaks the debate path */ }
+}
+
+/**
+ * His own pre-session words, read at fire time. The ONLY source that can answer
+ * "does this match the plan" — the app must never supply the standard itself.
+ */
+function readWrittenPlan() {
+  try {
+    const slot = jessiBucketKey(loadConfig());
+    const today = tradingDayStampIST(Date.now());
+    const notes = dataLoad('notes__' + slot) || {};
+    const n = notes[today] || null;
+    if (!n || typeof n !== 'object') return null;
+    const parts = [];
+    if (n.entryCriteria) parts.push('Entry conditions he wrote: ' + String(n.entryCriteria));
+    if (n.exitCriteria) parts.push('Exit conditions he wrote: ' + String(n.exitCriteria));
+    if (n.text) parts.push('What he wrote about today: ' + String(n.text));
+    return parts.length ? parts.join('\n') : null;
+  } catch (e) { return null; }
+}
+
+
 // ── Signal outcome resolution (2026-08-23) ─────────────────────────────────
 // Closes the selection-bias hole in the detection loop. The ledger above
 // records every fire; signal-join.js matches TAKEN trades back to one. Until
@@ -9839,6 +10957,14 @@ function armSetup(fields) {
       });
     }
     shadowRecordMachineOrder(plan, { playbook: fields.playbook, tf: fields.tfCode, setupId: sid, why });
+    // Phase 2 (2026-09-19): one shadow router read per armed setup, keyed by the
+    // same setupId so it joins to this signal's outcome when it resolves.
+    // signalTs is the ledger's own join key (`signalTs|playbook|tf`), and it
+    // was hardcoded null here — so EVERY router row persisted signalTs:null and
+    // the composite fallback in joinToOutcomes could never fire. `now` is the
+    // same value armedSetup carries below, i.e. the exact key the outcome row
+    // for this signal will use. (Found 2026-09-21: 3 live router rows, 0 joined.)
+    routerShadowOnArm(fields, sid, now);
     // Push the ticket into the app chat — Anoop's request: direction, stop and
     // target in BOTH dollars and ticks, plus why it was confirmed. A signal
     // that only names a candle makes him re-derive the trade every time.
@@ -11842,6 +12968,44 @@ async function pollTVBrokerAccountInner() {
       } catch (e) {
         console.log('[mistake-pattern] F4 check failed: ' + e.message);
       }
+      // 2026-09-19 (F5, post-payout relapse). Deva's warning: after his first
+      // payout he blew three accounts on "it's easy, I did it before" —
+      // overtrading, stopped waiting, entering early. Every signal below is one
+      // the app already had (cap, size-up-into-loss, the rulebook's own 5-trade
+      // checkpoint); what was missing was the WINDOW, so the only period with a
+      // documented, repeated, specific failure mode was the one period nothing
+      // watched. Per-kind fired flags, same shape as F2's, so the mildest
+      // signature of the day cannot silence the serious one. Advisory only.
+      try {
+        const arF5 = getActiveRules();
+        const ppF5 = arF5.postPayoutRelapse || {};
+        if (ppF5.enabled !== false) {
+          const feesF5 = dataLoad('account_fees') || { payouts: [] };
+          const lastF5 = mostRecentPayout(feesF5.payouts);
+          const firedF5 = tvBrokerFeedState.f5FiredKinds || {};
+          const f5 = mistakePatterns.checkPostPayoutRelapse(tvBrokerFeedState.trades, {
+            enabled: true,
+            lastPayout: lastF5,
+            daysSincePayout: lastF5 ? tradingDaysSince(lastF5.date) : null,
+            windowDays: ppF5.windowDays,
+            overtradeAt: ppF5.overtradeAt,
+            sizeCap: arF5.sizeCap,
+          });
+          if (f5.matched && !firedF5[f5.kind]) {
+            console.log('[mistake-pattern] F5 fired (' + f5.kind + '): ' + f5.message);
+            tvBrokerFeedState = { ...tvBrokerFeedState, f5FiredKinds: { ...firedF5, [f5.kind]: true } };
+            persistTVBrokerFeedState();
+            broadcast({
+              type: 'mistake-pattern', pattern: 'F5', kind: f5.kind, message: f5.message,
+              daysSincePayout: f5.daysSincePayout, windowDays: f5.windowDays,
+              lastPayoutDate: f5.lastPayoutDate, payoutAmount: f5.payoutAmount,
+              tradeCount: f5.tradeCount, maxSize: f5.maxSize,
+            });
+          }
+        }
+      } catch (e) {
+        console.log('[mistake-pattern] F5 check failed: ' + e.message);
+      }
 
       // 2026-08-25: HIS OWN armed detectors, evaluated on the same trades and
       // announced on the same channel as F1-F4. The four built-ins are the
@@ -11908,8 +13072,9 @@ async function pollTVBrokerAccountInner() {
     // real trading day before Phase 2b ever wires it to anything that acts.
     try {
       const activeRules = getActiveRules();
-      const shadowCheck = tradeConfirmRules.checkTradeAllowed(activeRules, currentMode, tvBrokerFeedState.trades, activeRules.sizeCap);
-      if (!shadowCheck.allowed) {
+      const shadowRaw = tradeConfirmRules.checkTradeAllowed(activeRules, currentMode, tvBrokerFeedState.trades, activeRules.sizeCap);
+      const shadowCheck = tier.applyTier(shadowRaw, activeTier);
+      if (shadowRaw.allowed === false) {
         console.log(`[trade-confirm-shadow] would BLOCK a ${activeRules.sizeCap}-size trade right now: ${shadowCheck.reason}`);
       }
     } catch (e) {
@@ -12140,20 +13305,23 @@ function enforcePerTradeStop(rows) {
 //
 // The honest limitation, stated here because it is the whole reason a bracket would be
 // better: this only protects while the app is awake.
-let positionProtectionState = { key: null, attempted: false, blindFired: false, closeFailures: 0 };
+let positionProtectionState = { key: null, attempted: false, blindFired: false, closeFailures: 0, peakUsd: null };
 function enforcePositionProtection(rows) {
   const rules = getActiveRules();
-  const ap = rules.autoProtection || {};
+  // Resolve the EFFECTIVE band for the CURRENT stage (eval vs funded) through the
+  // same function the renderer uses, so the HUD's numbers and the enforced ones
+  // can never come from two different blocks of rules.json.
+  const ap = positionProtection.resolveAutoProtection(rules.autoProtection, currentMode);
   if (ap.enabled === false) return;
   const pos = oversizeGuard.netPosition(rows);
   const size = pos ? Number(pos.size) : 0;
   if (!Number.isFinite(size) || size === 0) {
-    positionProtectionState = { key: null, attempted: false, blindFired: false, closeFailures: 0 };
+    positionProtectionState = { key: null, attempted: false, blindFired: false, closeFailures: 0, peakUsd: null };
     return;
   }
   const posKey = String((pos && pos.symbol) || '?') + '|' + String((pos && pos.side) || '?');
   if (positionProtectionState.key !== posKey) {
-    positionProtectionState = { key: posKey, attempted: false, blindFired: false, closeFailures: 0 };
+    positionProtectionState = { key: posKey, attempted: false, blindFired: false, closeFailures: 0, peakUsd: null };
   }
   let pointValue = null;
   try { pointValue = tradeProtection.pointValueForSymbol(rules, pos && pos.symbol); } catch (e) { pointValue = null; }
@@ -12165,9 +13333,16 @@ function enforcePositionProtection(rows) {
     pointValue,
     stopLossUsd: ap.stopLossUsd,
     takeProfitUsd: ap.takeProfitUsd,
+    breakEvenAtUsd: ap.breakEvenAtUsd,
+    trailDistanceUsd: ap.trailDistanceUsd,
+    peakUsd: positionProtectionState.peakUsd,
     enabled: ap.enabled !== false,
     alreadyAttempted: positionProtectionState.attempted,
   });
+  // Carry the high-water mark forward so the trail is monotonic across polls
+  // (decide() is pure; the state lives here). A null peak means an early-return
+  // path (flat/latch/disabled) and must not overwrite a real one.
+  if (verdict.peakUsd != null) positionProtectionState.peakUsd = verdict.peakUsd;
   if (verdict.action === 'none') return;
 
   const side = pos && pos.side;
@@ -14461,6 +15636,24 @@ async function handleTradeConfirm(ws, msg) {
     return;
   }
 
+  // ── VIEW-ONLY GUARD (2026-09-19) ──────────────────────────────────────────
+  // A breached account is closed to trading in the UI: the picker marks it
+  // view-only and every renderer write path refuses. This is the same rule at
+  // the ONE place an order can actually leave the app. The firm has closed the
+  // account anyway, so this is defence in depth rather than the only wall — but
+  // an app that would happily fire a ticket at a dead account is one stale slot
+  // flag away from doing something surprising with live money.
+  try {
+    const cfg = loadConfig() || {};
+    const slots = Array.isArray(cfg.acctSlots) ? cfg.acctSlots : [];
+    const active = slots.filter(function (s) { return s && s.id === cfg.activeSlotId; })[0];
+    if (active && active.retired) {
+      rejectTicket(ws, requestId, 'the open account "' + (active.name || active.id)
+        + '" is marked BREACHED — it is view-only. Start a new account before placing orders.');
+      return;
+    }
+  } catch (e) { /* a config read failure must not block the normal order path */ }
+
   try {
     if (process.env.TV_ALLOW_LIVE_ORDERS !== '1') {
       rejectTicket(ws, requestId, 'live orders are not enabled this session (TV_ALLOW_LIVE_ORDERS was not set at launch)');
@@ -14512,7 +15705,13 @@ async function handleTradeConfirm(ws, msg) {
       pointValue: _pvSpec ? _pvSpec.pointValue : null,
       riskCapUsd: _riskCap,
     };
-    const check = tradeConfirmRules.checkTradeAllowed(rules, currentMode, tvBrokerFeedState.trades, qtyNum, accountRisk, _riskParam);
+    // Tier gate. At the default tier ('local') applyTier returns this verdict
+    // UNCHANGED, field for field -- proven in app/test/tier.test.js. Only a
+    // licence.json that explicitly says "free" turns a refusal into advice.
+    const check = tier.applyTier(tradeConfirmRules.checkTradeAllowed(rules, currentMode, tvBrokerFeedState.trades, qtyNum, accountRisk, _riskParam), activeTier);
+    if (check.wouldBlock) {
+      console.log('[trade-confirm] free-tier advisory (trade NOT blocked): ' + check.blockedReason);
+    }
     if (!check.allowed) {
       console.log(`[trade-confirm] BLOCKED requestId=${requestId}: ${check.reason}`);
       rejectTicket(ws, requestId, check.reason);

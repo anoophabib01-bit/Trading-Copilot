@@ -60,7 +60,7 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 6. `replay_stop` → return to realtime
 
 ### "Screen multiple symbols"
-- ⚠️ **`batch_run` is BROKEN (confirmed 2026-08-17 by reading `core/batch.js` directly)** — it switches symbol/timeframe per iteration and **never restores the original chart state** afterward, unlike every other multi-TF function in this project. Using it will leave the user's live chart parked on whatever it checked last. Do not wire it into anything automated. For a restore-safe multi-symbol pattern instead, see `app/server.js`'s `checkPo3SecondarySymbol()` in the MNQ-CoPilot app repo — switches, reads, and ALWAYS restores in a `finally`, same discipline as `withChartLock`/`getFullBars`.
+- ⚠️ **`batch_run` is BROKEN (confirmed 2026-08-17 by reading `core/batch.js` directly)** — it switches symbol/timeframe per iteration and **never restores the original chart state** afterward, unlike every other multi-TF function in this project. Using it will leave the user's live chart parked on whatever it checked last. Do not wire it into anything automated. For a restore-safe multi-symbol pattern instead, see `app/server.js`'s `checkPo3SecondarySymbol()` in the Trading-CoPilot app repo — switches, reads, and ALWAYS restores in a `finally`, same discipline as `withChartLock`/`getFullBars`.
 
 ### "Draw on the chart"
 - `draw_shape` → horizontal_line, trend_line, rectangle, text (pass point + optional point2)

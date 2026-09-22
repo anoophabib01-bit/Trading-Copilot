@@ -481,6 +481,51 @@
 
       case 'scorecard-data':
         emit('scorecard:data', msg);
+        // Same latent bug as router-data, fixed while it was in front of me:
+        // the existing getScorecard() awaits a reply this case never resolved.
+        if (msg.reqId) resolvePending(msg.reqId, msg);
+        break;
+
+      // The Settings panel's one-shot connectivity test.
+      case 'typesafe-test-result':
+        emit('typesafe:testResult', msg);
+        if (msg.reqId) resolvePending(msg.reqId, msg);
+        break;
+
+      // The settings sweep over STORED answers — no model calls at all.
+      case 'answer-sweep-data':
+        emit('answer:sweep', msg);
+        if (msg.reqId) resolvePending(msg.reqId, msg);
+        break;
+
+      // The rubric stability check — N real calls, so it has its own message.
+      case 'typesafe-consistency-result':
+        emit('typesafe:consistencyResult', msg);
+        if (msg.reqId) resolvePending(msg.reqId, msg);
+        break;
+
+      // Phase 2 (2026-09-19): the playbook registry + the shadow router read.
+      case 'router-data':
+        emit('router:data', msg);
+        // MUST resolve: getRouter() awaits this. Without it the request hangs
+        // to its 30s timeout, the .catch swallows it, and the Playbooks panel
+        // simply never populates — a silent failure that looks like 'no data'.
+        if (msg.reqId) resolvePending(msg.reqId, msg);
+        break;
+
+      case 'router-read':
+        emit('router:read', msg);
+        break;
+
+      // #3: the voice router's decision for one spoken utterance.
+      case 'voice-route':
+        emit('voice:route', msg);
+        break;
+
+      // A refused toggle (the validity gate, or a playbook with no order path)
+      // must surface, not fail silently — the switch would look stuck.
+      case 'registry-error':
+        emit('registry:error', msg);
         break;
 
       case 'playbook-b-signal':
@@ -1123,6 +1168,22 @@
     onH6Status:    (cb) => on('h6:status', cb),
     getScorecard:  () => sendRequest({ type: 'scorecard-get' }).then(r => r),
     onScorecardData: (cb) => on('scorecard:data', cb),
+    // Phase 2: playbook registry (no model needed) + shadow router (dormant
+    // until a TypeSafe key exists — invite-only as of 2026-09-19).
+    getRouter:          () => sendRequest({ type: 'router-get' }).then(r => r),
+    onRouterData:       (cb) => on('router:data', cb),
+    onRouterRead:       (cb) => on('router:read', cb),
+    onVoiceRoute:       (cb) => on('voice:route', cb),
+    onRegistryError:    (cb) => on('registry:error', cb),
+    registryToggle:     (id, on) => sendRequest({ type: 'registry-toggle', id: id, on: !!on }).then(r => r),
+    registryShadowSet:  (id, shadowOnly) => sendRequest({ type: 'registry-shadow-set', id: id, shadowOnly: !!shadowOnly }).then(r => r),
+    routerCallNow:      (opts) => sendRequest(Object.assign({ type: 'router-call-now' }, opts || {})).then(r => r),
+    // Settings → TypeSafe: one real call to prove a pasted key works.
+    testTypesafe:       () => sendRequest({ type: 'typesafe-test' }).then(r => r),
+    // 120s: this is N real calls in a row, not one.
+    checkConsistency:   (opts) => sendRequest(Object.assign({ type: 'typesafe-consistency' }, opts || {}), 120000).then(r => r),
+    // Fast: reads stored answers, calls nothing.
+    answerSweep:        (grid) => sendRequest({ type: 'answer-sweep', grid: grid }).then(r => r),
     onPlaybookBSignal: (cb) => on('sfp:playbookB',     cb),
     onLondonLevels:    (cb) => on('london:levels',     cb),
     onNyLevels:        (cb) => on('ny:levels',         cb), // FIX 2026-07-27 — see ws-client.js case 'ny-levels' note

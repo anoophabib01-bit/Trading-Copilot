@@ -2,7 +2,23 @@
 const { spawn } = require('child_process');
 const EventEmitter = require('events');
 
-const MCP_SERVER_PATH = 'G:\\MNQ-CoPilot\\tradingview-mcp\\src\\server.js';
+const fs = require('fs');
+
+// The project folder was renamed MNQ-CoPilot -> Trading-CoPilot (2026-09-18).
+// Resolve whichever path actually exists so the bridge keeps working whether or
+// not the folder rename has happened yet -- a rename must never be the thing
+// that breaks a live session.
+function resolveMcpServerPath() {
+  const candidates = [
+    'G:\\Trading-CoPilot\\tradingview-mcp\\src\\server.js',
+    'G:\\MNQ-CoPilot\\tradingview-mcp\\src\\server.js'
+  ];
+  for (let i = 0; i < candidates.length; i++) {
+    try { if (fs.existsSync(candidates[i])) return candidates[i]; } catch (e) {}
+  }
+  return candidates[0];
+}
+const MCP_SERVER_PATH = resolveMcpServerPath();
 
 // How often to verify TradingView's CDP connection is actually alive, not just
 // that this bridge's child process is up. Fixed 2026-07-15: `ready` only ever
@@ -336,7 +352,7 @@ class MCPBridge extends EventEmitter {
     const result = await this._rpc('initialize', {
       protocolVersion: '2024-11-05',
       capabilities: { roots: {}, sampling: {} },
-      clientInfo: { name: 'mnq-copilot', version: '1.0.0' }
+      clientInfo: { name: 'trading-copilot', version: '1.0.0' }
     });
     // Acknowledge
     this.proc.stdin.write(

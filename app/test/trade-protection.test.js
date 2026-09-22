@@ -68,10 +68,30 @@ test('an unknown symbol REFUSES - it does not assume MNQ', () => {
   assert.throws(() => pointValueForSymbol(rules, ''), /symbol is required/);
 });
 
-test('Anoop 2026-09-15 values are the ones actually configured', () => {
-  assert.equal(rules.autoProtection.stopLossUsd, 200);
-  assert.equal(rules.autoProtection.takeProfitUsd, 600);
-  assert.equal(rules.autoProtection.enabled, true);
+test('autoProtection is configured sanely — but the exact dollars are HIS to set', () => {
+  // REWRITTEN 2026-09-21. This pinned stopLossUsd === 200 and takeProfitUsd ===
+  // 600 against the LIVE app/rules.json. Both are settable from Settings ->
+  // Trading, and he changed the stop to 201 while testing the panel — so the
+  // suite went red reporting his own preference as a code regression. Third time
+  // this class of test has done that (the playbook registry and the s3 replay
+  // were the others).
+  //
+  // What is worth asserting about a user-set risk number: that it exists, is a
+  // positive finite dollar amount, is inside clampAutoProtection's own bounds,
+  // and that protection is switched ON. The exact value belongs to him — and
+  // note that pinned literals in the tests BELOW are fixtures, not reads of the
+  // file, so they do not depend on what he has set.
+  const ap = rules.autoProtection || {};
+  assert.equal(ap.enabled, true, 'auto-protection must be ON');
+  // Per-stage since 2026-09-21: eval and funded each carry their own band.
+  for (const stage of ['eval', 'funded']) {
+    const s = ap[stage] || {};
+    for (const k of ['stopLossUsd', 'takeProfitUsd']) {
+      assert.ok(Number.isFinite(Number(s[k])), stage + '.' + k + ' must be a number, got ' + JSON.stringify(s[k]));
+      assert.ok(Number(s[k]) > 0, stage + '.' + k + ' must be positive, got ' + s[k]);
+      assert.ok(Number(s[k]) <= 100000, stage + '.' + k + ' is implausibly large: ' + s[k]);
+    }
+  }
 });
 // --- G32 (2026-09-15): the UI can now change these, so they are clamped server-side.
 // A risk number a renderer can widen is not a risk number - the same reason sizeCap is clamped.
@@ -110,4 +130,40 @@ test('clamp: the block reasoning survives a UI write', () => {
 
 test('clamp: enabled:false from the UI is honoured', () => {
   assert.equal(clampAutoProtection({ enabled: false }, cur).enabled, false);
+});
+
+// ── per-stage clamp (2026-09-21) ────────────────────────────────────────────
+const curStage = { autoProtection: { enabled: true,
+  eval: { stopLossUsd: 201, takeProfitUsd: 600, breakEvenAtUsd: 150, trailDistanceUsd: 150 },
+  funded: { stopLossUsd: 200, takeProfitUsd: 300, breakEvenAtUsd: 100, trailDistanceUsd: 100 } } };
+
+test('clamp per-stage: sane per-stage values pass through', () => {
+  const r = clampAutoProtection({ eval: { stopLossUsd: 150, takeProfitUsd: 450, breakEvenAtUsd: 120, trailDistanceUsd: 120 } }, curStage);
+  assert.equal(r.eval.stopLossUsd, 150);
+  assert.equal(r.eval.takeProfitUsd, 450);
+  assert.equal(r.eval.breakEvenAtUsd, 120);
+  assert.equal(r.eval.trailDistanceUsd, 120);
+  assert.equal(r.funded.stopLossUsd, 200); // untouched stage carried forward
+});
+
+test('clamp per-stage: an explicit 0 trail DISABLES it (not bumped to the floor)', () => {
+  const r = clampAutoProtection({ eval: { breakEvenAtUsd: 0, trailDistanceUsd: 0 } }, curStage);
+  assert.equal(r.eval.breakEvenAtUsd, 0);
+  assert.equal(r.eval.trailDistanceUsd, 0);
+});
+
+test('clamp per-stage: a BLANK trail box keeps the existing number', () => {
+  const r = clampAutoProtection({ eval: { breakEvenAtUsd: '' } }, curStage);
+  assert.equal(r.eval.breakEvenAtUsd, 150);
+});
+
+test('clamp per-stage: an absurd trail is capped', () => {
+  assert.equal(clampAutoProtection({ eval: { trailDistanceUsd: 999999 } }, curStage).eval.trailDistanceUsd, 5000);
+});
+
+test('clamp per-stage: editing one stage leaves the other intact', () => {
+  const r = clampAutoProtection({ funded: { stopLossUsd: 250 } }, curStage);
+  assert.equal(r.funded.stopLossUsd, 250);
+  assert.equal(r.eval.stopLossUsd, 201);
+  assert.equal(r.enabled, true);
 });

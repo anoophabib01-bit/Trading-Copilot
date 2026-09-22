@@ -1,8 +1,8 @@
 'use strict';
 const fs = require('fs');
-const backtest = require('G:/MNQ-CoPilot/app/backtest');
+const backtest = require('G:/Trading-CoPilot/app/backtest');
 function load(f){const d=JSON.parse(fs.readFileSync(f,'utf8'));const b=Array.isArray(d)?d:(d.bars||[]);return b.filter(x=>x&&typeof x.time==='number'&&typeof x.close==='number');}
-const bars = load('G:/MNQ-CoPilot/DATA/bars/gc_15m.json');
+const bars = load('G:/Trading-CoPilot/DATA/bars/gc_15m.json');
 const span = (bars[bars.length-1].time-bars[0].time)/86400;
 const PV = 10, COMM = 0.95, horizon = 48;  // 48 x 15m = 12 hours
 

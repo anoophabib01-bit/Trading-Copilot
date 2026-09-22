@@ -9,9 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## ⚠️ THIS IS THE ONLY COPY — READ BEFORE TOUCHING ANYTHING
 
-**`G:\MNQ-CoPilot` is the single, canonical, live copy of this project. Nowhere else.**
+**`G:\Trading-CoPilot` is the single, canonical, live copy of this project. Nowhere else.**
 Anoop confirmed this explicitly on 2026-08-05: "everything should be only in this
-[G:\MNQ-CoPilot], nowhere else... it should run from the desktop app location
+[G:\Trading-CoPilot], nowhere else... it should run from the desktop app location
 Desktop MNQ co-pilot."
 
 This matters because it has gone wrong twice already:
@@ -30,14 +30,14 @@ it):
   `_ARCHIVED_2026-08-05_DUPLICATE_USE_G_DRIVE\` inside itself.
 - `D:\Claude Pro trading\Prop Trading` — contents moved into
   `_ARCHIVED_2026-08-05_DUPLICATE_USE_G_DRIVE\` inside itself (was confirmed
-  byte-identical to `G:\MNQ-CoPilot\Prop Trading` before archiving).
+  byte-identical to `G:\Trading-CoPilot\Prop Trading` before archiving).
 - `C:\Users\Admin\tradingview-mcp` → renamed to `tradingview-mcp_OLD_DUPLICATE_SEE_G_DRIVE`.
 - `C:\Users\Admin\sessions` → renamed to `sessions_OLD_DUPLICATE_SEE_G_DRIVE`.
-- Desktop shortcut "MNQ Co-Pilot" now points at `G:\MNQ-CoPilot\START CO-PILOT.bat`
+- Desktop shortcut "MNQ Co-Pilot" now points at `G:\Trading-CoPilot\START CO-PILOT.bat`
   (any shortcut still pointing at C: was auto-retired as "... (OLD - do not use)").
 
 **Before editing anything in a future session: confirm you're reading/writing
-under `G:\MNQ-CoPilot`, not a path that merely looks similar.**
+under `G:\Trading-CoPilot`, not a path that merely looks similar.**
 
 ## What this repo is
 
@@ -83,7 +83,7 @@ See `tradingview-mcp/CLAUDE.md` for the full tool-by-tool guide.
 Everything is one process: a raw `http` server + `ws` WebSocketServer, no Express routing despite `express` being a listed dependency. Structure to know before editing:
 
 - **Rules are data, not code.** `rules.json` at `app/rules.json` is the single source of truth for every discipline rule (size cap, trades/session, daily loss tiers, session windows, etc.) — `loadRules()`/`getActiveRules()` read it at runtime. Never hardcode a limit that already exists in `rules.json`; past bugs came from exactly that (a hardcoded `sizeCap` drifting out of sync with the file). `tradingMode` (`standard` | `scalper`) selects `scalperRules` as an overlay on top of the base rules.
-- **Modes**: `eval` vs `funded` (persisted in `~/.mnq-copilot-config.json`, switched via `handleModeSwitch`) select which account's rules/data apply — this is separate from `tradingMode`/scalper.
+- **Modes**: `eval` vs `funded` (persisted in `~/.trading-copilot-config.json`, switched via `handleModeSwitch`) select which account's rules/data apply — this is separate from `tradingMode`/scalper.
 - **WebSocket protocol**: all client↔server messages flow through the single `ws.on('message', ...)` handler (~line 427) which dispatches on `msg.key`/message type to `handle*` functions (`handleConfigSet`, `handleModeSwitch`, `handleJournalAdd`, `handleSessionStart`, `handleSessionTrade`, `handleScreenshot`, `handleEngulfToggle`, `handleFVGToggle`, `handleSFPToggle`, ...). `send(ws, obj)` / `broadcast(obj)` push back to client(s).
 - **ONE AI backend (consolidated 2026-09-02).** Every AI call site in the app runs on **DeepSeek**, model `deepseek-v4-flash-vision-exp`, via `groq-agent.js` — which despite its name is now the single provider-agnostic transport (OpenAI-shaped SSE + tool loop). `provider-chain.js` decides who answers: DeepSeek primary, then a two-step fail-open ladder `deepseek-v4-flash` → `gemini-3.5-flash`.
   - **Anthropic, Groq, OmniRoute and local Ollama were REMOVED**, along with `anthropic-native.js` and the `@anthropic-ai/sdk` dependency. Anoop's reason: five providers with four key fields and non-obvious precedence "is creating a lot of confusion." Do not reintroduce a provider without adding it to **BOTH** `provider-chain.js`'s `KNOWN_PROVIDERS` and `groq-agent.js`'s `VALID_PROVIDERS` — a provider in only one is skipped **silently** (`pushCandidate` skips rather than throws), so a configured paid key can serve zero requests while the app looks healthy. `provider-chain.test.js` now cross-checks the two real arrays.

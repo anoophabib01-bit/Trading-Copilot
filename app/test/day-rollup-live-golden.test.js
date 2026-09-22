@@ -22,7 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const { rollupDay, gradeTrades } = require('../renderer/day-rollup.js');
 
-const CANDIDATES = ['G:\\MNQ-CoPilot\\DATA\\accounts', 'D:\\co-pilot DATA\\accounts'];
+const CANDIDATES = ['G:\\Trading-CoPilot\\DATA\\accounts', 'D:\\co-pilot DATA\\accounts'];
 const WINDOW_SETS = [
   // 2026-09-15: the session windows are a FIFTH historical dimension, and hardcoding one
   // pair was silently wrong. This file carried London 810-900, but rules.json has used

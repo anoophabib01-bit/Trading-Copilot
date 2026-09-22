@@ -281,7 +281,7 @@ displayed, never enforced.
 
 # TIER 5 — small, do them whenever
 
-- **T5.1** Remove plain-text API keys from `~/.mnq-copilot-config.json` (`sk-ant-…`, `gsk_…`, Gemini,
+- **T5.1** Remove plain-text API keys from `~/.trading-copilot-config.json` (`sk-ant-…`, `gsk_…`, Gemini,
   OmniRoute). Move to env or an OS keystore.
 - **T5.2** Reconcile the daily-loss tiers: `Prop Trading/CLAUDE.md` says −250/−350/−500,
   `rules.json` says something else. Rulebook/engine drift is what produced the unenforced size cap.

@@ -127,7 +127,7 @@ setup, and it trains him to ignore the chime — the exact opposite of a signal.
 
 Gap 5 — The funded target and payout math are not one clean, correct number. The user's goal is
 $3,000 eval / $4,000 funded, and renderer/app.js:134 has the funded account at $100K with payout
-target $104,000 (i.e. $4,000). But ~/.mnq-copilot-config.json still carries stale Lucid numbers
+target $104,000 (i.e. $4,000). But ~/.trading-copilot-config.json still carries stale Lucid numbers
 (top-level payoutTarget: 52000, fundedTargetMin 800–1200) that contradict the per-slot Tradeify
 values (evalTarget 53000, fundedTargetMin 150–300). There is no single HUD number that says "funded
 = $104,000, you are at $X, you need $Y, your consistency allows $Z today." (Note: rules.json's
@@ -139,7 +139,7 @@ Gap 6 — The broker reconciliation is not automatic. The app-vs-broker mismatch
 discipline score on wrong numbers is worse than no score.
 
 Gap 7 — Housekeeping / hygiene. Plain-text API keys (sk-ant-…, gsk_…, Gemini, OmniRoute) sit in
-~/.mnq-copilot-config.json; the rulebook still names "Lucid" as the firm while the live accounts are
+~/.trading-copilot-config.json; the rulebook still names "Lucid" as the firm while the live accounts are
 Tradeify; Prop Trading/CLAUDE.md and app/rules.json describe different daily-loss tiers (−250/−350/−500
 vs −200/−300/−400). Drift between the rulebook and the engine is exactly the class of bug that already
 cost him a breach (the size cap that was "documented but never enforced").
@@ -215,7 +215,7 @@ $3,000 eval / $4,000 funded goals.
 | 5 | Enable autonomyModes.assist (entry+exit) size 2; add take-profit signal | app/autonomy-modes.js, app/playbook-spec.js | The "signal me to enter" ask |
 | 6 | One payout HUD number (funded $104,000, current, distance, consistency allowance) | app/renderer/app.js | Goal clarity |
 | 7 | Retire "Lucid" → Tradeify; reconcile daily-loss tiers with rules.json | Prop Trading/CLAUDE.md | Remove drift |
-| 8 | Remove plain-text keys from config | ~/.mnq-copilot-config.json | Hygiene |
+| 8 | Remove plain-text keys from config | ~/.trading-copilot-config.json | Hygiene |
 
 ---
 ## 7. Bottom line

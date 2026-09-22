@@ -3,7 +3,7 @@
 // One-shot, one-way: archives ALL current account/trade data into
 // DATA/history/<timestamp>/, then resets the live config to a single fresh
 // slot ("Account A", stage=eval). Run with the app/server CLOSED — this
-// edits the same ~/.mnq-copilot-config.json the live server reads/writes,
+// edits the same ~/.trading-copilot-config.json the live server reads/writes,
 // and a concurrent writer could clobber this script's changes or vice versa.
 //
 // Usage: node app/scripts/archive-and-reset-accounts.js [--dry-run]
@@ -23,7 +23,7 @@
 //     tied to a specific archived account), chat_transcript.json,
 //     align_notes.json, resume.html, token-usage.jsonl, charts/, reviews/
 //
-// Config changes (~/.mnq-copilot-config.json), snapshotted to
+// Config changes (~/.trading-copilot-config.json), snapshotted to
 // DATA/history/<timestamp>/config-snapshot.json BEFORE any change:
 //   acctSlots      -> [{ id: 's6', name: 'Account A', size: '50k', stage: 'eval' }]
 //   activeSlotId   -> 's6'
@@ -38,7 +38,7 @@ const atomicWrite = require('../atomic-write');
 const { resolveDataDir } = require('../resolve-data-dir');
 
 const DRY_RUN = process.argv.includes('--dry-run');
-const CONFIG_PATH = path.join(os.homedir(), '.mnq-copilot-config.json');
+const CONFIG_PATH = path.join(os.homedir(), '.trading-copilot-config.json');
 const { dir: DATA_DIR } = resolveDataDir();
 
 function ts() {

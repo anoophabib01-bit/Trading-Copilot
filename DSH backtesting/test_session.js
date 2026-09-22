@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('fs');
-const backtest = require('G:/MNQ-CoPilot/app/backtest');
-const rules = JSON.parse(fs.readFileSync('G:/MNQ-CoPilot/app/rules.json','utf8'));
+const backtest = require('G:/Trading-CoPilot/app/backtest');
+const rules = JSON.parse(fs.readFileSync('G:/Trading-CoPilot/app/rules.json','utf8'));
 const file = process.argv[2];
 function load(f){const d=JSON.parse(fs.readFileSync(f,'utf8'));const b=Array.isArray(d)?d:(d.bars||[]);return b.filter(x=>x&&typeof x.time==='number'&&typeof x.close==='number');}
 const bars = load(file);

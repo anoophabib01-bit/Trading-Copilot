@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('fs');
-const backtest = require('G:/MNQ-CoPilot/app/backtest');
-const rules = JSON.parse(fs.readFileSync('G:/MNQ-CoPilot/app/rules.json','utf8'));
+const backtest = require('G:/Trading-CoPilot/app/backtest');
+const rules = JSON.parse(fs.readFileSync('G:/Trading-CoPilot/app/rules.json','utf8'));
 function load(f){const d=JSON.parse(fs.readFileSync(f,'utf8'));const b=Array.isArray(d)?d:(d.bars||[]);return b.filter(x=>x&&typeof x.time==='number'&&typeof x.close==='number');}
 const buf=rules.playbooks.stopBufferPoints||3, rr=rules.playbooks.targetR||2, horizon=rules.playbooks.outcomeHorizonBars||12, pv=backtest.MNQ_POINT_VALUE;
 const minPts=rules.playbooks.minRiskPoints||0, maxUsd=rules.perTradeMaxLoss||Infinity;
@@ -41,7 +41,7 @@ function fullStats(t){
   const days=Object.values(byDay); const best=Math.max(...days);
   return {n:t.length, net, win:w.length/t.length*100, pf:gl>0?gw/gl:Infinity, dd, bestDay:best, consistency:net>0?best/net*100:null, days:days.length};
 }
-const files = { '5th(Sep-Nov up)':'G:/MNQ-CoPilot/DATA/bars/mnq_1h_sepnov.json', 'flat(Nov-Jan)':'G:/MNQ-CoPilot/DATA/bars/mnq_1h_flat.json', 'downtrend(Feb-Mar)':'G:/MNQ-CoPilot/DATA/bars/mnq_1h_downtrend.json', 'uptrend(Apr-May)':'G:/MNQ-CoPilot/DATA/bars/mnq_1h_uptrend.json', 'in-sample(Jun-Aug)':'G:/MNQ-CoPilot/DATA/bars/mnq_60.json' };
+const files = { '5th(Sep-Nov up)':'G:/Trading-CoPilot/DATA/bars/mnq_1h_sepnov.json', 'flat(Nov-Jan)':'G:/Trading-CoPilot/DATA/bars/mnq_1h_flat.json', 'downtrend(Feb-Mar)':'G:/Trading-CoPilot/DATA/bars/mnq_1h_downtrend.json', 'uptrend(Apr-May)':'G:/Trading-CoPilot/DATA/bars/mnq_1h_uptrend.json', 'in-sample(Jun-Aug)':'G:/Trading-CoPilot/DATA/bars/mnq_60.json' };
 console.log('LONG-only breakout L10, ADX>=25 AND +DI>-DI, 2R target, stop beyond candle, 1 contract');
 console.log('  regime                n     win%    net$     PF    DD$    bestDay$  consist');
 let all=[];

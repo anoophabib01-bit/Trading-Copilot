@@ -470,13 +470,31 @@ function dailyReconciliationCheck(obs) {
   const tolerance = n(o.threshold) != null ? o.threshold : 0.02;
   const evidence = { dayPnl, dayTradesSum, grHistoryPnl, tradeCount, tradesLength, phantomFlats };
 
-  // Internal consistency first: tradeCount must equal trades.length minus phantoms.
+  // Internal consistency first: tradeCount must equal trades.length.
+  //
+  // IT DOES NOT SUBTRACT phantoms, and doing so was a real bug (fixed
+  // 2026-09-21). tv-broker-feed.js pushes a row AND increments tradeCount in
+  // every branch that scores a trade, and the phantom branch RETURNS before
+  // either happens — so a rejected phantom is absent from BOTH counts by
+  // construction. Subtracting phantomFlats here counted that same exclusion a
+  // second time, which means the check could only ever agree while phantomFlats
+  // was 0 and then failed permanently from the first phantom onward. Live that
+  // day it fired five times as the counter grew 1..5, reporting "7 does not
+  // equal 7 rows minus 2 rejected phantom(s) (5)" about a count that was in
+  // fact correct. The old unit tests all passed phantomFlats: 0, which is
+  // exactly why it shipped — the only case covered was the one where the bug
+  // is invisible.
+  //
+  // phantomFlats stays in `evidence`: it is telemetry about a repair that
+  // happened, not a term in the arithmetic.
   if (tradeCount != null && tradesLength != null) {
-    const expected = tradesLength - phantomFlats;
+    const expected = tradesLength;
     if (Math.abs(tradeCount - expected) > 0.5) {
+      const phantomNote = phantomFlats > 0
+        ? ` (${phantomFlats} phantom flat(s) already excluded from both)` : '';
       return check('daily-count', 'Broker feed count vs row count', 'fail', {
         severity: SEV.CRITICAL,
-        impact: `tradeCount ${tradeCount} does not equal ${tradesLength} rows minus ${phantomFlats} rejected phantom(s) (${expected}) — the per-day cap is counting a wrong number.`,
+        impact: `tradeCount ${tradeCount} does not equal ${tradesLength} stored row(s)${phantomNote} — the per-day cap is counting a wrong number.`,
         evidence,
       });
     }

@@ -365,7 +365,8 @@ test('a fast queue passes on both measures', () => {
 
 // ── G25: daily reconciliation (2026-09-08) ─────────────────────────────────
 // The three P&L stores must agree, and the feed's tradeCount must equal
-// trades.length minus rejected phantoms. Report, never rewrite.
+// trades.length. Phantoms are NOT a subtraction term — see the note in
+// dailyReconciliationCheck. Report, never rewrite.
 test('G25: agreeing stores reconcile and make no noise', () => {
   const c = dailyReconciliationCheck({
     dayPnl: -231.12, dayTradesSum: -231.12, grHistoryPnl: -231.12,
@@ -392,6 +393,34 @@ test('G25: tradeCount vs trades.length-minus-phantoms mismatch is detected', () 
   });
   assert.strictEqual(c.verdict, 'fail');
   assert.strictEqual(c.key, 'daily-count');
+});
+
+test('G25: rejected phantoms are excluded from BOTH counts, so they are not subtracted', () => {
+  // The 2026-09-21 live bug. tradeCount and trades.length move together —
+  // tv-broker-feed.js pushes a row AND increments the count in the same branch,
+  // and the phantom branch returns before either happens. Subtracting
+  // phantomFlats therefore counted the same exclusion twice, so once any
+  // phantom occurred the check failed for the rest of the day: it fired five
+  // times as the counter grew 1..5, reporting "tradeCount 7 does not equal 7
+  // rows minus 2 rejected phantom(s) (5)" about a day whose count was correct.
+  // Every pre-existing test here passed phantomFlats: 0, which is precisely
+  // why it shipped — the only covered case was the one where the bug is silent.
+  const c = dailyReconciliationCheck({
+    dayPnl: 381.70, dayTradesSum: 381.70, grHistoryPnl: 381.70,
+    tradeCount: 7, tradesLength: 7, phantomFlats: 2,
+  });
+  assert.strictEqual(c.verdict, 'pass');
+});
+
+test('G25: a genuine count mismatch still fails with phantoms present, and says so', () => {
+  const c = dailyReconciliationCheck({
+    dayPnl: 0, dayTradesSum: 0, grHistoryPnl: 0,
+    tradeCount: 5, tradesLength: 7, phantomFlats: 2,
+  });
+  assert.strictEqual(c.verdict, 'fail');
+  assert.strictEqual(c.key, 'daily-count');
+  assert.match(c.impact, /does not equal 7 stored row\(s\)/);
+  assert.match(c.impact, /already excluded from both/);
 });
 
 test('G25: the check REPORTS and never rewrites — no rectify action', () => {

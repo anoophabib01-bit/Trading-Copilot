@@ -34,7 +34,7 @@ const INTERVAL = parseInt(ARG('interval', '15000'), 10);
 const MAX_MINUTES = parseInt(ARG('max-minutes', '480'), 10);
 const CDP = ARG('cdp', 'http://127.0.0.1:9222');
 const APP = ARG('app', 'ws://127.0.0.1:7433');
-const LOG = ARG('log', path.join('G:/MNQ-CoPilot', 'DATA', 'blind-watch.log'));
+const LOG = ARG('log', path.join('G:/Trading-CoPilot', 'DATA', 'blind-watch.log'));
 
 let WebSocketImpl = null;
 try { WebSocketImpl = require('ws'); } catch (e) { WebSocketImpl = globalThis.WebSocket; }

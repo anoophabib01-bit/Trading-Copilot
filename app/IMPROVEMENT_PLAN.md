@@ -136,7 +136,7 @@ API key, runs one bounded analysis on the *grouped* trade data (not raw CSV text
 cheaper and more accurate than the current 12,000-char CSV dump), then clears the key
 from memory. **Security flag:** Edgedesk has a Telegram bot token hardcoded in
 `monitor.py` and a `notion.key` file in the repo root. Revoke/rotate both; never
-commit keys. Keep the co-pilot's key only in `~/.mnq-copilot-config.json` (already
+commit keys. Keep the co-pilot's key only in `~/.trading-copilot-config.json` (already
 outside the repo — good).
 
 ---

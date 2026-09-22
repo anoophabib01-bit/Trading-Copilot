@@ -290,4 +290,117 @@ function checkBreakEvenChurn(trades, opts) {
   };
 }
 
-module.exports = { checkTradeCountEscalation, F1_WIN_THRESHOLD, checkRevengeCluster, F2_LOSS_STREAK, checkInvertedRR, checkBreakEvenChurn, F4_BAND_USD, F4_REMINDER_COUNT };
+
+// ── F5: post-payout relapse (2026-09-19) ────────────────────────────────────
+// Deva's warning, in his own words: after his first payout he blew three
+// accounts on "it's easy, I did it before" — overtrading, stopped waiting for
+// the setup, entering 5-10 candles early. The app could not see this at all.
+// It had no concept of a payout window, so the days that statistically follow
+// a payout were treated exactly like every other day, and the one period with
+// a documented, repeated, specific failure mode was the one period nothing
+// watched.
+//
+// WHAT THIS IS NOT: a new threshold. Every signal below is one the app already
+// knows — size against the live cap, a size-up while the day is red (the exact
+// shape that breached the 150K eval on 2026-07-21), and the rulebook's own
+// 5-trade caution checkpoint. What is new is only the WINDOW: those signals
+// mean something different for five trading days after he gets paid, and that
+// is Deva's whole point.
+//
+// TRADING days, not calendar days — the caller passes daysSincePayout, because
+// a payout followed by a two-week break is not a two-week window and this
+// module has no calendar of its own. Pure, like everything else here.
+//
+// Fired kinds are tracked by the caller (same shape as F2's per-kind map), so
+// the first signature of the day cannot silence the more serious ones.
+const F5_WINDOW_DAYS = 5;   // fallback only; rules.json is the source of truth
+const F5_OVERTRADE_AT = 5;  // fallback only; the rulebook's own checkpoint
+
+/**
+ * @param {Array} trades  today's trades (tv-broker-feed.js fold() shape)
+ * @param {object} opts   { lastPayout:{date,amount}|null, daysSincePayout:number,
+ *                          windowDays, overtradeAt, sizeCap, enabled }
+ * @returns {{matched:boolean, kind:string|null, message:string|null,
+ *            daysSincePayout:number|null, windowDays:number,
+ *            lastPayoutDate:string|null, payoutAmount:number|null,
+ *            tradeCount:number, maxSize:number}}
+ */
+function checkPostPayoutRelapse(trades, opts) {
+  const o = opts || {};
+  const empty = {
+    matched: false, kind: null, message: null, daysSincePayout: null,
+    windowDays: Number(o.windowDays) > 0 ? Number(o.windowDays) : F5_WINDOW_DAYS,
+    lastPayoutDate: null, payoutAmount: null, tradeCount: 0, maxSize: 0,
+  };
+  if (o.enabled === false) return empty;
+
+  const windowDays = Number(o.windowDays) > 0 ? Number(o.windowDays) : F5_WINDOW_DAYS;
+  const overtradeAt = Number(o.overtradeAt) > 0 ? Number(o.overtradeAt) : F5_OVERTRADE_AT;
+  const last = o.lastPayout;
+  const since = Number(o.daysSincePayout);
+  if (!last || !last.date) return empty;
+  if (!Number.isFinite(since) || since < 0 || since > windowDays) return empty;
+
+  const list = (Array.isArray(trades) ? trades : [])
+    .filter(t => t && !t.pnlUnknown && typeof t.pnl === 'number');
+  if (!list.length) return empty;
+
+  const numOf = (v) => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+  const r2 = (n) => Math.round(n * 100) / 100;
+  const seq = list.slice().sort((a, b) => (numOf(a.at) || numOf(a.t) || 0) - (numOf(b.at) || numOf(b.t) || 0));
+
+  // Walk the day in order: biggest size, and the first size-UP taken while the
+  // day's running P&L was already negative.
+  let running = 0, prevSize = null, sizeUpWhileRed = null, maxSize = 0;
+  seq.forEach(t => {
+    const size = numOf(t.size) || 0;
+    if (size > maxSize) maxSize = size;
+    if (running < 0 && prevSize != null && size > prevSize && sizeUpWhileRed === null) {
+      sizeUpWhileRed = { from: prevSize, to: size, atPnl: r2(running) };
+    }
+    running = r2(running + (numOf(t.pnl) || 0));
+    prevSize = size;
+  });
+
+  const sizeCap = Number(o.sizeCap) > 0 ? Number(o.sizeCap) : null;
+  const oversize = (sizeCap !== null && maxSize > sizeCap) ? { size: maxSize, cap: sizeCap } : null;
+  const overtrading = seq.length >= overtradeAt ? { count: seq.length, threshold: overtradeAt } : null;
+
+  // Severity order, same idea as pattern-memory's pickPrimary: the size-up is
+  // the one that killed an account, so it is reported over the other two.
+  let kind = null;
+  if (sizeUpWhileRed) kind = 'size-up-into-loss';
+  else if (oversize) kind = 'oversize';
+  else if (overtrading) kind = 'overtrading';
+  if (!kind) {
+    return Object.assign({}, empty, { daysSincePayout: since, windowDays, lastPayoutDate: last.date, tradeCount: seq.length, maxSize });
+  }
+
+  const amount = Number(last.amount);
+  const head = 'POST-PAYOUT RELAPSE — trading day ' + since + ' of ' + windowDays
+    + ' after the ' + (amount > 0 ? '$' + amount + ' ' : '') + 'payout on ' + last.date + '.';
+  let detail;
+  if (kind === 'size-up-into-loss') {
+    detail = ' You went from ' + sizeUpWhileRed.from + ' to ' + sizeUpWhileRed.to
+      + ' contracts with the day already at $' + sizeUpWhileRed.atPnl
+      + ' — sizing up into a loss is the exact pattern that breached the 150K eval.';
+  } else if (kind === 'oversize') {
+    detail = ' Biggest size today was ' + oversize.size + ' against a cap of ' + oversize.cap + '.';
+  } else {
+    detail = ' You are at ' + overtrading.count + ' trades, past the '
+      + overtrading.threshold + '-trade caution checkpoint in your own rulebook.';
+  }
+  const tail = ' Deva blew three accounts exactly here — "it is easy, I did it before".'
+    + ' Until this window closes the job is small, boring, rule-clean days: size and trade count are'
+    + ' decided before the session, not during it.';
+
+  return {
+    matched: true, kind,
+    daysSincePayout: since, windowDays, lastPayoutDate: last.date,
+    payoutAmount: amount > 0 ? amount : null,
+    tradeCount: seq.length, maxSize, sizeCap,
+    message: head + detail + tail,
+  };
+}
+
+module.exports = { checkTradeCountEscalation, F1_WIN_THRESHOLD, checkRevengeCluster, F2_LOSS_STREAK, checkInvertedRR, checkBreakEvenChurn, F4_BAND_USD, F4_REMINDER_COUNT, checkPostPayoutRelapse, F5_WINDOW_DAYS, F5_OVERTRADE_AT };

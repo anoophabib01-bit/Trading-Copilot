@@ -12,12 +12,19 @@
 // the app was running when both happened.
 //
 // Only ARMED-setup signal events can back a trade ('engulf-fire',
-// 'fvg-fire', 'playbook-b-confirm'): rejections, raids-alone and phase
-// changes never armed a setup, so they can never be what the entry was based
-// on. Direction mapping: buy → BULLISH, sell → BEARISH (the ledger stores
-// BULLISH/BEARISH; the joined record's side is buy/sell).
+// 'fvg-fire', 'playbook-b-confirm', 'c-adx-fire'): rejections, raids-alone and
+// phase changes never armed a setup, so they can never be what the entry was
+// based on. Direction mapping: buy → BULLISH, sell → BEARISH (the ledger
+// stores BULLISH/BEARISH; the joined record's side is buy/sell).
+//
+// 'c-adx-fire' ADDED 2026-09-21. Playbook C-ADX is armed through the SAME
+// armSetup() call every other playbook uses (server.js's adx-breakout monitor),
+// carries a real entry and stop from planEntry, and had simply been left out of
+// this vocabulary — so a trade taken off an armed C-ADX setup was recorded as
+// freestyle while the identical setup would have been signal-backed under
+// Playbook A. Kept in step with signal-outcome.js's set for the same reason.
 
-const ARMING_EVENTS = new Set(['engulf-fire', 'fvg-fire', 'playbook-b-confirm']);
+const ARMING_EVENTS = new Set(['engulf-fire', 'fvg-fire', 'playbook-b-confirm', 'c-adx-fire']);
 
 function directionOfTrade(trade) {
   const side = String((trade && trade.side) || '').toLowerCase();

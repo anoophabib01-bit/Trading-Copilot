@@ -133,7 +133,7 @@ extraction that *did* earn its place (`chart-reads`, `provider-chain`,
 ## How to check me in 60 seconds
 
 ```
-cd G:\MNQ-CoPilot\app
+cd G:\Trading-CoPilot\app
 npm test                       # expect: 135 pass, 0 fail
 node -e "require('./server.js')" # (or just restart the app)
 curl http://localhost:7433/health

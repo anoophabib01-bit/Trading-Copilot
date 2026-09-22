@@ -62,6 +62,6 @@ echo     1. Account button - Rebuild list
 echo     2. Start fresh on the 50K slot
 echo     3. JOURNAL tab - the top line shows
 echo        where data is saved. It should say
-echo        G:\MNQ-CoPilot\DATA
+echo        G:\Trading-CoPilot\DATA
 echo  ========================================
 timeout /t 8 /nobreak >nul

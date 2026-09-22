@@ -147,7 +147,7 @@ async function pollOnce() {
 
   if (!alertedThisOutage) {
     alertedThisOutage = true;
-    const msg = `MNQ Co-Pilot server is DOWN (port ${PORT} unreachable) as of ${istStamp()}. Attempting one automatic relaunch.`;
+    const msg = `Trading Co-Pilot server is DOWN (port ${PORT} unreachable) as of ${istStamp()}. Attempting one automatic relaunch.`;
     alertWindows(msg);
     attemptRelaunch();
   }

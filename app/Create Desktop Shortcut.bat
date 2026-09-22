@@ -7,7 +7,7 @@ echo sLinkFile = oWS.SpecialFolders("Desktop") ^& "\Co-Pilot.lnk" >> %SCRIPT%
 echo Set oLink = oWS.CreateShortcut(sLinkFile) >> %SCRIPT%
 echo oLink.TargetPath = "%~dp0launch.bat" >> %SCRIPT%
 echo oLink.WorkingDirectory = "%~dp0" >> %SCRIPT%
-echo oLink.Description = "MNQ Trading Co-Pilot" >> %SCRIPT%
+echo oLink.Description = "Trading Co-Pilot" >> %SCRIPT%
 echo oLink.Save >> %SCRIPT%
 cscript //nologo %SCRIPT%
 del %SCRIPT%

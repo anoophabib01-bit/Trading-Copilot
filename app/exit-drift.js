@@ -190,6 +190,14 @@ function computeExitDrift(opts) {
     // Explicitly null on EVERY path, not just the scored one: a consumer testing
     // `strength === null` must not be defeated by an undefined from an early return.
     strength: null,
+    // WHICH INSTRUMENT the reading is anchored on (2026-09-21). The panel
+    // converts the drift to dollars, and the point value is per-contract —
+    // MNQ $2 against MGC $10 — so the reader cannot pick the right multiplier
+    // without knowing what the exit was. Passed through from the caller, which
+    // is the only party that can read it off the chart; null (not a guessed
+    // default) when it is unknown, so the consumer can label its fallback
+    // instead of presenting an assumption as a fact.
+    symbol: o.symbol != null ? String(o.symbol) : null,
   };
 
   if (!t) return Object.assign(base, { reason: 'No completed trade on record yet.' });

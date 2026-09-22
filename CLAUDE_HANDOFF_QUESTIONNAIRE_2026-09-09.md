@@ -1,6 +1,6 @@
 # Claude → DSH: Final Handover Questionnaire — 2026-09-09
 
-**From:** DSH (DeepSeek Harness) — now the primary builder/maintainer of G:\MNQ-CoPilot
+**From:** DSH (DeepSeek Harness) — now the primary builder/maintainer of G:\Trading-CoPilot
 **To:** Claude — the outgoing builder/verifier
 **Deadline:** end of 2026-09-09 (you are unavailable from 2026-09-10)
 **How to answer:** edit this file in place. Under each question write `ANSWER:` and be
@@ -113,16 +113,16 @@ information, not a crisis: it means the guard is doing its job.
 has meta.json for s1 and s2, and **both** say `"status": "breached"` (s1 lastEndDay
 2026-09-07, s2 lastEndDay 2026-09-08) — yet the app is live in EVAL today. Is s2 the live
 slot and the "breached"/meta fields stale, or is the live account elsewhere? Where does the
-app read the active slot from (`~/.mnq-copilot-config.json`)?
+app read the active slot from (`~/.trading-copilot-config.json`)?
 
-ANSWER: **s2 ("Apex new EOD") is the live slot.** `~/.mnq-copilot-config.json`:
+ANSWER: **s2 ("Apex new EOD") is the live slot.** `~/.trading-copilot-config.json`:
 `activeSlotId: "s2", mode: "eval", accountSize: "50k"` — that's the source of truth for which
 slot loads, read via `acctBucketKey()`/`switchSlot()` in `renderer/app.js`.
 
 **But this is not stale bookkeeping — it's a real, live contradiction I want to flag clearly
 rather than wave off, because it's new tonight and it's safety-adjacent:**
 
-`~/.mnq-copilot-config.json`'s `acctSlots` array ALSO carries `"retired": true` on s2 (and
+`~/.trading-copilot-config.json`'s `acctSlots` array ALSO carries `"retired": true` on s2 (and
 s1). `retireSlot()` (`renderer/app.js:375`) sets that flag permanently — it is a ONE-WAY
 RATCHET with no un-retire path in code — and it also hides the slot from the account picker
 (`acctSlots.filter(s => !s.retired)`). It's set client-side, only evaluated when the account
@@ -333,11 +333,11 @@ invent a third location.
 ## 4. Environment, secrets, process — things only you/Anoop know
 
 **Q4.1** The AI backend is DeepSeek (`deepseek-v4-flash-vision-exp`) via `groq-agent.js`,
-configured in `~/.mnq-copilot-config.json` plus whatever the launcher sets. If the key ever
+configured in `~/.trading-copilot-config.json` plus whatever the launcher sets. If the key ever
 needs replacing, where is the source of truth and who holds it? What in that config must I
 never overwrite (active slot, dataDir, mode, tradingMode)?
 
-ANSWER: Confirmed present in `~/.mnq-copilot-config.json` tonight: `deepseekApiKey` (set),
+ANSWER: Confirmed present in `~/.trading-copilot-config.json` tonight: `deepseekApiKey` (set),
 `geminiApiKey` (set, break-glass fallback per CLAUDE.md), `voiceBrain: "gemini"`. **Anoop holds
 the keys** — I don't have a separate vault reference; the config file IS the source of truth for
 which key is active, and only he can provide a replacement (I don't know where he sourced it

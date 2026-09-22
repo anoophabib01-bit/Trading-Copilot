@@ -68,7 +68,7 @@ past bugs came from exactly that drift.
 
 Two independent axes select state:
 - **`mode`** (`eval` | `funded`) — which account's rules/data apply, persisted
-  in `~/.mnq-copilot-config.json`, switched via `handleModeSwitch`.
+  in `~/.trading-copilot-config.json`, switched via `handleModeSwitch`.
 - **`tradingMode`** (`standard` | `scalper`) — whether the Scalper overlay is
   active. Independent of `mode`.
 

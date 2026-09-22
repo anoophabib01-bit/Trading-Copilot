@@ -7,7 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const barArchive = require('../bar-archive');
 const forensics = require('../trade-forensics');
-const DATA = 'G:/MNQ-CoPilot/DATA';
+const DATA = 'G:/Trading-CoPilot/DATA';
 const ARCHIVE = path.join(DATA, 'bars', 'archive');
 let filled = 0, unfilled = 0, refused = 0;
 const reasons = {};

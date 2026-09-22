@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading Co-Pilot -- the app that says no</title>
+<meta name="description" content="A real-time discipline cockpit for prop-firm futures traders. It refuses the trade your rules say you should not take.">
+<style>
+  :root{
+    --bg:#080b10; --panel:#101720; --panel2:#151d28; --line:#1f2b39;
+    --ink:#e8eef6; --dim:#8fa1b6; --accent:#3ea6ff; --ok:#2ecc71;
+    --warn:#f0b429; --bad:#ff5c5c; --radius:12px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);
+       font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 22px}
+  a{color:var(--accent);text-decoration:none}
+
+  nav{position:sticky;top:0;z-index:20;background:rgba(8,11,16,.85);
+      backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+  nav .wrap{display:flex;align-items:center;justify-content:space-between;height:62px}
+  .logo{font-weight:700;letter-spacing:-.3px;font-size:16px}
+  .logo span{color:var(--accent)}
+  nav .links{display:flex;gap:22px;font-size:14px;color:var(--dim)}
+  nav .links a{color:var(--dim)}
+  nav .links a:hover{color:var(--ink)}
+
+  header{padding:88px 0 64px;text-align:center}
+  .kicker{display:inline-block;font-size:12.5px;letter-spacing:.08em;text-transform:uppercase;
+          color:var(--accent);border:1px solid rgba(62,166,255,.35);
+          background:rgba(62,166,255,.08);border-radius:20px;padding:5px 14px;margin-bottom:22px}
+  h1{font-size:clamp(32px,5.2vw,52px);line-height:1.1;letter-spacing:-1.4px;font-weight:700}
+  h1 em{font-style:normal;color:var(--accent)}
+  .lede{max-width:640px;margin:22px auto 0;color:var(--dim);font-size:18px}
+  .cta{display:flex;gap:12px;justify-content:center;margin-top:32px;flex-wrap:wrap}
+  .btn{display:inline-block;background:var(--accent);color:#04121f;font-weight:650;
+       border-radius:9px;padding:13px 26px;font-size:15px}
+  .btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  .micro{margin-top:14px;font-size:13px;color:var(--dim)}
+
+  section{padding:56px 0;border-top:1px solid var(--line)}
+  h2{font-size:clamp(23px,3vw,31px);letter-spacing:-.7px;margin-bottom:12px;font-weight:680}
+  .sub{color:var(--dim);max-width:660px;margin-bottom:34px}
+
+  .grid{display:grid;gap:16px}
+  .g2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+  .g3{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:26px}
+  .card h3{font-size:17px;margin-bottom:8px;font-weight:650}
+  .card p{color:var(--dim);font-size:14.5px}
+  .icon{font-size:20px;margin-bottom:14px;display:block}
+
+  .quote{border-left:3px solid var(--accent);padding:4px 0 4px 20px;margin:26px 0;
+         font-size:17.5px;color:#c9dcef}
+  .quote .src{display:block;margin-top:10px;font-size:13.5px;color:var(--dim);font-style:normal}
+
+  table{width:100%;border-collapse:collapse;font-size:14.5px}
+  th,td{text-align:left;padding:13px 14px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.05em}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .yes{color:var(--ok);font-weight:600}
+  .no{color:var(--dim)}
+  tr.hi{background:rgba(62,166,255,.07)}
+  tr.hi td{font-weight:600}
+
+  .prices{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));
+          align-items:start}
+  .tier{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+        padding:30px 26px;position:relative}
+  .tier.best{border-color:var(--accent);box-shadow:0 0 0 1px rgba(62,166,255,.25)}
+  .badge{position:absolute;top:-11px;left:26px;background:var(--accent);color:#04121f;
+         font-size:11.5px;font-weight:700;padding:4px 11px;border-radius:20px;
+         letter-spacing:.04em;text-transform:uppercase}
+  .tname{font-size:15px;color:var(--dim);font-weight:600;margin-bottom:14px}
+  .price{font-size:40px;font-weight:700;letter-spacing:-1.5px;line-height:1}
+  .price small{font-size:15px;font-weight:500;color:var(--dim);letter-spacing:0}
+  .plabel{font-size:13.5px;color:var(--dim);margin-top:9px;min-height:38px}
+  ul.feat{list-style:none;margin:22px 0 24px;font-size:14.5px}
+  ul.feat li{padding:7px 0 7px 24px;position:relative;color:#c9dcef}
+  ul.feat li:before{content:"";position:absolute;left:0;top:15px;width:7px;height:7px;
+        border-radius:50%;background:var(--ok)}
+  ul.feat li.off{color:var(--dim)}
+  ul.feat li.off:before{background:var(--line)}
+  .tier .btn{width:100%;text-align:center}
+  .tier .btn.ghost{width:100%}
+
+  .faq details{border-bottom:1px solid var(--line);padding:18px 0}
+  .faq summary{cursor:pointer;font-weight:600;font-size:16px;list-style:none}
+  .faq summary::-webkit-details-marker{display:none}
+  .faq summary:after{content:"+";float:right;color:var(--accent);font-weight:400;font-size:20px}
+  .faq details[open] summary:after{content:"\2212"}
+  .faq p{color:var(--dim);margin-top:12px;font-size:15px}
+
+  .note{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--warn);
+        border-radius:8px;padding:16px 20px;font-size:14.5px;color:#c9dcef;margin-top:26px}
+
+  footer{border-top:1px solid var(--line);padding:38px 0 60px;color:var(--dim);font-size:13.5px}
+  footer .wrap{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}
+  .disc{max-width:720px;font-size:12.5px;color:#6d7f93;margin-top:22px;line-height:1.6}
+</style>
+</head>
+<body>
+
+<nav><div class="wrap">
+  <div class="logo">Trading<span> Co-Pilot</span></div>
+  <div class="links">
+    <a href="#how">How it works</a>
+    <a href="#compare">Compare</a>
+    <a href="#pricing">Pricing</a>
+    <a href="#faq">FAQ</a>
+  </div>
+</div></nav>
+
+<header class="wrap">
+  <span class="kicker">For prop-firm futures traders</span>
+  <h1>The app that says <em>no</em><br>when you can't.</h1>
+  <p class="lede">You already know what to trade. You keep losing anyway. Co-Pilot watches your
+     own rules during the session and refuses the entry that breaks them.</p>
+  <div class="cta">
+    <a class="btn" href="#pricing">See pricing</a>
+    <a class="btn ghost" href="#how">How it works</a>
+  </div>
+  <p class="micro">Runs on your machine. No account required for the free tier.</p>
+</header>
+
+<section id="how"><div class="wrap">
+  <h2>Every other tool reports. This one refuses.</h2>
+  <p class="sub">Journals tell you on Sunday what you did wrong on Tuesday. That is too late.
+     Co-Pilot reads your live chart and your rulebook, and it answers one question while your
+     finger is on the button: <b>is this trade allowed?</b></p>
+
+  <div class="grid g2">
+    <div class="card"><span class="icon">&#9203;</span>
+      <h3>Post-loss cooldown</h3>
+      <p>After a loss the app locks entries for a set period. Revenge trading is not talked out
+         of you, it is physically blocked.</p></div>
+    <div class="card"><span class="icon">&#9940;</span>
+      <h3>News blackout</h3>
+      <p>Red-folder events force a NO-GO. The app will not let you hold through a release you
+         said you would not hold through.</p></div>
+    <div class="card"><span class="icon">&#128207;</span>
+      <h3>Oversize guard</h3>
+      <p>Position size is checked against your cap, not your mood. Exceed it and the entry is
+         refused, with the number that broke it shown.</p></div>
+    <div class="card"><span class="icon">&#9989;</span>
+      <h3>Plan-adherence grading</h3>
+      <p>A losing trade that followed every rule is a good trade. A winner that broke them is a
+         bad one. You get scored on the rules, not the P&amp;L.</p></div>
+  </div>
+
+  <div class="quote">
+    "Grade the session on plan-adherence, not P&amp;L. Broke the cap or took setups outside the
+    plan and made money anyway = loss, full stop, regardless of what the account shows."
+    <span class="src">&#8212; the rule the whole app is built around</span>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <h2>Why the rules, and not another signal</h2>
+  <p class="sub">Losing an evaluation is rarely a strategy problem. It is a control problem.
+     In one recorded session on this account, the trader took a position ten times larger than
+     his own rule allowed.</p>
+
+  <div class="grid g3">
+    <div class="card"><div class="price" style="font-size:30px">$784.50</div>
+      <p style="margin-top:10px">Spent on evaluations.</p></div>
+    <div class="card"><div class="price" style="font-size:30px">$0</div>
+      <p style="margin-top:10px">Taken out in payouts.</p></div>
+    <div class="card"><div class="price" style="font-size:30px">$150&#8211;300</div>
+      <p style="margin-top:10px">Cost of one reset.</p></div>
+  </div>
+
+  <div class="note"><b>Do the arithmetic yourself.</b> If Co-Pilot stops a single blow-up, it has
+     paid for itself. That is the entire pitch &#8212; no projections, no compounding curves,
+     no screenshots of somebody else's profit.</div>
+</div></section>
+
+<section id="compare"><div class="wrap">
+  <h2>What things actually cost</h2>
+  <p class="sub">Prices below were read from the vendors' own pricing pages. Check them yourself
+     before you buy anything from anyone, including us.</p>
+
+  <table>
+    <thead><tr><th>Tool</th><th class="num">Cost in year one</th><th>Billing</th><th>Enforces rules live?</th></tr></thead>
+    <tbody>
+      <tr><td>TradeZella Pro</td><td class="num">$531</td><td>annual subscription</td><td class="no">No</td></tr>
+      <tr><td>TradeZella Ultra</td><td class="num">$891</td><td>annual subscription</td><td class="no">No</td></tr>
+      <tr><td>TraderSync (top tier)</td><td class="num">$719</td><td>annual subscription</td><td class="no">No</td></tr>
+      <tr><td>Edgewonk</td><td class="num">$197</td><td>annual subscription</td><td class="no">No</td></tr>
+      <tr><td>TradesViz</td><td class="num">$179</td><td>annual subscription</td><td class="no">No</td></tr>
+      <tr><td>Heron Copier</td><td class="num">$179</td><td>annual subscription</td><td class="no">Partly &#8212; balance protection only</td></tr>
+      <tr><td>Signal services</td><td class="num">$108&#8211;1,176</td><td>monthly subscription</td><td class="no">No</td></tr>
+      <tr class="hi"><td>Trading Co-Pilot Local</td><td class="num">$149</td><td><b>once, yours to keep</b></td><td class="yes">Yes</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">Every tool in that table bills you again next year. Only one of them does not.
+     That is not a discount gimmick &#8212; the app runs on your machine, so there is no server
+     for us to pay for.</div>
+</div></section>
+
+<section id="pricing"><div class="wrap">
+  <h2>Pricing</h2>
+  <p class="sub">One product, three ways to run it. No per-seat fees, no feature gates inside a
+     tier, no upsell after you have paid.</p>
+
+  <div class="prices">
+
+    <div class="tier">
+      <div class="tname">Free</div>
+      <div class="price">$0</div>
+      <div class="plabel">See whether it would have stopped you.</div>
+      <ul class="feat">
+        <li>Read-only GO / NO-GO verdict</li>
+        <li>Live rules checklist</li>
+        <li>Session log and discipline score</li>
+        <li>One instrument</li>
+        <li class="off">No enforcement &#8212; it advises, you decide</li>
+        <li class="off">No cloud sync</li>
+      </ul>
+      <a class="btn ghost" href="#">Download</a>
+    </div>
+
+    <div class="tier best">
+      <span class="badge">Most chosen</span>
+      <div class="tname">Local</div>
+      <div class="price">$149 <small>once</small></div>
+      <div class="plabel">Pays for itself if it saves one eval reset.</div>
+      <ul class="feat">
+        <li><b>Full live enforcement</b> &#8212; entries actually refused</li>
+        <li>Cooldown, news blackout, oversize guard</li>
+        <li>Plan-adherence grading</li>
+        <li>Unlimited instruments</li>
+        <li>Runs entirely on your machine</li>
+        <li>12 months of updates included</li>
+        <li>No subscription, ever</li>
+      </ul>
+      <a class="btn" href="#">Buy once &#8212; $149</a>
+    </div>
+
+    <div class="tier">
+      <div class="tname">Cloud</div>
+      <div class="price">$19 <small>/month</small></div>
+      <div class="plabel">Same rules, no install, nothing to configure.</div>
+      <ul class="feat">
+        <li>Everything in Local</li>
+        <li><b>No setup</b> &#8212; opens in a browser</li>
+        <li>No TradingView desktop requirement</li>
+        <li>AI review of your sessions included</li>
+        <li>Sync across machines</li>
+        <li>Cancel any time</li>
+      </ul>
+      <a class="btn ghost" href="#">Start free trial</a>
+    </div>
+
+  </div>
+
+  <div class="note"><b>Why Local is one-time and Cloud is not.</b> Local costs us nothing to run
+     &#8212; it lives on your computer and uses your data. Cloud costs us money every month for
+     your data and the AI review, so it is billed monthly. We would rather explain that than
+     hide a subscription inside a "lifetime" promise and then stop fixing it.</div>
+</div></section>
+
+<section id="faq"><div class="wrap faq">
+  <h2>Questions</h2>
+
+  <details><summary>Does this tell me what to trade?</summary>
+    <p>No, and deliberately so. There are a thousand signal services. Adding another one would
+       make your problem worse, not better. Co-Pilot only ever answers whether the trade you
+       have already chosen is allowed by the rules you set.</p></details>
+
+  <details><summary>Will it show me a track record or profit curve?</summary>
+    <p>No. Be careful with anyone in this industry who leads with one. You will see your own
+       discipline score over time &#8212; how often you followed your own rules &#8212; which is
+       the only number here we can honestly verify.</p></details>
+
+  <details><summary>What do I need to run it?</summary>
+    <p>Windows, TradingView Desktop, and about ten minutes for setup. The setup wizard checks all
+       of it before you pay anything and tells you exactly what is missing.</p></details>
+
+  <details><summary>Does it place trades?</summary>
+    <p>It can, but only if you deliberately switch that on, and it is off by default. The core
+       product never touches your orders &#8212; it only refuses to approve entries.</p></details>
+
+  <details><summary>What if I already have a journal?</summary>
+    <p>Keep it. Co-Pilot is not a journal and does not try to be. Use both: they answer different
+       questions, at different times, about the same day.</p></details>
+
+  <details><summary>What happens after 12 months on Local?</summary>
+    <p>Your licence keeps working forever. You stop receiving updates. If you want them
+       continued, a renewal is available at half the original price &#8212; that pays for the
+       ongoing work of keeping up with TradingView, which does change.</p></details>
+
+  <details><summary>Can I get a refund?</summary>
+    <p>Yes, within 14 days, no questions. If it does not fit how you trade, we would rather have
+       the feedback than your money.</p></details>
+</div></section>
+
+<footer><div class="wrap">
+  <div>&#169; 2026 Co-Pilot</div>
+  <div><a href="#">Terms</a> &nbsp;&middot;&nbsp; <a href="#">Privacy</a> &nbsp;&middot;&nbsp; <a href="#">Refunds</a></div>
+  <div class="disc"><b>Risk disclosure.</b> Trading futures involves substantial risk of loss
+     and is not suitable for every investor. Co-Pilot is a discipline and record-keeping tool.
+     It does not provide investment advice, does not recommend any trade, and does not guarantee
+     any result. A rule followed is not a profit made. Past performance is not indicative of
+     future results. Only trade with capital you can afford to lose.</div>
+</div></footer>
+
+</body>
+</html>

@@ -6,15 +6,16 @@ const mcpBridge = require('./mcp-bridge');
 const booksIndex = require('./books-index');
 const supercompress = require('./supercompress');
 const callLogger = require('./call-logger');
+const propFirmDoctrine = require('./prop-firm-doctrine'); // Deva's playbook + the math of prop firms — spliced into SHARED_RULES below so the main chat and Jessi share ONE copy (2026-09-17)
 
 // ── Token-optimization kill switch (2026-08-03) ─────────────────────────────────
 // A local config flag that instantly reverts prompt caching to today's exact
 // behavior (no cache_control, plain string system prompt) — checked fresh on
 // every stream() call, not just once at boot, so flipping it takes effect
 // immediately without restarting the app mid-session. Same config file
-// server.js already reads (~/.mnq-copilot-config.json); this file has no
+// server.js already reads (~/.trading-copilot-config.json); this file has no
 // other dependency on server.js, just its own tiny synchronous read.
-const CONFIG_PATH = path.join(os.homedir(), '.mnq-copilot-config.json');
+const CONFIG_PATH = path.join(os.homedir(), '.trading-copilot-config.json');
 // 2026-09-02: isTokenOptDisabled() removed with the Anthropic prompt-cache
 // breakpoints it gated. Its Settings toggle ("Disable prompt caching") was
 // still on screen after the caching code was deleted, writing a config value
@@ -24,7 +25,7 @@ const CONFIG_PATH = path.join(os.homedir(), '.mnq-copilot-config.json');
 // 2026-08-11: the model used to be hardcoded 'claude-sonnet-4-6' at the call
 // site, which meant changing it required editing this file. Anoop is funding
 // this from a small prepaid balance and needs to trade cost against quality
-// himself, so it now reads `claudeModel` from ~/.mnq-copilot-config.json.
+// himself, so it now reads `claudeModel` from ~/.trading-copilot-config.json.
 //
 // Default is Haiku 4.5, chosen deliberately: roughly a third of Sonnet's input
 // price, and — unlike the free models that broke the app on 08-10 — it is a
@@ -45,73 +46,75 @@ function claudeModel() {
 }
 
 // ── Mode-specific rule blocks ──────────────────────────────────────────────────
+// 2026-09-17 (drift fix, found while absorbing the prop-firm doctrine): EVAL_RULES
+// used to open with "Account: LucidFlex $50K Eval / Balance: $51,241 / ...
+// Consistency: 59.73%" and to impose "Consistency rule: best day <= 50%" plus a
+// $1,499 daily cap for it. All of that was stale: he trades an APEX 50K EOD
+// Drawdown Evaluation (opened 2026-09-07), and Apex EOD eval has NO consistency
+// rule at all — so the agent was enforcing a rule from a firm he no longer
+// trades, against a balance frozen weeks earlier. Balance/floor/target move
+// daily and now come from the live context; only the firm's STATIC facts stay
+// here, and the operative limits are read from rules.json via the RULES line.
+// FUNDED_RULES carried the same disease (LucidFlex figures, Lucid's own 5-day
+// payout rule, tiers that no longer match rules.json) and is now firm-generic.
 const EVAL_RULES = `
 ## CURRENT MODE: EVALUATION (Stage 1)
-Account: LucidFlex $50K Eval (account ID kept out of source control — pulled from Settings/local config, not hardcoded)
-Balance: $51,241 | Drawdown Floor: $49,364 | Buffer: $1,877
-Total P&L: +$1,240 | Remaining to target: $1,760 (need $53,000 balance)
-Best day: $741 (Jun 11) | Consistency: 59.73%
+Firm: Apex Trader Funding — 50K EOD Drawdown Evaluation (opened 2026-09-07). LIVE balance, floor, buffer, target-remaining and today's P&L come from the ACCOUNT & TRADE DATA block / app_get_data — never from memory. What follows is the firm's static rulebook plus strategy doctrine.
+Numbers that change daily do not belong in a persona — that is why the live ones are not repeated here.
 
-### Eval Rules (NON-NEGOTIABLE)
+### Eval Rules (NON-NEGOTIABLE — the firm's, quoted from Prop Trading/CLAUDE.md)
 - Profit target: $3,000 (balance to $53,000)
-- Max Loss Limit: $2,000 EOD trailing drawdown
-- MLL trails until balance exceeds $52,100, then LOCKS at $50,100
-- Consistency rule: Best day ≤ 50% of total P&L
-- HARD CAP: NEVER exceed $1,499 in a single day (consistency protection)
-- Personal daily stop: $400 loss → done for the day
-- Max size: 40 micros (full size from day 1)
-- Max trades: 3 per session (NY), 5 per day total
-- 15-min break MANDATORY after every trade
+- EOD threshold — the limit that FAILS the account: $48,000. Recalculated once per day at the close off the EOD balance, but ENFORCED INTRADAY: touching it at any moment is immediate liquidation and evaluation failure. It trails up with the EOD balance and LOCKS at $50,100 when the target-profit balance is reached.
+- Daily Loss Limit: $1,000 fixed, measured on total equity including open positions. Hitting it auto-liquidates and pauses trading for the session — it does NOT fail the account, and it resets at 6:00 PM ET.
+- The two limits are not the same thing: the DLL ends your day, the EOD threshold ends your account.
+- No minimum trading days — the account passes the moment the target is met.
+- Flat by 4:59 PM ET (the auto-close is a failsafe, not a tool).
+- His own rules are far tighter than the firm's and are the operative numbers: read the RULES line in the context for the active size cap, daily loss tiers, per-trade stop and trade caps. Never hardcode them here.
 
-### Eval Strategy: Sprint Mode
-- Target $400–$600/day (2 clean trades)
-- Need $1,760 more → fastest path: 2 days × $880 each
-- Use up to 40 micros
-- Do NOT exceed $1,499 in a single day — it will fail the consistency rule
+### Eval Strategy: Sprint Mode (the math of the race)
+- The eval is a race between two boundaries: touch +$3,000 before -$2,000. The $50,000 is product size — the $2,000 drawdown is the REAL account, and it is how many mistakes he can survive.
+- Break the remaining target into DAILY CHUNKS (Deva: $3,000 → $750 × 4 days) and win on pace, not on hero days. Identical rule-clean chunks, repeated.
+- Expectancy is the only edge test: winRate × avgWin − lossRate × avgLoss must be positive, and win rate alone proves nothing (break-even 50% at 1:1, 33% at 2:1, 25% at 3:1).
+- Size cannot create an edge. Too small never reaches the target; too big lets one losing streak breach the drawdown. His per-trade stop (autoProtection $200, backstop perTradeMaxLoss $300) is sized so the drawdown survives the streak — keep it that way.
+- Order decides a challenge as much as count: ask "if these same trades came in the worst order, would the account survive?" before sizing up.
 
-### Pattern Warnings (Eval-specific)
-- If daily P&L approaches -$400 → "EVAL STOP — $400 personal daily stop. Protect the eval."
-- If single-day P&L approaches $1,400 → "CONSISTENCY CAP WARNING — slow down, $1,499 is the hard limit."
-- If trade count exceeds 3 in a session → "EVAL RULE BREACH — 3 trades max per NY session."`;
+### Pattern Warnings (Eval-specific — read the live tiers from the context, never quote a remembered number)
+- If daily P&L approaches the yellow tier → "EVAL STOP — personal daily stop. Protect the eval: the drawdown is the real account."
+- If daily P&L approaches -$1,000 → "DLL WARNING — Apex auto-flattens at $1,000. Stop before the firm stops you."
+- If trade count exceeds the session cap → "EVAL RULE BREACH — session cap hit. Never push for another entry."`;
 
 const FUNDED_RULES = `
 ## CURRENT MODE: FUNDED (Stage 2 — LIVE MONEY)
-Account: LucidFlex Funded (account ID kept out of source control — pulled from Settings/local config, not hardcoded; activated Jun 17 2026)
-Starting Balance: $50,000 | Hard Floor: $48,000 (EOD trailing)
-Max Loss Limit: $2,000 EOD trailing | Profit Split: 90% Anoop / 10% Lucid
-Scaling: $0–$999 profit → 20 micros | $1K–$1.999K → 30 micros | $2K+ → 40 micros
-Max contracts per entry: 2 HARD CAP (no "high conviction" override)
+The live funded account, its floor, balance, profit split and scaling tier come from the ACCOUNT & TRADE DATA block / app_get_data. This is the account that actually pays out; everything below is doctrine, not a substitute for the live numbers.
+Firm numbers that move do not belong in a persona — that is why none of them are repeated here.
 
-### Funded Rules (NON-NEGOTIABLE, updated 2026-07-02)
-- Daily loss tiers: –$100 = YELLOW (caution, reassess mental state) | –$150 = RED (reduce size, only A+ setups) | –$200 = HARD CUT-OFF (CLOSE TRADOVATE IMMEDIATELY, non-negotiable)
-- Daily target: $150–$300 → hit $300 → strongly consider stopping
-- Max 20 trades per day — HARD LIMIT. 5+ trades in a session is a caution checkpoint, not a stop (profitable days run 6–12 trades; blow-up days run into the 60s at ~20% win rate)
-- Session windows: London (1:30–3:00 PM IST / 8:00–9:30 AM UTC, prep/small-size only, NOT a full session) AND NY (7:00–9:00 PM IST / 13:30–15:30 UTC, primary session, full rules)
-- 15-minute break MANDATORY after every trade — win or loss
-- All 4H key zones MUST be pre-marked before session opens — no zone = no trade
-- ONE instrument per DAY — never MNQ and MGC on the same day, even across London and NY
+### Funded Rules (NON-NEGOTIABLE)
+- Read the ACTIVE size cap (funded clamps to 2), daily loss tiers, per-trade stop and trade caps from the RULES line in the context. They are the operative numbers and they are tighter than any firm wall.
+- Stage asymmetry: evaluation exists to be cleared FAST; funded exists to be PROTECTED. Zero slack on process here, because this is the account that pays.
+- $200 per-trade stop (autoProtection) is the first line; perTradeMaxLoss $300 is the backstop. No "I'll get it back", no "high conviction" override.
+- The drawdown must last 5–6 days, never one. "You control the losses; the gains aren't in anyone's control."
+- 15-minute break MANDATORY after every trade — win or loss.
+- All 4H key zones MUST be pre-marked before session opens — no zone = no trade.
+- ONE instrument per DAY — never MNQ and MGC on the same day, even across London and NY.
 - Mon/Friday = choppy — reduce size and expectation. Tue/Wed/Thu best.
-- Watch previous day's replay/screen recording before ANY session — no exceptions
+- Watch previous day's replay/screen recording before ANY session — no exceptions.
 
 ### Payout Rules (Funded)
-- Need 5 qualifying days (≥$150 each) per cycle
-- Do NOT request payout before balance reaches $52,000 (floor must lock first)
-- Min payout $500, max 50% of profit above $50,000 (up to $2,000)
-- Payout = 90% of amount
+- The consistency gate is computed live — read the PAYOUT line in the context and quote it. Never state a consistency percentage from memory: it differs by firm and tier, and after a big day MORE SMALL green days is the fast route, never another big one.
+- Do not request a payout before the account's own floor/eligibility line says so — that line is in the context.
 
 ### Funded Strategy: Factory Mode
-- Slow and boring. $150–$300/day.
-- $200 hard stop — no exceptions, no "I'll get it back"
+- Slow and boring. Small daily chunks, consistency-aware.
 - 2 good trades, done. Don't turn a winning day into a losing one.
-- Each $150 qualifying day = one brick toward payout
+- Each small green day = one brick toward payout. Plan payouts over 10–15 days, not one session.
+- Real return: payouts must cover every account bought (fees + activations). One payout does not make the process profitable.
 
-### Pattern Warnings (Funded-specific)
-- If daily P&L hits -$100 → "YELLOW FLAG — $100 down. Reassess mental state before the next entry."
-- If daily P&L hits -$150 → "RED FLAG — $150 down. Reduce size, only A+ setups from here."
-- If daily P&L hits -$200 → "FUNDED HARD STOP — $200 limit hit. CLOSE TRADOVATE NOW."
-- If daily P&L hits $300 → "FUNDED TARGET HIT — consider stopping. Don't give it back."
-- If trade count hits 5 → "CAUTION — 5 trades. Not a stop, just a checkpoint: normal profitable days run 6–12. Reassess setup quality."
-- If trade count exceeds 20 → "FUNDED HARD STOP — 20-trade daily limit hit. Stop trading now. This is where the account blow-ups happened."`;
+### Pattern Warnings (Funded-specific — read the live tiers from the context)
+- Yellow tier → "YELLOW FLAG — reassess mental state before the next entry."
+- Red tier → "RED FLAG — reduce size, only A+ setups from here."
+- Hard tier → "FUNDED HARD STOP — close the platform now. The drawdown is the account."
+- Daily target hit → "FUNDED TARGET HIT — close AND leave the desk. Don't give it back."
+- Trade count past the cap → "FUNDED HARD STOP — trade-count limit hit."`;
 
 const SHARED_RULES = `
 ## WHO YOU ARE TALKING TO
@@ -163,6 +166,8 @@ Playbook C — Engulfing Bar Validity Rules (GRADES Playbook A and any other eng
 6. Account was UP before crash — Account 6: +$937 then gave back $2,637. "STOP — Pattern 6, lock the win."
 7. Entering too fast on the 1Min chart (self-identified) — a single 1Min candle distorts judgment. Fix: wait 5–15 min, or confirm 2–3 consecutive candle closes in the trade direction before entering. Don't exit immediately after entry — hold through 2–3 candle closes unless the stop is hit. "SLOW DOWN — wait for candle confirmation."
 
+${propFirmDoctrine.JESSI_MATH_SECTION}
+
 ## PRE-SESSION PROTOCOL (before ANY session — London or NY)
 1. Check in before session open — report balance, mental, bias, zones marked.
 2. Physical: eaten well (not overfull), rested, phone face-down.
@@ -206,7 +211,7 @@ Always output: bias direction, key level, setup validity NOW, what to wait for.
 
 London Session: 1:30–3:00 PM IST (prep/small-size). NY Session: 7:00–9:00 PM IST (13:30–15:30 UTC, primary).
 Primary: MNQ1!. Secondary: MGC (NEVER both on the same day, even across sessions).
-Long-term mission: erase $10,784.50 lifetime losses → payouts → 3 evals simultaneously → copy trading.`;
+Long-term mission: erase the lifetime losses (the live figure is in the COST line of the account data — quote that, never a remembered number) → payouts → scaling. Running several accounts at once / copy-trading is a LATER-STAGE plan, not today's.`;
 
 // Current date/time in IST, computed fresh per request. REPLACES a previously
 // hardcoded date line that sat in SHARED_RULES and went ~6 weeks stale — the AI

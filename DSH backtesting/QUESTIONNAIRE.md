@@ -1,6 +1,6 @@
 # DSH Backtesting - Strategy Questionnaire
 
-> Created for the 'DSH backtesting' folder (G:\MNQ-CoPilot\DSH backtesting).
+> Created for the 'DSH backtesting' folder (G:\Trading-CoPilot\DSH backtesting).
 > Purpose: gather the parameters needed to build a profitable, backtested strategy
 > whose EVERY trade is forced flat by 03:00 IST. That overnight flatten is already a hard
 > rule in the app: app/rules.json -> flattenByISTMinutes: 180.

@@ -6,7 +6,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
 const fs = require('node:fs');
-const { decide, unrealisedUsd } = require('../position-protection.js');
+const { decide, unrealisedUsd, resolveAutoProtection } = require('../position-protection.js');
 const rules = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'rules.json'), 'utf8'));
 const base = { side: 'Long', size: 1, entryPrice: 29200, pointValue: 2, stopLossUsd: 200, takeProfitUsd: 600 };
 
@@ -68,10 +68,96 @@ test('at 4 lots the same dollars are a quarter of the point distance', () => {
   assert.equal(decide(Object.assign({}, four, { lastPrice: 29180 })).action, 'none');
 });
 
-test('the configured rule is the one these tests assume', () => {
-  assert.equal(rules.autoProtection.stopLossUsd, 200);
-  assert.equal(rules.autoProtection.takeProfitUsd, 600);
+test('autoProtection is configured sanely — but the exact dollars are HIS to set', () => {
+  // REWRITTEN 2026-09-21. This used to pin stopLossUsd === 200 and
+  // takeProfitUsd === 600 against the LIVE app/rules.json. Both are settable
+  // from Settings -> Trading, and he changed the stop to 201 while testing the
+  // panel, so the suite went red reporting his own preference as a code
+  // regression — the third time this class of test has done that (the playbook
+  // registry and the s3 replay were the others).
+  //
+  // What is actually worth asserting about a user-set number: that it is there,
+  // that it is a positive finite dollar amount, and that the module UNDER TEST
+  // reads it rather than a hardcoded literal. The exact value belongs to him.
+  const ap = rules.autoProtection || {};
+  assert.equal(ap.enabled, true, 'auto-protection must be ON');
+  // Per-stage since 2026-09-21: eval and funded each carry their own band.
+  for (const stage of ['eval', 'funded']) {
+    const eff = resolveAutoProtection(ap, stage);
+    for (const k of ['stopLossUsd', 'takeProfitUsd']) {
+      assert.ok(Number.isFinite(Number(eff[k])), stage + '.' + k + ' must be a number, got ' + JSON.stringify(eff[k]));
+      assert.ok(Number(eff[k]) > 0, stage + '.' + k + ' must be positive, got ' + eff[k]);
+      assert.ok(Number(eff[k]) <= 100000, stage + '.' + k + ' is implausibly large: ' + eff[k]);
+    }
+    for (const k of ['breakEvenAtUsd', 'trailDistanceUsd']) {
+      assert.ok(Number.isFinite(Number(eff[k])), stage + '.' + k + ' must be a number');
+      assert.ok(Number(eff[k]) >= 0, stage + '.' + k + ' must be >= 0 (0 = trail off)');
+    }
+  }
 });
+// ── Trailing stop (2026-09-21) ──────────────────────────────────────────────
+test('trail: below the break-even trigger the fixed stop still applies', () => {
+  // entry 30000, last 29900 → -100 pts × $2 = -$200 unrealised. Trail not armed.
+  const r = decide({ side: 'Long', size: 1, entryPrice: 30000, lastPrice: 29900, pointValue: 2, stopLossUsd: 200, takeProfitUsd: 600, breakEvenAtUsd: 150, trailDistanceUsd: 150, peakUsd: null });
+  assert.equal(r.action, 'close');
+  assert.match(r.reason, /STOP/);
+});
+
+test('trail: once the peak reached the trigger, falling into the trail CLOSES (banks the winner)', () => {
+  // peak +$300, trail $150 → stop at +$150. Observed +$140 is at/past it.
+  const r = decide({ side: 'Long', size: 1, entryPrice: 30000, pointValue: 2, unrealisedUsd: 140, stopLossUsd: 200, takeProfitUsd: 600, breakEvenAtUsd: 150, trailDistanceUsd: 150, peakUsd: 300 });
+  assert.equal(r.action, 'close');
+  assert.match(r.reason, /TRAIL/);
+  assert.equal(r.stopLevelUsd, 150);
+});
+
+test('trail: above the trailing stop the position is HELD — no early exit', () => {
+  // stop at +$150 (300−150), observed +$200 → hold.
+  const r = decide({ side: 'Long', size: 1, entryPrice: 30000, pointValue: 2, unrealisedUsd: 200, stopLossUsd: 200, takeProfitUsd: 600, breakEvenAtUsd: 150, trailDistanceUsd: 150, peakUsd: 300 });
+  assert.equal(r.action, 'none');
+  assert.match(r.reason, /trailing stop armed at \+150/);
+});
+
+test('trail: at the trigger the stop is break-even when be == trail', () => {
+  // peak == be == 150, trail 150 → stop = max(0, 150−150) = 0 (break-even lock).
+  const r = decide({ side: 'Long', size: 1, entryPrice: 30000, pointValue: 2, unrealisedUsd: 150, stopLossUsd: 200, takeProfitUsd: 600, breakEvenAtUsd: 150, trailDistanceUsd: 150, peakUsd: 150 });
+  assert.equal(r.action, 'none');
+  assert.equal(r.stopLevelUsd, 0);
+});
+
+test('trail: the peak only rises, and is returned for the caller to persist', () => {
+  const base = { side: 'Long', size: 1, entryPrice: 30000, pointValue: 2, stopLossUsd: 200, takeProfitUsd: 600, breakEvenAtUsd: 150, trailDistanceUsd: 150 };
+  assert.equal(decide(Object.assign({}, base, { unrealisedUsd: 80, peakUsd: 200 })).peakUsd, 200);
+  assert.equal(decide(Object.assign({}, base, { unrealisedUsd: 250, peakUsd: 200 })).peakUsd, 250);
+});
+
+test('trail disabled (0 trail) behaves exactly like the fixed stop/target', () => {
+  const r = decide({ side: 'Long', size: 1, entryPrice: 30000, lastPrice: 30250, pointValue: 2, stopLossUsd: 200, takeProfitUsd: 600, breakEvenAtUsd: 0, trailDistanceUsd: 0, peakUsd: null });
+  // +250 pts → +$500, inside the fixed band → hold (no trail).
+  assert.equal(r.action, 'none');
+  assert.equal(r.stopLevelUsd, -200);
+});
+
+// ── resolveAutoProtection (2026-09-21) ──────────────────────────────────────
+test('resolveAutoProtection: per-stage override, flat fallback, and trailEnabled derivation', () => {
+  const ap = {
+    enabled: true, stopLossUsd: 199,
+    eval: { stopLossUsd: 201, takeProfitUsd: 600, breakEvenAtUsd: 150, trailDistanceUsd: 150 },
+    funded: { stopLossUsd: 200, takeProfitUsd: 300, breakEvenAtUsd: 0, trailDistanceUsd: 0 },
+  };
+  const e = resolveAutoProtection(ap, 'eval');
+  assert.equal(e.stopLossUsd, 201);
+  assert.equal(e.takeProfitUsd, 600);
+  assert.equal(e.trailEnabled, true);
+  const f = resolveAutoProtection(ap, 'funded');
+  assert.equal(f.stopLossUsd, 200);
+  assert.equal(f.takeProfitUsd, 300);
+  assert.equal(f.trailEnabled, false); // 0 trail → off
+  const flat = resolveAutoProtection({ enabled: true, stopLossUsd: 199, takeProfitUsd: 500 }, 'eval');
+  assert.equal(flat.stopLossUsd, 199);
+  assert.equal(flat.trailEnabled, false);
+});
+
 // --- G32 (2026-09-15): the parse that a live test caught. This broker prints losses with a
 // UNICODE MINUS, and the old parser stripped it - turning -19.00 into +19.00, so the per-trade
 // stop compared a PROFIT against a loss cap and never fired. These are the real string shapes.

@@ -105,7 +105,7 @@ Two problems, both real:
 2. **It is dead config.** `grep -rn "consistencyPctMax"` returns exactly one hit —
    its own definition in `rules.json`. No code reads it. Nothing computes it.
 
-Your connected account is `TDFYSL50413184562` (read live from the broker panel
+Your connected account is `TDFYSL…(account-id redacted)` (read live from the broker panel
 today). The `TDFY`+`SL` prefix reads as **Tradeify Select**, which would put you
 on the 40%-during-evaluation / none-when-funded track — but **confirm this against
 your Tradeify dashboard before any number is wired in.** Do not let me guess your
@@ -322,6 +322,6 @@ be worthless, and #5 is what would prove it either way.
 
 **Open question, blocking nothing but worth settling:** `rules.json`'s
 `payout.accountFamily` is set to `select`, inferred from the live account id
-`TDFYSL50413184562`. Confirm it against your Tradeify dashboard — an inferred
+`TDFYSL…(account-id redacted)`. Confirm it against your Tradeify dashboard — an inferred
 tier quietly becoming fact is exactly how the wrong `50` got into the config.
 If it is wrong, change that one value; every threshold follows from it.

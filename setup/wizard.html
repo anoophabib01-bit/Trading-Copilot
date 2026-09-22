@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading Co-Pilot -- Setup</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#121821; --panel2:#161e29; --line:#22303f;
+    --ink:#e6edf5; --dim:#8b9bb0; --accent:#3ea6ff; --ok:#2ecc71;
+    --warn:#f0b429; --bad:#ff5c5c; --radius:10px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:820px;margin:0 auto;padding:32px 20px 80px}
+  header{display:flex;align-items:baseline;gap:12px;margin-bottom:6px}
+  h1{font-size:22px;margin:0;letter-spacing:-.2px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:26px}
+  .steps{display:flex;gap:6px;margin-bottom:26px;flex-wrap:wrap}
+  .stepdot{flex:1;min-width:60px;height:4px;border-radius:2px;background:var(--line)}
+  .stepdot.on{background:var(--accent)}
+  .stepdot.done{background:var(--ok)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+        padding:24px;margin-bottom:18px}
+  h2{font-size:17px;margin:0 0 6px}
+  .hint{color:var(--dim);font-size:13px;margin:0 0 18px}
+  label{display:block;font-size:13px;color:var(--dim);margin:14px 0 5px}
+  input,select{width:100%;background:var(--panel2);border:1px solid var(--line);
+        color:var(--ink);border-radius:7px;padding:9px 11px;font-size:14px;font-family:inherit}
+  input:focus,select:focus{outline:none;border-color:var(--accent)}
+  .row{display:flex;gap:14px;flex-wrap:wrap}
+  .row>div{flex:1;min-width:170px}
+  .checks{list-style:none;padding:0;margin:0}
+  .checks li{display:flex;gap:11px;align-items:flex-start;padding:11px 0;border-bottom:1px solid var(--line)}
+  .checks li:last-child{border-bottom:0}
+  .dot{width:9px;height:9px;border-radius:50%;margin-top:6px;flex:0 0 auto}
+  .pass{background:var(--ok)} .warn{background:var(--warn)}
+  .fail{background:var(--bad)} .pending{background:var(--dim)}
+  .cl{font-size:14px}
+  .cd{color:var(--dim);font-size:12.5px;margin-top:2px;word-break:break-word}
+  .fix{color:var(--warn);font-size:12.5px;margin-top:5px}
+  .btn{background:var(--accent);color:#04121f;border:0;border-radius:8px;
+       padding:11px 22px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .btn.ghost{background:transparent;color:var(--dim);border:1px solid var(--line);font-weight:500}
+  .nav{display:flex;gap:10px;justify-content:space-between;margin-top:22px}
+  pre{background:#0a0e13;border:1px solid var(--line);border-radius:8px;padding:14px;
+      overflow:auto;font-size:12.5px;max-height:340px;color:#a9c4dd}
+  .banner{padding:12px 14px;border-radius:8px;font-size:13.5px;margin-bottom:16px}
+  .banner.ok{background:rgba(46,204,113,.12);border:1px solid rgba(46,204,113,.35)}
+  .banner.bad{background:rgba(255,92,92,.1);border:1px solid rgba(255,92,92,.35)}
+  .pill{display:inline-block;background:var(--panel2);border:1px solid var(--line);
+        border-radius:20px;padding:4px 11px;font-size:12.5px;margin:3px 5px 3px 0;cursor:pointer}
+  .pill.on{border-color:var(--accent);color:var(--accent)}
+  .foot{color:var(--dim);font-size:12px;margin-top:30px;text-align:center}
+  code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header><h1>Trading Co-Pilot</h1><span class="sub" style="margin:0">Setup</span></header>
+  <p class="sub">Six steps. It checks this machine can run the Co-Pilot, then writes your rules.
+     Nothing here places an order.</p>
+
+  <div class="banner ok" id="preloaded" hidden>Loaded your existing rules. Change only what you want.</div>
+  <div class="steps" id="stepbar"></div>
+
+  <!-- STEP 0 -->
+  <div class="card" id="s0">
+    <h2>Before we start</h2>
+    <p class="hint">The Co-Pilot is not a signals app. It does not tell you what to trade.
+       It watches your own rules and refuses entries that break them.</p>
+    <p class="hint">That means it needs two numbers from you for every trade you take:
+       <b>where you are wrong</b> (your stop) and <b>how much you are risking</b> (your size).
+       The next steps collect those.</p>
+    <p class="hint"><b>Have your prop firm dashboard open.</b> You will be asked for your
+       account's daily loss limit, drawdown threshold and profit target. Guessing these is
+       how accounts die.</p>
+    <div class="nav"><span></span><button class="btn" onclick="go(1)">Start</button></div>
+  </div>
+
+  <!-- STEP 1 -->
+  <div class="card" id="s1" hidden>
+    <h2>Is this machine ready?</h2>
+    <p class="hint">Re-checked every time you open this page. Nothing is installed without asking.</p>
+    <div id="probebanner"></div>
+    <ul class="checks" id="checklist"><li class="cd">Checking...</li></ul>
+    <div class="nav">
+      <button class="btn ghost" onclick="runProbe()">Re-check</button>
+      <button class="btn" onclick="go(2)">Continue</button>
+    </div>
+  </div>
+
+  <!-- STEP 2 -->
+  <div class="card" id="s2" hidden>
+    <h2>Who is trading</h2>
+    <p class="hint">Kept in <code>app/profile.json</code>. Never sent anywhere.</p>
+    <label>Your name</label>
+    <input id="traderName" placeholder="e.g. Anoop">
+    <label>Instruments you trade</label>
+    <div id="instr"></div>
+    <div class="row">
+      <div><label>Prop firm</label><input id="firm" placeholder="e.g. Apex Trader Funding"></div>
+      <div><label>Account / product</label><input id="product" placeholder="e.g. 50K EOD Evaluation"></div>
+    </div>
+    <label>Account size (USD)</label>
+    <input id="accountSize" type="number" placeholder="50000">
+    <label>Your timezone</label>
+    <select id="timezone">
+      <option value="America/New_York">New York (ET)</option>
+      <option value="Europe/London">London</option>
+      <option value="Asia/Kolkata">India (IST)</option>
+      <option value="Europe/Berlin">Berlin</option>
+      <option value="Asia/Dubai">Dubai</option>
+      <option value="Asia/Singapore">Singapore</option>
+      <option value="Australia/Sydney">Sydney</option>
+    </select>
+    <div class="nav"><button class="btn ghost" onclick="go(1)">Back</button>
+      <button class="btn" onclick="go(3)">Continue</button></div>
+  </div>
+
+  <!-- STEP 3 -->
+  <div class="card" id="s3" hidden>
+    <h2>Your prop firm's limits</h2>
+    <p class="hint">Copy these from your firm's dashboard. They are the outer walls --
+       the app uses them to compute your warning tiers.</p>
+    <div class="row">
+      <div><label>Daily loss limit (USD)</label><input id="firmDailyLossLimit" type="number" placeholder="1000"></div>
+      <div><label>Max drawdown threshold (USD)</label><input id="eodThresholdDrawdown" type="number" placeholder="2000"></div>
+      <div><label>Profit target (USD)</label><input id="profitTarget" type="number" placeholder="3000"></div>
+    </div>
+    <p class="hint" style="margin-top:18px">Your own tighter stops. These are what actually protect you -- set them
+       <b>well inside</b> the firm's numbers.</p>
+    <div class="row">
+      <div><label>Stop the day at (evaluation)</label><input id="dayStopEval" type="number" placeholder="300"></div>
+      <div><label>Stop the day at (funded)</label><input id="dayStopFunded" type="number" placeholder="200"></div>
+    </div>
+    <div class="nav"><button class="btn ghost" onclick="go(2)">Back</button>
+      <button class="btn" onclick="go(4)">Continue</button></div>
+  </div>
+
+  <!-- STEP 4 -->
+  <div class="card" id="s4" hidden>
+    <h2>Your risk rules</h2>
+    <p class="hint">The Co-Pilot enforces these live and will refuse a trade that breaks them.</p>
+    <div class="row">
+      <div><label>Trades per day (max)</label><input id="tradesPerDay" type="number" placeholder="5"></div>
+      <div><label>Cooldown after a loss (minutes)</label><input id="cooldownMinutes" type="number" placeholder="15"></div>
+    </div>
+    <div class="row">
+      <div><label>Trades/day allowed in evaluation</label><input id="tradeLimitEval" type="number" placeholder="2"></div>
+      <div><label>Trades/day allowed when funded</label><input id="tradeLimitFunded" type="number" placeholder="6"></div>
+    </div>
+    <div class="row">
+      <div><label>Size cap, evaluation (contracts)</label><input id="evalSizeCap" type="number" placeholder="4"></div>
+      <div><label>Size cap, funded (contracts)</label><input id="fundedSizeCap" type="number" placeholder="2"></div>
+    </div>
+    <div class="row">
+      <div><label>Size floor (contracts)</label><input id="sizeFloor" type="number" placeholder="1"></div>
+      <div><label>Max loss per trade (USD)</label><input id="perTradeMaxLoss" type="number" placeholder="300"></div>
+    </div>
+    <label>Warning tiers &#8212; your own stops, inside the firm's limit</label>
+    <p class="hint" style="margin:0 0 12px">The HUD turns yellow, then red, then ends the session.
+       These numbers are yours, not the firm's. Leave all three blank and they will be derived
+       from your daily loss limit at 50% / 70% / 100%.</p>
+    <div class="row">
+      <div><label>Yellow warning at</label><input id="tierYellow" type="number" placeholder="e.g. -250" oninput="validateTiers()"></div>
+      <div><label>Red warning at</label><input id="tierRed" type="number" placeholder="e.g. -350" oninput="validateTiers()"></div>
+      <div><label>Hard stop at</label><input id="tierHard" type="number" placeholder="e.g. -500" oninput="validateTiers()"></div>
+    </div>
+    <button class="btn ghost" type="button" style="margin-top:10px" onclick="deriveTiers()">Auto-fill from my daily loss limit</button>
+    <div id="tierwarn"></div>
+    <label>Trading style</label>
+    <select id="tradingMode">
+      <option value="scalper">Scalper (short holds, more trades)</option>
+      <option value="standard">Standard (longer holds, fewer trades)</option>
+    </select>
+    <div class="nav"><button class="btn ghost" onclick="go(3)">Back</button>
+      <button class="btn" onclick="go(5)">Continue</button></div>
+  </div>
+
+  <!-- STEP 5 -->
+  <div class="card" id="s5" hidden>
+    <h2>When you are allowed to trade</h2>
+    <p class="hint">Outside these windows the Co-Pilot returns NO-GO. One window is fine.</p>
+    <div class="row">
+      <div><label>First window name</label><input id="w1name" value="New York open"></div>
+      <div><label>Start</label><input id="w1start" type="time" value="09:30"></div>
+      <div><label>End</label><input id="w1end" type="time" value="11:30"></div>
+    </div>
+    <div class="row">
+      <div><label>Second window name (optional)</label><input id="w2name" value=""></div>
+      <div><label>Start</label><input id="w2start" type="time" value=""></div>
+      <div><label>End</label><input id="w2end" type="time" value=""></div>
+    </div>
+    <label>Playbooks you trade (optional, comma separated)</label>
+    <input id="playbooks" placeholder="A, B, C">
+    <div class="nav"><button class="btn ghost" onclick="go(4)">Back</button>
+      <button class="btn" onclick="review()">Review</button></div>
+  </div>
+
+  <!-- STEP 6 -->
+  <div class="card" id="s6" hidden>
+    <h2>Review and write</h2>
+    <p class="hint">This writes <code>app/rules.json</code> and <code>app/profile.json</code>.
+       Your existing rules.json is backed up first.</p>
+    <pre id="preview"></pre>
+    <div id="saverbanner"></div>
+    <div class="nav"><button class="btn ghost" onclick="go(5)">Back</button>
+      <button class="btn" id="savebtn" onclick="save()">Write my rules</button></div>
+  </div>
+
+  <p class="foot">Trading Co-Pilot setup &middot; reads and writes local files only &middot; no telemetry</p>
+</div>
+
+<script>
+var state = { step:0, instruments:[], probe:null };
+var INSTRUMENTS = ['MNQ','MGC','ES','NQ','MES','MGC','CL','GC'];
+
+function el(id){ return document.getElementById(id); }
+function val(id){ return el(id) ? el(id).value.trim() : ''; }
+function numv(id){ var v = val(id); return v === '' ? null : Number(v); }
+
+function renderSteps(){
+  var bar = el('stepbar'); bar.innerHTML = '';
+  for (var i=0;i<7;i++){
+    var d = document.createElement('div');
+    d.className = 'stepdot' + (i < state.step ? ' done' : (i === state.step ? ' on' : ''));
+    bar.appendChild(d);
+  }
+}
+
+function go(n){
+  state.step = n;
+  for (var i=0;i<7;i++){ var s = el('s'+i); if (s) s.hidden = (i !== n); }
+  renderSteps();
+  window.scrollTo(0,0);
+  if (n === 1) runProbe();
+  if (n === 6) renderPreview();
+}
+
+function renderInstruments(){
+  var box = el('instr'); box.innerHTML = '';
+  INSTRUMENTS.forEach(function(name){
+    var s = document.createElement('span');
+    s.className = 'pill' + (state.instruments.indexOf(name) >= 0 ? ' on' : '');
+    s.textContent = name;
+    s.onclick = function(){
+      var i = state.instruments.indexOf(name);
+      if (i >= 0) state.instruments.splice(i,1); else state.instruments.push(name);
+      renderInstruments();
+    };
+    box.appendChild(s);
+  });
+}
+
+function runProbe(){
+  var ul = el('checklist');
+  ul.innerHTML = '<li class="cd">Checking this machine...</li>';
+  el('probebanner').innerHTML = '';
+  fetch('/api/probe').then(function(r){ return r.json(); }).then(function(p){
+    state.probe = p;
+    ul.innerHTML = '';
+    p.checks.forEach(function(c){
+      var li = document.createElement('li');
+      var dot = document.createElement('div');
+      dot.className = 'dot ' + c.status;
+      var body = document.createElement('div');
+      var t = document.createElement('div');
+      t.className = 'cl'; t.textContent = c.label;
+      body.appendChild(t);
+      var d = document.createElement('div');
+      d.className = 'cd'; d.textContent = c.detail || '';
+      body.appendChild(d);
+      if (c.fix){
+        var f = document.createElement('div');
+        f.className = 'fix'; f.textContent = 'Fix: ' + c.fix;
+        body.appendChild(f);
+      }
+      li.appendChild(dot); li.appendChild(body); ul.appendChild(li);
+    });
+    var b = el('probebanner');
+    if (p.ok) b.innerHTML = '<div class="banner ok">This machine can run the Co-Pilot.</div>';
+    else b.innerHTML = '<div class="banner bad">Some checks failed. You can still finish setup, but the Co-Pilot will not run until they pass.</div>';
+  }).catch(function(){
+    ul.innerHTML = '<li class="cd">Could not reach the setup server. Is the SETUP window still open?</li>';
+  });
+}
+
+function setval(id, v){
+  var e = el(id);
+  if (e && v !== null && v !== undefined && v !== '') e.value = v;
+}
+
+/**
+ * Re-running the wizard must never silently discard numbers the trader already
+ * chose. Everything below is read back from app/rules.json + app/profile.json
+ * and shown as the starting value, so changing one field changes one field.
+ */
+function prefill(){
+  fetch('/api/current').then(function(r){ return r.json(); }).then(function(j){
+    if (!j || !j.exists || !j.rules) return;
+    var R = j.rules, P = j.profile || {};
+    var st = R.stageRules || {}, ev = st.eval || {}, fu = st.funded || {};
+    var fl = R.firmLimits || {}, tl = R.tradeLimit || {}, ds = R.dayStop || {}, dt = R.dailyLossTiers || {};
+
+    setval('traderName', P.traderName);
+    setval('firm', fl.firm || P.firm);
+    setval('product', fl.product || P.product);
+    setval('accountSize', P.accountSize);
+    setval('timezone', P.timezone);
+    setval('firmDailyLossLimit', fl.dailyLossLimit);
+    setval('eodThresholdDrawdown', fl.eodThresholdDrawdown);
+    setval('profitTarget', fl.profitTarget);
+    setval('dayStopEval', ds.eval);
+    setval('dayStopFunded', ds.funded);
+    setval('tradesPerDay', R.tradesPerDay);
+    setval('cooldownMinutes', R.cooldownMinutes);
+    setval('tradeLimitEval', tl.eval);
+    setval('tradeLimitFunded', tl.funded);
+    setval('evalSizeCap', ev.sizeCap !== undefined ? ev.sizeCap : R.sizeCap);
+    setval('fundedSizeCap', fu.sizeCap);
+    setval('sizeFloor', R.sizeFloor);
+    setval('perTradeMaxLoss', R.perTradeMaxLoss);
+    setval('tierYellow', dt.yellow);
+    setval('tierRed', dt.red);
+    setval('tierHard', dt.hard);
+    setval('tradingMode', R.tradingMode);
+
+    if (Array.isArray(P.instruments) && P.instruments.length){
+      state.instruments = P.instruments.slice();
+      renderInstruments();
+    }
+    if (Array.isArray(P.playbooks) && P.playbooks.length) setval('playbooks', P.playbooks.join(', '));
+
+    var w = R.sessionWindows;
+    if (Array.isArray(w) && w.length){
+      setval('w1name', w[0].name); setval('w1start', w[0].startLocal); setval('w1end', w[0].endLocal);
+      if (w[1]) { setval('w2name', w[1].name); setval('w2start', w[1].startLocal); setval('w2end', w[1].endLocal); }
+    }
+    var b = el('preloaded');
+    if (b) b.hidden = false;
+    validateTiers();
+  }).catch(function(){});
+}
+
+function deriveTiers(){
+  var dll = numv('firmDailyLossLimit');
+  if (!dll){ alert('Enter your daily loss limit first, then auto-fill.'); return; }
+  el('tierYellow').value = -Math.round(dll * 0.5);
+  el('tierRed').value = -Math.round(dll * 0.7);
+  el('tierHard').value = -dll;
+  validateTiers();
+}
+
+function validateTiers(){
+  var box = el('tierwarn');
+  if (!box) return;
+  var abs = function(id){ var v = numv(id); return v === null ? null : Math.abs(v); };
+  var y = abs('tierYellow'), r = abs('tierRed'), h = abs('tierHard');
+  var dll = abs('firmDailyLossLimit');
+  var msgs = [];
+  if (y !== null && r !== null && r < y) msgs.push('Red is tighter than yellow. Red should be the larger loss.');
+  if (r !== null && h !== null && h < r) msgs.push('Hard stop is tighter than red. Hard should be the largest loss.');
+  if (h !== null && dll !== null && h > dll) msgs.push('Hard stop is past your firm limit of ' + dll + ' -- your firm liquidates you first.');
+  var partial = (y !== null ? 1 : 0) + (r !== null ? 1 : 0) + (h !== null ? 1 : 0);
+  if (partial > 0 && partial < 3) msgs.push('Fill all three tiers, or leave all three blank to derive them.');
+  box.innerHTML = msgs.length ? '<div class="fix">' + msgs.join('<br>') + '</div>' : '';
+}
+
+function collect(){
+  var wins = [];
+  if (val('w1name') && val('w1start') && val('w1end')){
+    wins.push({ name: val('w1name'), tz: val('timezone'), startLocal: val('w1start'), endLocal: val('w1end') });
+  }
+  if (val('w2name') && val('w2start') && val('w2end')){
+    wins.push({ name: val('w2name'), tz: val('timezone'), startLocal: val('w2start'), endLocal: val('w2end') });
+  }
+  var pb = val('playbooks');
+  return {
+    traderName: val('traderName'),
+    instruments: state.instruments,
+    firm: val('firm'),
+    product: val('product'),
+    accountSize: numv('accountSize'),
+    timezone: val('timezone'),
+    playbooks: pb ? pb.split(',').map(function(s){ return s.trim(); }).filter(Boolean) : [],
+    firmDailyLossLimit: numv('firmDailyLossLimit'),
+    eodThresholdDrawdown: numv('eodThresholdDrawdown'),
+    profitTarget: numv('profitTarget'),
+    dayStopEval: numv('dayStopEval'),
+    dayStopFunded: numv('dayStopFunded'),
+    tradesPerDay: numv('tradesPerDay'),
+    tradesPerSession: numv('tradesPerDay'),
+    cooldownMinutes: numv('cooldownMinutes'),
+    tradeLimitEval: numv('tradeLimitEval'),
+    tradeLimitFunded: numv('tradeLimitFunded'),
+    evalSizeCap: numv('evalSizeCap'),
+    fundedSizeCap: numv('fundedSizeCap'),
+    sizeCap: numv('evalSizeCap'),
+    sizeFloor: numv('sizeFloor'),
+    perTradeMaxLoss: numv('perTradeMaxLoss'),
+    tierYellow: numv('tierYellow'),
+    tierRed: numv('tierRed'),
+    tierHard: numv('tierHard'),
+    tradingMode: val('tradingMode'),
+    sessionWindows: wins
+  };
+}
+
+function review(){
+  var a = collect();
+  if (!a.sessionWindows.length){
+    alert('Add at least one trading window with a name, start and end.');
+    return;
+  }
+  go(6);
+}
+
+function renderPreview(){
+  el('preview').textContent = JSON.stringify(collect(), null, 2);
+}
+
+function save(){
+  var btn = el('savebtn');
+  btn.disabled = true; btn.textContent = 'Writing...';
+  el('saverbanner').innerHTML = '';
+  fetch('/api/save', {
+    method:'POST',
+    headers:{ 'Content-Type':'application/json' },
+    // confirm:true is what makes this a deliberate write. The server refuses
+    // any save that does not carry it, so a stray request cannot rewrite the
+    // rules the live app trades from.
+    body: JSON.stringify({ confirm: true, answers: collect() })
+  }).then(function(r){ return r.json(); }).then(function(j){
+    btn.disabled = false; btn.textContent = 'Write my rules';
+    if (!j.ok){
+      el('saverbanner').innerHTML = '<div class="banner bad">' + (j.error || 'Could not write.') + '</div>';
+      return;
+    }
+    var html = '<div class="banner ok"><b>Written.</b><br>';
+    j.wrote.forEach(function(p){ html += p + '<br>'; });
+    if (j.backups && j.backups.length){
+      html += '<br>Backed up:<br>' + j.backups.join('<br>');
+    }
+    if (j.warnings && j.warnings.length){
+      html += '<br><br><b>Check these before you trade:</b><br>';
+      j.warnings.forEach(function(w){ html += '&bull; ' + w + '<br>'; });
+    }
+    html += '<br>' + j.next + '</div>';
+    el('saverbanner').innerHTML = html;
+    window.scrollTo(0, document.body.scrollHeight);
+  }).catch(function(e){
+    btn.disabled = false; btn.textContent = 'Write my rules';
+    el('saverbanner').innerHTML = '<div class="banner bad">' + String(e) + '</div>';
+  });
+}
+
+renderSteps();
+renderInstruments();
+prefill();
+</script>
+</body>
+</html>

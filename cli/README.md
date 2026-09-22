@@ -550,7 +550,7 @@ Two structural reasons, both about how this app is actually built:
    account. No MCP server addresses any of them.
 
 Anything MCP Market surfaces plugs into **Claude Code or Claude Desktop**, not
-into MNQ-CoPilot — the same builder-vs-product split as the `pp-*` agent skills.
+into Trading-CoPilot — the same builder-vs-product split as the `pp-*` agent skills.
 It is a workflow tool for whoever is building, not a capability source for the
 app.
 

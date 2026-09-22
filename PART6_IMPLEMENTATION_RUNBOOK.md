@@ -11,7 +11,7 @@ first, biggest code changes last.
    - sizeCapMin:2 / sizeCapMax:6 stay as the dial bounds, but leave sizeCap at 2 (the safe default).
    - stageRules.eval.sizeCap = 2 and stageRules.funded.sizeCap = 2 are already correct. Verify only.
 
-2. Remove plain-text API keys  (~/.mnq-copilot-config.json)  [CAUTION]
+2. Remove plain-text API keys  (~/.trading-copilot-config.json)  [CAUTION]
    - First CONFIRM which provider is actually active (CLAUDE.md says DeepSeek is primary; the config
      holds apiKey=Anthropic, groqApiKey, geminiApiKey, omniRouteApiKey, disableOmniRoute:true).
    - Only remove keys that are NOT in use: Anthropic apiKey and omniRouteApiKey are safe to remove

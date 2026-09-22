@@ -3,7 +3,18 @@ const fs = require('fs');
 const path = require('path');
 const atomicWrite = require('./atomic-write');
 
-const SESSIONS_DIR = 'G:\\MNQ-CoPilot\\sessions';
+// Renamed 2026-09-18. Anchor on app/server.js so a stray empty folder of the
+// new name cannot capture the session history -- splitting session notes away
+// from the ledger would silently break the week rollup and the dashboard.
+const SESSIONS_DIR = (function () {
+  const fs = require('fs');
+  const path = require('path');
+  const roots = ['G:\\Trading-CoPilot', 'G:\\MNQ-CoPilot'];
+  for (let i = 0; i < roots.length; i++) {
+    try { if (fs.existsSync(path.join(roots[i], 'app', 'server.js'))) return path.join(roots[i], 'sessions'); } catch (e) {}
+  }
+  return 'G:\\MNQ-CoPilot\\sessions';
+})();
 
 function ensureDir() {
   if (!fs.existsSync(SESSIONS_DIR)) {

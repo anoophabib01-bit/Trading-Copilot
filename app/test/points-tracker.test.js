@@ -101,7 +101,25 @@ test('REPLAY: s3 real trade history reproduces the 2026-08-12 expectancy figure'
     return;
   }
   const byDay = JSON.parse(fs.readFileSync(file, 'utf8'));
-  const trades = Object.keys(byDay).sort().flatMap((d) => byDay[d]);
+  const days = Object.keys(byDay).sort();
+  // ── THE SUBJECT MUST STILL EXIST (2026-09-21) ─────────────────────────────
+  // This replay asserts a fact about a specific period of history. When a slot is
+  // RESET — a new account started on it — that history is replaced, and the test
+  // then asserts the historical figure against a fresh account's first few
+  // trades. That is not a weaker version of the same check, it is a check of
+  // something else entirely.
+  //
+  // It went red on 2026-09-21 exactly this way: s3 was reset and now holds three
+  // trades from that one day, so expectancy (rightly) reads positive and the
+  // ratio (rightly) reads above 1. Reported as a code regression, it was an
+  // account reset — and the failure would have been blamed on whatever was
+  // edited that day. Skip when the period is gone; still run when it is present.
+  if (!days.some((d) => d <= '2026-08-12')) {
+    console.log('  (skipped — s3 has been reset: it holds ' + days.length + ' day(s) starting '
+      + days[0] + ', so the 2026-08-12 history this replay reproduces is no longer on disk)');
+    return;
+  }
+  const trades = days.flatMap((d) => byDay[d]);
   const s = pt.summarize(trades);
   assert.ok(s, 'summary must not be null against real recorded trades');
   // Loose tolerance: the spoken figure was rounded and computed from a

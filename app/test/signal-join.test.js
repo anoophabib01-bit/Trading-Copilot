@@ -70,6 +70,21 @@ test('an engulf-alert cannot back a trade', () => {
   assert.equal(r.signalBacked, false);
 });
 
+test('a c-adx-fire setup can back a trade (added 2026-09-21)', () => {
+  // Playbook C-ADX arms through the same armSetup() path as A and B, so a trade
+  // taken off an armed C-ADX setup was being recorded as freestyle purely
+  // because the event name was absent from this vocabulary — the same setup
+  // would have counted as signal-backed under Playbook A.
+  // side + entryAt, not a `direction` field and not `entryTs`: the join reads
+  // the trade's SIDE ('buy'/'sell') and its entryAt/at stamp, so a trade built
+  // from other field names returns false for reasons unrelated to the arming
+  // set — a test shaped that way would pass whether or not this fix existed.
+  const t = { side: 'buy', entryAt: 1000000 };
+  const r = joinTradeToSignal(t, [{ event: 'c-adx-fire', playbook: 'C-ADX', direction: 'BULLISH', ts: 950000 }], { windowMinutes: 15 });
+  assert.equal(r.signalBacked, true);
+  assert.equal(r.playbook, 'C-ADX');
+});
+
 test('ISO-string ts (the real ledger format) parses and backs the trade', () => {
   // The bug this guards: the ledger stores ts as an ISO string, not a number.
   // A bare typeof check for 'number' skipped every real row and left playbook

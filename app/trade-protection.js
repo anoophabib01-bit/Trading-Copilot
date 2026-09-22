@@ -105,21 +105,59 @@
     // Floor is 5, not 25 (2026-09-15, Anoop): he asked to be able to run a $15 band, and a
     // floor that refuses a value he wants is a floor he will work around. It still catches the
     // thing it exists for - a blank, a zero, or a stray keystroke - without limiting him.
-    const STOP_MIN = 5, STOP_MAX = 5000, TGT_MIN = 5, TGT_MAX = 10000;
+    const STOP_MIN = 5, STOP_MAX = 5000, TGT_MIN = 5, TGT_MAX = 10000, TRAIL_MIN = 5, TRAIL_MAX = 5000;
     const clampOne = (v, fallback, lo, hi) => {
       const n = Number(v);
       if (!Number.isFinite(n) || n <= 0) return fallback;
       return Math.min(hi, Math.max(lo, Math.round(n)));
     };
-    const stop = clampOne(inb.stopLossUsd, Number.isFinite(Number(cur.stopLossUsd)) ? Number(cur.stopLossUsd) : 200, STOP_MIN, STOP_MAX);
-    const target = clampOne(inb.takeProfitUsd, Number.isFinite(Number(cur.takeProfitUsd)) ? Number(cur.takeProfitUsd) : 600, TGT_MIN, TGT_MAX);
-    return {
+    // Trail numbers differ from stop/target: a BLANK box keeps the existing value,
+    // but an explicit 0 (or anything non-positive) DISABLES the trail - because
+    // "0" is a real answer here ("no trailing, just the fixed stop") and must not
+    // be silently upgraded to a floor of 5.
+    const clampTrail = (v, fallback) => {
+      if (v === '' || v === null || v === undefined) return fallback;
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) return 0;
+      return Math.min(TRAIL_MAX, Math.max(TRAIL_MIN, Math.round(n)));
+    };
+    // 2026-09-21: the band is PER-STAGE (eval / funded). Clamp whichever stage the
+    // UI wrote, falling back first to that stage's current value, then to the flat
+    // block (a pre-split config), then to the documented default.
+    const clampStage = (inS, curS) => {
+      const cs = curS || {};
+      const pick = (k, fb) => {
+        if (cs[k] != null) return cs[k];
+        if (cur[k] != null) return cur[k];
+        return fb;
+      };
+      return {
+        stopLossUsd: clampOne(inS && inS.stopLossUsd, pick('stopLossUsd', 200), STOP_MIN, STOP_MAX),
+        takeProfitUsd: clampOne(inS && inS.takeProfitUsd, pick('takeProfitUsd', 600), TGT_MIN, TGT_MAX),
+        breakEvenAtUsd: clampTrail(inS && inS.breakEvenAtUsd, pick('breakEvenAtUsd', 0)),
+        trailDistanceUsd: clampTrail(inS && inS.trailDistanceUsd, pick('trailDistanceUsd', 0)),
+      };
+    };
+    const hasStage = inb.eval != null || inb.funded != null;
+    const out = {
       enabled: inb.enabled === undefined ? (cur.enabled !== false) : inb.enabled !== false,
-      stopLossUsd: stop,
-      takeProfitUsd: target,
       _comment: cur._comment,
       _status: cur._status,
     };
+    if (hasStage) {
+      if (inb.eval != null) out.eval = clampStage(inb.eval, cur.eval);
+      if (inb.funded != null) out.funded = clampStage(inb.funded, cur.funded);
+      // Carry forward the stage the user did NOT touch, so a partial write can
+      // never drop the other stage's numbers.
+      if (out.eval == null && cur.eval != null) out.eval = cur.eval;
+      if (out.funded == null && cur.funded != null) out.funded = cur.funded;
+    } else {
+      // Legacy flat write - bit-for-bit the pre-2026-09-21 behaviour, so any
+      // caller or test that predates the per-stage split is unchanged.
+      out.stopLossUsd = clampOne(inb.stopLossUsd, Number.isFinite(Number(cur.stopLossUsd)) ? Number(cur.stopLossUsd) : 200, STOP_MIN, STOP_MAX);
+      out.takeProfitUsd = clampOne(inb.takeProfitUsd, Number.isFinite(Number(cur.takeProfitUsd)) ? Number(cur.takeProfitUsd) : 600, TGT_MIN, TGT_MAX);
+    }
+    return out;
   }
 
   return { bracketFor, pointsForUsd, pointValueForSymbol, specForSymbol, clampAutoProtection };

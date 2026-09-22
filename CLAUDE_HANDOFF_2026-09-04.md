@@ -71,7 +71,7 @@ real resolved outcomes first.
 | app/renderer/styles.css | flex-wrap on .control-toggle | prevent button clipping |
 | Prop Trading/CLAUDE.md | firm line Lucid→Tradeify | stale firm reference |
 | DATA/autonomy/state.json | mode→assist | gitignored (runtime state) |
-| ~/.mnq-copilot-config.json | removed 3 orphaned keys | outside the repo |
+| ~/.trading-copilot-config.json | removed 3 orphaned keys | outside the repo |
 
 ---
 

@@ -29,7 +29,7 @@ const path = require('path');
 const os = require('os');
 const { resolveDataDir } = require('./resolve-data-dir');
 
-const CONFIG_PATH = path.join(os.homedir(), '.mnq-copilot-config.json');
+const CONFIG_PATH = path.join(os.homedir(), '.trading-copilot-config.json');
 
 // Files a traded slot accumulates. Absence is NOT an error on a fresh account —
 // each one is created by its first triggering event, so the list doubles as

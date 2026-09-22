@@ -91,7 +91,7 @@ const STANDARD_FALLBACK_CHAIN = Object.freeze([
 /**
  * Choose the primary provider/model.
  *
- * @param {object} cfg   ~/.mnq-copilot-config.json contents
+ * @param {object} cfg   ~/.trading-copilot-config.json contents
  */
 function primaryProviderModel(cfg) {
   // AUDIT C2: `cfg = {}` only defends against undefined. An explicit null threw

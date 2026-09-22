@@ -35,7 +35,7 @@ Entry planning (playbook-spec planEntry → entry/stop/target) and outcome detec
 exist; this just wires the detection into the live monitor so it speaks during the trade.
 
 ### C. Remove orphaned API keys — needs your confirmation (outside workspace write)
-File: C:/Users/Admin/.mnq-copilot-config.json (outside G:\MNQ-CoPilot, so the sandbox blocks it
+File: C:/Users/Admin/.trading-copilot-config.json (outside G:\Trading-CoPilot, so the sandbox blocks it
 without escalation). Safe to remove (providers already removed from code):
   - apiKey  (Anthropic sk-ant-…) — Anthropic REMOVED from code
   - groqApiKey (gsk_…) — Groq REMOVED from code

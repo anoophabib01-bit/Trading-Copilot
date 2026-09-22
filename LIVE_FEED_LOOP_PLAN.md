@@ -708,7 +708,7 @@ the prerequisite for Phase 5's scorecard.*
 
 ### Phase 7 — Obsidian as the live session surface
 
-*Added 2026-08-23. Context: the vault root is now the repo itself (`G:\MNQ-CoPilot`),
+*Added 2026-08-23. Context: the vault root is now the repo itself (`G:\Trading-CoPilot`),
 so `sessions/*.md` are the live files Obsidian renders — no copy, no sync, no link.
 `G:` is exFAT, so symlinks and junctions are impossible on this volume; pointing the
 vault at the repo root is what replaced them.*

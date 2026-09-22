@@ -1,9 +1,9 @@
 'use strict';
 const fs = require('fs');
-const backtest = require('G:/MNQ-CoPilot/app/backtest');
-const rules = JSON.parse(fs.readFileSync('G:/MNQ-CoPilot/app/rules.json','utf8'));
+const backtest = require('G:/Trading-CoPilot/app/backtest');
+const rules = JSON.parse(fs.readFileSync('G:/Trading-CoPilot/app/rules.json','utf8'));
 function load(f){const d=JSON.parse(fs.readFileSync(f,'utf8'));const b=Array.isArray(d)?d:(d.bars||[]);return b.filter(x=>x&&typeof x.time==='number'&&typeof x.close==='number');}
-const bars = load('G:/MNQ-CoPilot/DATA/bars/mnq_60.json');
+const bars = load('G:/Trading-CoPilot/DATA/bars/mnq_60.json');
 const span = (bars[bars.length-1].time-bars[0].time)/86400;
 const buf = rules.playbooks.stopBufferPoints || 3;
 const rr = rules.playbooks.targetR || 2;

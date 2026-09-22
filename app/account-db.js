@@ -334,7 +334,7 @@ function buildHtmlReport(db) {
   const flagRows = db.dataQuality.map(f => `<li><b>${htmlEscape(f.slotId)}:</b> ${htmlEscape(f.issue)}</li>`).join('');
 
   return `<!doctype html>
-<html><head><meta charset="utf-8"><title>MNQ Co-Pilot — All Accounts Report</title>
+<html><head><meta charset="utf-8"><title>Trading Co-Pilot — All Accounts Report</title>
 <style>
   body { font-family: -apple-system, Segoe UI, Arial, sans-serif; background:#0d1117; color:#e6edf3; margin:0; padding:28px 34px; }
   h1 { font-size:20px; margin:0 0 4px; }
@@ -353,7 +353,7 @@ function buildHtmlReport(db) {
   .flags li { margin:3px 0; }
 </style></head>
 <body>
-  <h1>MNQ Co-Pilot — All Accounts Report</h1>
+  <h1>Trading Co-Pilot — All Accounts Report</h1>
   <p class="meta">Generated ${htmlEscape(genDate)} &middot; read-only, combined from every account slot &middot; nothing here changes your live data</p>
 
   <div class="summary-grid">
@@ -418,7 +418,7 @@ module.exports = {
 
 // CLI: `node account-db.js [dataDir]` — defaults to ../DATA relative to this
 // file (app/), matching this machine's confirmed live location
-// (G:\MNQ-CoPilot\DATA, no custom dataDir configured as of 2026-08-13).
+// (G:\Trading-CoPilot\DATA, no custom dataDir configured as of 2026-08-13).
 if (require.main === module) {
   const dataDir = process.argv[2] || path.join(__dirname, '..', 'DATA');
   const db = rebuildAccountDatabase(dataDir);

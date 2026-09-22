@@ -32,7 +32,21 @@
 // vocabularies ever do; a silent shared coupling would be worse.
 const tradeForensics = require('./trade-forensics'); // shared excursion kernel (F1)
 
-const ARMING_EVENTS = new Set(['engulf-fire', 'fvg-fire', 'playbook-b-confirm']);
+// 'c-adx-fire' ADDED 2026-09-21. C-ADX was the one playbook whose fire event
+// was missing from this set, and the consequence was invisible for a specific
+// reason worth recording: the shadow router (typesafe-router.js) reads the same
+// armed setups this set decides whether to SCORE, and it had logged three live
+// C-ADX reads against an outcome ledger that could never contain a C-ADX row.
+// Measured live that day: 3 router rows, 2 outcomes, 0 joined. The join key was
+// correct (both ledgers key on the same setupId format); the POPULATIONS simply
+// never overlapped, so the router's whole justification — "does the ranking
+// predict outcomes?" — could accumulate nothing.
+//
+// The row is scoreable on the same terms as any other arming event: server.js's
+// adx-breakout monitor writes it through armSetup with a real entry and stop
+// from planEntry (see the G19 note on that write), and the resolver anchors on
+// `entry` when present.
+const ARMING_EVENTS = new Set(['engulf-fire', 'fvg-fire', 'playbook-b-confirm', 'c-adx-fire']);
 
 function isArmingEvent(event) {
   return ARMING_EVENTS.has(String(event || ''));
@@ -168,6 +182,13 @@ function resolveSignalOutcome(signal, bars, opts) {
     // it went wrong. Null rather than Infinity when MAE is zero, so averaging
     // a batch can never produce Infinity.
     edgeRatio: mae > 0 ? mfe / mae : null,
+    // 2026-09-19: carried through so the shadow router's rows (which are keyed
+    // by setupId) can be joined to this outcome EXACTLY rather than by
+    // signalTs|playbook|tf — two engulf fires on one timeframe in one second
+    // are one bucket under the composite key, and a mismatch there would score
+    // the router against the wrong signal. Additive: every existing reader keys
+    // on the fields it already used.
+    setupId: signal.setupId || null,
     resolvedAt: new Date().toISOString(),
   };
 }

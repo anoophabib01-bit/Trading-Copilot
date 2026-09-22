@@ -1,4 +1,4 @@
-<!-- /autoplan restore point: /c/Users/Admin/.gstack/projects/MNQ-CoPilot/master-autoplan-restore-20260820-214341.md -->
+<!-- /autoplan restore point: /c/Users/Admin/.gstack/projects/Trading-CoPilot/master-autoplan-restore-20260820-214341.md -->
 # Live Trade Events — Plan
 
 **Status:** built 2026-08-20, zero live verification. Written after the fact, as input to a full review pass.

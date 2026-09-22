@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('fs');
-const backtest = require('G:/MNQ-CoPilot/app/backtest');
-const rules = JSON.parse(fs.readFileSync('G:/MNQ-CoPilot/app/rules.json','utf8'));
+const backtest = require('G:/Trading-CoPilot/app/backtest');
+const rules = JSON.parse(fs.readFileSync('G:/Trading-CoPilot/app/rules.json','utf8'));
 function load(f){const d=JSON.parse(fs.readFileSync(f,'utf8'));const b=Array.isArray(d)?d:(d.bars||[]);return b.filter(x=>x&&typeof x.time==='number'&&typeof x.close==='number');}
 const buf=rules.playbooks.stopBufferPoints||3, rr=rules.playbooks.targetR||2, horizon=rules.playbooks.outcomeHorizonBars||12, pv=backtest.MNQ_POINT_VALUE;
 const minPts=rules.playbooks.minRiskPoints||0, maxUsd=rules.perTradeMaxLoss||Infinity;
@@ -32,7 +32,7 @@ function runLongAdx(bars, lookback, adxMin){
   }
   return trades;
 }
-const files = ['G:/MNQ-CoPilot/DATA/bars/mnq_1h_sepnov.json','G:/MNQ-CoPilot/DATA/bars/mnq_1h_flat.json','G:/MNQ-CoPilot/DATA/bars/mnq_1h_downtrend.json','G:/MNQ-CoPilot/DATA/bars/mnq_1h_uptrend.json','G:/MNQ-CoPilot/DATA/bars/mnq_60.json'];
+const files = ['G:/Trading-CoPilot/DATA/bars/mnq_1h_sepnov.json','G:/Trading-CoPilot/DATA/bars/mnq_1h_flat.json','G:/Trading-CoPilot/DATA/bars/mnq_1h_downtrend.json','G:/Trading-CoPilot/DATA/bars/mnq_1h_uptrend.json','G:/Trading-CoPilot/DATA/bars/mnq_60.json'];
 let all=[];
 for(const f of files){ all=all.concat(runLongAdx(load(f),10,35)); }
 all.sort((a,b)=>a.time-b.time);

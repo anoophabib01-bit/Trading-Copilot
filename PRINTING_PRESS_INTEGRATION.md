@@ -1,4 +1,4 @@
-# Printing Press CLI Integration for MNQ-CoPilot
+# Printing Press CLI Integration for Trading-CoPilot
 
 **Date:** 2026-09-06  
 **Status:** Integration Framework  
@@ -8,7 +8,7 @@
 
 ## Overview
 
-The **printing-press-library** provides real-time NSE India market data (equity quotes, indices, corporate actions, portfolio analysis) without API keys. This document maps all available CLI commands to MNQ-CoPilot trading workflows.
+The **printing-press-library** provides real-time NSE India market data (equity quotes, indices, corporate actions, portfolio analysis) without API keys. This document maps all available CLI commands to Trading-CoPilot trading workflows.
 
 **Key Insight:** While MNQ trades US Nasdaq futures, Indian institutional activity (delivery %, sector breadth, index attribution) serves as a **leading indicator** for global market rotations affecting MNQ. This integration adds a cross-market validation layer.
 
@@ -66,7 +66,7 @@ nse-india-pp-cli market --agent
 }
 ```
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - Pre-session GO/NO-GO checklist
 - Verify NSE market status → informs global risk-on/off sentiment
 - Timing reference for IST-to-EST correlation
@@ -100,7 +100,7 @@ nse-india-pp-cli equity quote --symbol RELIANCE --agent
 }
 ```
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - Monitor key Indian mega-caps (RELIANCE, TCS, INFY, HDFC)
 - Cross-reference delivery % with MNQ sector bias
 - Volume confirmation for institutional accumulation signals
@@ -137,7 +137,7 @@ nse-india-pp-cli symbol-lookup "Infosys" --agent
 }
 ```
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - Validate symbol names before bulk queries
 - Match Indian IT stocks to US Nasdaq sectors
 - Industry classification for sector allocation
@@ -164,7 +164,7 @@ nse-india-pp-cli indices list --agent
 }
 ```
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - Build a cached index list for quick lookups
 - Filter by sector (IT, BANK, AUTO, etc.) for sector-specific analysis
 - Reference for broader index-driver analysis
@@ -195,7 +195,7 @@ nse-india-pp-cli indices constituents --index "NIFTY 50" --agent
 }
 ```
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - Bulk fetch all NIFTY 50 stocks for breadth analysis
 - Identify momentum leaders vs. laggards
 - Filter for "stocks near 52W high" → early strength signals
@@ -239,7 +239,7 @@ nse-india-pp-cli corporate actions --symbol RELIANCE --agent
 }
 ```
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - Flag dividend ex-dates → impacts stock price gaps
 - Anticipate delivery % shifts around ex-dates
 - Build event calendar for risk management
@@ -272,7 +272,7 @@ nse-india-pp-cli corporate announcements --symbol TCS --agent
 }
 ```
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - Monitor earnings calendar for key mega-caps
 - Detect unexpected announcements (surprise corporate actions)
 - Track insider trading disclosures for conviction signals
@@ -311,7 +311,7 @@ nse-india-pp-cli equity derivatives --symbol RELIANCE --agent
 }
 ```
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - Analyze India F&O open interest → positioning signals
 - Compare put/call ratios for sentiment
 - Track implied volatility for option-selling setups
@@ -337,7 +337,7 @@ nse-india-pp-cli movers --agent
 }
 ```
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - Gauge overall market breadth & activity
 - Identify sector rotation (which stocks are getting bought/sold)
 - Early warning for volatility expansion/contraction
@@ -376,7 +376,7 @@ nse-india-pp-cli delivery-spike --threshold 1.5 --agent
 - Institutions are **accumulating** at current prices
 - Precedes price moves by 2-3 trading sessions
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - Early warning signal for Indian sector rotation
 - When BANK/IT stocks show delivery spike → expect MNQ to follow 2-3 days later
 - Confirms directional bias for your MNQ setup
@@ -436,7 +436,7 @@ nse-india-pp-cli delivery-divergence --lookback 10 --agent
 - **Accumulation:** Price down but delivery % up = institutions buying dips → reversal signal
 - Strongest when confidence > 0.85 and duration > 2 days
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - Spot potential reversals in Indian mega-caps
 - When RELIANCE shows distribution → MNQ often peaks 1-2 days later
 - When INFY shows accumulation → MNQ often bottoms 1-2 days later
@@ -493,7 +493,7 @@ nse-india-pp-cli sector-breadth --sector AUTO --agent
 - **Median % Change:** Central performance (filters outliers)
 - **Delivery Breadth:** How many stocks in the sector showing high delivery %
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - Validate MNQ directional bias
 - If IT sector A/D ratio = 2.0 → MNQ rally is broad, continue
 - If IT sector A/D ratio = 0.3 → MNQ rally is narrow/weak, fade
@@ -544,7 +544,7 @@ nse-india-pp-cli index-driver --index "NIFTY 50" --agent
 - **Concentration Ratio = 0.87:** 87% of the move is driven by top 3-5 stocks
 - **Broad-Based Strength = Narrow:** Move is NOT supported by the full index
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - When NIFTY moves but concentration is low (< 0.5) → broad rally, trust MNQ continuation
 - When NIFTY moves but concentration is high (> 0.8) → single-stock event, fade MNQ
 - Helps distinguish true market moves from noise
@@ -594,7 +594,7 @@ INFY,8,2400,2026-09-03
 }
 ```
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - If you have a small India holdings (portfolio tracker)
 - Cross-check: if your India positions are up 3% but MNQ is down → MNQ weakness is temporary
 - Real-time validation of directional thesis
@@ -623,7 +623,7 @@ nse-india-pp-cli portfolio margin-health --holdings ~/holdings.csv --agent
 }
 ```
 
-**MNQ-CoPilot Use:**
+**Trading-CoPilot Use:**
 - If you trade India stocks alongside MNQ
 - Ensure India positions don't blow margin during gap moves
 - Coordinate leverage across both portfolios
@@ -984,10 +984,10 @@ setInterval(async () => {
 
 ### SECTION 6: DATA SCHEMA MAPPINGS
 
-#### Printing Press Output → MNQ-CoPilot Schema
+#### Printing Press Output → Trading-CoPilot Schema
 
 ```javascript
-// Transform printing-press JSON to MNQ-CoPilot internal format
+// Transform printing-press JSON to Trading-CoPilot internal format
 const transformers = {
   marketContext: (ppData) => ({
     timestamp: ppData.meta.synced_at,
@@ -1104,7 +1104,7 @@ async function batchMarketContext() {
    npx -y @mvanhorn/printing-press-library install nse-india --cli-only
    ```
 
-2. **Copy `app/market-data.js`** into MNQ-CoPilot project
+2. **Copy `app/market-data.js`** into Trading-CoPilot project
 
 3. **Update `app/server.js`**
    - Import `marketData` module

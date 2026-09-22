@@ -100,6 +100,19 @@
   border-top: 1px solid var(--border);
   overflow-wrap: anywhere;
 }
+/* ── Money line (2026-09-21) ────────────────────────────────────────────────
+   The same drift in dollars at the two sizes that matter. Brighter than the
+   detail prose and set apart by a rule above it: the point reading explains the
+   market, this one is the number he sizes off, and they must not read as one
+   run-on sentence. */
+.xd-money {
+  color: var(--text);
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  font-weight: 600;
+}
+.xd-money:empty { display: none; }
 .xd-btn { margin-top: 8px !important; width: 100%; }
 .xd-status {
   font: 11px/1.4 'Inter', 'Segoe UI', system-ui, sans-serif;

@@ -10,13 +10,13 @@ date; treat line numbers as approximate anchors, not guarantees.
 
 ## 0. Read this first: the one-copy rule
 
-`G:\MNQ-CoPilot` is the **only** live copy of this project. Every other copy on this
+`G:\Trading-CoPilot` is the **only** live copy of this project. Every other copy on this
 machine has been archived (see `CLAUDE.md` for the full list and the two incidents
 that made this necessary — one where an entire debugging session was spent editing a
 stale copy on `C:\`, and the fixes had to be redone here).
 
 Before your first edit in any session: confirm the absolute path you are writing to
-starts with `G:\MNQ-CoPilot`.
+starts with `G:\Trading-CoPilot`.
 
 ## 0.1 What kind of software this is
 
@@ -58,7 +58,7 @@ contents into new documents — extend them in place.
 ## 1. Repository layout
 
 ```
-G:\MNQ-CoPilot\
+G:\Trading-CoPilot\
 ├── START CO-PILOT.bat              ← the ONLY supported launch path
 ├── START CO-PILOT (LIVE ORDERS).bat← same, with TV_ALLOW_LIVE_ORDERS=1
 ├── CLAUDE.md ARCHITECTURE.md AGENTS.md TODOS.md TRUST-PROTOCOL.md HANDOVER.md
@@ -90,7 +90,7 @@ When searching, exclude `*.bak` or you will read dead code and "fix" nothing.
 **Primary path (what Anoop uses):**
 
 ```
-"G:\MNQ-CoPilot\START CO-PILOT.bat"
+"G:\Trading-CoPilot\START CO-PILOT.bat"
 ```
 
 This batch file: kills any running TradingView/node processes → relaunches TradingView
@@ -104,7 +104,7 @@ fails to connect. Nearly every "TradingView isn't working" report traces back to
 **Iterating on server code only:**
 
 ```
-cd G:\MNQ-CoPilot\app
+cd G:\Trading-CoPilot\app
 node server.js            # or: launch.bat  (kills :7433, starts, polls, opens Chrome)
 ```
 
@@ -142,7 +142,7 @@ watchdog can never block the app from starting. Starting it is a separate manual
 match the existing style. Everything is one process. Structure:
 
 - **Crash guards** (top of file) — keep the process alive on uncaught errors. Do not remove.
-- **`CONFIG_PATH`** = `~/.mnq-copilot-config.json` — holds `apiKey`, `dataDir`, current
+- **`CONFIG_PATH`** = `~/.trading-copilot-config.json` — holds `apiKey`, `dataDir`, current
   `mode`, etc. Read via `loadConfig()`, written via `atomic-write.js`.
 - **Static file server** (~line 687) — serves `renderer/` over plain HTTP. `/` → `index.html`.
 - **The single WebSocket dispatcher** at `ws.on('message', ...)` (~line 774) — a `switch`
@@ -264,7 +264,7 @@ key fields with non-obvious precedence "is creating a lot of confusion".
 - **`stage-rules.js`** — the `eval` vs `funded` risk layer, applied **after** `scalperRules`.
   `eval` permits upward from the base; `funded` can only ever *tighten* (one-way ratchet).
 - **`resolve-data-dir.js`** — one resolver for `DATA_DIR`, shared by `server.js`,
-  `call-logger.js`, and `token-usage-report.js`. Default `G:\MNQ-CoPilot\DATA`, overridable
+  `call-logger.js`, and `token-usage-report.js`. Default `G:\Trading-CoPilot\DATA`, overridable
   via `cfg.dataDir`, falling back to `app/data/`. It exists because a duplicated,
   incomplete copy of this logic once wrote logs to a different directory silently.
 - **`atomic-write.js`** — write-temp-then-rename. Use it for anything persisted.
@@ -429,8 +429,8 @@ Replicate this pattern for any new auto-starting monitor.
 
 | Path | Contents |
 |---|---|
-| `~/.mnq-copilot-config.json` | API key, `dataDir`, current mode (`eval`/`funded`), user config. **Not in the repo.** |
-| `DATA/` (default `G:\MNQ-CoPilot\DATA`) | The live dataset: `accounts/`, `account_fees.json`, `account_journeys.json`, `align_notes.json`, `balance_ledger.json`, `day_trades.json`, `eval_milestones.json`, `maemfe.json`, `charts/`, `history/`, `reviews/`, `books/`, `chat_transcript.json`, `token-usage.jsonl`, `tv_broker_feed_state.json`, `loop_state.json`. |
+| `~/.trading-copilot-config.json` | API key, `dataDir`, current mode (`eval`/`funded`), user config. **Not in the repo.** |
+| `DATA/` (default `G:\Trading-CoPilot\DATA`) | The live dataset: `accounts/`, `account_fees.json`, `account_journeys.json`, `align_notes.json`, `balance_ledger.json`, `day_trades.json`, `eval_milestones.json`, `maemfe.json`, `charts/`, `history/`, `reviews/`, `books/`, `chat_transcript.json`, `token-usage.jsonl`, `tv_broker_feed_state.json`, `loop_state.json`. |
 | `sessions/` | Session recordings. |
 | `app/data/` | Fallback `DATA_DIR` if the configured one isn't writable. |
 | `app/logs/` | Runtime logs. |
@@ -438,7 +438,7 @@ Replicate this pattern for any new auto-starting monitor.
 
 Two axes of mode, frequently confused:
 - **`mode`**: `eval` \| `funded` — which account's rules/data apply. Persisted in
-  `~/.mnq-copilot-config.json`, switched by `handleModeSwitch`, layered by `stage-rules.js`.
+  `~/.trading-copilot-config.json`, switched by `handleModeSwitch`, layered by `stage-rules.js`.
 - **`tradingMode`**: `standard` \| `scalper` — trading style. Persisted in `rules.json`,
   applied as the `scalperRules` overlay.
 
@@ -560,7 +560,7 @@ distinction between "built" and "verified" made explicit.
 
 ## 9. Fast orientation checklist for a new agent
 
-1. Confirm you are in `G:\MNQ-CoPilot`.
+1. Confirm you are in `G:\Trading-CoPilot`.
 2. Read `CLAUDE.md`, then this file, then `ARCHITECTURE.md` and `AGENTS.md`.
 3. Skim `TODOS.md` for what is unverified, and `TRUST-PROTOCOL.md` for how to report numbers.
 4. `cd app && npm test` — confirm the suite is green before you change anything.

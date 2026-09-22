@@ -1,12 +1,12 @@
 // Distribution of stop distance (riskPoints) per playbook, over the cached
 // bar sets. Answers: at sizeCap 2, how many setups fit under a $200 ceiling?
 const path = require('path');
-const APP = 'g:/MNQ-CoPilot/app';
+const APP = 'g:/Trading-CoPilot/app';
 const bt = require(path.join(APP, 'backtest.js'));
 const rules = require(path.join(APP, 'rules.json'));
 
 function load(f) {
-  const j = require('g:/MNQ-CoPilot/DATA/bars/' + f);
+  const j = require('g:/Trading-CoPilot/DATA/bars/' + f);
   return j.bars || j;
 }
 

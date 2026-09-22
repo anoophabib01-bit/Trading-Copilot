@@ -339,7 +339,10 @@ function slotDataKey(base) { return base + '__' + activeSlotId; }
 async function migrateSlotsIfNeeded() {
   let cfg = {};
   try { cfg = (await window.api.getConfig()) || {}; } catch (e) {}
-  if (Array.isArray(cfg.acctSlots) && cfg.acctSlots.length === ACCT_SLOT_COUNT) {
+  // 2026-09-19: >= 1, not exactly ACCT_SLOT_COUNT (5). Accounts now accumulate —
+  // "Start new account" pushes a new slot with its own id and folder — and the
+  // old exact-length check would have thrown that list away on the next launch.
+  if (Array.isArray(cfg.acctSlots) && cfg.acctSlots.length >= 1) {
     acctSlots = cfg.acctSlots;
     activeSlotId = cfg.activeSlotId || acctSlots[0].id;
     return false;
@@ -1629,8 +1632,177 @@ function gatePeekBucket(cfg, bucketKey, size, stage) {
   const bal = Math.round(_bal * 100) / 100;
   const breached = (bal != null && floor != null) ? bal < floor : false;
   const start = prof.startBalance;
-  return { bal, floor, breached, lastDate, days, start };
+  return { bal, floor, breached, lastDate, days, start, source: 'config' };
 }
+
+// ── 2026-09-17: the picker read the CONFIG MIRROR and nothing else ──────────
+// Anoop's screenshot showed "Apex new EOD — $50,000 · last traded no days
+// logged · 0 days" on an account that had five logged days and $49,342.84.
+// gatePeekBucket() above is not wrong — it faithfully renders
+// cfg['acctBucket__<slot>'], and at that moment that blob's
+// copilot_balance_ledger was literally null. The truth was on disk the whole
+// time (DATA/accounts/s2/balance_ledger.json, 5 days): the same store the
+// server reads, and the same one the chat's own "5 days logged" line came
+// from. Two surfaces, one app, two different answers.
+//
+// The 2026-08-18 overlay fix (overlaySlotDiskData) restores disk -> localStorage
+// on load, but never writes the disk truth back into the config blob the picker
+// reads, so the mirror can sit empty indefinitely while the account trades.
+// This reads the authoritative per-slot file directly. Same key format the
+// server maps ('balance_ledger__s2' -> accounts/s2/balance_ledger.json), and it
+// is NOT restricted to the active slot.
+//
+// SCOPE: this fixes what the picker DISPLAYS. The breach flag that feeds
+// retireSlot() is deliberately left on the old mirror-based value — retireSlot
+// is a ONE-WAY ratchet with no un-retire path, so changing what triggers it is
+// a separate decision, not a side effect of a display fix.
+async function diskPeekBucket(slotId, size, stage) {
+  if (!window.api || !window.api.dataLoad || !slotId) return null;
+  const prof = (ACCOUNT_PROFILES[size] || {})[stage];
+  if (!prof) return null;
+  let led = null;
+  try { led = await window.api.dataLoad('balance_ledger__' + slotId); } catch (e) { return null; }
+  if (!led || typeof led !== 'object' || Array.isArray(led)) return null;
+  const keys = Object.keys(led).sort();
+  // An empty ledger is a genuinely fresh slot, not a traded one — fall through
+  // to the mirror so "Start fresh" still renders as empty.
+  if (!keys.length) return null;
+  const _buffer = stage === 'eval' ? prof.maxLoss : prof.floorBuffer;
+  const _lock = prof.startBalance + 100;
+  let _bal = prof.startBalance, _floor = prof.startBalance - _buffer;
+  keys.forEach(k => {
+    _bal += (led[k] && led[k].net) || 0;
+    _floor = Math.min(_lock, Math.max(_floor, _bal - _buffer));
+  });
+  const bal = Math.round(_bal * 100) / 100;
+  const floor = Math.round(_floor);
+  // firstDate is the account's own first logged day - the only honest answer to
+  // "when did this account start", and what stops two same-size accounts being
+  // confused in the picker.
+  return { bal, floor, breached: bal < floor, lastDate: keys[keys.length - 1] || null, firstDate: keys[0] || null, days: keys.length, start: prof.startBalance, source: 'disk' };
+}
+
+// Every account carries a DATE, so two accounts of the same size can never be
+// mistaken for each other. Preference order:
+//   1. slot.startedAt   - stamped once learned, survives a later wipe
+//   2. peek.firstDate   - this account's own first logged day
+//   3. slot.retiredAt   - a retired account with no surviving ledger
+// Returns null only for a slot that has never been traded.
+function slotOpenedOn(slot, peek) {
+  if (slot && slot.startedAt) return slot.startedAt;
+  if (peek && peek.firstDate) return peek.firstDate;
+  if (slot && slot.retiredAt) return slot.retiredAt;
+  return null;
+}
+
+// ── THE ACCOUNTS INDEX (2026-09-19) ─────────────────────────────────────────
+// Anoop: "i do not want to hide anything and want to see the account that is
+// actually breached until new account is started... each account should have
+// separate file and should move to new file only when fresh account is started
+// again but all the data should be visible in the app."
+//
+// Until now the picker rendered acctSlots.filter(s => !s.retired), so a breached
+// account left behind nothing but a count in the footer. It now renders EVERY
+// account with a status, from ONE derivation (accounts-index.js — pure,
+// unit-tested), so the picker, its footer and any future surface cannot
+// disagree about which accounts exist.
+//
+// The sealed record (CLOSED_<status>.json, written inside the account's own
+// folder when it closes) is read as well. With no live data on disk that record
+// is the account's last word on itself — which is what stops s5 advertising
+// itself as a live $148k/150K account when its own sealed record says it was a
+// 50K "paper" funded account that ended on 2026-09-04.
+async function buildAccountsIndex() {
+  const empty = { accounts: [], byId: {}, summary: { footer: 'Accounts index unavailable.', breached: 0 } };
+  const AI = window.AccountsIndex;
+  if (!AI || !window.api || !window.api.dataLoad) return empty;
+  const peeks = {}, closed = {};
+  for (const slot of acctSlots) {
+    try { peeks[slot.id] = (await diskPeekBucket(slot.id, slot.size, slot.stage)) || null; } catch (e) { peeks[slot.id] = null; }
+    try {
+      const b = await window.api.dataLoad('CLOSED_breached__' + slot.id);
+      const c = b ? null : await window.api.dataLoad('CLOSED_cleared__' + slot.id);
+      closed[slot.id] = b || c || null;
+    } catch (e) { closed[slot.id] = null; }
+  }
+  let archives = [];
+  try { archives = (await window.api.dataLoad('account_archives')) || []; } catch (e) {}
+  let fees = [];
+  try { const d = await window.api.dataLoad('account_fees'); fees = (d && d.fees) || []; } catch (e) {}
+  try {
+    const res = AI.buildAccounts({ slots: acctSlots, peeks, closed, archives, fees, activeId: activeSlotId });
+    const byId = {};
+    res.accounts.forEach(a => { byId[a.id] = a; });
+    return { accounts: res.accounts, byId, summary: res.summary };
+  } catch (e) {
+    console.error('accounts index failed:', e.message);
+    return empty;
+  }
+}
+
+// VIEW-ONLY: the ACTIVE slot is a breached account. ONE definition, so every
+// write path that could record a trade into a dead account asks the same
+// question — the manual "Log trade", the live broker ingest, and the order path
+// on the server.
+function isViewOnlySlot(slot) {
+  const s = slot || acctSlot();
+  return !!(s && s.retired);
+}
+
+// ── START A NEW ACCOUNT (2026-09-19) ───────────────────────────────────────
+// The old per-row "Start fresh" WIPED the slot: dataWipeAccount() is
+// fs.rmSync(accounts/<slot>, {recursive:true}). That is the wrong shape for "I
+// blew this one, I am opening the next" — it destroys the record of the account
+// he then wants to look back at, which is exactly the complaint that produced
+// this work.
+//
+// This instead SEALS the account he is leaving (closeAccountRecord writes the
+// CLOSED record into its own folder, where it stays readable) and creates a
+// genuinely NEW account: new id, new folder, clean bucket. Nothing wiped,
+// nothing reused, the old account still listed.
+async function startNewAccount() {
+  const current = acctSlot();
+  const AI = window.AccountsIndex;
+  if (!current || !AI) return;
+  const today = (typeof edToday === 'function' ? edToday() : new Date().toISOString().slice(0, 10));
+  const sizeLabels = AI.SIZE_LABELS || {};
+  const suggested = (sizeLabels[current.size] || '') + ' ' + String(current.stage || '').toUpperCase() + ' (new)';
+  const name = prompt(
+    'Start a NEW account?\n\n' +
+    'Your current account "' + (current.name || current.id) + '" is sealed into its own file and stays visible in this list.\n' +
+    'A new account is created with its own data folder — nothing is wiped and nothing is reused.\n\n' +
+    'Name for the new account:', suggested);
+  if (name == null) return;
+
+  // 1. Seal the account being left, in its own folder.
+  try { await closeAccountRecord(current, current.retired ? 'breached' : 'cleared'); } catch (e) {}
+  current.closedAt = today;
+  if (!current.startedAt) current.startedAt = today;
+
+  // 2. A new slot with a new id, derived from the date so two accounts opened
+  //    on the same day cannot collide.
+  const newId = AI.nextAccountId(acctSlots.map(s => s.id), today);
+  const newSlot = {
+    id: newId,
+    name: (name || '').trim() || ((sizeLabels[current.size] || current.id) + ' ' + String(current.stage || '').toUpperCase()),
+    size: current.size,
+    stage: current.stage,
+    startedAt: today,
+    status: 'active',
+  };
+  acctSlots.push(newSlot);
+  persistSlots();
+
+  // 3. Open it. switchSlot loads a bucket that has no data, so every profile
+  //    default applies and nothing from the old account can leak in.
+  await switchSlot(newId, { force: true });
+  hideAccountGate();
+  if (typeof addSystemMessage === 'function') {
+    addSystemMessage('🆕 New account started — "' + newSlot.name + '" (folder accounts/' + newId
+      + '). "' + (current.name || current.id) + '" is sealed and still listed; nothing was deleted.');
+  }
+}
+window.startNewAccount = startNewAccount;
 
 async function showAccountGate(size, stage) {
   const el = document.getElementById('account-gate');
@@ -1651,6 +1823,18 @@ async function showAccountGate(size, stage) {
   // trading, so offering them in a "which account are you trading" picker is
   // just an invitation to a mistake. They're auto-logged to the Cost tab and
   // their history stays in the archive.
+  // 2026-09-17: DISPLAY state comes from disk first (diskPeekBucket above), the
+  // config mirror only as a fallback. The RETIRE decision below deliberately
+  // keeps reading the mirror: retireSlot() is a one-way ratchet with no
+  // un-retire path, so widening what can trigger it is a policy change, not a
+  // rendering fix. Resolved once here because gatePeekBucket() is synchronous.
+  const peekBySlot = {};
+  for (const slot of acctSlots) {
+    peekBySlot[slot.id] = (await diskPeekBucket(slot.id, slot.size, slot.stage))
+      || gatePeekBucket(cfg, slot.id, slot.size, slot.stage);
+  }
+
+  let slotsLearned = false;
   let retiredCount = 0;
   for (const slot of acctSlots) {
     const pk = gatePeekBucket(cfg, slot.id, slot.size, slot.stage);
@@ -1658,21 +1842,54 @@ async function showAccountGate(size, stage) {
     if (slot.retired) retiredCount++;
   }
 
-  acctSlots.filter(s => !s.retired).forEach(slot => {
+  // 2026-09-19: the index, read AFTER the breach auto-detect above so a slot
+  // that was just retired shows as breached in this same pass.
+  const idx = await buildAccountsIndex();
+
+  // EVERY account renders, breached ones included. That is the change: a
+  // breached account is closed to trading, not invisible.
+  acctSlots.forEach(slot => {
+    const acctMeta = idx.byId[slot.id] || null;
     const isCurrent = slot.id === activeSlotId;
     // Slot-keyed only — no legacy fallback. The old size_stage fallback is what
     // let two slots of the same size display each other's data.
-    const peek = gatePeekBucket(cfg, slot.id, slot.size, slot.stage);
+    // 2026-09-17: disk-first, resolved in the async pre-pass above.
+    const peek = peekBySlot[slot.id] || gatePeekBucket(cfg, slot.id, slot.size, slot.stage);
+    const acctStatus = acctMeta ? acctMeta.status : null;
+    const viewOnly = acctMeta ? acctMeta.viewOnly : !!slot.retired;
     const row = document.createElement('div');
-    row.className = 'gate-row gate-slot' + (isCurrent ? ' current' : '') + (peek && peek.breached ? ' breached' : '');
+    row.className = 'gate-row gate-slot' + (isCurrent ? ' current' : '')
+      + (viewOnly || (peek && peek.breached) ? ' breached' : '');
+
+    // Learn and KEEP the account's start date. Once stamped it survives a wipe,
+    // so "which account is this" always has an answer.
+    if (!slot.startedAt) {
+      const learned = slotOpenedOn(slot, peek);
+      if (learned) { slot.startedAt = learned; slotsLearned = true; }
+    }
 
     let stateTxt;
-    if (!peek) stateTxt = 'Empty — no data yet';
+    if (acctMeta) {
+      const bits = [acctMeta.balanceLabel];
+      if (acctMeta.days) bits.push(acctMeta.days + ' day' + (acctMeta.days === 1 ? '' : 's'));
+      if (acctMeta.lastTraded) bits.push('last traded ' + fmtDMY(acctMeta.lastTraded));
+      if (acctMeta.status === 'breached') bits.push('BREACHED' + (acctMeta.closedOn ? ' ' + fmtDMY(acctMeta.closedOn) : ''));
+      if (acctMeta.lastPeriodLabel) bits.push('last period ' + acctMeta.lastPeriodLabel);
+      stateTxt = bits.join(' · ');
+      // A live figure and a sealed record that disagree are BOTH shown, with the
+      // disagreement named. Silently picking one is how an accounts screen stops
+      // being trusted.
+      if (acctMeta.sealedNote) stateTxt += ' · ' + acctMeta.sealedNote;
+    } else if (!peek) stateTxt = 'Empty - no data yet';
     else {
       const money = (n) => (n < 0 ? '-$' : '$') + Math.abs(Math.round(n)).toLocaleString();
       const when = peek.lastDate ? fmtDMY(peek.lastDate) : 'no days logged';
       stateTxt = `${money(peek.bal)} · last traded ${when} · ${peek.days} day${peek.days === 1 ? '' : 's'}`;
     }
+    // The date is shown on EVERY row, traded or not - that is the whole point.
+    const _opened = slotOpenedOn(slot, peek);
+    const openedTxt = _opened ? ('opened ' + fmtDMY(_opened)) : 'opened - never traded';
+    stateTxt = openedTxt + ' | ' + stateTxt;
 
     row.innerHTML =
       `<input class="gate-slot-name" value="${(slot.name || '').replace(/"/g, '&quot;')}" title="Rename this account">` +
@@ -1683,6 +1900,7 @@ async function showAccountGate(size, stage) {
         ['eval', 'funded'].map(s => `<option value="${s}"${slot.stage === s ? ' selected' : ''}>${s.toUpperCase()}</option>`).join('') +
       `</select>` +
       `<span class="gate-row-id">${stateTxt}</span>` +
+      (viewOnly ? '<span class="gate-row-tag gate-breached">BREACHED</span>' : '') +
       (isCurrent ? '<span class="gate-row-tag">ACTIVE</span>' : '');
 
     // Editing name/size/stage must NOT trigger the row's "trade this" click.
@@ -1704,7 +1922,12 @@ async function showAccountGate(size, stage) {
 
     const go = document.createElement('button');
     go.className = 'gate-slot-go';
-    go.textContent = isCurrent ? 'Continue' : 'Trade this';
+    go.textContent = viewOnly
+      ? (isCurrent ? 'Viewing (view only)' : 'Open (view only)')
+      : (isCurrent ? 'Continue' : 'Trade this');
+    if (viewOnly) {
+      go.title = 'This account is breached — closed to trading. Open it to read its journal, insights and cost; nothing can be recorded into it.';
+    }
     go.onclick = async (ev) => {
       ev.stopPropagation();
       await switchSlot(slot.id, { force: isCurrent });
@@ -1713,15 +1936,22 @@ async function showAccountGate(size, stage) {
       // after choosing account type. After that, all the other tasks come."
       // Picking the account is the moment the session starts, so this is where
       // the checklist gets the first word.
-      try { if (typeof ckAfterAccountChosen === 'function') ckAfterAccountChosen(); } catch (e) {}
+      if (!viewOnly) { try { if (typeof ckAfterAccountChosen === 'function') ckAfterAccountChosen(); } catch (e) {} }
+      else if (typeof addSystemMessage === 'function') {
+        addSystemMessage('👁 "' + (slot.name || slot.id) + '" is BREACHED — opened in view-only mode. Its journal, insights and history are readable; no trades can be recorded into it. Use "＋ Start new account" when you open the next one.');
+      }
     };
     row.appendChild(go);
 
     if (peek) {
       const fresh = document.createElement('button');
       fresh.className = 'gate-fresh-btn';
-      fresh.textContent = 'Start fresh';
-      fresh.title = 'Wipe this slot back to its starting balance — other accounts untouched';
+      // 2026-09-19: renamed from "Start fresh". Two different things were
+      // hiding behind that one phrase — "open my next account" (which must NOT
+      // destroy the old one) and "wipe this slot clean" (which does). A breach
+      // is followed by the first, so the destructive one now says what it is.
+      fresh.textContent = 'Wipe this slot';
+      fresh.title = 'DESTRUCTIVE — erases this account\'s history and resets it to its starting balance. To open your next account instead, use "＋ Start new account" below: it seals this one and creates a new one, deleting nothing.';
       fresh.onclick = async (ev) => {
         ev.stopPropagation();
         const startBal = ACCOUNT_PROFILES[slot.size][slot.stage].startBalance;
@@ -1758,7 +1988,12 @@ async function showAccountGate(size, stage) {
     // manual declaration, not something gated on ledger state.
     const status = document.createElement('div');
     status.className = 'gate-status-actions';
-    if (slot.stage === 'eval') {
+    // A breached account cannot be breached again and clearing one makes no
+    // sense: the row keeps only its view-only action rather than offering
+    // declarations that contradict the status printed beside them.
+    if (viewOnly) {
+      // nothing to declare
+    } else if (slot.stage === 'eval') {
       const breachBtn = document.createElement('button');
       breachBtn.className = 'gate-status-btn gate-status-breach';
       breachBtn.textContent = 'Eval breached';
@@ -1785,12 +2020,32 @@ async function showAccountGate(size, stage) {
     rowsEl.appendChild(row);
   });
 
-  // Footer: retired-account note + a rebuild escape hatch.
+  // ── Footer (2026-09-19) ──────────────────────────────────────────────────
+  // The word "hidden" is gone from this line, because nothing is hidden any
+  // more: every account has its own row above, with its status, its dates and
+  // its own folder name. The name-the-hidden-accounts list that used to live
+  // here is redundant now for the same reason.
   const foot = document.createElement('div');
   foot.className = 'gate-foot';
-  foot.innerHTML = (retiredCount
-    ? `<span class="gate-foot-note">${retiredCount} breached account${retiredCount === 1 ? '' : 's'} hidden — closed to trading, logged in the Cost tab.</span>`
-    : '<span class="gate-foot-note">Switch accounts any time from the ⇄ button in the title bar.</span>');
+  const newAcct = document.createElement('button');
+  newAcct.className = 'gate-fresh-btn';
+  newAcct.textContent = '＋ Start new account';
+  newAcct.title = 'Seal the account you are on into its own file and open a brand-new account with its own data folder. Nothing is wiped.';
+  newAcct.onclick = (ev) => { ev.stopPropagation(); startNewAccount(); };
+  foot.appendChild(newAcct);
+  const note = document.createElement('span');
+  note.className = 'gate-foot-note';
+  note.textContent = (idx.summary && idx.summary.footer) || 'Switch accounts any time from the ⇄ button in the title bar.';
+  foot.appendChild(note);
+  if (acctSlots.some(s => s.id === activeSlotId && s.retired)) {
+    const warn = document.createElement('div');
+    warn.className = 'gate-foot-note';
+    warn.style.color = '#f0b429';
+    warn.textContent = 'Heads up: the account marked ACTIVE is a BREACHED one, so the app is in view-only mode and will not record trades into it. Open one of your live accounts, or use "＋ Start new account".';
+    foot.appendChild(warn);
+  }
+  if (slotsLearned) persistSlots();
+
   const rebuild = document.createElement('button');
   rebuild.className = 'gate-fresh-btn';
   rebuild.textContent = 'Rebuild list';
@@ -1930,7 +2185,7 @@ function setTvDeadVisual(dead) {
     if (bar)  bar.classList.toggle('show', !!dead);
     // Title bleeds into the taskbar, so it reaches him even when the app is
     // behind TradingView on another monitor.
-    document.title = dead ? '\u26A0 TV DISCONNECTED — Co-Pilot' : 'Co-Pilot';
+    document.title = dead ? '\u26A0 TV DISCONNECTED — Trading Co-Pilot' : 'Trading Co-Pilot';
   } catch (e) { /* the alert must never be the thing that breaks the UI */ }
 }
 
@@ -4556,7 +4811,10 @@ function alokKbLiveTieIn(id) {
 // a rolling local log of exchanges so Alok can be asked what was already
 // discussed, capped so it doesn't grow unbounded. ──────────────────────────
 function alokMemoryLog() {
-  let m = []; try { m = JSON.parse(localStorage.getItem('copilot_alok_memory') || '[]'); } catch (e) {}
+  // acctRead/acctWrite, not localStorage: same lifetime rule as the history
+  // stores — while the merged view is on, a write must be refused rather than
+  // attributed to whichever slot happens to be active.
+  let m = []; try { m = JSON.parse(acctRead('copilot_alok_memory') || '[]'); } catch (e) {}
   return m;
 }
 function alokMemorySave(q, a) {
@@ -4564,7 +4822,7 @@ function alokMemorySave(q, a) {
     const m = alokMemoryLog();
     m.push({ t: Date.now(), q: q, a: a });
     while (m.length > 40) m.shift();
-    localStorage.setItem('copilot_alok_memory', JSON.stringify(m));
+    acctWrite('copilot_alok_memory', JSON.stringify(m));
   } catch (e) {}
 }
 
@@ -7353,8 +7611,8 @@ function updateAccountUI() {
   // fallback (159000) whenever evalTarget was missing — now derived from the
   // active profile so a 50K never shows a 150K number.
   const remEl = document.getElementById('stat-remaining-eval');
-  const evalTarget = acc.evalTarget || (_prof.startBalance + (_prof.target || 0));
-  if (remEl) remEl.textContent = '$' + evalTarget.toLocaleString();
+  const evalTarget = resolveAccountTarget();
+  if (remEl) remEl.textContent = evalTarget != null ? '$' + evalTarget.toLocaleString() : '—';
 
   const pnlEl = document.getElementById('stat-pnl');
   pnlEl.textContent  = (acc.profit >= 0 ? '+' : '') + '$' + acc.profit;
@@ -7386,6 +7644,8 @@ function updateRulesTab() {
   set('rules-daystop-funded', '−$' + acc.fundedDayStop.toLocaleString() + ' → CLOSE TRADOVATE');
   set('rules-daytarget-funded', '$' + acc.fundedTargetMin.toLocaleString() + '–$' + acc.fundedTargetMax.toLocaleString());
   set('rules-payout-funded', 'Balance ≥$' + acc.payoutTarget.toLocaleString());
+  // Doctrine reference (2026-09-19) — the text the agents run on, readable here.
+  try { renderDoctrineBlock(); } catch (e) {}
 }
 
 // ── Post-exit drift box (2026-08-31) ───────────────────────────────────────
@@ -7393,14 +7653,92 @@ function updateRulesTab() {
 // worth showing: no exit price, too few bars, sub-threshold drift, or still
 // inside the cooldown all hide the box rather than fill it with a shrug.
 // An empty panel that is always present trains him to stop looking at it.
+//
+// ── THE MONEY LINE (2026-09-21) ────────────────────────────────────────────
+// Anoop: "always calculate in points and dollars with 2 and 4 size and compare
+// it with current market". Points are the right unit for measuring the market
+// and the wrong unit for deciding whether to care: the same 4.00-point drift is
+// $8 at one contract and $32 at four, and the panel previously said neither.
+//
+// Sizes come from rules.json (sizeFloor / sizeCap); the point value comes from
+// rules.json's contracts block. Neither is a literal here — MGC is $10/pt
+// against MNQ's $2, so a hardcoded 2 would be five times wrong the moment the
+// chart is on gold. Same rule point-value-verify.js sets out.
+function exitDriftContract(d) {
+  const r = (typeof getRules === 'function' ? getRules() : null) || {};
+  const contracts = r.contracts || {};
+  const keys = Object.keys(contracts);
+  const sym = String((d && d.symbol) || '').toUpperCase();
+  let key = null;
+  for (let i = 0; i < keys.length; i++) {
+    if (sym && sym.indexOf(keys[i].toUpperCase()) >= 0) { key = keys[i]; break; }
+  }
+  // No symbol on the payload — the chart had not reported one, or the server is
+  // older than this change. Fall back to the account's traded instrument rather
+  // than guessing per-read. The label always names the contract actually used,
+  // so the assumption is visible in the panel rather than silent.
+  if (!key) key = contracts.MNQ ? 'MNQ' : (keys[0] || null);
+  const c = key ? contracts[key] : null;
+  const pv = c && Number(c.pointValue) > 0 ? Number(c.pointValue) : null;
+  return { key: key, pointValue: pv };
+}
+
+// The two sizes worth converting: the floor he is told never to go under, and
+// the ceiling he is told never to exceed. Deduped and ordered, so a rules.json
+// where they are equal renders one figure instead of the same one twice.
+function exitDriftSizes() {
+  const r = (typeof getRules === 'function' ? getRules() : null) || {};
+  const out = [];
+  [Number(r.sizeFloor), Number(r.sizeCap)].forEach(function (n) {
+    if (Number.isFinite(n) && n > 0 && out.indexOf(n) < 0) out.push(n);
+  });
+  out.sort(function (a, b) { return a - b; });
+  return out.length ? out : [2, 4];
+}
+
+function exitDriftMoneyText(d) {
+  if (!d) return '';
+  const contract = exitDriftContract(d);
+  const pv = contract.pointValue;
+  if (pv == null) return '';
+  const sizes = exitDriftSizes();
+  const sign = function (n) { return (n >= 0 ? '+' : '−') + '$' + Math.abs(n).toFixed(2); };
+  const usd = function (pts, size) { return (Number(pts) || 0) * size * pv; };
+
+  const parts = sizes.map(function (s) {
+    return s + 'c ' + sign(usd(d.netDrift, s));
+  });
+  const widest = sizes[sizes.length - 1];
+  const range = '+$' + Math.abs(usd(d.maxUp, widest)).toFixed(2)
+    + ' / −$' + Math.abs(usd(d.maxDown, widest)).toFixed(2);
+
+  return 'Now ' + d.lastPrice + ' vs exit ' + d.exitPrice + '  =  ' + (d.netDrift > 0 ? '+' : '')
+    + (Number(d.netDrift) || 0).toFixed(2) + ' pts  ·  ' + parts.join('  ·  ')
+    + '  (' + contract.key + ' $' + pv + '/pt)  ·  range at ' + widest + 'c ' + range;
+}
+
 function renderExitDrift(payload) {
   var box = document.getElementById("exit-drift-box");
   if (!box) return;
   var d = payload && payload.data;
+  var idleMoney = document.getElementById("exit-drift-money-idle");
+  var paintIdleMoney = function (dd) {
+    if (!idleMoney) return;
+    // Only ever on NO_READ: a real measurement that simply does not clear the
+    // threshold. COOLING is a deliberate refusal (showing a fresh exit its own
+    // foregone dollars is how a revenge re-entry starts — see exit-drift.js),
+    // and UNKNOWN has no numbers to convert. Both clear the line.
+    var txt = (dd && dd.verdict === "NO_READ" && dd.netDrift != null) ? exitDriftMoneyText(dd) : "";
+    if (idleMoney.textContent !== txt) idleMoney.textContent = txt;
+    idleMoney.title = txt;
+    idleMoney.style.display = txt ? "" : "none";
+  };
   if (!d || payload.error || d.verdict === "UNKNOWN" || d.verdict === "COOLING" || d.verdict === "NO_READ") {
+    paintIdleMoney(d);
     box.style.display = "none";
     return;
   }
+  paintIdleMoney(null);
   // MISMATCH is SHOWN, not hidden. Every other refusal means "nothing to say";
   // this one means the chart is on the wrong contract, which he can fix in one
   // click — and silently hiding it would look identical to the feature being
@@ -7409,9 +7747,13 @@ function renderExitDrift(payload) {
     var mv = document.getElementById("exit-drift-verdict");
     var md = document.getElementById("exit-drift-detail");
     var mb = document.getElementById("exit-drift-bias");
+    var mm = document.getElementById("exit-drift-money");
     if (mv) { mv.textContent = "Chart is on a different contract"; mv.style.color = "var(--amber)"; }
     if (md) md.textContent = d.reason || "";
     if (mb) mb.style.display = "none";
+    // No money line on a MISMATCH: the drift figures do not exist, so converting
+    // them to dollars would be converting nothing into a confident number.
+    if (mm) { mm.textContent = ""; mm.style.display = "none"; }
     box.style.display = "";
     return;
   }
@@ -7452,6 +7794,16 @@ function renderExitDrift(payload) {
     dEl.textContent = q + "  Distance " + dist + " ("
       + Math.abs(d.atrUnits) + " ATR) over " + d.minutesSince + " min." + rangeLabel
       + d.maxUp + " / -" + d.maxDown + "." + sb;
+  }
+  // The same reading in the unit he actually risks. Kept on its own line so the
+  // points reading stays readable and the two can never be confused for each
+  // other; the full form is in the tooltip for when the panel is too narrow.
+  var mEl = document.getElementById("exit-drift-money");
+  if (mEl) {
+    var money = exitDriftMoneyText(d);
+    mEl.textContent = money;
+    mEl.title = money;
+    mEl.style.display = money ? "" : "none";
   }
   // Declared bias vs. drift. The server does the judging (exit-bias-align.js);
   // this only paints it. DIVERGED is the informative case, so it gets the amber
@@ -7563,13 +7915,10 @@ function sizeCapBoundsClient() {
   return { min: lo, max: Math.max(lo, hi) };
 }
 
-// 2026-09-05: there are now TWO copies of this control - the original in the
-// left rail's Today flyout, and a compact one in the titlebar beside the
-// oversize chip. This paints both. It used to reach for `#stat-sizecap` and
-// assume `document.querySelectorAll('.sizecap-btn').length === 2`; that length
-// check silently stopped disabling the buttons the moment a second copy
-// existed, which would have left + looking live at the ceiling. Selection is
-// by data attribute now, so a third copy needs no change here.
+// 2026-09-21: consolidated back to ONE copy — the titlebar's standalone
+// "− Cap 4 +" control was removed, so this paints only the Today flyout's
+// row. Selection stays by data attribute rather than an assumed count, so the
+// day a second view comes back it needs no change here.
 function renderSizeCapRow() {
   const vals = document.querySelectorAll('[data-sizecap-val]');
   if (!vals.length) return;
@@ -7614,6 +7963,471 @@ function adjustSizeCap(delta) {
   addSystemMessage(next > cur
     ? 'Size cap raised to ' + next + ' contracts per entry. Ceiling is ' + b.max + '.'
     : 'Size cap lowered to ' + next + ' contracts per entry.');
+}
+
+// ── DAY PLAN controls (2026-09-19) ─────────────────────────────────────────
+// The settings behind the HUD's plan tags and the Today flyout's readouts, all
+// from day-plan.js — the same module the server hands every agent, so this panel
+// and the coaching sentence cannot disagree.
+//
+// Same contract as the size cap directly above: these buttons only ASK. The
+// server clamps every one of them (rules-set), so a renderer bug or a replayed
+// message cannot widen a number that decides when a session ends.
+const PLAN_SAT_MIN = 50, PLAN_SAT_MAX = 2000, PLAN_DAYS_MIN = 1, PLAN_DAYS_MAX = 10;
+const PLAN_STREAK_MIN = 1, PLAN_STREAK_MAX = 8;
+const planMoney = (n) => (n < 0 ? '-$' : '$') + Math.abs(Math.round(Number(n) || 0)).toLocaleString();
+
+// Why a raise is spoken and a lower is not: the same doctrine as the size cap.
+// Raising the satisfaction number stretches the day out past the point he had
+// already decided was enough, which is precisely how a green day becomes a red
+// one. Lowering it costs him nothing but a smaller win.
+function adjustSatisfaction(delta) {
+  const S = (getRules().satisfaction) || {};
+  const cur = Number.isFinite(Number(S.amountUsd)) ? Number(S.amountUsd) : 300;
+  const next = Math.min(PLAN_SAT_MAX, Math.max(PLAN_SAT_MIN, cur + delta));
+  if (next === cur) return;
+  if (!window.api || !window.api.setRules) { addSystemMessage('Not connected — satisfaction number unchanged.'); return; }
+  window.api.setRules({ satisfaction: { enabled: true, amountUsd: next } });
+  addSystemMessage(next < cur
+    ? 'Daily satisfaction number lowered to ' + planMoney(next) + ' — the day closes sooner.'
+    : 'Daily satisfaction number raised to ' + planMoney(next) + '. This is the number the day ends on; deciding it mid-session is how a good day turns into a bad one.');
+}
+
+function adjustEvalDays(delta) {
+  const P = (getRules().evalPlan) || {};
+  const cur = Number.isFinite(Number(P.days)) ? Number(P.days) : 4;
+  const next = Math.min(PLAN_DAYS_MAX, Math.max(PLAN_DAYS_MIN, cur + delta));
+  if (next === cur) return;
+  if (!window.api || !window.api.setRules) { addSystemMessage('Not connected — eval plan unchanged.'); return; }
+  window.api.setRules({ evalPlan: { enabled: true, days: next } });
+  addSystemMessage('Eval plan is now ' + next + ' day' + (next === 1 ? '' : 's') + ' — the daily chunk is recomputed from what is left to the target.');
+}
+
+function adjustStreakGate(delta) {
+  const G = (getRules().streakGate) || {};
+  const cur = Number.isFinite(Number(G.afterLosses)) ? Number(G.afterLosses) : 2;
+  const next = Math.min(PLAN_STREAK_MAX, Math.max(PLAN_STREAK_MIN, cur + delta));
+  if (next === cur) return;
+  if (!window.api || !window.api.setRules) { addSystemMessage('Not connected — streak gate unchanged.'); return; }
+  window.api.setRules({ streakGate: { enabled: true, afterLosses: next } });
+  addSystemMessage('Streak gate fires after ' + next + ' consecutive loss' + (next === 1 ? '' : 'es') + ' — the HUD then states how many full stops are left before the daily limit ends the day.');
+}
+
+// ── ONE target resolver (2026-09-21) ────────────────────────────────────────
+// Every surface that asks "what balance is this account trying to reach?"
+// calls this instead of resolving its own fallback. The bug that forced it:
+// the left card and Pass Math used `evalTarget || start+target`, Coach's Notes
+// used `evalTarget || 159000` (a hardcoded 150K leftover), and the Day Plan
+// used `evalTarget` only — so on a Tradovate 50K account the card showed
+// $53,000, the Day Plan showed "—", and Coach's Notes would have shown
+// $159,000. One number, three answers. day-plan.js resolveTarget() is the
+// shared definition; this is the renderer's thin mapping from state.
+function resolveAccountTarget() {
+  const acc = state.account || {};
+  const prof = ACCOUNT_PROFILES[state.accountSize] && ACCOUNT_PROFILES[state.accountSize][state.mode];
+  if (!prof) return null;
+  const DP = window.DayPlan;
+  if (DP && typeof DP.resolveTarget === 'function') {
+    return DP.resolveTarget({
+      mode: state.mode,
+      liveTarget: state.mode === 'eval' ? acc.evalTarget : acc.payoutTarget,
+      startBalance: prof.startBalance,
+      profitTarget: state.mode === 'eval' ? prof.target : null,
+      payoutProfileTarget: state.mode === 'funded' ? prof.payoutTarget : null,
+    });
+  }
+  // day-plan.js not yet loaded — mirror the same precedence rather than invent a new one.
+  if (state.mode === 'eval') {
+    return Number(acc.evalTarget) > 0 ? Number(acc.evalTarget)
+      : (Number(prof.startBalance) > 0 && prof.target != null ? Number(prof.startBalance) + Number(prof.target) : null);
+  }
+  return Number(acc.payoutTarget) > 0 ? Number(acc.payoutTarget)
+    : (Number(prof.payoutTarget) > 0 ? Number(prof.payoutTarget)
+      : (Number(prof.startBalance) > 0 ? Number(prof.startBalance) + 3000 : null));
+}
+
+// ── ONE protection resolver (2026-09-21) ────────────────────────────────────
+// The effective autoProtection band for the CURRENT stage (eval vs funded),
+// through the same resolveAutoProtection() the server enforces, so the HUD's
+// stop and the enforced stop can never come from two different blocks. Mirrors
+// the logic inline as a fallback for the instant before position-protection.js
+// loads.
+function currentProtection() {
+  const ap = (window.RULES && window.RULES.autoProtection) || {};
+  if (window.PositionProtection && window.PositionProtection.resolveAutoProtection) {
+    return window.PositionProtection.resolveAutoProtection(ap, state.mode);
+  }
+  const s = (state.mode === 'funded' ? ap.funded : ap.eval) || {};
+  const pick = (k) => (s[k] != null ? s[k] : ap[k]);
+  return {
+    enabled: ap.enabled !== false,
+    stopLossUsd: pick('stopLossUsd'),
+    takeProfitUsd: pick('takeProfitUsd'),
+    breakEvenAtUsd: pick('breakEvenAtUsd'),
+    trailDistanceUsd: pick('trailDistanceUsd'),
+  };
+}
+
+// The live inputs both the panel and the day-plan module need. Reads the SAME
+// sources the guardrail HUD uses (grTodayTrades for today's trades) so the two
+// surfaces cannot report different streaks.
+function dayPlanState() {
+  const R = getRules() || {};
+  const DP = window.DayPlan;
+  const acc = state.account || {};
+  const dayPnl = Number.isFinite(Number(acc.profit)) ? Number(acc.profit) : null;
+  const trades = (window.grTodayTrades ? window.grTodayTrades() : []) || [];
+  const ap = currentProtection();
+  const stopUsd = (ap.enabled && Number(ap.stopLossUsd) > 0) ? Number(ap.stopLossUsd) : (Number(R.perTradeMaxLoss) || 0);
+  const fl = R.firmLimits || {};
+  const out = { dayPnl, gate: null, plan: null, sat: null, dll: Number(fl.dailyLossLimit) || null };
+  if (!DP) return out;
+  out.sat = DP.satisfactionStatus({ cfg: R.satisfaction, dayPnl });
+  out.plan = DP.evalPlan({
+    cfg: R.evalPlan,
+    balance: Number(acc.balance) || null,
+    targetBalance: state.mode === 'eval' ? resolveAccountTarget() : null,
+    todayPnl: dayPnl,
+  });
+  out.gate = DP.streakGate({
+    cfg: R.streakGate, trades, perTradeStopUsd: stopUsd,
+    dailyLossLimit: out.dll, drawdownLimit: Number(fl.eodThresholdDrawdown) || null, dayPnl,
+  });
+  return out;
+}
+
+// How far into a post-payout window he is. Async because it reads the payout
+// log; cached so the flyout can paint synchronously.
+let payoutWatch = null;
+async function refreshPayoutWatch() {
+  payoutWatch = null;
+  try {
+    if (!window.api || !window.api.dataLoad) return;
+    const fees = await window.api.dataLoad('account_fees');
+    const payouts = (fees && fees.payouts) || [];
+    const last = payouts.slice().sort((a, b) => (String(a.date || '') < String(b.date || '') ? 1 : -1))[0];
+    if (!last || !last.date) return;
+    const hist = (window.grHistory ? window.grHistory() : []) || [];
+    const key = (typeof today === 'function') ? today() : new Date().toISOString().slice(0, 10);
+    const days = hist.filter(d => d && d.date && d.date > last.date && d.date <= key).length;
+    payoutWatch = { daysSince: days, payoutDate: last.date, amount: Number(last.amount) || 0 };
+    // The real-return line on the Insights card reads the same file, so the
+    // window and the lifetime spend can never come from two different reads.
+    costTotals = {
+      fees: (fees.fees || []).reduce((s, f) => s + (Number(f.cost) || 0), 0),
+      payouts: (fees.payouts || []).reduce((s, p) => s + (Number(p.amount) || 0), 0),
+      feeCount: (fees.fees || []).length,
+    };
+  } catch (e) { payoutWatch = null; }
+}
+
+// Opens the Today flyout, where the full Day plan block lives. The chip is the
+// always-visible half; this is the door to the rest of it.
+function openDayPlan() {
+  try {
+    if (window.LeftRail && window.LeftRail.open) window.LeftRail.open('fly-today');
+  } catch (e) {}
+}
+window.openDayPlan = openDayPlan;
+
+// ── Playbook registry + shadow router (Phase 2, 2026-09-19) ─────────────────
+// Two halves with different prerequisites, and the panel never blurs them:
+//
+//   REGISTRY  — no model, works now. The one place that answers "is Playbook B
+//               on?", plus an ON/OFF recommendation computed from Anoop's OWN
+//               resolved signals (playbook-registry.js decideSwitch: n>=30 AND
+//               the Wilson LOWER bound above break-even AND positive expectancy).
+//               The recommendation is advice; only he flips a switch.
+//   ROUTER    — needs a TypeSafe key, which is invite-only as of 2026-09-19, so
+//               it reads DORMANT and says why. An empty panel would imply "no
+//               signal yet" when the truth is "no access yet".
+let _routerData = null;
+let _routerComposite = null;   // the last graded setup's breakdown
+let _lastVoiceRoute = null;    // the last spoken utterance's routing decision
+
+function routerEsc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function togglePlaybook(id, on) {
+  if (!window.api || !window.api.registryToggle) return;
+  window.api.registryToggle(id, on).catch(function () {});
+}
+
+function renderRouterBlock() {
+  const host = document.getElementById('router-rows');
+  if (!host) return;
+  const d = _routerData;
+  if (!d) { host.innerHTML = '<div class="dayplan-tab-line">—</div>'; return; }
+
+  const advice = (d.stats && d.stats.advice) || [];
+  if (!advice.length) {
+    host.innerHTML = '<div class="dayplan-tab-line">No playbooks in the registry.</div>';
+  } else {
+    host.innerHTML = advice.map(function (a) {
+      const label = a.locked ? 'ON 🔒' : (a.enabled ? 'ON' : 'OFF');
+      const cls = 'router-toggle' + (a.enabled ? ' on' : '') + (a.locked ? ' locked' : '');
+      // His own measurement, in his own units. Points per contract because the
+      // outcome ledger measures the signal's excursion in price — calling that
+      // dollars would need a point value this line does not have.
+      const measured = a.n
+        ? a.n + ' scored · ' + a.wins + ' win' + (a.wins === 1 ? '' : 's')
+          + (a.expectancyPoints != null ? ' · ' + a.expectancyPoints + ' pts/contract' : '')
+        : 'no scored signals yet';
+      const verdict = a.recommend === 'on' ? 'evidence says ON'
+        : a.recommend === 'off' ? 'evidence says OFF' : 'not enough data yet';
+      const tip = (a.reason || '') + (a.blurb ? ' — ' + a.blurb : '');
+      return '<div class="router-row">'
+        + '<button type="button" class="' + cls + '"' + (a.locked ? ' disabled' : '')
+        + ' onclick="togglePlaybook(\'' + routerEsc(a.id) + '\',' + (a.enabled ? 'false' : 'true') + ')"'
+        + ' title="' + routerEsc(tip) + '">' + label + '</button>'
+        + '<span class="router-name">' + routerEsc(a.label)
+        + (a.shadowOnly ? ' <span class="router-tag">shadow</span>' : '')
+        + (a.kind === 'gate' ? ' <span class="router-tag">gate</span>' : '')
+        + (a.unknown ? ' <span class="router-tag">no detector</span>' : '')
+        + '</span>'
+        + '<span class="router-detail">' + routerEsc(verdict) + ' · ' + routerEsc(measured) + '</span>'
+        + '</div>';
+    }).join('');
+  }
+
+  const sw = d.switches || {};
+  const swEl = document.getElementById('router-switch');
+  if (swEl) {
+    swEl.textContent = 'Jev journal: ' + (sw.journal ? 'ON' : 'OFF')
+      + ' · router: ' + (sw.router ? 'ON' : 'OFF')
+      + (sw.keyPresent ? ' · key present' : ' · NO API KEY')
+      + ' · ' + (sw.callsToday || 0) + '/' + (sw.maxCallsPerDay || 0) + ' calls today';
+    swEl.className = 'dayplan-tab-line' + (sw.keyPresent ? '' : ' dp-dim');
+  }
+
+  const shEl = document.getElementById('router-shadow');
+  if (shEl) {
+    if (!sw.router) {
+      shEl.textContent = sw.keyPresent
+        ? 'Shadow router off (typesafe.router.enabled). Nothing is being called.'
+        : 'Shadow router dormant — TypeSafe is invite-only, so there is no key to add yet. The registry below works without it.';
+      shEl.className = 'dayplan-tab-line dp-dim';
+    } else if (d.line) {
+      shEl.textContent = d.line;
+      shEl.className = 'dayplan-tab-line';
+    } else {
+      shEl.textContent = 'Router on, no read recorded yet.';
+      shEl.className = 'dayplan-tab-line';
+    }
+  }
+
+  // #5 — the pre-trade advisory. Separate line from the ranking because it
+  // answers a different question: not "which playbook is this" but "is this
+  // what you said you would take".
+  const pEl = document.getElementById('router-plan');
+  if (pEl) {
+    const p = d.plan || {};
+    if (!p.written) {
+      pEl.textContent = 'Plan check: no written plan for today, so nothing is asked (the app will not invent the standard).';
+      pEl.className = 'dayplan-tab-line dp-dim';
+    } else if (!p.asked) {
+      pEl.textContent = 'Plan check: a plan is on file; no setup has been checked against it yet.';
+      pEl.className = 'dayplan-tab-line dp-dim';
+    } else if (p.lastMatch == null) {
+      pEl.textContent = 'Plan check: ' + p.asked + ' checked, ' + p.matched + ' matched his written plan.';
+      pEl.className = 'dayplan-tab-line';
+    } else {
+      const pct = Math.round(p.lastMatch * 100);
+      pEl.textContent = 'Plan check: last setup ' + pct + '% matched his written plan'
+        + ' · ' + p.matched + '/' + p.asked + ' today.'
+        + ' Advisory only — it never blocks anything.';
+      pEl.className = 'dayplan-tab-line';
+    }
+  }
+
+  // #2 — the escalation band. Say the MODE out loud: in observe the debate still
+  // fires, and claiming otherwise would misrepresent what the app is doing.
+  const escEl = document.getElementById('router-escalation');
+  if (escEl) {
+    const e = d.escalation || {};
+    if (!e.mode || e.mode === 'off') {
+      escEl.textContent = 'Debate escalation: off — the debate path is unchanged.';
+      escEl.className = 'dayplan-tab-line dp-dim';
+    } else {
+      const last = e.last ? (' · last: ' + e.last.outcome + ' (' + e.last.playbook + ')') : '';
+      escEl.textContent = 'Debate escalation: ' + e.mode + ' (' + (e.band || []).join('–') + ')'
+        + (e.mode === 'observe' ? ' — recording, not suppressing' : ' — suppressing outside the band')
+        + ' · today ' + (e.today || 0) + ' (' + (e.wouldSuppress || 0) + ' would-suppress, ' + (e.suppressed || 0) + ' suppressed)'
+        + last;
+      escEl.className = 'dayplan-tab-line' + (e.mode === 'observe' ? ' dp-dim' : '');
+    }
+  }
+
+  // The composite breakdown (COMPOSITE_SCORING_PLAN.md step 5). A bare 72% would
+  // be a number from nowhere; showing the parts, their raw levels and the weight
+  // each actually carried is the whole reason for scoring dimensions separately.
+  const cEl = document.getElementById('router-composite');
+  if (cEl) {
+    const c = _routerComposite;
+    if (!c || c.composite == null) {
+      cEl.innerHTML = '<div class="dayplan-tab-line dp-dim">Composite: no graded setup yet.</div>';
+    } else {
+      const rows = (c.parts || []).map(function (p) {
+        const w = (c.weightsUsed && c.weightsUsed[p.key] != null) ? c.weightsUsed[p.key] : p.weight;
+        const pct = p.answered ? Math.round((p.value || 0) * 100) + '%' : '--';
+        const detail = p.answered ? ('level ' + p.raw + ' - weight ' + Math.round((w || 0) * 100) + '%') : 'no read';
+        return '<div class="router-row"><span class="router-comp-val">' + pct + '</span>'
+          + '<span class="router-name">' + routerEsc(p.label) + '</span>'
+          + '<span class="router-detail">' + detail + '</span></div>';
+      }).join('');
+      const cov = c.coverage || {};
+      const head = '<div class="dayplan-tab-line"><b>Composite ' + Math.round(c.composite * 100) + '%</b>'
+        + ' from ' + (cov.answered || 0) + ' of ' + (cov.total || 0) + ' dimensions</div>';
+      cEl.innerHTML = head + rows;
+    }
+  }
+
+  // The last voice routing decision. The router's ONLY effect on a voice turn is
+  // a line added to the prompt, so if that is invisible there is no way to tell a
+  // misroute from a mishearing.
+  const vEl = document.getElementById('router-voice');
+  if (vEl) {
+    const vr = _lastVoiceRoute;
+    if (!vr) { vEl.textContent = 'Voice router: nothing spoken yet this session.'; vEl.className = 'dayplan-tab-line dp-dim'; }
+    else {
+      const conf = vr.confidence != null ? ', ' + Math.round(vr.confidence * 100) + '%' : '';
+      vEl.textContent = 'Voice: "' + String(vr.transcript || '').slice(0, 40) + '" -> ' + (vr.intent || 'coach') + ' (' + vr.decision + conf + ')';
+      vEl.className = 'dayplan-tab-line' + (vr.decision === 'agent' ? ' dp-dim' : '');
+    }
+  }
+
+  const mEl = document.getElementById('router-measure');
+  if (mEl && d.measurement) {
+    const m = d.measurement;
+    const ev = m.evaluate || {};
+    const join = m.routerRows
+      ? ' · ' + m.scored + ' joined, ' + m.unjoined + ' pending'
+      : '';
+    mEl.textContent = (ev.summary || '') + join;
+    mEl.className = 'dayplan-tab-line dp-dim';
+  }
+}
+window.togglePlaybook = togglePlaybook;
+window.renderRouterBlock = renderRouterBlock;
+
+function refreshRouter() {
+  if (!window.api || !window.api.getRouter) return Promise.resolve(null);
+  return window.api.getRouter().then(function (r) {
+    _routerData = (r && r.data) ? r.data : null;
+    try { renderRouterBlock(); } catch (e) {}
+    return _routerData;
+  }).catch(function () { return null; });
+}
+window.refreshRouter = refreshRouter;
+
+
+
+function renderDayPlanRow() {
+  const satEl = document.getElementById('stat-satisfaction');
+  if (!satEl) return;
+  try {
+    const R = getRules() || {};
+    const st = dayPlanState();
+    const satCfg = R.satisfaction || {};
+    const planCfg = R.evalPlan || {};
+    const streakCfg = R.streakGate || {};
+    const satAmt = Number.isFinite(Number(satCfg.amountUsd)) ? Number(satCfg.amountUsd) : 300;
+    const planDays = Number.isFinite(Number(planCfg.days)) ? Number(planCfg.days) : 4;
+    const streakAt = Number.isFinite(Number(streakCfg.afterLosses)) ? Number(streakCfg.afterLosses) : 2;
+
+    satEl.textContent = planMoney(satAmt);
+    const satStatus = document.getElementById('stat-sat-status');
+    if (satStatus) {
+      if (satCfg.enabled === false) { satStatus.textContent = 'off'; satStatus.style.color = ''; }
+      else if (!st.sat || st.sat.pct == null) { satStatus.textContent = '—'; satStatus.style.color = ''; }
+      else if (st.sat.reached) {
+        satStatus.textContent = 'DAY DONE — close and leave the desk';
+        satStatus.style.color = 'var(--green)';
+      } else if (st.dayPnl != null && st.dayPnl < 0) {
+        // Same rule as the doctrine: a red day gets no satisfaction line.
+        satStatus.textContent = '—';
+        satStatus.style.color = '';
+      } else {
+        satStatus.textContent = planMoney(st.dayPnl) + ' / ' + planMoney(satAmt) + ' (' + st.sat.pct + '%)';
+        satStatus.style.color = '';
+      }
+    }
+
+    const chunkEl = document.getElementById('stat-evalchunk');
+    if (chunkEl) {
+      if (!st.plan || !st.plan.enabled) chunkEl.textContent = '—';
+      else if (st.plan.reached) chunkEl.textContent = 'target reached';
+      else chunkEl.textContent = planMoney(st.plan.chunk) + '/day';
+      chunkEl.title = st.plan && st.plan.enabled
+        ? ('Plan: ' + planDays + ' day(s). ' + planMoney(st.plan.remaining || 0) + ' left to the target. Use − / + to change the plan length.')
+        : 'Eval pace applies to an evaluation account.';
+    }
+
+    const stopsEl = document.getElementById('stat-stopsleft');
+    if (stopsEl) {
+      if (st.gate && st.gate.matched) {
+        stopsEl.textContent = (st.gate.stopsToDll != null && st.dll != null)
+          ? (st.gate.stopsToDll + ' full stop' + (st.gate.stopsToDll === 1 ? '' : 's') + ' to ' + planMoney(st.dll))
+          : 'room unknown';
+        stopsEl.style.color = st.gate.stopsToDll != null && st.gate.stopsToDll <= 1 ? 'var(--red)' : 'var(--amber)';
+      } else {
+        stopsEl.textContent = '—';
+        stopsEl.style.color = '';
+      }
+      stopsEl.title = 'Appears after ' + streakAt + ' consecutive losses: how many full per-trade stops are left before the daily loss limit ends the day.';
+    }
+
+    const streakEl = document.getElementById('stat-streakgate');
+    if (streakEl) streakEl.textContent = String(streakAt);
+
+    const watchEl = document.getElementById('stat-payoutwatch');
+    if (watchEl) {
+      const win = Number.isFinite(Number((R.postPayoutRelapse || {}).windowDays)) ? Number(R.postPayoutRelapse.windowDays) : 5;
+      if ((R.postPayoutRelapse || {}).enabled === false) { watchEl.textContent = 'off'; watchEl.style.color = ''; }
+      else if (!payoutWatch) { watchEl.textContent = 'no payout on record'; watchEl.style.color = ''; }
+      else if (payoutWatch.daysSince > win) { watchEl.textContent = 'clear (last payout ' + fmtDMY(payoutWatch.payoutDate) + ')'; watchEl.style.color = ''; }
+      else {
+        watchEl.textContent = 'day ' + payoutWatch.daysSince + ' of ' + win + ' since ' + (payoutWatch.amount ? planMoney(payoutWatch.amount) + ' on ' : '') + fmtDMY(payoutWatch.payoutDate);
+        watchEl.style.color = 'var(--amber)';
+      }
+      watchEl.title = 'Inside this window the app watches for the relapse signatures Deva named: sizing up while red, oversize, or running past the 5-trade checkpoint.';
+    }
+
+    const note = document.getElementById('plan-note');
+    if (note) {
+      note.textContent = 'Day done at ' + planMoney(satAmt) + ' · plan over ' + planDays + ' day' + (planDays === 1 ? '' : 's')
+        + ' · streak gate at ' + streakAt + ' loss' + (streakAt === 1 ? '' : 'es') + ' · all three are advisory';
+    }
+
+    // ── The always-visible chip (consolidated 2026-09-21) ──────────────────
+    // The single titlebar entry to the day plan. The Analysis-tab block and the
+    // standalone − Cap 4 + adjuster are gone; this chip + the Today flyout are
+    // the only two views, and both are painted from the same dayPlanState().
+    const chipEl = document.getElementById('plan-chip-text');
+    const chip = document.getElementById('plan-chip');
+    if (chipEl && chip) {
+      const bits = [];
+      if (satCfg.enabled !== false && st.sat && st.sat.pct != null) {
+        bits.push(st.sat.reached ? '✅ DONE at ' + planMoney(satAmt) : planMoney(st.dayPnl) + ' / ' + planMoney(satAmt));
+      }
+      if (st.plan && st.plan.enabled && !st.plan.reached) bits.push('chunk ' + planMoney(st.plan.chunk) + '/day');
+      if (st.gate && st.gate.matched) bits.push(st.gate.stopsToDll != null ? st.gate.stopsToDll + ' stops left' : 'room unknown');
+      chipEl.textContent = 'Plan · ' + (bits.length ? bits.join(' · ') : 'open Today');
+      chip.className = (st.sat && st.sat.reached) ? 'plan-reached'
+        : (st.gate && st.gate.matched ? 'plan-warn' : '');
+    }
+
+    // Bound the controls so a click at the edge cannot look like it did nothing.
+    document.querySelectorAll('[data-sat="dec"]').forEach(x => { x.disabled = satAmt <= PLAN_SAT_MIN; });
+    document.querySelectorAll('[data-sat="inc"]').forEach(x => { x.disabled = satAmt >= PLAN_SAT_MAX; });
+    document.querySelectorAll('[data-evdays="dec"]').forEach(x => { x.disabled = planDays <= PLAN_DAYS_MIN; });
+    document.querySelectorAll('[data-evdays="inc"]').forEach(x => { x.disabled = planDays >= PLAN_DAYS_MAX; });
+    document.querySelectorAll('[data-streak="dec"]').forEach(x => { x.disabled = streakAt <= PLAN_STREAK_MIN; });
+    document.querySelectorAll('[data-streak="inc"]').forEach(x => { x.disabled = streakAt >= PLAN_STREAK_MAX; });
+  } catch (e) { /* advisory panel — never let it break the flyout */ }
 }
 
 function renderBreakRow() {
@@ -7963,7 +8777,7 @@ async function accountDbRebuildAndShow() {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'mnq-copilot-all-trades-' + ckToday() + '.csv';
+        a.download = 'trading-copilot-all-trades-' + ckToday() + '.csv';
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -8167,52 +8981,232 @@ async function loadSettings() {
   applyConfig(cfg);
 }
 
+// ── Settings tabs (2026-09-21) ─────────────────────────────────────────────
+// One pane visible at a time. The Save/Cancel footer is NOT inside a pane — it
+// is a sibling — so no tab state can hide the way out of this panel, which is
+// exactly what the previous collapsed-sections version did (it swallowed Save
+// into the Tradovate section, and Anoop could not save anything).
+function showSettingsTab(name) {
+  const tabs = document.querySelectorAll('#settings-box .settings-tab');
+  const panes = document.querySelectorAll('#settings-box .settings-pane');
+  if (!tabs.length || !panes.length) return;
+  // FAIL-SAFE (2026-09-21): .settings-pane is display:none unless .is-active, so
+  // a name that matches nothing used to hide EVERY pane and open the panel blank
+  // (it did exactly that while this was called with the stale name 'jev'). If the
+  // requested name is absent, fall back to the first pane rather than to none.
+  const known = Array.prototype.some.call(panes, (p) => p.dataset.spane === name);
+  const target = known ? name : (panes[0] && panes[0].dataset.spane);
+  for (const t of tabs) t.classList.toggle('is-active', t.dataset.stab === target);
+  for (const p of panes) p.classList.toggle('is-active', p.dataset.spane === target);
+  const host = document.querySelector('#settings-box .settings-panes');
+  if (host) host.scrollTop = 0;
+}
+window.showSettingsTab = showSettingsTab;
+
 function openSettings() {
   const acc = state.account;
   window.api.getConfig().then(cfg => {
     cfg = cfg || {};
+    // NULL-SAFE, and it has to be: this runs inside the getConfig().then() BEFORE
+    // the overlay is made visible, so a throw here means the Settings panel never
+    // opens at all. Removing the derived account fields from the panel (2026-09-21)
+    // would have done exactly that — nine val() calls below pointed at elements
+    // that no longer exist. A missing field is now a no-op, which is the only
+    // sane reading once the field is gone on purpose.
     const val = (id, cfgKey, fallback) => {
-      document.getElementById(id).value = cfg[cfgKey] !== undefined ? cfg[cfgKey] : fallback;
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.value = cfg[cfgKey] !== undefined ? cfg[cfgKey] : fallback;
     };
     { const dsk = document.getElementById('settings-deepseek-key'); if (dsk && cfg.deepseekApiKey) dsk.value = cfg.deepseekApiKey; }
     { const dds = document.getElementById('settings-disable-deepseek'); if (dds) dds.checked = !!cfg.disableDeepSeek; }
     { const gk = document.getElementById('settings-gemini-key'); if (gk && cfg.geminiApiKey) gk.value = cfg.geminiApiKey; }
+    // -- TypeSafe (Jev), 2026-09-21 ------------------------------------------
+    // Two homes on purpose: the KEYS live in the app config (the file that
+    // already holds every other key), while the backend, model and switches are
+    // rules.json values, so they are read from window.RULES, the copy the server
+    // broadcasts, never from a stale local echo.
+    { const tk = document.getElementById('settings-typesafe-key'); if (tk && cfg.typesafeApiKey) tk.value = cfg.typesafeApiKey; }
+    { const ok = document.getElementById('settings-openrouter-key'); if (ok && cfg.openRouterApiKey) ok.value = cfg.openRouterApiKey; }
+    const tR = (window.RULES && window.RULES.typesafe) || {};
+    { const b = document.getElementById('settings-typesafe-backend'); if (b) b.value = tR.backend || 'typesafe'; }
+    { const m = document.getElementById('settings-typesafe-model'); if (m) m.value = tR.model || ''; }
+    { const j = document.getElementById('settings-typesafe-journal'); if (j) j.checked = tR.enabled === true; }
+    { const r = document.getElementById('settings-typesafe-router'); if (r) r.checked = !!(tR.router && tR.router.enabled); }
+    { const e = document.getElementById('settings-typesafe-escalation'); if (e) e.value = (tR.router && tR.router.escalationMode) || 'observe'; }
+    try { refreshTypesafeStatus(); } catch (e) {}
     { const vn = document.getElementById('settings-voice-name'); if (vn) vn.value = cfg.edgeVoice || 'en-IN-NeerjaNeural'; }
-    val('settings-balance', 'balance', acc.balance);
-    val('settings-profit',  'profit',  acc.profit);
-
-    val('settings-funded-floor',     'fundedFloor',     acc.fundedFloor);
-    val('settings-funded-daystop',   'fundedDayStop',   acc.fundedDayStop);
-    val('settings-funded-targetmin', 'fundedTargetMin', acc.fundedTargetMin);
-    val('settings-funded-targetmax', 'fundedTargetMax', acc.fundedTargetMax);
-    val('settings-payout',           'payoutTarget',    acc.payoutTarget);
-
-    val('settings-eval-floor',   'evalFloor',   acc.evalFloor);
-    val('settings-eval-daycap',  'evalDayCap',  acc.evalDayCap);
-    val('settings-eval-daystop', 'evalDayStop', acc.evalDayStop);
+    // ── The account numbers are NOT prefilled here any more (2026-09-21) ────
+    // balance, profit, the funded/eval floors, day stops, targets and payout are
+    // all DERIVED by updateAccount() from the account's own terms and the live
+    // feed — "never trusted from storage". They were never settings, so they are
+    // no longer fields. Where he reads them is the left rail's Account panel,
+    // which renders floor / buffer / stop / target LIVE via syncAccount().
+    // Nothing is lost by removing them from here: a value typed into the old
+    // boxes was overwritten on the next account refresh anyway.
 
     // G32 (2026-09-15): the app-side protection band, read from the LIVE rules (not from
     // state.account) because these are rules.json numbers and window.RULES is the copy the
     // server broadcasts on every rules-set - so the fields always show what is actually
     // being enforced, never a stale local echo.
     const apRules = (window.RULES && window.RULES.autoProtection) || {};
-    const stEl = document.getElementById('settings-protect-stop');
-    if (stEl) stEl.value = Number.isFinite(Number(apRules.stopLossUsd)) ? Number(apRules.stopLossUsd) : '';
-    const tgEl = document.getElementById('settings-protect-target');
-    if (tgEl) tgEl.value = Number.isFinite(Number(apRules.takeProfitUsd)) ? Number(apRules.takeProfitUsd) : '';
+    const setProtect = (id, val) => { const el = document.getElementById(id); if (el) el.value = Number.isFinite(Number(val)) ? Number(val) : ''; };
+    const evP = apRules.eval || {}, fuP = apRules.funded || {};
+    setProtect('settings-protect-eval-stop', evP.stopLossUsd);
+    setProtect('settings-protect-eval-target', evP.takeProfitUsd);
+    setProtect('settings-protect-eval-be', evP.breakEvenAtUsd);
+    setProtect('settings-protect-eval-trail', evP.trailDistanceUsd);
+    setProtect('settings-protect-funded-stop', fuP.stopLossUsd);
+    setProtect('settings-protect-funded-target', fuP.takeProfitUsd);
+    setProtect('settings-protect-funded-be', fuP.breakEvenAtUsd);
+    setProtect('settings-protect-funded-trail', fuP.trailDistanceUsd);
 
-    if (cfg.telegramBotToken) document.getElementById('settings-telegram-token').value = cfg.telegramBotToken;
-    document.getElementById('settings-telegram-chatid').value = cfg.telegramChatId !== undefined ? cfg.telegramChatId : '';
-    document.getElementById('settings-tv-enabled').checked = !!cfg.tvEnabled;
+    // Guarded like the rest: these ran BEFORE the overlay is shown, so a throw
+    // here means the Settings panel never opens at all, with no visible cause.
+    { const t = document.getElementById('settings-telegram-token'); if (t && cfg.telegramBotToken) t.value = cfg.telegramBotToken; }
+    { const c = document.getElementById('settings-telegram-chatid'); if (c) c.value = cfg.telegramChatId !== undefined ? cfg.telegramChatId : ''; }
+    { const e = document.getElementById('settings-tv-enabled'); if (e) e.checked = !!cfg.tvEnabled; }
     val('settings-tv-env', 'tvEnv', 'demo');
     val('settings-tv-name', 'tvName', '');
-    if (cfg.tvPassword) document.getElementById('settings-tv-password').value = cfg.tvPassword;
-    val('settings-tv-appid', 'tvAppId', 'MNQ Co-Pilot');
+    { const p = document.getElementById('settings-tv-password'); if (p && cfg.tvPassword) p.value = cfg.tvPassword; }
+    val('settings-tv-appid', 'tvAppId', 'Trading Co-Pilot');
     val('settings-tv-cid', 'tvCid', '');
     if (cfg.tvSec) document.getElementById('settings-tv-sec').value = cfg.tvSec;
   });
+  // Always open on the Keys tab: it holds the Jev actions, and a panel that
+  // remembers whichever tab was last used would sometimes open on a tab with
+  // nothing to do.
+  //
+  // BUG FIX (2026-09-21): this said 'jev', which is the OLD name — the v5 control
+  // room's panes are keyed keys/trading/integrations/diagnostics, so the name
+  // matched no pane, `showSettingsTab` stripped is-active from the one pane that
+  // had it and gave it to none, and since .settings-pane is display:none unless
+  // .is-active, the Settings panel opened COMPLETELY BLANK. That is why the
+  // Auto-protection block could not be found: there was nothing on screen to
+  // click. Guarded in showSettingsTab as well, so a future rename cannot blank
+  // the panel again.
+  try { showSettingsTab('keys'); } catch (e) {}
   document.getElementById('settings-overlay').className = 'visible';
 }
+
+function refreshTypesafeStatus() {
+  const el = document.getElementById('settings-typesafe-status');
+  if (!el || !window.api || !window.api.getRouter) return Promise.resolve();
+  return window.api.getRouter().then(function (r) {
+    const d = (r && r.data) || {};
+    const sw = d.switches || {};
+    const parts = [];
+    parts.push(sw.keyPresent ? ('key present (' + (sw.keySource || 'unknown source') + ')') : 'NO KEY for this backend');
+    parts.push((sw.backendLabel || sw.backend || '?') + ' - ' + (sw.model || '?'));
+    parts.push('journal ' + (sw.journal ? 'ON' : 'off') + ', router ' + (sw.router ? 'ON' : 'off'));
+    parts.push((sw.callsToday || 0) + '/' + (sw.maxCallsPerDay || 0) + ' calls today');
+    el.textContent = parts.join('  |  ');
+    el.style.color = sw.keyPresent ? '' : 'var(--amber)';
+    return d;
+  }).catch(function () { el.textContent = 'Could not read the TypeSafe status.'; return null; });
+}
+window.refreshTypesafeStatus = refreshTypesafeStatus;
+
+// One REAL call, so a pasted key is proven before anything is trusted to it.
+// The answer is shown raw, including a refusal, because the vendor's own reason
+// is the entire value of a test button. The key is never echoed into the DOM.
+function testTypesafe() {
+  const el = document.getElementById('settings-typesafe-status');
+  const btn = document.getElementById('settings-typesafe-test');
+  if (!el || !window.api || !window.api.testTypesafe) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Calling...'; }
+  el.style.color = '';
+  el.textContent = 'Sending one real call...';
+  window.api.testTypesafe().then(function (r) {
+    const d = (r && r.data) || {};
+    if (d.ok) {
+      el.style.color = 'var(--green)';
+      el.textContent = 'OK - ' + (d.model || '?') + ' via ' + (d.backend || '?')
+        + (d.latencyMs != null ? ' in ' + d.latencyMs + 'ms' : '')
+        + (d.cost != null ? ' - $' + d.cost : '')
+        + ' - answer ' + (d.answer != null ? d.answer : 'n/a')
+        + ' - ' + (d.callsToday || 0) + ' call(s) today';
+    } else {
+      el.style.color = 'var(--red)';
+      el.textContent = 'FAILED - ' + (d.reason || 'unknown reason')
+        + (d.keyPresent === false ? ' (no key saved for the ' + (d.backend || 'selected') + ' backend)' : '');
+    }
+  }).catch(function (e) {
+    el.style.color = 'var(--red)';
+    el.textContent = 'FAILED - ' + (e && e.message ? e.message : 'request failed');
+  }).then(function () {
+    if (btn) { btn.disabled = false; btn.textContent = 'Send one test call'; }
+  });
+}
+window.testTypesafe = testTypesafe;
+
+// The rubric stability check (consistency cookbook, items 1 and 3). N real calls
+// over ONE of his own written notes, then: did every question hold still, and
+// could the spread have flipped a threshold the app decides with?
+//
+// It reports the WORST question, not the average — one question free to flip a
+// gate is enough to make every label it produced untrustworthy.
+function checkRubricStability() {
+  const el = document.getElementById('settings-typesafe-status');
+  const btn = document.getElementById('settings-typesafe-consistency');
+  if (!el || !window.api || !window.api.checkConsistency) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Running 8 repeats...'; }
+  el.style.color = '';
+  el.textContent = 'Running the journal rubric 8 times over your most recent note...';
+  window.api.checkConsistency().then(function (r) {
+    const d = (r && r.data) || {};
+    if (!d.ok) {
+      el.style.color = 'var(--amber)';
+      el.textContent = 'Stability check: ' + (d.reason || 'could not run');
+      return;
+    }
+    const worst = (d.questions || []).slice().sort(function (a, b) { return (b.sd || 0) - (a.sd || 0); })[0];
+    const flips = (d.flipping || []);
+    el.style.color = flips.length ? 'var(--red)' : 'var(--green)';
+    var line = (flips.length ? 'STABILITY PROBLEM — ' : 'Stable: ') + d.summary;
+    line += '  |  ' + d.repeats + ' repeats over ' + d.date + ', worst spread ' + d.worstSd
+      + (worst && worst.id ? ' (' + worst.id + ')' : '') + ', cost $' + d.cost;
+    if (d.drift != null) line += '  |  previous run ' + d.previous.worstSd + ', drift ' + (d.drift >= 0 ? '+' : '') + d.drift;
+    el.textContent = line;
+  }).catch(function (e) {
+    el.style.color = 'var(--red)';
+    el.textContent = 'Stability check failed: ' + (e && e.message ? e.message : 'request failed');
+  }).then(function () {
+    if (btn) { btn.disabled = false; btn.textContent = 'Check rubric stability'; }
+  });
+}
+window.checkRubricStability = checkRubricStability;
+
+// The settings sweep (2026-09-21). Re-scores STORED answers under a grid of
+// cutoffs, with a held-out half by time, and calls nothing.
+//
+// The two numbers that matter are shown side by side, because the whole point is
+// whether the winner survived contact with the half it was not chosen from. A
+// single number would just be the best of a search.
+function runAnswerSweep() {
+  const el = document.getElementById('settings-typesafe-status');
+  const btn = document.getElementById('settings-typesafe-sweep');
+  if (!el || !window.api || !window.api.answerSweep) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Replaying...'; }
+  el.style.color = '';
+  el.textContent = 'Re-scoring stored answers (no model calls)...';
+  window.api.answerSweep().then(function (r) {
+    const d = (r && r.data) || {};
+    if (!d.ok) { el.style.color = 'var(--amber)'; el.textContent = 'Replay: ' + (d.reason || 'could not run'); return; }
+    var line = d.summary;
+    if (d.best && d.best.test && d.best.test.winRate != null) {
+      line += '  |  ' + d.settingsTried + ' cutoffs tried, ' + d.resolved + ' resolved of ' + d.records + ' stored.';
+    }
+    el.style.color = d.verdict === 'OVERFIT' ? 'var(--red)' : (d.verdict === 'HELD_UP' ? 'var(--green)' : '');
+    el.textContent = line;
+  }).catch(function (e) {
+    el.style.color = 'var(--red)';
+    el.textContent = 'Replay failed: ' + (e && e.message ? e.message : 'request failed');
+  }).then(function () {
+    if (btn) { btn.disabled = false; btn.textContent = 'Replay stored answers'; }
+  });
+}
+window.runAnswerSweep = runAnswerSweep;
 
 function closeSettings() {
   document.getElementById('settings-overlay').className = '';
@@ -8220,7 +9214,18 @@ function closeSettings() {
 
 async function saveSettings() {
   const acc = state.account;
-  const num = (id, fallback) => parseFloat(document.getElementById(id).value) || fallback;
+  // NULL-SAFE (2026-09-21). The old body was
+  //     parseFloat(document.getElementById(id).value) || fallback
+  // which THROWS when the element is not in the panel. Removing the derived
+  // account fields would therefore have thrown part-way through the save and
+  // silently dropped every setting after that point — the exact failure the
+  // comment below says this function was already fixed for once.
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    if (!el) return fallback;
+    const v = parseFloat(el.value);
+    return Number.isFinite(v) ? v : fallback;
+  };
 
   // Every field is read through a null check (not a bare getElementById().value)
   // so a stale cached index.html cannot throw partway through and silently drop
@@ -8229,49 +9234,97 @@ async function saveSettings() {
   const deepseekApiKey = deepseekKeyEl ? deepseekKeyEl.value.trim() : '';
   const geminiKeyEl = document.getElementById('settings-gemini-key');
   const geminiApiKey = geminiKeyEl ? geminiKeyEl.value.trim() : '';
+
+  // -- TypeSafe (Jev) ------------------------------------------------------
+  // Keys are written ONLY when non-empty. The other key fields round-trip
+  // because openSettings() refills them, but an empty box silently writing ''
+  // over a working key is the kind of data loss this app has already paid for
+  // once -- and 'blank means leave it alone' is the convention the protection
+  // band below already documents.
+  const tsKeyEl = document.getElementById('settings-typesafe-key');
+  const typesafeApiKey = tsKeyEl ? tsKeyEl.value.trim() : '';
+  const orKeyEl = document.getElementById('settings-openrouter-key');
+  const openRouterApiKey = orKeyEl ? orKeyEl.value.trim() : '';
   const voiceNameEl = document.getElementById('settings-voice-name');
   const edgeVoice = voiceNameEl ? voiceNameEl.value : 'en-IN-NeerjaNeural';
-  const balance = num('settings-balance', 50000);
-  const profit  = num('settings-profit', 0);
-
-  const fundedFloor     = num('settings-funded-floor', acc.fundedFloor);
-  const fundedDayStop   = num('settings-funded-daystop', acc.fundedDayStop);
-  const fundedTargetMin = num('settings-funded-targetmin', acc.fundedTargetMin);
-  const fundedTargetMax = num('settings-funded-targetmax', acc.fundedTargetMax);
-  const payoutTarget    = num('settings-payout', acc.payoutTarget);
-
-  const evalFloor   = num('settings-eval-floor', acc.evalFloor);
-  const evalDayCap  = num('settings-eval-daycap', acc.evalDayCap);
-  const evalDayStop = num('settings-eval-daystop', acc.evalDayStop);
+  // ── THE ACCOUNT NUMBERS ARE NO LONGER WRITTEN FROM HERE (2026-09-21) ────
+  // balance, profit, the funded/eval floors, day stops, targets and payout are
+  // DERIVED by this app, not set by him:
+  //   • balance  comes from the broker feed, or the ledger (updateAccount)
+  //   • profit   comes from DayPnl (live -> ledger -> trades)
+  //   • floor / target / dayStop / dayCap come from acctDefaults(size, stage)
+  // Already stated in this file at updateAccount: "Deterministic-from-terms
+  // fields — never trusted from storage."
+  //
+  // So the Settings inputs for them were controls that did nothing durable: a
+  // number typed there was overwritten by the next account refresh. Removing
+  // them removes a lie. The Account tab now SHOWS them, read-only, from the same
+  // state the HUD uses.
 
   // G32: the protection band is a RULES write, not a config write - it is a trading number,
   // so it goes through rules-set where the server clamps it. Blank means "leave it alone"
   // rather than "zero": an empty box must never silently disable protection.
-  const protectEls = {
-    stop: document.getElementById('settings-protect-stop'),
-    target: document.getElementById('settings-protect-target'),
+  // Per-stage protection (2026-09-21): each stage's four numbers are read as a
+  // map. A BLANK box means "leave that number alone" (the key is omitted), while
+  // an explicit 0 in a trail box means "trail off" (the key is set to 0) — the
+  // server's clampAutoProtection distinguishes the two exactly the same way.
+  const readProtectStage = (prefix) => {
+    const el = (suffix) => document.getElementById(prefix + suffix);
+    const num = (id) => {
+      const e = el(id);
+      if (!e || e.value === '') return undefined;
+      const v = parseFloat(e.value);
+      return Number.isFinite(v) ? v : undefined;
+    };
+    const o = {};
+    const stop = num('-stop');      if (stop !== undefined) o.stopLossUsd = stop;
+    const target = num('-target');  if (target !== undefined) o.takeProfitUsd = target;
+    const be = num('-be');          if (be !== undefined) o.breakEvenAtUsd = be;
+    const trail = num('-trail');    if (trail !== undefined) o.trailDistanceUsd = trail;
+    return o;
   };
   const wantProtect = {};
-  if (protectEls.stop && protectEls.stop.value !== '') {
-    const v = parseFloat(protectEls.stop.value);
-    if (Number.isFinite(v) && v > 0) wantProtect.stopLossUsd = v;
-  }
-  if (protectEls.target && protectEls.target.value !== '') {
-    const v = parseFloat(protectEls.target.value);
-    if (Number.isFinite(v) && v > 0) wantProtect.takeProfitUsd = v;
-  }
+  const wantEval = readProtectStage('settings-protect-eval');
+  const wantFunded = readProtectStage('settings-protect-funded');
+  if (Object.keys(wantEval).length) wantProtect.eval = wantEval;
+  if (Object.keys(wantFunded).length) wantProtect.funded = wantFunded;
   if (Object.keys(wantProtect).length && window.api && window.api.setRules) {
     try { window.api.setRules({ autoProtection: Object.assign({ enabled: true }, wantProtect) }); } catch (e) {}
   }
 
-  const telegramBotToken = document.getElementById('settings-telegram-token').value.trim();
-  const telegramChatId   = document.getElementById('settings-telegram-chatid').value.trim();
+  // Null-guarded like everything else — these were the last two bare .value reads.
+  const _tgTokenEl = document.getElementById('settings-telegram-token');
+  const _tgChatEl  = document.getElementById('settings-telegram-chatid');
+  const telegramBotToken = _tgTokenEl ? _tgTokenEl.value.trim() : '';
+  const telegramChatId   = _tgChatEl ? _tgChatEl.value.trim() : '';
 
-  const cfgEntries = {
-    deepseekApiKey, geminiApiKey, edgeVoice, balance, profit,
-    fundedFloor, fundedDayStop, fundedTargetMin, fundedTargetMax, payoutTarget,
-    evalFloor, evalDayCap, evalDayStop
-  };
+  // The backend/model/switches are RULES, not config, so they go through
+  // rules-set where the server clamps them (backend whitelist, model id shape).
+  // Sent as a PARTIAL block; the server merges it, so maxCallsPerDay and the
+  // per-playbook band tables survive the write.
+  const tsBackendEl = document.getElementById('settings-typesafe-backend');
+  const tsModelEl = document.getElementById('settings-typesafe-model');
+  const tsJournalEl = document.getElementById('settings-typesafe-journal');
+  const tsRouterEl = document.getElementById('settings-typesafe-router');
+  const tsEscEl = document.getElementById('settings-typesafe-escalation');
+  if (tsBackendEl && window.api && window.api.setRules) {
+    const wantTypesafe = {
+      backend: tsBackendEl.value,
+      model: tsModelEl ? tsModelEl.value.trim() : '',
+      enabled: !!(tsJournalEl && tsJournalEl.checked),
+      router: {
+        enabled: !!(tsRouterEl && tsRouterEl.checked),
+        escalationMode: tsEscEl ? tsEscEl.value : 'observe',
+      },
+    };
+    try { window.api.setRules({ typesafe: wantTypesafe }); } catch (e) {}
+  }
+
+  // Only what he actually SETS. Nothing derived, nothing the feed overwrites.
+  const cfgEntries = { deepseekApiKey, geminiApiKey, edgeVoice };
+  // Only when non-empty -- see the note above.
+  if (typesafeApiKey) cfgEntries.typesafeApiKey = typesafeApiKey;
+  if (openRouterApiKey) cfgEntries.openRouterApiKey = openRouterApiKey;
   for (const [key, value] of Object.entries(cfgEntries)) {
     await window.api.setConfig(key, value);
   }
@@ -8283,34 +9336,76 @@ async function saveSettings() {
   await window.api.setConfig('telegramBotToken', telegramBotToken);
   if (telegramChatId) await window.api.setConfig('telegramChatId', telegramChatId);
 
-  // Tradovate live-feed credentials (strings; enable flag set last so the server (re)starts the feed).
-  await window.api.setConfig('tvEnv', document.getElementById('settings-tv-env').value);
-  await window.api.setConfig('tvName', document.getElementById('settings-tv-name').value.trim());
-  await window.api.setConfig('tvPassword', document.getElementById('settings-tv-password').value);
-  await window.api.setConfig('tvAppId', document.getElementById('settings-tv-appid').value.trim());
-  await window.api.setConfig('tvCid', document.getElementById('settings-tv-cid').value.trim());
-  await window.api.setConfig('tvSec', document.getElementById('settings-tv-sec').value);
-  await window.api.setConfig('tvEnabled', document.getElementById('settings-tv-enabled').checked);
+  // Tradovate live-feed credentials (strings; the enable flag is set LAST so the
+  // server (re)starts the feed once it already has them).
+  //
+  // NULL-GUARDED (2026-09-21). These were the last seven bare .value reads in the
+  // function. They are the same bug as the two above: a missing element throws,
+  // and because they sit at the END of saveSettings the throw would land AFTER
+  // every other setting had been written — so the keys would save and the
+  // Integrations tab would silently not, with no error shown anywhere.
+  const tvEl = {
+    env: document.getElementById('settings-tv-env'),
+    name: document.getElementById('settings-tv-name'),
+    password: document.getElementById('settings-tv-password'),
+    appid: document.getElementById('settings-tv-appid'),
+    cid: document.getElementById('settings-tv-cid'),
+    sec: document.getElementById('settings-tv-sec'),
+    enabled: document.getElementById('settings-tv-enabled'),
+  };
+  if (tvEl.env) await window.api.setConfig('tvEnv', tvEl.env.value);
+  if (tvEl.name) await window.api.setConfig('tvName', tvEl.name.value.trim());
+  if (tvEl.password) await window.api.setConfig('tvPassword', tvEl.password.value);
+  if (tvEl.appid) await window.api.setConfig('tvAppId', tvEl.appid.value.trim());
+  if (tvEl.cid) await window.api.setConfig('tvCid', tvEl.cid.value.trim());
+  if (tvEl.sec) await window.api.setConfig('tvSec', tvEl.sec.value);
+  if (tvEl.enabled) await window.api.setConfig('tvEnabled', tvEl.enabled.checked);
 
 
   const ddsEl = document.getElementById('settings-disable-deepseek');
   if (ddsEl) await window.api.setConfig('disableDeepSeek', ddsEl.checked);
 
-  Object.assign(acc, {
-    balance, profit,
-    fundedFloor, fundedDayStop, fundedTargetMin, fundedTargetMax, payoutTarget,
-    evalFloor, evalDayCap, evalDayStop
-  });
-  state.hasApiKey = !!deepseekApiKey;
-  state.deepSeekConfigured = !!deepseekApiKey && !(ddsEl && ddsEl.checked);
-  updateAccountUI();
-  updateRulesTab();
+  // REMOVED 2026-09-21 — this block was the reason Save appeared to do nothing.
+  //
+  // It was left over from when balance / profit / the floors / the day stops /
+  // the targets were Settings INPUTS. When those ten fields were removed from the
+  // panel (they are DERIVED by updateAccount() from the account's own terms, and
+  // were never durable), this assignment stayed behind — and every identifier in
+  // it, `balance` through `evalDayStop`, is now UNDECLARED. Evaluating the object
+  // literal therefore threw ReferenceError: balance is not defined.
+  //
+  // The position mattered more than the throw: it sat AFTER every write (the
+  // protection band, the Jev rules, the keys, the Tradovate credentials) but
+  // BEFORE closeSettings() and the "Settings saved" message. So the numbers DID
+  // reach the server and rules.json, while the panel refused to close, the
+  // confirmation never appeared, and updateAccountUI()/updateRulesTab() never ran
+  // — which reads exactly like "Save does not work", even though the write had
+  // already landed.
+  //
+  // Nothing is lost by deleting it: those fields are recomputed from the ledger
+  // by enforceAccountInvariant() inside updateAccountUI() below, which is the
+  // "deterministic-from-terms, never trusted from storage" rule this app already
+  // follows for them.
+  // ── THE PANEL MUST NEVER STAY OPEN BECAUSE OF A THROW (2026-09-21) ───────
+  // Every write above has already been sent by this point. The steps below are
+  // pure refresh, so they are best-effort and individually harmless to skip —
+  // whereas the 2026-09-21 dead-block bug proved how bad the alternative is: one
+  // ReferenceError in between left the panel open with no confirmation, and Save
+  // looked broken even though the numbers had already reached rules.json.
+  try {
+    state.hasApiKey = !!deepseekApiKey;
+    state.deepSeekConfigured = !!deepseekApiKey && !(ddsEl && ddsEl.checked);
+    updateAccountUI();
+    updateRulesTab();
+    refreshPrice();
+    computeMechanicalGoNogo();
+  } catch (e) {
+    console.warn('[settings] a post-save refresh step failed:', e && e.message);
+  }
   closeSettings();
   addSystemMessage(deepseekApiKey
     ? 'Settings saved. AI co-pilot is ready.'
     : 'Settings saved. Running without an API key — mechanical monitors, GO/NO-GO gate, and manual chart tools stay live; AI chat/analysis is off.');
-  refreshPrice();
-  computeMechanicalGoNogo();
 }
 
 document.getElementById('settings-open-btn').addEventListener('click', openSettings);
@@ -8343,16 +9438,25 @@ document.getElementById('settings-open-btn').addEventListener('click', openSetti
     const START = acc.balance;
     const FLOOR0 = acc.evalFloor;
     const MLL = prof.maxLoss;
-    const TARGET = acc.evalTarget || (prof.startBalance + prof.target);
+    const TARGET = resolveAccountTarget();
+    if (TARGET == null) { wrap.innerHTML = ''; return; }
     // Lock threshold: eval floor stops trailing once balance clears
     // startBalance+$100 (matches the confirmed 150K eval behavior — floor
     // locked permanently at $150,100 on a $150,000 start).
     const LOCK_FLOOR = prof.startBalance + 100;
-    // Daily plan pace: scale the same ratio the old 150K ladder used
-    // (700/day plan vs its 9000 target ⇒ ~1.167x target/15days), so smaller
-    // accounts get a proportionally smaller daily plan instead of the old
-    // eval's flat $700/day showing up on a $50K account.
-    const PLAN_NET = Math.max(1, Math.round((prof.target * 1.167) / DAYS));
+    // ONE pace (2026-09-21): the same evalPlan chunk the Day Plan HUD and
+    // Coach's Notes read, instead of this ladder's own formula
+    // (target*1.167/15) — a second, competing daily pace for the same
+    // distance. Falls back to the old formula only if the plan is not
+    // computable, so the ladder never renders empty over a missing chunk.
+    let PLAN_NET = null;
+    try {
+      if (window.DayPlan && window.DayPlan.evalPlan) {
+        const p = window.DayPlan.evalPlan({ cfg: (getRules() || {}).evalPlan, balance: Number(START) || null, targetBalance: TARGET });
+        if (p && p.enabled && !p.reached && p.chunk > 0) PLAN_NET = p.chunk;
+      }
+    } catch (e) { PLAN_NET = null; }
+    if (PLAN_NET == null) PLAN_NET = Math.max(1, Math.round((prof.target * 1.167) / DAYS));
     function fl(prev,bal){ return Math.min(LOCK_FLOOR, Math.max(prev, bal-MLL)); }
 
     const badge=document.getElementById('ladder-badge');
@@ -8362,7 +9466,11 @@ document.getElementById('settings-open-btn').addEventListener('click', openSetti
 
     const a=loadA();
     let pBal=START, pFloor=FLOOR0, rows=[];
-    for(let d=1; d<=DAYS; d++){ pBal+=PLAN_NET; pFloor=fl(pFloor,pBal); rows.push({d:d, pBal:pBal, pFloor:pFloor, pCush:pBal-pFloor}); }
+    // Clamp the projected balance at TARGET: once the plan balance reaches
+    // the target the account is done, so the plan column must not keep
+    // stacking a daily chunk past it (the chunk is now the live 4-day pace,
+    // which reaches target well before the 15-row grid ends).
+    for(let d=1; d<=DAYS; d++){ pBal = Math.min(TARGET, pBal + PLAN_NET); pFloor=fl(pFloor,pBal); rows.push({d:d, pBal:pBal, pFloor:pFloor, pCush:pBal-pFloor}); }
     let aBal=START, aFloor=FLOOR0, curBal=START, curFloor=FLOOR0, logged=0;
     rows.forEach(function(r){ if(a[r.d]!==undefined){ aBal+=a[r.d]; aFloor=fl(aFloor,aBal); r.aBal=aBal; r.aFloor=aFloor; r.aCush=aBal-aFloor; curBal=aBal; curFloor=aFloor; logged++; } });
     const cush=curBal-curFloor, rem=TARGET-curBal, passed=curBal>=TARGET;
@@ -9686,11 +10794,18 @@ window.grInBlackout = false;
       });
     } catch (e) { return summarizeFallback(s); }
   }
-  function archive(sum) { try { let h = JSON.parse(localStorage.getItem(HKEY) || '[]'); h = h.filter(e => e.date !== sum.date); h.push(sum); localStorage.setItem(HKEY, JSON.stringify(h.slice(-60))); if (window.api && window.api.dataSave) window.api.dataSave(slotDataKey('gr_history'), h.slice(-60)).catch(() => {}); } catch (e) {} }
+  // acctWrite (not localStorage) so the documented lifetime rule applies here
+  // too: while the merged view is on, a write would attribute one account's day
+  // to whichever slot happens to be active. acctWrite refuses instead.
+  function archive(sum) { try { let h = JSON.parse(acctRead(HKEY) || '[]'); h = h.filter(e => e.date !== sum.date); h.push(sum); localStorage.setItem(HKEY, JSON.stringify(h.slice(-60))); if (window.api && window.api.dataSave) window.api.dataSave(slotDataKey('gr_history'), h.slice(-60)).catch(() => {}); } catch (e) {} }
   function load() {
     let s; try { s = JSON.parse(localStorage.getItem(GKEY)); } catch (e) {}
     if (s && s.date && s.date !== today() && s.trades && s.trades.length) archive(summarize(s));
-    if (!s || s.date !== today()) s = { date: today(), trades: [], cooldownUntil: 0, stopped: false, stoppedAt: 0, acked: false, live: null, lastLossSeen: 0 };
+    // stopReason (2026-09-21): WHICH limit stopped the day, with the numbers.
+    // A day stopped before that change has no reason recorded, and must keep
+    // rendering the generic DAILY STOP HIT rather than claiming a cause it
+    // does not know — hence the null default and the fallback in grShowStop.
+    if (!s || s.date !== today()) s = { date: today(), trades: [], cooldownUntil: 0, stopped: false, stoppedAt: 0, acked: false, live: null, lastLossSeen: 0, stopReason: null };
     // A day carried over from before stoppedAt existed: stop-alarm.js's
     // ackDelayRemainingMs() fails OPEN (returns 0) on a missing timestamp, so
     // this is a display nicety, not a safety requirement. MUST persist the
@@ -9703,7 +10818,15 @@ window.grInBlackout = false;
     return s;
   }
   function save(s) { localStorage.setItem(GKEY, JSON.stringify(s)); }
-  window.grHistory = function () { try { return JSON.parse(localStorage.getItem(HKEY) || '[]'); } catch (e) { return []; } };
+  // 2026-09-19 (Anoop: "if i click lifetime tab the lifetime data should sync,
+  // not just that account data"). This read localStorage DIRECTLY, so it
+  // bypassed acctRead() and therefore the lifetime overlay — and renderInsights()
+  // builds its whole page from this function. Result: the Lifetime banner
+  // correctly said "26 trading days across 3 accounts" while the content under
+  // it showed the ACTIVE account's few days. acctRead() returns the merged
+  // overlay when lifetime mode is on and localStorage otherwise, so one call now
+  // serves both modes — the same fix jrLS() already carries for the Journal.
+  window.grHistory = function () { try { return JSON.parse(acctRead(HKEY) || '[]'); } catch (e) { return []; } };
   window.grToday = function () { return summarize(load()); };
   window.grTodayTrades = function () { return load().trades; };
   // 2026-08-16: computeMechanicalGoNogo() previously had no notion of this
@@ -9713,7 +10836,7 @@ window.grInBlackout = false;
   // talked to each other. This is the bridge.
   window.grIsStopped = function () { return !!load().stopped; };
 
-  function bodyReduced() { try { const b = (JSON.parse(localStorage.getItem('copilot_checklist_plan') || '{}').body) || {}; return b.sleep === 'poor' || b.nap === 'no'; } catch (e) { return false; } }
+  function bodyReduced() { try { const b = (JSON.parse(acctRead('copilot_checklist_plan') || '{}').body) || {}; return b.sleep === 'poor' || b.nap === 'no'; } catch (e) { return false; } }
   // CHANGED 2026-07-28 (Anoop): was eval:2/funded:20 — now flat 10/day
   // (5/session × 2 sessions), same in both modes.
   const baseLimit = () => getRules().tradesPerDay || 10;
@@ -9722,10 +10845,29 @@ window.grInBlackout = false;
   // rather than on every HUD render (which runs on a timer).
   let grLastRatchetLevel = 'ok';
   let grLastVolumeLevel = 'ok';
+  // 2026-09-19: satisfaction number + streak gate fire their banner on CHANGE
+  // only, same contract as the ratchet/volume levels above — grRender runs on a
+  // timer, so a banner without a change-guard would re-announce every render.
+  let grLastSatisfactionDay = '';
+  let grLastStreakLosses = 0;
   const baseDayStop = () => {
     const a = (typeof state !== 'undefined' && state.account) || {};
     const ds = (getRules().dayStop) || { eval: 300, funded: 200 };
     return state.mode === 'eval' ? (a.evalDayStop || ds.eval || 300) : (a.fundedDayStop || ds.funded || 200);
+  };
+  // ── WHAT COUNTS AS A LOSS (2026-09-21) ─────────────────────────────────────
+  // ONE definition, read from rules.json, used by the size-freeze guard.
+  // Anoop's rule, verbatim: "Consider anything below 100$ and above -100$ as
+  // not a trade... as break even" → rules.json breakEvenBandUsd.
+  //
+  // Returns 0 (not the display default of 100) when the key is missing or
+  // non-positive. That is the FAIL-SAFE direction for a guard: 0 here means
+  // "every negative close counts as a loss", i.e. the behaviour this guard had
+  // before 2026-09-21. Inventing a permissive band on a missing key would
+  // quietly disarm a safety rule, which is the one way this must not fail.
+  const breakEvenBand = () => {
+    const b = Number((getRules() || {}).breakEvenBandUsd);
+    return b > 0 ? b : 0;
   };
 
   // ── LOSS RATCHET (2026-08-12, Anoop's own rule) ────────────────────────────
@@ -9812,6 +10954,14 @@ window.grInBlackout = false;
   function nextNewsTxt() { if (!grNewsStatus || !grNewsStatus.upcoming || !grNewsStatus.upcoming.length) return ''; const e = grNewsStatus.upcoming[0], m = Math.round((e.ts - Date.now()) / 60000); if (m < 0 || m > 180) return ''; return 'next: ' + e.title + ' in ' + m + 'm'; }
 
   window.grLog = function () {
+    // ── VIEW-ONLY GUARD (2026-09-19) ────────────────────────────────────────
+    // A breached account is readable, not writable. Without this, opening the
+    // blown account to review it and then logging a trade would write into a
+    // dead account's record — the one thing "view only" has to mean.
+    if (isViewOnlySlot()) {
+      banner('👁 VIEW ONLY — "' + (acctSlot().name || acctSlot().id) + '" is a BREACHED account. No trades can be recorded into it. Use "＋ Start new account" from the picker (⇄).', 'amber');
+      return;
+    }
     const s = load();
     if (s.stopped) { grShowStop(s); return; }
     const sizeEl = document.getElementById('gr-size'), pnlEl = document.getElementById('gr-pnl');
@@ -9839,14 +10989,22 @@ window.grInBlackout = false;
     // the funded drawdown than any single other pattern (trade immediately
     // after a loss: 42% win rate, -$1,197 net, avg size 3.6c vs 2.1c on the
     // day's first trade). See size-freeze-guard.js.
-    const sizedUpAfterLoss = window.SizeFreezeGuard ? window.SizeFreezeGuard.sizeUpAfterLossViolation(s.trades, size) : false;
+    // band-aware since 2026-09-21 — a scratch (|pnl| < breakEvenBandUsd) is not
+    // a loss, same definition the Journal table and the streak gate already use.
+    const freezeRead = window.SizeFreezeGuard
+      ? window.SizeFreezeGuard.sizeUpAfterLossReading(s.trades, size, { breakEvenBandUsd: breakEvenBand() })
+      : { violation: false, level: 'none', reason: '' };
+    const sizedUpAfterLoss = !!freezeRead.violation;
     s.trades.push({ t: Date.now(), size: size, pnl: pnl, g: grade.g, pts: grade.pts, flags: grade.flags });
     if (pnl < 0) s.cooldownUntil = Date.now() + COOLDOWN_MS;
     const dayPnl = s.trades.reduce((a, t) => a + t.pnl, 0);
     const wasStopped = s.stopped;
-    if (dayPnl <= -dayStop()) s.stopped = true;
-    if (sizedUpWhileLosing) s.stopped = true;
-    if (sizedUpAfterLoss) s.stopped = true;
+    // WHICH limit stopped the day, recorded at the moment it stops it. Without
+    // this the overlay can only say "DAILY STOP HIT" for all three, which on
+    // 2026-09-21 told him a +$124 / 4-trade / 4-lot day had hit its daily stop.
+    if (dayPnl <= -dayStop()) { s.stopped = true; s.stopReason = { kind: 'day-stop', dayPnl: dayPnl, cap: dayStop() }; }
+    if (sizedUpWhileLosing) { s.stopped = true; s.stopReason = { kind: 'size-up-while-losing', prevSize: prevTrade.size, prevPnl: prevTrade.pnl, newSize: size, dayPnl: runningBeforeThis }; }
+    if (sizedUpAfterLoss) { s.stopped = true; s.stopReason = { kind: 'size-up-after-loss', prevSize: freezeRead.prevSize, prevPnl: freezeRead.prevPnl, newSize: size }; }
     if (s.stopped && !wasStopped) s.stoppedAt = Date.now();
     save(s); pnlEl.value = ''; sizeEl.value = ''; grRender();
     banner('Trade graded ' + grade.g + ' (' + grade.pts + '/4)' + (grade.flags.length ? ' — ' + grade.flags.join(', ') : ' — clean'), grade.pts >= 3 ? 'green' : grade.pts === 2 ? 'amber' : 'red');
@@ -9866,6 +11024,18 @@ window.grInBlackout = false;
   // tv-broker-feed.js's balance-delta-at-flat fold); the SAME guards fire
   // automatically (no manual logging).
   window.grIngestLive = function (data) {
+    // ── VIEW-ONLY GUARD (2026-09-19) ────────────────────────────────────────
+    // Same reason as grLog, and worse if missed: a live fill arriving while the
+    // blown account is open on screen would append real trades to the record of
+    // an account that is already closed. The feed keeps running for the chart;
+    // only the RECORDING stops. Said once per session, not per tick.
+    if (isViewOnlySlot()) {
+      if (!window._viewOnlyFeedNoteShown) {
+        window._viewOnlyFeedNoteShown = true;
+        banner('👁 VIEW ONLY — the open account is breached, so live fills are NOT being recorded. Open a live account to record trades.', 'amber');
+      }
+      return;
+    }
     const s = load();
     // 2026-08-18: data.success===false means the chart/CDP connection is up
     // but the broker Trading Panel itself isn't readable (not open / not
@@ -9907,7 +11077,7 @@ window.grInBlackout = false;
     })();
     s.live = data && data.connected ? { connected: true, tradeCount: data.tradeCount || 0, dayPnl: data.dayPnl || 0, maxSize: data.maxSize || 0, brokerBalance: brokerBal, isFlat: isFlatNow, at: Date.now() } : null;
     if (s.live) {
-      if (s.live.dayPnl <= -dayStop() && !s.stopped) { s.stopped = true; s.stoppedAt = Date.now(); banner('DAILY STOP HIT (' + money(s.live.dayPnl) + ') — flatten and close Tradovate now.', 'red'); }
+      if (s.live.dayPnl <= -dayStop() && !s.stopped) { s.stopped = true; s.stoppedAt = Date.now(); s.stopReason = { kind: 'day-stop', dayPnl: s.live.dayPnl, cap: dayStop() }; banner('DAILY STOP HIT (' + money(s.live.dayPnl) + ') — flatten and close Tradovate now.', 'red'); }
       if (data.lastLossTs && data.lastLossTs > (s.lastLossSeen || 0)) { s.lastLossSeen = data.lastLossTs; s.cooldownUntil = data.lastLossTs + COOLDOWN_MS; banner('Live loss — 15-min cooldown started.', 'amber'); }
       if (s.live.maxSize > SIZE_CAP) banner('LIVE SIZE VIOLATION — ' + s.live.maxSize + ' > ' + SIZE_CAP + ' cap.', 'red');
       // ── THE CAP LOCKOUT MUST NOT OUTRANK THE APP'S OWN DOUBT (2026-09-02) ──
@@ -9952,11 +11122,17 @@ window.grInBlackout = false;
         let liveTrades = already.slice();
         for (let i = already.length; i < data.trades.length; i++) {
           const trade = data.trades[i];
-          const violation = window.SizeFreezeGuard ? window.SizeFreezeGuard.sizeUpAfterLossViolation(liveTrades, trade.size) : false;
+          // band-aware since 2026-09-21 — same definition of "loss" as the
+          // manual path above and as the Journal's break-even badge. This is
+          // the call site that raised the false DAILY STOP HIT on 2026-09-21.
+          const freezeRead = window.SizeFreezeGuard
+            ? window.SizeFreezeGuard.sizeUpAfterLossReading(liveTrades, trade.size, { breakEvenBandUsd: breakEvenBand() })
+            : { violation: false, level: 'none' };
           liveTrades = liveTrades.concat([trade]);
-          if (violation && !s.stopped) {
+          if (freezeRead.violation && !s.stopped) {
             s.stopped = true; s.stoppedAt = Date.now();
             const prevTrade = liveTrades[liveTrades.length - 2];
+            s.stopReason = { kind: 'size-up-after-loss', prevSize: freezeRead.prevSize, prevPnl: freezeRead.prevPnl, newSize: trade.size };
             banner('LIVE SIZE-UP RIGHT AFTER A LOSS — ' + trade.size + ' contracts after a ' + money(prevTrade.pnl) + ' loss on ' + prevTrade.size + '. HARD STOP.', 'red');
           }
         }
@@ -10074,11 +11250,66 @@ window.grInBlackout = false;
   // on top of just toggling visibility. Called every render tick (~1s) while
   // a stop is active and unacked — start() is idempotent so this does not
   // restart the alarm's escalation timer on every call.
+  // ── NAME THE ACTUAL REASON (2026-09-21) ────────────────────────────────────
+  // Until now every stop — the real daily-loss stop, a size-up-while-losing, and
+  // a size-up-after-a-loss — rendered the identical "⛔ DAILY STOP HIT / You are
+  // done trading today". On 2026-09-21 that told Anoop his day had hit its daily
+  // stop when the day was +$124.30 on 4 trades at 4/4 lots; the actual trigger
+  // was a 1→4 size-up after a −$0.90 scratch. He was right that the page was
+  // wrong, and the reason it was wrong is that it never said which limit it was.
+  //
+  // A stop that names the wrong reason is a stop he learns to dismiss — which
+  // costs the guard the days it is right. The title and the reason line are
+  // therefore derived from the recorded stopReason, with the old generic wording
+  // kept as the fallback for any day stopped before a reason was recorded.
+  function stopCopy(s) {
+    const r = (s && s.stopReason) || null;
+    if (!r || !r.kind) {
+      return { title: '⛔ DAILY STOP HIT', reason: '' };
+    }
+    if (r.kind === 'day-stop') {
+      return {
+        title: '⛔ DAILY LOSS STOP',
+        reason: 'You have lost ' + money(Math.abs(r.dayPnl)) + ' against your ' + money(r.cap)
+          + ' daily stop. That is the limit you set, so the day ends here.'
+      };
+    }
+    if (r.kind === 'size-up-while-losing') {
+      return {
+        title: '⛔ SIZE-UP WHILE LOSING',
+        reason: 'You went from ' + r.prevSize + ' contracts to ' + r.newSize + ' with the day already at '
+          + money(r.dayPnl) + '. This is the shape that blew the 150K eval on 07-21.'
+      };
+    }
+    if (r.kind === 'size-up-after-a-loss' || r.kind === 'size-up-after-loss') {
+      return {
+        title: '⛔ SIZE-UP AFTER A LOSS',
+        reason: 'You went from ' + r.prevSize + ' contracts to ' + r.newSize + ' on the trade right after a '
+          + money(r.prevPnl) + ' loss. Your own data: the trade immediately after a loss is a 42% win rate and '
+          + '-$1,197 across 24 trades.'
+      };
+    }
+    return { title: '⛔ DAILY STOP HIT', reason: '' };
+  }
+
   function grShowStop(s) {
     const ov = document.getElementById('gr-stop-overlay'); if (!ov) return;
     ov.style.display = s.acked ? 'none' : 'flex';
     if (s.acked) { stopAlarm.stop(); return; }
     stopAlarm.start();
+    // Repaint the copy on every tick — grShowStop is called each render, and the
+    // reason can legitimately change (a size-up freeze the day then also breaches
+    // the daily stop). textContent, not innerHTML: nothing here is markup.
+    try {
+      const copy = stopCopy(s);
+      const titleEl = document.getElementById('gr-stop-title');
+      const reasonEl = document.getElementById('gr-stop-reason');
+      if (titleEl && titleEl.textContent !== copy.title) titleEl.textContent = copy.title;
+      if (reasonEl) {
+        if (reasonEl.textContent !== copy.reason) reasonEl.textContent = copy.reason;
+        reasonEl.style.display = copy.reason ? '' : 'none';
+      }
+    } catch (e) { /* never let a copy change take the alarm down with it */ }
     const inp = document.getElementById('gr-stop-ack');
     const btn = document.getElementById('gr-stop-btn');
     const cd = document.getElementById('gr-stop-countdown');
@@ -10120,8 +11351,27 @@ window.grInBlackout = false;
     const reduced = bodyReduced();
     const stopped = s.stopped || (live && live.dayPnl <= -dayStop());
     const tag = live ? '● LIVE · ' : '';
+    // The satisfaction readout is computed HERE, ahead of the state line below,
+    // because that line reports it. Declaring it further down (next to the other
+    // meta tags) would put the reference before the `let` and throw a TDZ
+    // ReferenceError on every render — the HUD would stop painting entirely.
+    // The rest of the plan readouts (eval pace, streak gate) need nothing from
+    // the state line and stay down there with the other tags.
+    let satisfactionReached = false, satisfactionTarget = null, satReadout = null;
+    try {
+      const DPearly = window.DayPlan;
+      if (DPearly) {
+        satReadout = DPearly.satisfactionStatus({ cfg: (getRules() || {}).satisfaction, dayPnl: dayPnl });
+        if (satReadout.enabled) { satisfactionReached = satReadout.reached; satisfactionTarget = satReadout.target; }
+      }
+    } catch (e) { /* advisory — never let it break the HUD */ }
     let txt, cls;
-    if (stopped) { txt = tag + '⛔ STOPPED — DONE FOR THE DAY'; cls = 'gr-stop'; }
+    if (isViewOnlySlot()) {
+      txt = tag + '👁 VIEW ONLY — BREACHED ACCOUNT · nothing is recorded';
+      cls = 'gr-stop';
+    }
+    else if (stopped) { txt = tag + '⛔ STOPPED — DONE FOR THE DAY'; cls = 'gr-stop'; }
+    else if (satisfactionReached) { txt = tag + '✅ DAY DONE — ' + money(satisfactionTarget) + ' SATISFACTION NUMBER HIT' + (reduced ? ' · REDUCED DAY' : ''); cls = 'gr-clear'; }
     else if (window.grInBlackout) { txt = tag + '🚫 NEWS BLACKOUT' + (grNewsStatus && grNewsStatus.activeEvent ? ' — ' + grNewsStatus.activeEvent.title : '') + ' — no entries'; cls = 'gr-stop'; }
     else if (cd > 0) { txt = tag + '⏳ COOLDOWN ' + mmss(cd) + ' — no entries'; cls = 'gr-cool'; }
     else if (count >= lim) { txt = tag + '⛔ ' + count + '/' + lim + ' TRADES — DONE'; cls = 'gr-stop'; }
@@ -10194,6 +11444,80 @@ window.grInBlackout = false;
       }
     } catch (e) {}
 
+    // ── TODAY'S PLAN readouts (2026-09-19) ──────────────────────────────────
+    // Satisfaction number, eval pace and the streak gate, from
+    // renderer/day-plan.js — the SAME module the server reads for every
+    // agent's context, so the tag in this HUD and the sentence Jessi says
+    // cannot disagree. All three are ADVISORY: none blocks a trade, none moves
+    // the day stop, and each disappears when rules.json disables it.
+    let planTag = '', evalTag = '', streakTag = '', payoutTag = '';
+    try {
+      const DP = window.DayPlan;
+      const RR = getRules() || {};
+      if (DP) {
+        const accP = (typeof state !== 'undefined' && state.account) || {};
+        const apP = currentProtection();
+        const stopP = (apP.enabled && Number(apP.stopLossUsd) > 0) ? Number(apP.stopLossUsd) : (Number(RR.perTradeMaxLoss) || 0);
+        const flP = RR.firmLimits || {};
+        const dllP = Number(flP.dailyLossLimit) || null;
+        const ddP = Number(flP.eodThresholdDrawdown) || null;
+
+        const sat = satReadout;   // computed above, before the state line
+        if (sat && sat.enabled) {
+          // Progress is only shown while the day is not red — same rule as the
+          // agent-facing sentence (day-plan.js): "plan -$280/$300 (0%)" frames a
+          // losing day as a shortfall against a profit goal.
+          planTag = sat.reached
+            ? ' · ✅ DAY DONE at ' + money(sat.target)
+            : (dayPnl >= 0 ? ' · plan ' + money(dayPnl) + '/' + money(sat.target) + ' (' + sat.pct + '%)' : '');
+          if (sat.reached && grLastSatisfactionDay !== today()) {
+            grLastSatisfactionDay = today();
+            banner('✅ SATISFACTION NUMBER HIT — ' + money(dayPnl) + ' against your ' + money(sat.target)
+              + ' for the day. Close the platform AND physically leave the desk. The extra you might have'
+              + ' made is not worth the day you already have.', 'green');
+          }
+        }
+
+        // Eval pace is eval-only: a funded account has no distance-to-target,
+        // and showing it one would be a different product's number.
+        const evalTargetP = Number(accP.evalTarget) > 0 ? Number(accP.evalTarget) : null;
+        const ev = DP.evalPlan({
+          cfg: RR.evalPlan,
+          balance: Number(accP.balance) || null,
+          targetBalance: state.mode === 'eval' ? evalTargetP : null,
+          todayPnl: dayPnl,
+        });
+        if (ev.enabled && !ev.reached) evalTag = ' · pace ' + money(ev.chunk) + '/day (' + money(ev.remaining) + ' left)';
+
+        // Post-payout window (2026-09-19): while it is open, the HUD says so —
+        // those are the days Deva's relapse signature actually appears in, and
+        // the F5 detector is quietly watching them on the same feed.
+        const ppCfg = RR.postPayoutRelapse || {};
+        if (ppCfg.enabled !== false && payoutWatch) {
+          const win = Number(ppCfg.windowDays) > 0 ? Number(ppCfg.windowDays) : 5;
+          if (payoutWatch.daysSince <= win) {
+            payoutTag = ' · 💰 post-payout day ' + payoutWatch.daysSince + '/' + win;
+          }
+        }
+
+        const gate = DP.streakGate({
+          cfg: RR.streakGate, trades: s.trades, perTradeStopUsd: stopP,
+          dailyLossLimit: dllP, drawdownLimit: ddP, dayPnl: dayPnl,
+        });
+        if (gate.matched) {
+          streakTag = (gate.stopsToDll != null && dllP != null)
+            ? ' · ⚠ ' + gate.losses + 'L streak — ' + gate.stopsToDll + ' stop' + (gate.stopsToDll === 1 ? '' : 's') + ' left to ' + money(dllP)
+            : ' · ⚠ ' + gate.losses + 'L streak — room unknown';
+          if (gate.losses !== grLastStreakLosses) {
+            grLastStreakLosses = gate.losses;
+            banner('⚠ ' + gate.text, 'amber');
+          }
+        } else {
+          grLastStreakLosses = 0;
+        }
+      }
+    } catch (e) { /* advisory readouts — never let them break the HUD */ }
+
     // 2026-08-18/19: continuous reconciliation readout, not just a one-time
     // banner — Anoop keeps 3 monitors open specifically to spot-check this,
     // so the HUD should show it on every render, not just the moment it first
@@ -10214,7 +11538,7 @@ window.grInBlackout = false;
     const evTag = (live && s.countEvidence === 'degraded')
       ? ' · ~COUNT PROVISIONAL (' + s.degradedTradeCount + ' scored on a degraded feed — cap is advisory)'
       : (live && s.feedDegraded ? ' · ⚠ FEED DEGRADED — counts approximate' : '');
-    document.getElementById('gr-meta').textContent = posTag + 'Day ' + money(dayPnl) + srcTag + ' · trades ' + count + '/' + lim + ' · stop ' + money(-dayStop()) + ratchetTag + ' · size ' + (maxSize || 0) + '/' + SIZE_CAP + volTag + (disc !== null ? ' · disc ' + disc + '%' : '') + scTxt + (nn ? ' · ' + nn : '') + domTag + tcTag + evTag;
+    document.getElementById('gr-meta').textContent = posTag + 'Day ' + money(dayPnl) + srcTag + ' · trades ' + count + '/' + lim + ' · stop ' + money(-dayStop()) + ratchetTag + ' · size ' + (maxSize || 0) + '/' + SIZE_CAP + volTag + evalTag + planTag + streakTag + payoutTag + (disc !== null ? ' · disc ' + disc + '%' : '') + scTxt + (nn ? ' · ' + nn : '') + domTag + tcTag + evTag;
     const logWrap = document.getElementById('gr-logwrap'); if (logWrap) logWrap.style.opacity = live ? '0.4' : '1';
     if (stopped && !s.acked) grShowStop(s); else stopAlarm.stop();
   };
@@ -10235,7 +11559,7 @@ window.grInBlackout = false;
     // input/button start disabled and grShowStop() unlocks them once
     // StopAlarm.ackDelayRemainingMs() reaches 0. id added to the button
     // (previously class-only) so grShowStop() can address it directly.
-    ov.innerHTML = '<div class="gr-stop-box"><div class="gr-stop-title">⛔ DAILY STOP HIT</div><div class="gr-stop-sub">You are done trading today. Flatten every position and close Tradovate. The account you keep is worth more than the trade you skip.</div><div id="gr-stop-countdown" class="gr-stop-countdown"></div><input id="gr-stop-ack" class="gr-stop-inp" placeholder="type: i am done" disabled><button id="gr-stop-btn" class="gr-btn gr-stop-btn" onclick="grAckStop()" disabled>Acknowledge</button></div>';
+    ov.innerHTML = '<div class="gr-stop-box"><div class="gr-stop-title" id="gr-stop-title">⛔ DAILY STOP HIT</div><div id="gr-stop-reason" class="gr-stop-reason"></div><div class="gr-stop-sub">You are done trading today. Flatten every position and close Tradovate. The account you keep is worth more than the trade you skip.</div><div id="gr-stop-countdown" class="gr-stop-countdown"></div><input id="gr-stop-ack" class="gr-stop-inp" placeholder="type: i am done" disabled><button id="gr-stop-btn" class="gr-btn gr-stop-btn" onclick="grAckStop()" disabled>Acknowledge</button></div>';
     document.body.appendChild(ov);
     if (window.api && window.api.onNewsStatus) window.api.onNewsStatus(grNews);
     if (window.api && window.api.onTradovateAccount) window.api.onTradovateAccount(grIngestLive);
@@ -10251,8 +11575,54 @@ window.grInBlackout = false;
       // have clamped the request — so the row renders from the broadcast, not
       // from what the button asked for.
       try { renderSizeCapRow(); } catch (e) {}
+      try { renderDayPlanRow(); } catch (e) {}
     });
+    // The payout window is a read, so it is fetched once (and after any payout
+    // is logged) rather than on every paint.
+    try { refreshPayoutWatch().then(function () { try { renderDayPlanRow(); } catch (e) {} }); } catch (e) {}
+    // THE LOOP's ledger, read once at startup so the Insights card has it (and
+    // refreshed on demand from the card itself).
+    try { refreshPatternMemory(); } catch (e) {}
     grRender(); setInterval(grRender, 1000);
+    // Day-plan readouts ride the same cadence, from the same live inputs (today's
+    // P&L, today's trades). Cheap: a handful of DOM writes on elements that exist
+    // whether or not the Today flyout is open.
+    try { renderDayPlanRow(); } catch (e) {}
+    setInterval(function () { try { renderDayPlanRow(); } catch (e) {} }, 2000);
+    // Phase 2: the playbook registry is a read, so it is pulled once and again
+    // after any toggle; the router's own broadcast updates the last-read line
+    // without a poll. Refresh also rides the rules broadcast, so a toggle made
+    // in another window repaints this one.
+    try { refreshRouter(); } catch (e) {}
+    if (window.api && window.api.onRouterData) window.api.onRouterData(function (m) {
+      _routerData = (m && m.data) ? m.data : null;
+      try { renderRouterBlock(); } catch (e) {}
+    });
+    // The voice router's own broadcast, kept even when it routes to the coach —
+    // 'it decided to let the agent handle it' is a decision too.
+    if (window.api && window.api.onVoiceRoute) window.api.onVoiceRoute(function (m) {
+      try { _lastVoiceRoute = m || null; renderRouterBlock(); } catch (e) {}
+    });
+    if (window.api && window.api.onRouterRead) window.api.onRouterRead(function (m) {
+      try {
+        if (m && m.composite) _routerComposite = m.composite;
+        if (m && m.line && _routerData) {
+          _routerData.line = m.line;
+          _routerData.stats = _routerData.stats || {};
+          _routerData.stats.lastRead = m.row || null;
+        }
+        renderRouterBlock();
+      } catch (e) {}
+    });
+    if (window.api && window.api.onRegistryError) window.api.onRegistryError(function (m) {
+      // A refused toggle must say why — a switch that silently does nothing
+      // reads as a bug in the app rather than a rule in the code.
+      try {
+        const el = document.getElementById('router-shadow');
+        if (el) { el.textContent = 'Refused: ' + ((m && m.message) || 'unknown reason'); el.className = 'dayplan-tab-line dp-warn'; }
+      } catch (e) {}
+      try { refreshRouter(); } catch (e) {}
+    });
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', grInit); else grInit();
 })();
@@ -10366,10 +11736,12 @@ function renderInsights() {
   const el = document.getElementById('ins-body'); if (!el) return;
   const hist = (typeof grHistory === 'function' ? grHistory() : []).slice().sort((a, b) => a.date < b.date ? -1 : 1);
   const acc = state.account;
-  if (!hist.length) { el.innerHTML = '<div class="no-trades">No days logged yet. Upload your Performance reports (Update File) — each day is analyzed separately.</div>' + insJourneyBlock() + insArchiveBlock() + insClearBtn(); return; }
+  if (!hist.length) { el.innerHTML = '<div class="no-trades">No days logged yet. Upload your Performance reports (Update File) — each day is analyzed separately.</div>' + insPatternMemoryBlock() + insSurvivalBlock() + insJourneyBlock() + insArchiveBlock() + insClearBtn(); return; }
   let h = '';
   h += insJourneyBlock();
   h += insLoopBlock();
+  h += insPatternMemoryBlock();
+  h += insSurvivalBlock();
   h += insScoreBlock(hist);
   h += insRedDayBlock(hist);
   h += insPlaybookBlock();
@@ -10507,9 +11879,7 @@ function insPassMath(hist, acc) {
   if (!prof) return '';   // unknown size: show nothing rather than a wrong number
   const start = prof.startBalance;
   const floor = mode === 'eval' ? acc.evalFloor : acc.fundedFloor;
-  const target = mode === 'eval'
-    ? (acc.evalTarget || (start + prof.target))
-    : (acc.payoutTarget || prof.payoutTarget || (start + 3000));
+  const target = resolveAccountTarget();
   const cushion = acc.balance - floor, profit = acc.balance - start;
   const pos = hist.filter(d => d.pnl > 0).map(d => d.pnl);
   const largest = pos.length ? Math.max.apply(null, pos) : 0;
@@ -10565,8 +11935,27 @@ function insProse(hist, acc) {
   bad.forEach(n => { const k = keyOf(n.t); if (!k) return; freq[k] = (freq[k] || 0) + 1; if (!flabel[k]) flabel[k] = labelOf(n.t); });
   const top = Object.keys(freq).sort((a, b) => freq[b] - freq[a])[0];
   if (top) parts.push('Most-repeated mistake: ' + (flabel[top] || top) + ' (' + freq[top] + '×). Fix this one first.');
-  const rem = Math.max(0, (acc.evalTarget || 159000) - acc.balance), pAvg = avg(prime);
-  if (pAvg > 0) parts.push('At ' + insMoney(pAvg) + '/prime-day, the ' + insMoney(rem) + ' to target is ~' + Math.ceil(rem / pAvg) + ' prime days (~' + Math.max(1, Math.ceil(rem / pAvg / 3)) + ' weeks). Protect the cushion and it is very doable.');
+  const target = resolveAccountTarget();
+  if (target != null) {
+    const rem = Math.max(0, target - acc.balance);
+    // ONE pace everywhere (2026-09-21): the same evalPlan chunk the Day Plan
+    // HUD, the titlebar chip and the Ladder read. This line used to project
+    // "~N prime days" from the Tue-Thu average — a second, competing pace for
+    // the same distance, and it fell back to a hardcoded 159000 target when
+    // acc.evalTarget was missing.
+    let pace = null;
+    try {
+      if (window.DayPlan && window.DayPlan.evalPlan) {
+        const p = window.DayPlan.evalPlan({ cfg: (getRules() || {}).evalPlan, balance: Number(acc.balance) || null, targetBalance: target });
+        if (p && p.enabled && !p.reached && p.chunk > 0) pace = p.chunk;
+      }
+    } catch (e) { pace = null; }
+    if (pace != null) {
+      parts.push('The ' + insMoney(rem) + ' to target at the ' + insMoney(pace) + '/day plan pace is ~' + Math.ceil(rem / pace) + ' plan days. Protect the cushion and it is very doable.');
+    } else {
+      parts.push('The ' + insMoney(rem) + ' to target. Protect the cushion and it is very doable.');
+    }
+  }
   return '<div class="analysis-block"><div class="block-title">Coach’s Notes</div><div class="ins-prose">' + parts.map(x => '<p>' + x + '</p>').join('') + '</div>'
     + '<div class="ins-do"><b>Do</b> — start 2–4 lots; add to 8–12 only after 2 confirming candles + aligned bias; trade NY Tue–Thu; aim 5–10min holds.</div>'
     + '<div class="ins-dont"><b>Don’t</b> — open big, size up while red, revenge inside 15min, or push past 20 trades. Mon-AM & Fri-PM: smallest size or sit out.</div></div>';
@@ -10650,7 +12039,10 @@ function insRedDayBlock(hist) {
 }
 
 // ═══ Feature 3: Playbook tagging → per-setup stats ═══
-function pbTags() { try { return JSON.parse(localStorage.getItem('copilot_pb_tags') || '{}'); } catch (e) { return {}; } }
+// acctRead: lifetime-aware. These stores are not in the merged overlay yet,
+// so behaviour is unchanged in normal mode and they stop reading the wrong
+// slot the moment they are added to it.
+function pbTags() { try { return JSON.parse(acctRead('copilot_pb_tags') || '{}'); } catch (e) { return {}; } }
 function pbDayTrades() { try { return JSON.parse(acctRead('copilot_day_trades') || '{}'); } catch (e) { return {}; } }
 window.pbTag = function (key, val) {
   const tags = pbTags();
@@ -10705,7 +12097,7 @@ function insPlaybookBlock() {
 // verifiable goal (green day, score ≥ target), checker runs on every CSV ingest,
 // output picks tomorrow's single focus and tracks the 5-green-day challenge.
 function loopState() {
-  try { return JSON.parse(localStorage.getItem('copilot_loop') || '{}'); } catch (e) { return {}; }
+  try { return JSON.parse(acctRead('copilot_loop') || '{}'); } catch (e) { return {}; }
 }
 function loopSave(s) {
   localStorage.setItem('copilot_loop', JSON.stringify(s));
@@ -10810,7 +12202,7 @@ function loopUpdate(hist) {
 //     translating an abstract number into a concrete, achievable unit is a
 //     standard chunking technique for long-horizon goals.
 function evalMilestoneState() {
-  try { return JSON.parse(localStorage.getItem('copilot_eval_milestones') || '{}'); } catch (e) { return {}; }
+  try { return JSON.parse(acctRead('copilot_eval_milestones') || '{}'); } catch (e) { return {}; }
 }
 function evalMilestoneSave(s) {
   localStorage.setItem('copilot_eval_milestones', JSON.stringify(s));
@@ -10869,6 +12261,128 @@ function evalTrophy(label, emoji, done) {
     + '<div style="font-size:9px;letter-spacing:.3px;margin-top:2px;">' + label + '</div>'
     + '</div>';
 }
+// ── SURVIVAL MATH (2026-09-19) ─────────────────────────────────────────────
+// The arithmetic the agents reason from, finally visible to him. Same module
+// (prop-firm-doctrine.js) the Loop's context is built from, so the number in
+// this card and the sentence THE LOOP says cannot differ. This is the card that
+// answers "why does size matter more than the setup": the real account is the
+// drawdown, and a streak is only survivable if the risk per trade was sized
+// for it.
+let costTotals = null;   // {fees, payouts, feeCount} — filled by refreshPayoutWatch()
+function insSurvivalBlock() {
+  const D = window.PropFirmDoctrine;
+  if (!D) return '';
+  const rules = (typeof getRules === 'function' ? getRules() : {}) || {};
+  const fl = rules.firmLimits || {};
+  const ap = currentProtection();
+  const stopUsd = (ap.enabled && Number(ap.stopLossUsd) > 0) ? Number(ap.stopLossUsd) : (Number(rules.perTradeMaxLoss) || 0);
+  const trades = (typeof jrAllTrades === 'function' ? jrAllTrades() : []) || [];
+  const wr = D.winRateFromRows(trades, 10);
+  const line = D.formatSurvivalMath({
+    winRate: wr ? wr.winRate : null,
+    nTrades: wr ? wr.n : null,
+    perTradeStopUsd: stopUsd,
+    dailyLossLimit: Number(fl.dailyLossLimit) || null,
+    drawdownLimit: Number(fl.eodThresholdDrawdown) || null,
+  });
+  let h = '<div class="analysis-block"><div class="block-title">Survival math — the real account</div>'
+    + '<div class="ins-prose" style="line-height:1.55">' + line + '</div>';
+  if (costTotals) {
+    h += '<div class="ins-prose" style="margin-top:8px;line-height:1.55">'
+      + D.realReturnLine({ fees: costTotals.fees, payouts: costTotals.payouts, feeCount: costTotals.feeCount }) + '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
+// ── PATTERN MEMORY (2026-09-19) ────────────────────────────────────────────
+// THE LOOP has kept a permanent ledger since 2026-09-03 and spoken from it into
+// chat — but the ledger itself was never on screen: patternMemoryQuery existed
+// in ws-client.js and was called by nothing. So "eleventh time, $5,516" could
+// appear in chat while the record behind it stayed invisible. This is that
+// record, with the same numbers the agent quotes.
+let _patternMemory = null;   // array of recurrence records, or null while loading
+function insPatternMemoryBlock() {
+  let h = '<div class="analysis-block"><div class="block-title">Pattern memory — what repeats, and what it has cost</div>';
+  h += '<div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">'
+    + '<button class="jr-nav dj-btn" onclick="askLoopNow()" title="Ask THE LOOP to reason about your most serious repeat right now — bypasses the once-per-day gate but not the repeat bar">Ask THE LOOP now</button>'
+    + '<button class="jr-nav dj-btn" onclick="refreshPatternMemory()" title="Re-read the pattern ledger from disk">↻ Refresh</button>'
+    + '</div>';
+  if (_patternMemory === null) { return h + '<div class="no-trades">Reading the pattern ledger…</div></div>'; }
+  const rows = Array.isArray(_patternMemory) ? _patternMemory : [];
+  if (!rows.length) { return h + '<div class="no-trades">Nothing on the ledger yet — it fills as trades close and days roll up.</div></div>'; }
+  const money = (n) => (n < 0 ? '-$' : '$') + Math.abs(Math.round(Number(n) || 0)).toLocaleString();
+  const trendLabel = { worsening: '📈 worsening', improving: '📉 improving', steady: '→ steady', new: '🆕 new', establishing: '· establishing', unknown: '· unknown' };
+  h += '<div class="jr-tbl-wrap"><table class="jr-tbl"><thead><tr>'
+    + '<th>Pattern</th><th>Times</th><th>Days</th><th>Cost</th><th>Gain</th><th>Trend</th></tr></thead><tbody>';
+  rows.forEach(function (r) {
+    const isMistake = r.type === 'mistake';
+    h += '<tr>'
+      + '<td>' + (isMistake ? '🔴 ' : '🟢 ') + escHtml(r.label || r.kind) + '</td>'
+      + '<td>' + r.count + '</td>'
+      + '<td>' + r.days + (r.daysTradedTotal ? ' / ' + r.daysTradedTotal : '') + '</td>'
+      + '<td class="' + (Number(r.totalCost) ? 'jr-r' : '') + '">' + (Number(r.totalCost) ? money(-Math.abs(r.totalCost)) : '—') + '</td>'
+      + '<td class="' + (Number(r.totalGain) ? 'jr-g' : '') + '">' + (Number(r.totalGain) ? money(r.totalGain) : '—') + '</td>'
+      + '<td>' + (trendLabel[r.trend] || r.trend || '—') + '</td>'
+      + '</tr>';
+  });
+  h += '</tbody></table></div>';
+  h += '<div class="sizecap-note">Every row is a CITED episode from your own records — the same ledger THE LOOP reasons from, not a summary of it.</div>';
+  return h + '</div>';
+}
+
+async function refreshPatternMemory() {
+  try {
+    if (!window.api || !window.api.patternMemoryQuery) { _patternMemory = []; }
+    else {
+      const res = await window.api.patternMemoryQuery({ scope: 'summary' });
+      const data = (res && res.data !== undefined) ? res.data : res;
+      _patternMemory = Array.isArray(data) ? data : [];
+    }
+  } catch (e) { _patternMemory = []; }
+  try {
+    if (typeof renderInsights === 'function' && document.getElementById('ins-body')) renderInsights();
+  } catch (e) {}
+}
+window.refreshPatternMemory = refreshPatternMemory;
+
+window.askLoopNow = async function () {
+  try {
+    if (!window.api || !window.api.runLoop) return;
+    const res = await window.api.runLoop({});
+    if (res && res.ok === false) addSystemMessage('THE LOOP had nothing to add: ' + (res.error || 'no repeat worth speaking about yet.'));
+    else addSystemMessage('Asked THE LOOP for its read — the answer arrives in this chat, with the recurrence record behind it.');
+  } catch (e) { addSystemMessage('Could not reach THE LOOP: ' + e.message); }
+};
+
+// ── DOCTRINE REFERENCE (2026-09-19) ────────────────────────────────────────
+// The Rules tab reads the doctrine straight out of the module the agents are
+// built from. It is collapsible because it is reference, not a daily read.
+function renderDoctrineBlock() {
+  const host = document.getElementById('rules-doctrine');
+  if (!host) return;
+  const D = window.PropFirmDoctrine;
+  if (!D) { host.innerHTML = ''; return; }
+  const paras = (text) => String(text || '').split('\n').map(function (l) {
+    return '<div style="font-size:11.5px;line-height:1.5;margin:2px 0">' + escHtml(l) + '</div>';
+  }).join('');
+  host.innerHTML = '<details class="rules-block" style="margin-top:10px">'
+    + '<summary style="cursor:pointer;font-weight:700;font-size:12px">📜 Deva\'s doctrine + the math of prop firms — what every agent is running on</summary>'
+    + '<div class="sizecap-note" style="margin:6px 0">Absorbed 2026-09-17 from the two sources Anoop sent. ONE copy lives in '
+    + '<code>app/prop-firm-doctrine.js</code> and is spliced into THE LOOP, Jessi, the Scalper, the Post-Session Analyst and the main chat — '
+    + 'so this text is literally what they are told, not a paraphrase of it.</div>'
+    + '<div class="edg-card"><div class="edg-label">The math — "The Math of Winning in Prop Firms"</div>'
+    + paras(D.MATH_DOCTRINE) + '</div>'
+    + '<div class="edg-card"><div class="edg-label">Deva\'s doctrine — Jasara podcast ep. 2</div>'
+    + paras(D.DEVA_DOCTRINE) + '</div>'
+    + '<div class="edg-card"><div class="edg-label">Sources</div>'
+    + '<div style="font-size:11px;line-height:1.6">'
+    + '· The Math of Winning in Prop Firms — <a href="https://www.youtube.com/watch?v=CCu3YpugadQ" target="_blank" rel="noopener">youtube.com/watch?v=CCu3YpugadQ</a><br>'
+    + '· Deva\'s journey (Jasara podcast ep. 2) — <a href="https://www.youtube.com/watch?v=vGSpbspmGoM" target="_blank" rel="noopener">youtube.com/watch?v=vGSpbspmGoM</a>'
+    + '</div></div>'
+    + '</details>';
+}
+
 function insLoopBlock() {
   const s = loopState();
   if (!s.lastDate) return '';
@@ -10946,7 +12460,7 @@ if (document.readyState === 'loading') document.addEventListener('DOMContentLoad
 
 // ═══ Feature 4: MAE/MFE via TradingView 1-min bars (no external API) ═══
 const MNQ_PT_VALUE = 2; // $ per index point per micro contract
-function mmStore() { try { return JSON.parse(localStorage.getItem('copilot_maemfe') || '{}'); } catch (e) { return {}; } }
+function mmStore() { try { return JSON.parse(acctRead('copilot_maemfe') || '{}'); } catch (e) { return {}; } }
 // window.api.mcpCall('<tool>', args) resolves to { ok, result } where result is
 // the RAW MCP tool envelope { content: [{ type:'text', text: '<JSON string>' }] }
 // — the JSON payload (bars, resolution, etc.) is one level deeper than that and
@@ -11735,7 +13249,7 @@ async function handleGoodTradeShot(ev) {
       const analysis = await window.api.sendChat([buildContextMessage(), ...state.messages]);
       const last = state.messages[state.messages.length - 1];
       if (last && Array.isArray(last.content)) last.content = [{ type: 'text', text: '[Uploaded a good-trade screenshot for review]' }];
-      try { const j = JSON.parse(localStorage.getItem('copilot_goodtrades') || '[]'); j.push({ at: Date.now(), name: file.name, analysis: String(analysis || '').slice(0, 4000) }); localStorage.setItem('copilot_goodtrades', JSON.stringify(j.slice(-50))); } catch (e) {}
+      try { const j = JSON.parse(acctRead('copilot_goodtrades') || '[]'); j.push({ at: Date.now(), name: file.name, analysis: String(analysis || '').slice(0, 4000) }); localStorage.setItem('copilot_goodtrades', JSON.stringify(j.slice(-50))); } catch (e) {}
     } catch (e) { setStreaming(false); addSystemMessage('Analysis error: ' + e.message); }
   };
   reader.onerror = () => addSystemMessage('Could not read that image.');
@@ -12319,6 +13833,35 @@ async function renderJournal() {
       + '<b>Sizing right now:</b> ' + guidance.label + '</div>';
   }
 
+  // ── TWO JOURNALS, summarised (2026-09-19) ────────────────────────────────
+  // Every day card below is already split by its own P&L — a red day opens the
+  // LOSS JOURNAL (with state-at-entry, state-after and the criteria he actually
+  // applied), a green day opens the WIN JOURNAL. This line is the count, so the
+  // split is visible without opening twenty cards, and it names the gap Deva
+  // says is the expensive one: a loss day with no loss data written on it.
+  try {
+    const noted = Object.keys(djNotes || {}).filter(d => {
+      const n = djNotes[d] || {};
+      return n.text || n.mistake || n.lesson || n.entryCriteria || n.exitCriteria || n.stateAtEntry || n.stateNow;
+    });
+    if (noted.length) {
+      const dayNet = (d) => { const row = (ledger || {})[d]; return row && Number.isFinite(Number(row.net)) ? Number(row.net) : null; };
+      const win = noted.filter(d => dayNet(d) > 0).length;
+      const loss = noted.filter(d => dayNet(d) < 0).length;
+      const lossWithDetail = noted.filter(d => dayNet(d) < 0 && (djNotes[d].entryCriteria || djNotes[d].exitCriteria || djNotes[d].stateAtEntry || djNotes[d].stateNow)).length;
+      const missing = loss - lossWithDetail;
+      html += '<div class="jr-journal-split">'
+        + '<b>📓 Two journals</b> — ' + noted.length + ' day' + (noted.length === 1 ? '' : 's') + ' written: '
+        + '<span class="jr-g">🟢 ' + win + ' win journa' + (win === 1 ? 'l' : 'ls') + '</span> · '
+        + '<span class="jr-r">🔴 ' + loss + ' loss journa' + (loss === 1 ? 'l' : 'ls') + '</span>'
+        + (missing > 0
+          ? ' · <span style="color:var(--amber)">' + missing + ' loss day' + (missing === 1 ? '' : 's')
+            + ' still without state/criteria — Deva: "you absolutely need data from your losses"</span>'
+          : (loss > 0 ? ' · every loss day has its detail recorded' : ''))
+        + '</div>';
+    }
+  } catch (e) { /* the day cards below are the substance; this is a summary */ }
+
   const sweetRows = jrSizeSweetSpot();
   if (sweetRows.length) {
     html += '<div class="analysis-block"><div class="block-title">Size sweet spot — expectancy (pts) by size</div>'
@@ -12434,7 +13977,7 @@ async function endDay() {
   const prof = ACCOUNT_PROFILES[slot.size][slot.stage];
   const isEval = slot.stage === 'eval';
   const floor = isEval ? acc.evalFloor : acc.fundedFloor;
-  const target = isEval ? (acc.evalTarget || prof.startBalance + (prof.target || 0)) : null;
+  const target = isEval ? resolveAccountTarget() : null;
 
   const ls = (k, fb) => { try { return JSON.parse(acctRead(k) || 'null') || fb; } catch (e) { return fb; } };
   const hist = ls('copilot_gr_history', []);
@@ -12568,6 +14111,16 @@ window.djSaveNote = async function (date) {
     lesson: g('dj-lesson-' + date),
     savedAt: new Date().toISOString()
   };
+  // The loss-journal fields exist only on a red day (see djDayRow). Writing
+  // them unconditionally would blank a saved entry the moment the form is not
+  // rendered — the same silent-overwrite class of bug this function already
+  // had once, fixed 2026-08-25. Presence is tested, not assumed.
+  if (document.getElementById('dj-entry-' + date)) {
+    note.entryCriteria = g('dj-entry-' + date);
+    note.exitCriteria = g('dj-exit-' + date);
+    note.stateAtEntry = g('dj-stateentry-' + date);
+    note.stateNow = g('dj-statenow-' + date);
+  }
   djNotes[date] = note;
   const ok = await window.api.noteSave(slot.id, date, note);
   const badge = document.getElementById('dj-saved-' + date);
@@ -12596,6 +14149,12 @@ window.djSaveNote = async function (date) {
     set('dj-mistake-' + date, note.mistake);
     set('dj-text-' + date, note.text);
     set('dj-lesson-' + date, note.lesson);
+    if (note.entryCriteria !== undefined) {
+      set('dj-entry-' + date, note.entryCriteria);
+      set('dj-exit-' + date, note.exitCriteria);
+      set('dj-stateentry-' + date, note.stateAtEntry);
+      set('dj-statenow-' + date, note.stateNow);
+    }
     // Refresh the scorecard — the note just saved may BE the repeat.
     if (typeof renderJournal === 'function') { try { renderJournal(); } catch (e) {} }
   }
@@ -12794,12 +14353,48 @@ function djDayRow(date, dayStats, trades) {
     // Dropdown-driven detail + free text, saved per day per account
     const sel = (id, opts, val, label) => '<label class="dj-f"><span>' + label + '</span><select id="' + id + '">'
       + opts.map(o => '<option value="' + o + '"' + (val === o ? ' selected' : '') + '>' + (o || '—') + '</option>').join('') + '</select></label>';
+    // ── TWO JOURNALS (2026-09-19) ──────────────────────────────────────────
+    // Deva, whose journey mirrors Anoop's: "keep a couple of journals — one for
+    // your profitable days and definitely one for your losing days... whether or
+    // not you have data from your wins, you absolutely need data from your
+    // losses: why did you lose, what was your psychological state, what were
+    // your entry and exit criteria, what mistakes did you make."
+    //
+    // This tab had ONE form for both kinds of day, which quietly assumes the
+    // same questions apply to a green day and a red one. They do not: the win
+    // journal asks what to repeat, the loss journal asks why it happened. The
+    // day's own net P&L decides which one he is writing, so he never has to
+    // choose — and a loss day additionally asks for the two things his notes
+    // never carried: the criteria he actually applied, and his state at entry
+    // versus after the loss (the same pair JESSI_PERSONA rule #10 asks for out
+    // loud — "how sure at entry versus now").
+    const isLossDay = net < 0;
+    const isWinDay = net > 0;
+    const jHead = isLossDay
+      ? '<div class="dj-jhead dj-jloss">🔴 LOSS JOURNAL — why did you lose, what was your state, what were your entry and exit criteria, what mistake did you make.</div>'
+      : (isWinDay
+        ? '<div class="dj-jhead dj-jwin">🟢 WIN JOURNAL — what worked today, so it can be repeated on purpose instead of by accident.</div>'
+        : '<div class="dj-jhead">⚪ FLAT DAY — neither a win nor a loss. Record what you waited out.</div>');
+    const escAttr = (v) => String(v == null ? '' : v).replace(/"/g, '&quot;').replace(/</g, '&lt;');
+    // Loss-day extras only. Nothing here is required to save the note — it is
+    // the data Deva says is non-negotiable after a red day and that this tab
+    // had no field for.
+    const lossExtras = isLossDay
+      ? '<div class="dj-fields">'
+          + sel('dj-stateentry-' + date, DJ_MOODS, note.stateAtEntry || '', 'State at entry')
+          + sel('dj-statenow-' + date, DJ_MOODS, note.stateNow || '', 'State after the loss')
+        + '</div>'
+        + '<input id="dj-entry-' + date + '" class="dj-lesson" placeholder="Entry criteria you actually applied — what made you click" value="' + escAttr(note.entryCriteria) + '">'
+        + '<input id="dj-exit-' + date + '" class="dj-lesson" placeholder="Exit criteria — how you planned to get out, and what actually happened" value="' + escAttr(note.exitCriteria) + '">'
+      : '';
     h += '<div class="dj-note">'
+      + jHead
       + '<div class="dj-fields">'
         + sel('dj-mood-' + date, DJ_MOODS, note.mood || '', 'State of mind')
         + sel('dj-plan-' + date, DJ_YN, note.followedPlan || '', 'Followed the plan')
         + sel('dj-mistake-' + date, DJ_MISTAKES, note.mistake || '', 'Main mistake')
       + '</div>'
+      + lossExtras
       + '<textarea id="dj-text-' + date + '" class="dj-text" rows="3" placeholder="What happened today — setups, how you felt, what you would repeat…">' + (note.text || '').replace(/</g, '&lt;') + '</textarea>'
       + '<input id="dj-lesson-' + date + '" class="dj-lesson" placeholder="One lesson to carry into tomorrow" value="' + (note.lesson || '').replace(/"/g, '&quot;') + '">'
       + '<div class="dj-actions">'

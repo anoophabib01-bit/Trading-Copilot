@@ -84,7 +84,7 @@ function ensureModeDir(dataDir, mode) {
 }
 
 // ── state.json — the toggle's memory across restarts ──────────────────────
-// Kept HERE rather than in ~/.mnq-copilot-config.json (where mode/tradingMode
+// Kept HERE rather than in ~/.trading-copilot-config.json (where mode/tradingMode
 // live) so the whole autonomy record travels together and can be inspected,
 // archived or deleted as one unit. Never defaults to anything but 'off': a
 // control switch that comes back on by itself after a crash is the last thing
