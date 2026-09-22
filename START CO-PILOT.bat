@@ -45,10 +45,26 @@ REM  If TradingView is ALREADY running with the debug port open, this now reuses
 REM  it instead of killing a working chart and paying the cold start again.
 REM ============================================================================
 
-set "ROOT=G:\Trading-CoPilot"
-REM The project folder was renamed 2026-09-18. Prefer the new name, fall back to
-REM the old one, so this launcher works whether or not the rename has happened.
+REM ---------------------------------------------------- WHERE THE PROJECT IS ---
+REM  CHANGED 2026-09-22. This used to be pinned to "G:\Trading-CoPilot" with a
+REM  fallback to "G:\MNQ-CoPilot", so a fresh clone anywhere else died right
+REM  here with "Is the G: drive plugged in?". That was the single thing stopping
+REM  the repo from being runnable exactly as cloned.
+REM
+REM  The folder this script lives in is the correct answer on every machine: on
+REM  Anoop's it resolves to the same G: path it always did, and in a clone it
+REM  resolves to the clone. %~dp0 carries a trailing backslash, so it is
+REM  stripped -- "G:\MNQ-CoPilot\" + "\app\server.js" would work, but the
+REM  doubled separator shows up in every echoed message below.
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+
+REM  The G: paths are kept ONLY as a safety net, for the case where this script
+REM  is launched from a copy that is not sitting beside app\server.js (a stale
+REM  copy in Downloads, a shortcut left on the desktop). The project folder was
+REM  renamed 2026-09-18, so both names are tried.
 if not exist "%ROOT%\app\server.js" if exist "G:\MNQ-CoPilot\app\server.js" set "ROOT=G:\MNQ-CoPilot"
+if not exist "%ROOT%\app\server.js" if exist "G:\Trading-CoPilot\app\server.js" set "ROOT=G:\Trading-CoPilot"
 set "PS=powershell -NoProfile -ExecutionPolicy Bypass -File"
 
 echo.
@@ -72,7 +88,9 @@ echo.
 
 if not exist "%ROOT%\app\server.js" (
     echo  [X] Cannot find %ROOT%\app\server.js
-    echo      Is the G: drive plugged in?
+    echo      This launcher expects to sit in the project folder, next to app\.
+    echo      If you cloned the repo, run it from the clone. Otherwise start the
+    echo      server directly:  cd app  then  npm install  then  node server.js
     pause & exit /b 1
 )
 

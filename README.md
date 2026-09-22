@@ -53,8 +53,12 @@ Fill in your own keys. Never commit real keys — the config lives outside the r
 ## Running
 
 TradingView must be launched with remote debugging enabled
-(`--remote-debugging-port=9222`) **before** the server. On Windows, `START CO-PILOT.bat`
-does this in the right order (it hardcodes local paths — edit them for your machine).
+(`--remote-debugging-port=9222`) **before** the server.
+
+On Windows, `START CO-PILOT.bat` does that in the right order: it launches TradingView
+with the debug port, waits for it to answer, then starts the server. **It runs from
+wherever you put it** — it resolves the project folder from its own location, so a fresh
+clone works as cloned. (It used to be pinned to one drive letter; fixed 2026-09-22.)
 
 Or run the server directly:
 
