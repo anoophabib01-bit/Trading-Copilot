@@ -1,8 +1,17 @@
 {
-  "apiKey": "sk-ant-REPLACE_WITH_YOUR_ANTHROPIC_KEY",
-  "groqApiKey": "gsk_REPLACE_WITH_YOUR_GROQ_KEY_OR_LEAVE_EMPTY",
+  "_comment": "EXAMPLE ONLY - never put a real key in this file, and never commit one. The app reads its real config from ~/.trading-copilot-config.json (outside this repo), or from the matching environment variables. Updated 2026-09-21: the providers below are the ones the app actually talks to. Anthropic, Groq, OmniRoute and local Ollama were removed on 2026-09-02 - see CLAUDE.md's ONE AI BACKEND section and app/provider-chain.js.",
+
+  "deepseekApiKey": "REPLACE_WITH_YOUR_DEEPSEEK_KEY",
+  "deepSeekModel": "deepseek-v4-flash-vision-exp",
+  "disableDeepSeek": false,
+
   "geminiApiKey": "REPLACE_WITH_YOUR_GEMINI_KEY_OR_LEAVE_EMPTY",
-  "omniRouteApiKey": "REPLACE_OR_LEAVE_EMPTY_FOR_SELF_HOSTED_ROUTER",
-  "omniRouteBaseUrl": "http://127.0.0.1:20128",
-  "disableTokenOpt": false
+
+  "_gemini_comment": "Break-glass only. If the DeepSeek key is absent, empty, or kill-switched, Gemini answers instead - and every reply that comes from it is alarmed in the UI, because a different vendor answering as the coach (including on the Judge path that can emit a TRADE_TICKET) must never be silent. Set disableDeepSeek to drop to the backup mid-session without deleting a paid key.",
+
+  "edgeVoice": true,
+  "_edgeVoice_comment": "Text-to-speech: Edge neural, falling back to local Windows SAPI and then the browser's own voice. Speech-to-text is the browser's Web Speech API. No speech vendor and no audio API key are involved.",
+  
+  "openRouterApiKey": "REPLACE_OR_LEAVE_EMPTY",
+  "_openRouter_comment": "Only needed for the TypeSafe shadow layer (app/typesafe-*.js), which is OFF until this key exists. It is a spend guard as much as a feature flag."
 }
